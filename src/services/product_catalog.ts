@@ -15,9 +15,13 @@ import type { CopilotResponse } from './copilot';
 export interface CatalogItem {
   cnp: string;
   designacao: string;
-  norm: string; // designação normalizada
+  norm: string; // designação normalizada + categoria + subcategoria + DCI
   categoria: string;
   normCategoria: string;
+  subcategoria?: string;
+  normSubcategoria?: string;
+  macroArea?: string;
+  sazonalidade?: string;
   tipoVenda: string; // VENDA_LIVRE | MNSRM | MSRM
   ehGenerico: boolean;
   moleculaDci?: string | null;
@@ -110,7 +114,17 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
   const cnps = Array.from(new Set([...invMap.keys(), ...vendMap.keys()]));
   const produtos = await prisma.produtoMestre.findMany({
     where: { cnp_codigo: { in: cnps } },
-    select: { cnp_codigo: true, designacao: true, pvp: true, margem_padrao: true, taxa_iva: true },
+    select: {
+      cnp_codigo: true,
+      designacao: true,
+      pvp: true,
+      margem_padrao: true,
+      taxa_iva: true,
+      macro_area: true,
+      categoria: true,
+      subcategoria: true,
+      sazonalidade: true,
+    },
   });
 
   const items: CatalogItem[] = produtos.map((p) => {
@@ -130,12 +144,22 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
         ? ((pvp - custo) / pvp) * 100
         : 0;
 
+    const cat = p.categoria || c.categoria || '';
+    const subcat = p.subcategoria || c.subcategoria || '';
+    const dci = c.molecula_dci || '';
+    // Incluir designação, categoria, subcategoria e DCI na string pesquisável
+    const searchableText = `${p.designacao} ${cat} ${subcat} ${dci}`;
+
     return {
       cnp: p.cnp_codigo,
       designacao: p.designacao,
-      norm: normalizeText(p.designacao),
-      categoria: c.categoria || '',
-      normCategoria: normalizeText(c.categoria || ''),
+      norm: normalizeText(searchableText),
+      categoria: cat,
+      normCategoria: normalizeText(cat),
+      subcategoria: subcat,
+      normSubcategoria: normalizeText(subcat),
+      macroArea: p.macro_area || c.macro_area,
+      sazonalidade: p.sazonalidade || c.sazonalidade,
       tipoVenda: c.tipo_venda,
       ehGenerico: !!c.eh_generico,
       moleculaDci: c.molecula_dci,

@@ -12,6 +12,16 @@ try {
   console.warn('[Classifier] Dicionário FirstPharma não carregado:', e);
 }
 
+let infarmedMnsrmMap: Record<string, { nome: string; dci: string; forma: string; dosagem: string; embalagem: string; titular: string }> = {};
+try {
+  const infPath = path.join(__dirname, '../data/infarmed_mnsrm_official.json');
+  if (fs.existsSync(infPath)) {
+    infarmedMnsrmMap = JSON.parse(fs.readFileSync(infPath, 'utf-8'));
+  }
+} catch (e) {
+  console.warn('[Classifier] Dicionário Infarmed MNSRM não carregado:', e);
+}
+
 export interface TaxonomyEntry {
   macro_area: string;
   categoria: string;
@@ -77,8 +87,9 @@ const MNSRM_BRAND_PATTERNS: RegExp[] = [
   /\bben-u-ron\b(?!.*1000\s*mg.*comp)/i,
   /\b(c[eê]gripe|ilvico|griponal|ben-u-gripe|antigrippine|vigrippe|grippostad|sinutab)\b/i,
   // Garganta, Tosse e Nariz
+  /\b(vicks|vaporub|babyrub|oscillococcinum|stodal|grintuss|anginovag|bucomax|pastilhas\s*dr\s*andreub?)\b/i,
   /\b(strepsils|strepfen|meboca[ií]na|tantum\s*verde|orovox|septolete|drill|euphon)\b/i,
-  /\b(vibrocil|nasorhinathiol|nasitrim|snup|neo-sinefrina|rhinospray|rhinomer)\b/i,
+  /\b(vibrocil|nasorhinathiol|nasitrim|snup|neo-sinefrina|rhinospray|rhinomer|irigaston|sterimar|sinomarin)\b/i,
   /\b(bisolvon|broncoliber|bronxol|fluimucil|fluprox|levotuss|tussilib|sekitocil|pulmiben|bromexina)\b/i,
   // Digestivo, Azia, Obstipação e Diarreia
   /\b(gaviscon|kompensan|rennie|eno\b|nexium\s*control|ulcermin|maalox)\b/i,
@@ -232,6 +243,24 @@ function classifyProductInternal(
       molecula_dci: null,
       grupo_equivalencia_dci: null,
       categoria: (fpEntry?.c && fpEntry.c !== 'MSRM') ? fpEntry.c : categoria,
+      subcategoria_cross_sell,
+    };
+  }
+
+  // Regra Oficial INFARMED: Listagem Oficial de Medicamentos Não Sujeitos a Receita Médica (MNSRM)
+  const infarmedEntry = infarmedMnsrmMap[code];
+  if (infarmedEntry) {
+    const segmentoMed: SegmentoProduto = ehGenerico ? 'GENERICO_MG' : 'MEDICAMENTO_MARCA';
+    const moleculaFinal = molecula_dci || infarmedEntry.dci || null;
+    return {
+      tipo_venda: 'MNSRM',
+      segmento: segmentoMed,
+      eh_generico: ehGenerico,
+      molecula_dci: moleculaFinal,
+      grupo_equivalencia_dci,
+      macro_area: 'MNSRM_OTC',
+      categoria: categoria || 'Venda Livre / OTC',
+      subcategoria: subcategoria_cross_sell,
       subcategoria_cross_sell,
     };
   }
