@@ -2013,19 +2013,46 @@ function getDashboardHtml(): string {
 
   <div class="container">
     <div class="controls-card">
-      <div class="control-group" style="flex: 1.1; min-width: 220px;">
-        <label>Segmento / Estatuto de Dispensa</label>
+      <div class="control-group" style="flex: 1; min-width: 190px;">
+        <label>Segmento / Estatuto</label>
         <select id="selectTipoVenda" onchange="renderActiveTable()">
           <option value="ALL" selected>Todos os Produtos</option>
           <option value="LIVRE_TOTAL">🟢 Venda Livre + MNSRM (Balcão)</option>
-          <option value="GENERICO_MG">🧬 Só Medicamentos Genéricos (MG)</option>
-          <option value="MEDICAMENTO_MARCA">🏷️ Só Medicamentos de Marca</option>
+          <option value="GENERICO_MG">🧬 Só Genéricos (MG)</option>
+          <option value="MEDICAMENTO_MARCA">🏷️ Só Marca</option>
           <option value="VENDA_LIVRE">🟢 Só PSBE / Cosmética</option>
-          <option value="MNSRM">🔵 Só MNSRM (Sem Receita)</option>
-          <option value="MSRM">🔴 Só MSRM (Com Receita)</option>
+          <option value="MNSRM">🔵 Só MNSRM</option>
+          <option value="MSRM">🔴 Só MSRM (Receita)</option>
         </select>
       </div>
-      <div class="control-group">
+      <div class="control-group" style="flex: 1; min-width: 180px;">
+        <label>Macro-Área / Balcão</label>
+        <select id="selectMacroArea" onchange="onMacroAreaChange()">
+          <option value="ALL" selected>Todas as Áreas</option>
+          <option value="MNSRM_OTC">🔵 Balcão / OTC (MNSRM)</option>
+          <option value="MSRM">🔴 Receita Médica (MSRM)</option>
+          <option value="DERMOCOSMETICA">🌸 Dermocosmética & Higiene</option>
+          <option value="NUTRICAO_SUPLEMENTOS">🌿 Nutrição & Suplementos</option>
+          <option value="DISPOSITIVOS_SAUDE">🩹 Dispositivos Médicos</option>
+        </select>
+      </div>
+      <div class="control-group" style="flex: 1.2; min-width: 210px;">
+        <label>Família / Categoria</label>
+        <select id="selectCategoria" onchange="renderActiveTable()">
+          <option value="ALL" selected>Todas as Categorias</option>
+        </select>
+      </div>
+      <div class="control-group" style="min-width: 160px;">
+        <label>Sazonalidade</label>
+        <select id="selectSazonalidade" onchange="renderActiveTable()">
+          <option value="ALL" selected>Todas as Épocas</option>
+          <option value="INVERNO">❄️ Inverno (Pico Atual)</option>
+          <option value="PRIMAVERA">🌸 Primavera</option>
+          <option value="VERAO">☀️ Verão</option>
+          <option value="TODO_O_ANO">🔄 Todo o Ano (Crónicos)</option>
+        </select>
+      </div>
+      <div class="control-group" style="min-width: 150px;">
         <label>Critério de Monos</label>
         <select id="selectDiasMonos" onchange="onMonosFilterChange()">
           <option value="28">Últimas 4 Semanas (28 dias)</option>
@@ -2035,8 +2062,8 @@ function getDashboardHtml(): string {
           <option value="365">Últimos 12 Meses (365 dias)</option>
         </select>
       </div>
-      <div class="control-group">
-        <label>Alerta Excesso Cobertura</label>
+      <div class="control-group" style="min-width: 140px;">
+        <label>Alerta Cobertura</label>
         <select id="selectCobertura" onchange="onCoberturaFilterChange()">
           <option value="2">> 2 Meses</option>
           <option value="3">> 3 Meses</option>
@@ -2829,6 +2856,121 @@ function getDashboardHtml(): string {
       return item.tipo_venda === selected;
     }
 
+    function escapeHtml(str) {
+      if (str == null) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function formatCategoriaBadge(item) {
+      let html = \`<span class="badge" style="background:rgba(99,102,241,0.15);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);font-size:0.75rem;">\${escapeHtml(item.categoria || 'Geral')}</span>\`;
+      if (item.subcategoria && item.subcategoria !== item.categoria && item.subcategoria !== 'Geral') {
+        html += \`<br/><span style="font-size:0.72rem;color:var(--muted);display:inline-block;margin-top:2px;">\${escapeHtml(item.subcategoria)}</span>\`;
+      }
+      if (item.sazonalidade && item.sazonalidade !== 'TODO_O_ANO') {
+        let sazBadge = '';
+        if (item.sazonalidade === 'INVERNO') {
+          sazBadge = '<span class="badge" style="background:rgba(56,189,248,0.18);color:#38bdf8;border:1px solid rgba(56,189,248,0.35);margin-left:4px;font-size:0.7rem;">❄️ Inverno</span>';
+        } else if (item.sazonalidade === 'VERAO') {
+          sazBadge = '<span class="badge" style="background:rgba(251,191,36,0.18);color:#fbbf24;border:1px solid rgba(251,191,36,0.35);margin-left:4px;font-size:0.7rem;">☀️ Verão</span>';
+        } else if (item.sazonalidade === 'PRIMAVERA') {
+          sazBadge = '<span class="badge" style="background:rgba(52,211,153,0.18);color:#34d399;border:1px solid rgba(52,211,153,0.35);margin-left:4px;font-size:0.7rem;">🌸 Primavera</span>';
+        }
+        html += ' ' + sazBadge;
+      }
+      return html;
+    }
+
+    function matchesMacroAreaFilter(item, selected) {
+      if (!selected || selected === 'ALL') return true;
+      return item.macro_area === selected;
+    }
+
+    function matchesCategoriaFilter(item, selected) {
+      if (!selected || selected === 'ALL') return true;
+      return item.categoria === selected;
+    }
+
+    function matchesSazonalidadeFilter(item, selected) {
+      if (!selected || selected === 'ALL') return true;
+      return item.sazonalidade === selected;
+    }
+
+    function populateCategoriasOptions() {
+      const catSelect = document.getElementById('selectCategoria');
+      if (!catSelect || !currentReport) return;
+      const macroVal = document.getElementById('selectMacroArea') ? document.getElementById('selectMacroArea').value : 'ALL';
+      const prevVal = catSelect.value;
+
+      const allItems = [
+        ...(currentReport.alertas_excesso_cobertura || []),
+        ...(currentReport.monos || []),
+        ...(currentReport.risco_elevado_caducidade || [])
+      ];
+
+      const catCounts = new Map();
+      for (const item of allItems) {
+        if (!item.categoria) continue;
+        if (macroVal !== 'ALL' && item.macro_area !== macroVal) continue;
+        catCounts.set(item.categoria, (catCounts.get(item.categoria) || 0) + 1);
+      }
+
+      const sortedCats = Array.from(catCounts.entries()).sort((a, b) => b[1] - a[1]);
+
+      let html = '<option value="ALL">Todas as Categorias</option>';
+      for (const [cat, count] of sortedCats) {
+        html += \`<option value="\${escapeHtml(cat)}">\${escapeHtml(cat)} (\${count})</option>\`;
+      }
+      catSelect.innerHTML = html;
+      if (catCounts.has(prevVal)) {
+        catSelect.value = prevVal;
+      } else {
+        catSelect.value = 'ALL';
+      }
+    }
+
+    function onMacroAreaChange() {
+      populateCategoriasOptions();
+      renderActiveTable();
+    }
+
+    function updateMacroAreaOptionsCounts() {
+      const selMacro = document.getElementById('selectMacroArea');
+      if (!selMacro || !currentReport) return;
+      const allItems = [
+        ...(currentReport.alertas_excesso_cobertura || []),
+        ...(currentReport.monos || []),
+        ...(currentReport.risco_elevado_caducidade || [])
+      ];
+      const mCounts = {
+        MNSRM_OTC: 0,
+        MSRM: 0,
+        DERMOCOSMETICA: 0,
+        NUTRICAO_SUPLEMENTOS: 0,
+        DISPOSITIVOS_SAUDE: 0
+      };
+      const seen = new Set();
+      for (const item of allItems) {
+        if (!item.cnp_codigo || seen.has(item.cnp_codigo)) continue;
+        seen.add(item.cnp_codigo);
+        if (item.macro_area && mCounts[item.macro_area] !== undefined) {
+          mCounts[item.macro_area]++;
+        }
+      }
+      for (let i = 0; i < selMacro.options.length; i++) {
+        const opt = selMacro.options[i];
+        if (opt.value === 'MNSRM_OTC') opt.text = \`🔵 Balcão / OTC (\${mCounts.MNSRM_OTC})\`;
+        else if (opt.value === 'MSRM') opt.text = \`🔴 Receita Médica (\${mCounts.MSRM})\`;
+        else if (opt.value === 'DERMOCOSMETICA') opt.text = \`🌸 Dermocosmética (\${mCounts.DERMOCOSMETICA})\`;
+        else if (opt.value === 'NUTRICAO_SUPLEMENTOS') opt.text = \`🌿 Suplementos (\${mCounts.NUTRICAO_SUPLEMENTOS})\`;
+        else if (opt.value === 'DISPOSITIVOS_SAUDE') opt.text = \`🩹 Dispositivos (\${mCounts.DISPOSITIVOS_SAUDE})\`;
+      }
+    }
+
     let activeFarmaciaId = localStorage.getItem('bi_pharma_farmacia_id') || '';
     let activeAccessCode = localStorage.getItem('bi_pharma_access_code') || '';
     let activeAuthRole = localStorage.getItem('bi_pharma_auth_role') || '';
@@ -3278,6 +3420,9 @@ function getDashboardHtml(): string {
           selTv.options[5].text = \`🔵 Só MNSRM (\${r.artigos_mnsrm} SKUs)\`;
           selTv.options[6].text = \`🔴 Só MSRM (\${r.artigos_msrm_receita} SKUs)\`;
         }
+
+        updateMacroAreaOptionsCounts();
+        populateCategoriasOptions();
 
         renderActiveTable();
         renderWeeklyActionPlan();
@@ -4024,13 +4169,21 @@ function getDashboardHtml(): string {
         return;
       }
 
+      const macroAreaFilter = document.getElementById('selectMacroArea') ? document.getElementById('selectMacroArea').value : 'ALL';
+      const catFilter = document.getElementById('selectCategoria') ? document.getElementById('selectCategoria').value : 'ALL';
+      const sazFilter = document.getElementById('selectSazonalidade') ? document.getElementById('selectSazonalidade').value : 'ALL';
+
       const matchRow = (i) => {
         if (!matchesTipoVendaFilter(i, tvFilter)) return false;
+        if (!matchesMacroAreaFilter(i, macroAreaFilter)) return false;
+        if (!matchesCategoriaFilter(i, catFilter)) return false;
+        if (!matchesSazonalidadeFilter(i, sazFilter)) return false;
         if (!filter) return true;
         return (
           normStr(i.cnp_codigo).includes(filter) ||
           normStr(i.designacao).includes(filter) ||
           normStr(i.categoria).includes(filter) ||
+          normStr(i.subcategoria).includes(filter) ||
           normStr(i.grupo_equivalencia_dci).includes(filter)
         );
       };
@@ -4074,7 +4227,7 @@ function getDashboardHtml(): string {
             <tr>
               <th>Código</th>
               <th>Segmento / Estatuto</th>
-              <th>Categoria</th>
+              <th>Categoria & Sazonalidade</th>
               <th>Designação</th>
               <th>Stock</th>
               <th>Validade</th>
@@ -4089,7 +4242,7 @@ function getDashboardHtml(): string {
               <tr class="clickable-row" onclick="openProductModal('\${r.cnp_codigo}')">
                 <td><b>\${r.cnp_codigo}</b></td>
                 <td>\${formatSegmentoBadge(r)}</td>
-                <td style="color:var(--muted);font-size:0.8rem">\${r.categoria}</td>
+                <td>\${formatCategoriaBadge(r)}</td>
                 <td>\${r.designacao}</td>
                 <td>\${r.stock_atual}</td>
                 <td><span class="badge badge-danger">\${r.data_validade} (\${r.meses_ate_caducidade}m)</span></td>
@@ -4107,7 +4260,7 @@ function getDashboardHtml(): string {
             <tr>
               <th>Código</th>
               <th>Segmento / Estatuto</th>
-              <th>Categoria</th>
+              <th>Categoria & Sazonalidade</th>
               <th>Designação</th>
               <th>Stock</th>
               <th>Custo Unit.</th>
@@ -4122,7 +4275,7 @@ function getDashboardHtml(): string {
               <tr class="clickable-row" onclick="openProductModal('\${r.cnp_codigo}')">
                 <td><b>\${r.cnp_codigo}</b></td>
                 <td>\${formatSegmentoBadge(r)}</td>
-                <td style="color:var(--muted);font-size:0.8rem">\${r.categoria}</td>
+                <td>\${formatCategoriaBadge(r)}</td>
                 <td>\${r.designacao}</td>
                 <td>\${r.stock_atual}</td>
                 <td>\${r.custo_unitario.toFixed(2)} €</td>
@@ -4140,7 +4293,7 @@ function getDashboardHtml(): string {
             <tr>
               <th>Código</th>
               <th>Segmento / Estatuto</th>
-              <th>Categoria</th>
+              <th>Categoria & Sazonalidade</th>
               <th>Designação</th>
               <th>Stock</th>
               <th>PVP (Margem)</th>
@@ -4154,7 +4307,7 @@ function getDashboardHtml(): string {
               <tr class="clickable-row" onclick="openProductModal('\${r.cnp_codigo}')">
                 <td><b>\${r.cnp_codigo}</b></td>
                 <td>\${formatSegmentoBadge(r)}</td>
-                <td style="color:var(--muted);font-size:0.8rem">\${r.categoria}</td>
+                <td>\${formatCategoriaBadge(r)}</td>
                 <td>\${r.designacao}</td>
                 <td>\${r.stock_atual}</td>
                 <td>\${r.pvp !== null ? r.pvp.toFixed(2) + ' €' : '-'} \${r.margem_percentagem ? '(' + r.margem_percentagem.toFixed(0) + '%)' : ''}</td>

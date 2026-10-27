@@ -16,7 +16,10 @@ export interface ProdutoCoberturaItem {
   segmento: SegmentoProduto;
   eh_generico: boolean;
   grupo_equivalencia_dci: string | null;
+  macro_area?: string | null;
   categoria: string;
+  subcategoria?: string | null;
+  sazonalidade?: string | null;
   sugestao_balcao: string;
   prateleira: string | null;
   lote: string;
@@ -37,7 +40,10 @@ export interface ProdutoMonoItem {
   segmento: SegmentoProduto;
   eh_generico: boolean;
   grupo_equivalencia_dci: string | null;
+  macro_area?: string | null;
   categoria: string;
+  subcategoria?: string | null;
+  sazonalidade?: string | null;
   prateleira: string | null;
   lote: string;
   stock_atual: number;
@@ -58,7 +64,10 @@ export interface ProdutoRiscoCaducidadeItem {
   segmento: SegmentoProduto;
   eh_generico: boolean;
   grupo_equivalencia_dci: string | null;
+  macro_area?: string | null;
   categoria: string;
+  subcategoria?: string | null;
+  sazonalidade?: string | null;
   prateleira: string | null;
   lote: string;
   stock_atual: number;
@@ -474,6 +483,9 @@ export async function analyzePharmacyInventory(
     const ehGenerico = computedClass.eh_generico;
     const grupoDci = computedClass.grupo_equivalencia_dci;
     const categoria = item.produto.categoria || computedClass.categoria;
+    const macroArea = item.produto.macro_area || computedClass.macro_area || (tipoVenda === 'MSRM' ? 'MSRM' : 'MNSRM_OTC');
+    const subcategoria = item.produto.subcategoria || computedClass.subcategoria || null;
+    const sazonalidade = item.produto.sazonalidade || computedClass.sazonalidade || 'TODO_O_ANO';
 
     const custoUnit = Number(item.custo_unitario);
     const pvp = item.produto.pvp !== null ? Number(item.produto.pvp) : null;
@@ -556,7 +568,10 @@ export async function analyzePharmacyInventory(
         segmento,
         eh_generico: ehGenerico,
         grupo_equivalencia_dci: grupoDci,
+        macro_area: macroArea,
         categoria,
+        subcategoria,
+        sazonalidade,
         sugestao_balcao: sugestaoBalcao,
         prateleira: item.prateleira,
         lote: item.lote,
@@ -600,7 +615,10 @@ export async function analyzePharmacyInventory(
         segmento,
         eh_generico: ehGenerico,
         grupo_equivalencia_dci: grupoDci,
+        macro_area: macroArea,
         categoria,
+        subcategoria,
+        sazonalidade,
         prateleira: item.prateleira,
         lote: item.lote,
         stock_atual: item.quantidade,
@@ -660,7 +678,10 @@ export async function analyzePharmacyInventory(
           segmento,
           eh_generico: ehGenerico,
           grupo_equivalencia_dci: grupoDci,
+          macro_area: macroArea,
           categoria,
+          subcategoria,
+          sazonalidade,
           prateleira: item.prateleira,
           lote: item.lote,
           stock_atual: item.quantidade,
