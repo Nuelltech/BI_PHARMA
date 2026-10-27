@@ -147,6 +147,7 @@ async function seedSupabase() {
             quantidade: inv.quantidade,
             custo_unitario: inv.custo_unitario,
             data_validade: inv.data_validade,
+            data_extracao: inv.data_extracao,
             atualizadoEm: inv.atualizadoEm,
           })),
           skipDuplicates: true,

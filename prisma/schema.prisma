@@ -20,6 +20,7 @@ model Farmacia {
   stagingInventario  StagingInventario[]
   stagingVendas      StagingVendas[]
   stagingValidades   StagingValidades[]
+  precos             PrecoFarmacia[]
   criadoEm           DateTime            @default(now())
 }
 
@@ -143,6 +144,22 @@ model Venda {
   @@index([farmaciaId])
   @@index([cnp_codigo])
   @@index([data_venda])
+}
+
+// Preço de venda (PVP) e margem (MG%) praticados por CADA farmácia.
+// Nunca partilhado entre farmácias: cada tenant vê apenas os valores do seu próprio ficheiro.
+model PrecoFarmacia {
+  farmaciaId   String
+  cnp_codigo   String
+  pvp          Decimal?  @db.Decimal(10, 2)
+  margem       Decimal?  @db.Decimal(10, 2)
+  custo_ref    Decimal?  @db.Decimal(10, 2)
+  atualizadoEm DateTime  @default(now())
+
+  farmacia     Farmacia  @relation(fields: [farmaciaId], references: [id])
+
+  @@id([farmaciaId, cnp_codigo])
+  @@index([farmaciaId])
 }
 
 // ============================================================================

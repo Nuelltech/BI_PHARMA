@@ -12,6 +12,7 @@
     "analyze": "tsx src/cli.ts analyze",
     "pipeline": "tsx src/cli.ts pipeline",
     "seed:supabase": "tsx src/seed_supabase.ts",
+    "audit:supabase": "tsx src/audit_db_parity.ts",
     "dashboard": "tsx src/server.ts",
     "test": "vitest run"
   },

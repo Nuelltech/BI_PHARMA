@@ -428,6 +428,7 @@ export async function transformStagingVendas(
     designacao: string;
     quantidade: number;
     valor_total: Prisma.Decimal;
+    custo_unitario?: Prisma.Decimal;
     pvp?: Prisma.Decimal;
     margem?: Prisma.Decimal;
     data_venda: Date;
@@ -450,6 +451,7 @@ export async function transformStagingVendas(
       }
 
       const designacao = (row.descricao || 'Produto Sem Designação').trim();
+      const custo_unitario = row.custo_unitario ? parsePortugueseDecimal(row.custo_unitario, 'P.CUSTO') : undefined;
       const pvp = row.pvp ? parsePortugueseDecimal(row.pvp, 'PVP') : undefined;
       const margem = row.margem ? parsePortugueseDecimal(row.margem, 'MG (%)') : undefined;
 
@@ -459,6 +461,7 @@ export async function transformStagingVendas(
         designacao,
         quantidade,
         valor_total,
+        custo_unitario,
         pvp,
         margem,
         data_venda,
@@ -479,12 +482,13 @@ export async function transformStagingVendas(
 
   if (validRows.length === 0) return result;
 
-  // 1. Garantir ProdutoMestre e enriquecer PVP / Margem + Classificação Automática
+  // 1. Garantir ProdutoMestre e guardar PrecoFarmacia (PVP / Margem isolados por Farmácia)
   const uniqueProducts = new Map<
     string,
     {
       cnp_codigo: string;
       designacao: string;
+      custo_ref?: Prisma.Decimal;
       pvp?: Prisma.Decimal;
       margem_padrao?: Prisma.Decimal;
       tipo_venda: string;
@@ -496,6 +500,7 @@ export async function transformStagingVendas(
     uniqueProducts.set(r.cnp_codigo, {
       cnp_codigo: r.cnp_codigo,
       designacao: r.designacao,
+      ...(r.custo_unitario ? { custo_ref: r.custo_unitario } : {}),
       ...(r.pvp ? { pvp: r.pvp } : {}),
       ...(r.margem ? { margem_padrao: r.margem } : {}),
       tipo_venda: classification.tipo_venda,
@@ -504,23 +509,69 @@ export async function transformStagingVendas(
   }
 
   await prisma.produtoMestre.createMany({
-    data: Array.from(uniqueProducts.values()),
+    data: Array.from(uniqueProducts.values()).map((p) => ({
+      cnp_codigo: p.cnp_codigo,
+      designacao: p.designacao,
+      pvp: p.pvp,
+      margem_padrao: p.margem_padrao,
+      tipo_venda: p.tipo_venda,
+      categoria: p.categoria,
+    })),
     skipDuplicates: true,
   });
 
-  // Atualiza PVP e margem (e preenche tipo_venda/categoria caso estivessem vazios) nos produtos existentes
+  // Guardar PVP e Margem específicos desta farmácia na tabela PrecoFarmacia
+  const tenantPrices = Array.from(uniqueProducts.values()).filter(
+    (p) => p.pvp !== undefined || p.margem_padrao !== undefined || p.custo_ref !== undefined
+  );
+  if (tenantPrices.length > 0) {
+    await prisma.precoFarmacia.deleteMany({
+      where: {
+        farmaciaId,
+        cnp_codigo: { in: tenantPrices.map((p) => p.cnp_codigo) },
+      },
+    });
+    for (let i = 0; i < tenantPrices.length; i += 1000) {
+      const chunk = tenantPrices.slice(i, i + 1000);
+      await prisma.precoFarmacia.createMany({
+        data: chunk.map((p) => ({
+          farmaciaId,
+          cnp_codigo: p.cnp_codigo,
+          pvp: p.pvp ?? null,
+          margem: p.margem_padrao ?? null,
+          custo_ref: p.custo_ref ?? null,
+        })),
+        skipDuplicates: true,
+      });
+    }
+  }
+
+  // Atualiza PVP e margem no ProdutoMestre apenas quando estava vazio (não sobrescreve preços de outra farmácia)
   const existingMap = new Map(
     (
       await prisma.produtoMestre.findMany({
         where: { cnp_codigo: { in: Array.from(uniqueProducts.keys()) } },
-        select: { cnp_codigo: true, tipo_venda: true, categoria: true, taxa_iva: true, designacao: true },
+        select: {
+          cnp_codigo: true,
+          pvp: true,
+          margem_padrao: true,
+          tipo_venda: true,
+          categoria: true,
+          taxa_iva: true,
+          designacao: true,
+        },
       })
     ).map((p) => [p.cnp_codigo, p])
   );
 
   const productsToUpdate = Array.from(uniqueProducts.values()).filter((p) => {
     const ex = existingMap.get(p.cnp_codigo);
-    return p.pvp || p.margem_padrao || !ex?.tipo_venda || !ex?.categoria;
+    return (
+      (p.pvp && ex?.pvp === null) ||
+      (p.margem_padrao && ex?.margem_padrao === null) ||
+      !ex?.tipo_venda ||
+      !ex?.categoria
+    );
   });
 
   for (let i = 0; i < productsToUpdate.length; i += 250) {
@@ -532,8 +583,8 @@ export async function transformStagingVendas(
         return prisma.produtoMestre.update({
           where: { cnp_codigo: p.cnp_codigo },
           data: {
-            ...(p.pvp ? { pvp: p.pvp } : {}),
-            ...(p.margem_padrao ? { margem_padrao: p.margem_padrao } : {}),
+            ...(p.pvp && ex?.pvp === null ? { pvp: p.pvp } : {}),
+            ...(p.margem_padrao && ex?.margem_padrao === null ? { margem_padrao: p.margem_padrao } : {}),
             ...(!ex?.tipo_venda ? { tipo_venda: recalc.tipo_venda } : {}),
             ...(!ex?.categoria ? { categoria: recalc.categoria } : {}),
           },
@@ -542,11 +593,11 @@ export async function transformStagingVendas(
     );
   }
 
-  // 2. Inserir/atualizar vendas (em lotes de 500)
+  // 2. Inserir/atualizar vendas (em lotes de 500) — inclui meses negativos (devoluções), ignora apenas qtd === 0
   const CHUNK_SIZE = 500;
   for (let i = 0; i < validRows.length; i += CHUNK_SIZE) {
     const chunk = validRows.slice(i, i + CHUNK_SIZE);
-    const salesToUpsert = chunk.filter((r) => r.quantidade > 0);
+    const salesToUpsert = chunk.filter((r) => r.quantidade !== 0);
 
     if (salesToUpsert.length > 0) {
       await prisma.$transaction(

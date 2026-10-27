@@ -353,6 +353,7 @@ export async function parseVendasCsvFile(
       .pipe(
         csv({
           separator: ';',
+          quote: '\0',
           mapHeaders: ({ header, index }) => `${index}_${header.trim().toUpperCase()}`,
         })
       );
@@ -398,7 +399,9 @@ export async function parseVendasCsvFile(
         const qtdStr = (row[mc.headerKey] ?? '0').trim();
         const qtdNum = parseInt(qtdStr, 10);
 
-        if (!Number.isNaN(qtdNum) && qtdNum > 0) {
+        // Inclui também meses NEGATIVOS (devoluções/regularizações) para que o total líquido
+        // por mês seja exatamente igual ao ficheiro original do Sifarma.
+        if (!Number.isNaN(qtdNum) && qtdNum !== 0) {
           teveVendas = true;
           const valorMes = (qtdNum * (Number.isNaN(pvpNum) ? 0 : pvpNum)).toFixed(2).replace('.', ',');
           stagingRows.push({
@@ -412,6 +415,21 @@ export async function parseVendasCsvFile(
             data_movimento: mc.isoDate,
           });
         }
+      }
+
+      // Artigo sem qualquer movimento nos 13 meses: guardar 1 linha com quantidade 0
+      // apenas para registar o artigo no catálogo ProdutoMestre e o PVP/Margem desta farmácia (não gera venda).
+      if (!teveVendas && monthColumns.length > 0) {
+        stagingRows.push({
+          codigo_produto: codigoRaw,
+          descricao: descricaoRaw || 'Sem Designação',
+          quantidade: '0',
+          valor_venda: '0,00',
+          custo_unitario: custoRaw,
+          pvp: pvpRaw,
+          margem: margemRaw,
+          data_movimento: monthColumns[monthColumns.length - 1].isoDate,
+        });
       }
 
       // Mesmo que o produto não tenha vendido nenhuma unidade nos 13 meses, se tiver PVP/Margem podemos opcionalmente

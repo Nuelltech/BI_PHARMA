@@ -134,3 +134,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS "Venda_farmaciaId_cnp_codigo_data_venda_key" O
 CREATE INDEX IF NOT EXISTS "Venda_farmaciaId_idx" ON public."Venda"("farmaciaId");
 CREATE INDEX IF NOT EXISTS "Venda_cnp_codigo_idx" ON public."Venda"("cnp_codigo");
 CREATE INDEX IF NOT EXISTS "Venda_data_venda_idx" ON public."Venda"("data_venda");
+
+-- Preços e margens específicos de cada farmácia (PVP e MG% do ficheiro de vendas de cada farmácia)
+CREATE TABLE IF NOT EXISTS public."PrecoFarmacia" (
+  "farmaciaId" TEXT NOT NULL,
+  "cnp_codigo" TEXT NOT NULL,
+  "pvp" DECIMAL(10,2),
+  "margem" DECIMAL(10,2),
+  "custo_ref" DECIMAL(10,2),
+  "atualizadoEm" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "PrecoFarmacia_pkey" PRIMARY KEY ("farmaciaId", "cnp_codigo"),
+  CONSTRAINT "PrecoFarmacia_farmaciaId_fkey" FOREIGN KEY ("farmaciaId") REFERENCES public."Farmacia"("id") ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS "PrecoFarmacia_farmaciaId_idx" ON public."PrecoFarmacia"("farmaciaId");

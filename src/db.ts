@@ -111,17 +111,19 @@ export async function ensureDatabaseReady(): Promise<{
     console.log(`[DB] Ligação remota configurada para ${host}:${port} (Modo Cloud / Supabase)...`);
   }
 
-  const prisma = new PrismaClient({
+  const basePrisma = new PrismaClient({
     datasources: {
       db: { url: dbUrl },
     },
   });
 
-  await prisma.$connect();
-  await ensureNonDestructiveSchema(prisma);
+  await basePrisma.$connect();
+  await ensureNonDestructiveSchema(basePrisma);
+
+  const prisma = attachTenantPriceOverlay(basePrisma);
 
   const cleanup = async () => {
-    await prisma.$disconnect();
+    await basePrisma.$disconnect();
     if (embeddedPgInstance) {
       await embeddedPgInstance.stop();
       embeddedPgInstance = null;
@@ -129,4 +131,101 @@ export async function ensureDatabaseReady(): Promise<{
   };
 
   return { prisma, cleanup };
+}
+
+/**
+ * Sobrepõe automaticamente o PVP e a Margem específicos da farmácia ativa (tabela PrecoFarmacia)
+ * em todas as leituras de Inventario (include.produto) e ProdutoMestre (include.inventarios),
+ * garantindo isolamento total de preços entre Farmácia A, Farmácia B e futuras farmácias.
+ */
+export function attachTenantPriceOverlay(basePrisma: PrismaClient): PrismaClient {
+  const tenantCache = new Map<string, { ts: number; map: Map<string, { pvp: any; margem: any }> }>();
+
+  async function getTenantPriceMap(farmaciaId: string) {
+    const now = Date.now();
+    const cached = tenantCache.get(farmaciaId);
+    if (cached && now - cached.ts < 30_000) {
+      return cached.map;
+    }
+    const rows = await basePrisma.precoFarmacia.findMany({
+      where: { farmaciaId },
+      select: { cnp_codigo: true, pvp: true, margem: true },
+    });
+    const map = new Map<string, { pvp: any; margem: any }>();
+    for (const r of rows) {
+      map.set(r.cnp_codigo, { pvp: r.pvp, margem: r.margem });
+    }
+    tenantCache.set(farmaciaId, { ts: now, map });
+    return map;
+  }
+
+  return basePrisma.$extends({
+    query: {
+      precoFarmacia: {
+        async $allOperations({ operation, args, query }) {
+          if (operation !== 'findMany' && operation !== 'findUnique' && operation !== 'findFirst') {
+            tenantCache.clear();
+          }
+          return query(args);
+        },
+      },
+      inventario: {
+        async findMany({ args, query }) {
+          const result: any = await query(args);
+          const farmaciaId = typeof (args?.where as any)?.farmaciaId === 'string' ? (args!.where as any).farmaciaId : null;
+          if (farmaciaId && Array.isArray(result) && result.length > 0 && result[0]?.produto) {
+            const priceMap = await getTenantPriceMap(farmaciaId);
+            if (priceMap.size > 0) {
+              for (const row of result) {
+                const tp = priceMap.get(row.cnp_codigo);
+                if (tp && row.produto) {
+                  if (tp.pvp !== null && tp.pvp !== undefined) row.produto.pvp = tp.pvp;
+                  if (tp.margem !== null && tp.margem !== undefined) row.produto.margem_padrao = tp.margem;
+                }
+              }
+            }
+          }
+          return result;
+        },
+      },
+      produtoMestre: {
+        async findUnique({ args, query }) {
+          const result: any = await query(args);
+          const farmaciaId =
+            typeof (args?.include as any)?.inventarios?.where?.farmaciaId === 'string'
+              ? (args!.include as any).inventarios.where.farmaciaId
+              : null;
+          if (result && farmaciaId) {
+            const priceMap = await getTenantPriceMap(farmaciaId);
+            const tp = priceMap.get(result.cnp_codigo);
+            if (tp) {
+              if (tp.pvp !== null && tp.pvp !== undefined) result.pvp = tp.pvp;
+              if (tp.margem !== null && tp.margem !== undefined) result.margem_padrao = tp.margem;
+            }
+          }
+          return result;
+        },
+        async findMany({ args, query }) {
+          const result: any = await query(args);
+          const farmaciaId =
+            typeof (args?.include as any)?.inventarios?.where?.farmaciaId === 'string'
+              ? (args!.include as any).inventarios.where.farmaciaId
+              : null;
+          if (Array.isArray(result) && result.length > 0 && farmaciaId) {
+            const priceMap = await getTenantPriceMap(farmaciaId);
+            if (priceMap.size > 0) {
+              for (const p of result) {
+                const tp = priceMap.get(p.cnp_codigo);
+                if (tp) {
+                  if (tp.pvp !== null && tp.pvp !== undefined) p.pvp = tp.pvp;
+                  if (tp.margem !== null && tp.margem !== undefined) p.margem_padrao = tp.margem;
+                }
+              }
+            }
+          }
+          return result;
+        },
+      },
+    },
+  }) as unknown as PrismaClient;
 }
