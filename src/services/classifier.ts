@@ -1,4 +1,16 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { PrismaClient } from '@prisma/client';
+
+let firstPharmaDict: Record<string, { m: number; c: string; p: number; gh: string }> = {};
+try {
+  const dictPath = path.join(__dirname, '../data/firstpharma_dictionary.json');
+  if (fs.existsSync(dictPath)) {
+    firstPharmaDict = JSON.parse(fs.readFileSync(dictPath, 'utf-8'));
+  }
+} catch (e) {
+  console.warn('[Classifier] Dicionário FirstPharma não carregado:', e);
+}
 
 export type TipoVenda = 'VENDA_LIVRE' | 'MNSRM' | 'MSRM';
 export type SegmentoProduto = 'GENERICO_MG' | 'MEDICAMENTO_MARCA' | 'VENDA_LIVRE_PSBE';
@@ -143,28 +155,61 @@ export function classifyProduct(
 
   // Regra A: Códigos ANF (6xxxxxx, 7xxxxxx) e códigos internos (10xxxxx) são SEMPRE Venda Livre (PSBE / Dispositivos / Cosmética)
   if (/^(6|7|10)/.test(code)) {
+    const fpEntry = firstPharmaDict[code];
     return {
       tipo_venda: 'VENDA_LIVRE',
       segmento: 'VENDA_LIVRE_PSBE',
       eh_generico: false,
       molecula_dci: null,
       grupo_equivalencia_dci: null,
-      categoria,
+      categoria: (fpEntry?.c && fpEntry.c !== 'MSRM') ? fpEntry.c : categoria,
       subcategoria_cross_sell,
     };
   }
 
   // Regra B: Taxa de IVA a 23% é SEMPRE Venda Livre
   if (iva === 23) {
+    const fpEntry = firstPharmaDict[code];
     return {
       tipo_venda: 'VENDA_LIVRE',
       segmento: 'VENDA_LIVRE_PSBE',
       eh_generico: false,
       molecula_dci: null,
       grupo_equivalencia_dci: null,
-      categoria,
+      categoria: (fpEntry?.c && fpEntry.c !== 'MSRM') ? fpEntry.c : categoria,
       subcategoria_cross_sell,
     };
+  }
+
+  // Regra C: Dicionário Mestre Oficial FirstPharma (55.632 CNPs com HMR3 e Grupos Homogéneos)
+  const fpEntry = firstPharmaDict[code];
+  if (fpEntry) {
+    const segmentoMed: SegmentoProduto = ehGenerico ? 'GENERICO_MG' : 'MEDICAMENTO_MARCA';
+    const catFinal = (fpEntry.c && fpEntry.c !== 'MSRM') ? fpEntry.c : categoria;
+
+    if (fpEntry.m === 1) {
+      return {
+        tipo_venda: 'MSRM',
+        segmento: segmentoMed,
+        eh_generico: ehGenerico,
+        molecula_dci,
+        grupo_equivalencia_dci,
+        categoria: catFinal,
+        subcategoria_cross_sell,
+      };
+    } else {
+      // fpEntry.m === 0 (Não sujeito a receita médica)
+      const isMnsrm = /^(2|3|4|5|8|9)/.test(code) && iva !== 23;
+      return {
+        tipo_venda: isMnsrm ? 'MNSRM' : 'VENDA_LIVRE',
+        segmento: isMnsrm ? segmentoMed : 'VENDA_LIVRE_PSBE',
+        eh_generico: isMnsrm ? ehGenerico : false,
+        molecula_dci: isMnsrm ? molecula_dci : null,
+        grupo_equivalencia_dci: isMnsrm ? grupo_equivalencia_dci : null,
+        categoria: catFinal,
+        subcategoria_cross_sell,
+      };
+    }
   }
 
   // Dispositivos médicos / Soluções de irrigação e lavagem nasal/ocular (Soro Fisiológico em frascos)
@@ -437,7 +482,7 @@ export async function classifyAllExistingProducts(prisma: PrismaClient): Promise
     if (c.segmento === 'GENERICO_MG') genericosMg++;
     else if (c.segmento === 'MEDICAMENTO_MARCA') marca++;
 
-    if (p.tipo_venda !== c.tipo_venda || p.categoria !== c.categoria) {
+    if (p.tipo_venda !== c.tipo_venda || (!p.categoria && c.categoria)) {
       updatesNeeded.push({
         cnp_codigo: p.cnp_codigo,
         tipo_venda: c.tipo_venda,
