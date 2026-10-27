@@ -1,0 +1,222 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// TABELAS DE DOMÍNIO E MULTI-TENANT
+// ==========================================
+model Farmacia {
+  id                 String              @id @default(uuid())
+  nome               String
+  nif                String              @unique
+  codigo_acesso      String?             @unique
+  inventarios        Inventario[]
+  vendas             Venda[]
+  stagingInventario  StagingInventario[]
+  stagingVendas      StagingVendas[]
+  stagingValidades   StagingValidades[]
+  criadoEm           DateTime            @default(now())
+}
+
+model ProdutoMestre {
+  cnp_codigo         String              @id
+  aim                String?
+  designacao         String
+  tipo_venda         String?             // MSRM ou MNSRM
+  categoria          String?
+  pvp                Decimal?            @db.Decimal(10, 2)
+  margem_padrao      Decimal?            @db.Decimal(10, 2)
+  taxa_iva           Int?
+  inventarios        Inventario[]
+  vendas             Venda[]
+}
+
+// ==========================================
+// TABELAS DE STAGING (DADOS BRUTOS)
+// ==========================================
+model StagingInventario {
+  id               String   @id @default(uuid())
+  batch_id         String
+  farmaciaId       String   
+  prat             String?  
+  aim              String?  
+  codigo           String?  
+  designacao       String?  
+  lote             String?  
+  stock            String?  
+  custo_unit       String?  
+  valor_s_iva      String?  
+  taxa_iva         String?  
+  data_extracao    DateTime @default(now())
+  processado       Boolean  @default(false)
+  erro_validacao   String?
+
+  farmacia         Farmacia @relation(fields: [farmaciaId], references: [id])
+  @@index([batch_id])
+  @@index([processado])
+}
+
+model StagingValidades {
+  id               String   @id @default(uuid())
+  batch_id         String
+  farmaciaId       String   
+  
+  // Colunas extraídas do PDF de Validades (Raw Strings)
+  ord              String?  
+  codigo           String?  
+  designacao       String?  
+  lote             String?  
+  stock            String?  
+  pratel           String?  
+  validade         String?  // Formato bruto: MM-YYYY
+  correccao        String?  
+  
+  data_extracao    DateTime @default(now())
+  processado       Boolean  @default(false)
+  erro_validacao   String?
+
+  farmacia         Farmacia @relation(fields: [farmaciaId], references: [id])
+  @@index([batch_id])
+  @@index([processado])
+}
+
+model StagingVendas {
+  id               String   @id @default(uuid())
+  batch_id         String   
+  farmaciaId       String   
+  codigo_produto   String?
+  descricao        String?
+  quantidade       String?
+  valor_venda      String?
+  custo_unitario   String?
+  pvp              String?
+  margem           String?
+  data_movimento   String?  
+  data_extracao    DateTime @default(now())
+  processado       Boolean  @default(false)
+  erro_validacao   String?
+
+  farmacia         Farmacia @relation(fields: [farmaciaId], references: [id])
+  @@index([batch_id])
+  @@index([processado])
+}
+
+// ==========================================
+// TABELAS FINAIS (DADOS TRATADOS)
+// ==========================================
+model Inventario {
+  id               String        @id @default(uuid())
+  farmaciaId       String
+  cnp_codigo       String
+  lote             String        @default("LOTE ÚNICO")
+  prateleira       String?
+  quantidade       Int
+  custo_unitario   Decimal       @db.Decimal(10, 2)
+  data_validade    DateTime?     // Mapeado a partir do ficheiro de validades
+  data_extracao    DateTime      @default(now())
+  
+  farmacia         Farmacia      @relation(fields: [farmaciaId], references: [id])
+  produto          ProdutoMestre @relation(fields: [cnp_codigo], references: [cnp_codigo])
+
+  @@unique([farmaciaId, cnp_codigo, lote])
+  @@index([farmaciaId])
+  @@index([cnp_codigo])
+}
+
+model Venda {
+  id               String        @id @default(uuid())
+  farmaciaId       String
+  cnp_codigo       String
+  quantidade       Int
+  valor_total      Decimal       @db.Decimal(10, 2)
+  data_venda       DateTime
+  
+  farmacia         Farmacia      @relation(fields: [farmaciaId], references: [id])
+  produto          ProdutoMestre @relation(fields: [cnp_codigo], references: [cnp_codigo])
+
+  @@unique([farmaciaId, cnp_codigo, data_venda])
+  @@index([farmaciaId])
+  @@index([cnp_codigo])
+  @@index([data_venda])
+}
+
+// ============================================================================
+// TABELAS EXISTENTES NO PROJETO SUPABASE PARTILHADO (GESTÃO DE FATURAS)
+// Marcadas com @@ignore para que o Prisma nunca as altere ou remova.
+// ============================================================================
+model FaturasProcessadasExistente {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  drive_file_id          String    @unique
+  nome_ficheiro_original String
+  nome_ficheiro_novo     String?
+  fornecedor             String?
+  farmacia               String?
+  tipo_documento         String?
+  numero_documento       String?
+  data_documento         DateTime? @db.Date
+  valor_total            Decimal?  @db.Decimal
+  confianca              String
+  motivo_baixa_confianca String?
+  status_processamento   String
+  numero_lote_associado  String?
+  drive_file_url         String?
+  created_at             DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at             DateTime? @default(now()) @db.Timestamptz(6)
+  data_vencimento        DateTime? @db.Date
+  nif_fornecedor         String?
+
+  @@map("faturas_processadas")
+  @@ignore
+}
+
+model ResumosLoteExistente {
+  id                        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  drive_file_id             String
+  numero_lote               String
+  fornecedor                String
+  farmacia                  String?
+  data_lote                 DateTime? @db.Date
+  valor_total_lote          Decimal?  @db.Decimal
+  lista_faturas_agregadas   Json?
+  soma_faturas_processadas  Decimal?  @default(0.00) @db.Decimal
+  lote_conciliado           Boolean?  @default(false)
+  created_at                DateTime? @default(now()) @db.Timestamptz(6)
+
+  @@map("resumos_lote")
+  @@ignore
+}
+
+model FaturasNuelltechExistente {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  drive_file_id          String    @unique
+  nome_ficheiro_original String
+  nome_ficheiro_novo     String?
+  fornecedor             String?
+  nif_emissor            String?
+  pais_emissor           String?
+  tipo_documento         String?
+  numero_documento       String?
+  data_documento         DateTime? @db.Date
+  data_vencimento        DateTime? @db.Date
+  moeda                  String?   @default("EUR")
+  valor_total            Decimal?  @db.Decimal
+  valor_subtotal         Decimal?  @db.Decimal
+  valor_iva              Decimal?  @db.Decimal
+  regime_iva             String?
+  categoria_despesa      String?
+  descricao_resumida     String?
+  confianca              String
+  motivo_baixa_confianca String?
+  status_processamento   String    @default("PROCESSADO")
+  drive_file_url         String?
+  created_at             DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at             DateTime? @default(now()) @db.Timestamptz(6)
+
+  @@map("faturas_nuelltech")
+  @@ignore
+}

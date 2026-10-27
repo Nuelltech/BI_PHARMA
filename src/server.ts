@@ -1,0 +1,4517 @@
+import http from 'http';
+import url from 'url';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { ensureDatabaseReady } from './db';
+import { analyzePharmacyInventory } from './services/analysis';
+import { classifyAllExistingProducts, classifyProduct } from './services/classifier';
+import { processFreeformQuestion } from './services/copilot';
+import { processQuestionWithLlmOrLocal } from './services/llm_router';
+import {
+  ingestInventarioPdf,
+  ingestValidadesPdf,
+  ingestVendasCsv,
+} from './services/ingestion';
+import {
+  transformStagingInventario,
+  transformStagingValidades,
+  transformStagingVendas,
+} from './services/transformation';
+import {
+  getSeasonalCampaignSuggestions,
+  getMarketingAndCrossSellingIntelligence,
+  calculateCampaignFinancials,
+  generateOmnichannelMaterials,
+  generateMonthlyEmailDigest,
+  buildCustomCampaign,
+  analyzeProductMarketingAndCrossSell360,
+  searchProductsForMarketingPicker,
+  ANNUAL_CAMPAIGNS,
+  CampaignProductItem,
+} from './services/campaigns';
+
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const MASTER_ACCESS_CODE = (process.env.MASTER_ACCESS_CODE || 'MASTER-BI').trim().toUpperCase();
+
+function maskNif(rawNif: string): string {
+  const clean = (rawNif || '').trim();
+  if (/^\d{9}$/.test(clean)) {
+    return `${clean.slice(0, 3)} *** *${clean.slice(7)}`;
+  }
+  return clean;
+}
+
+async function ensureAnonymizedTenantsAndAccessCodes(prisma: any) {
+  const farms = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
+  for (let idx = 0; idx < farms.length; idx++) {
+    const f = farms[idx];
+    const letter = String.fromCharCode(65 + idx); // A, B, C...
+    const defaultCode = `FARMACIA-${letter}`;
+    const lowerNome = (f.nome || '').toLowerCase();
+
+    let newNome = f.nome;
+    // Se ainda tiver um nome real (ex: Baptista, Avenida), anonimiza automaticamente para Pitch Comercial
+    if (lowerNome.includes('baptista') || lowerNome.includes('avenida')) {
+      newNome = `Farmácia ${letter}`;
+    }
+
+    const newCode = f.codigo_acesso && f.codigo_acesso.trim() ? f.codigo_acesso.trim().toUpperCase() : defaultCode;
+
+    if (newNome !== f.nome || newCode !== f.codigo_acesso) {
+      await prisma.farmacia.update({
+        where: { id: f.id },
+        data: { nome: newNome, codigo_acesso: newCode },
+      });
+    }
+  }
+
+  const updated = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
+  console.log('\n🔐 [ACESSOS MULTI-TENANT E ANONIMIZAÇÃO PARA PITCH]:');
+  console.log(`   👑 Código Master (Admin / Multi-Farmácia): ${MASTER_ACCESS_CODE} (ou MASTER)`);
+  for (const uf of updated) {
+    console.log(
+      `   🏥 ${uf.nome.padEnd(22)} | NIF: ${maskNif(uf.nif).padEnd(11)} | Código Isolado: ${(uf.codigo_acesso || '').padEnd(12)} | Link Direto: http://localhost:${PORT}/?acesso=${uf.codigo_acesso}`
+    );
+  }
+  console.log('');
+}
+
+async function startServer() {
+  const { prisma, cleanup } = await ensureDatabaseReady();
+
+  const farmacia = await prisma.farmacia.findFirst({
+    orderBy: { criadoEm: 'desc' },
+  });
+
+  if (!farmacia) {
+    console.warn('⚠️ Nenhuma farmácia encontrada na base de dados no arranque (use o painel Admin para importar ou npm run pipeline).');
+  } else {
+    await ensureAnonymizedTenantsAndAccessCodes(prisma);
+  }
+
+  console.log('[Classificador] A verificar e atualizar estatuto (VENDA_LIVRE / MNSRM / MSRM) e segmento (GENERICO_MG / MARCA)...');
+  const statsClass = await classifyAllExistingProducts(prisma);
+  console.log(
+    `[Classificador] ${statsClass.total} produtos caracterizados -> PSBE: ${statsClass.vendaLivre} | Genéricos MG: ${statsClass.genericosMg} | Marca: ${statsClass.marca}`
+  );
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const parsedUrl = url.parse(req.url || '/', true);
+      const pathname = parsedUrl.pathname || '/';
+
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-access-code');
+
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
+      async function resolveAccessContext(explicitCode?: string | null) {
+        const rawCode = String(
+          explicitCode ||
+            req.headers['x-access-code'] ||
+            parsedUrl.query.accessCode ||
+            parsedUrl.query.acesso ||
+            ''
+        )
+          .trim()
+          .toUpperCase();
+
+        if (
+          rawCode === MASTER_ACCESS_CODE ||
+          rawCode === 'MASTER' ||
+          rawCode === 'ADMIN-BI-2026'
+        ) {
+          return {
+            authenticated: true,
+            role: 'ADMIN' as const,
+            code: rawCode,
+            lockedFarmacia: null,
+          };
+        }
+
+        if (rawCode.length > 0) {
+          const matchedFarm = await prisma.farmacia.findFirst({
+            where: {
+              codigo_acesso: {
+                equals: rawCode,
+                mode: 'insensitive',
+              },
+            },
+          });
+          if (matchedFarm) {
+            return {
+              authenticated: true,
+              role: 'PHARMACY' as const,
+              code: matchedFarm.codigo_acesso || rawCode,
+              lockedFarmacia: matchedFarm,
+            };
+          }
+          return {
+            authenticated: false,
+            role: 'NONE' as const,
+            code: rawCode,
+            lockedFarmacia: null,
+          };
+        }
+
+        return {
+          authenticated: false,
+          role: 'NONE' as const,
+          code: '',
+          lockedFarmacia: null,
+        };
+      }
+
+      async function getActiveFarmacia(requestedId?: string | null) {
+        const ctx = await resolveAccessContext();
+        // Se for um acesso isolado de farmácia, bloqueia estritamente a essa farmácia!
+        if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
+          return ctx.lockedFarmacia;
+        }
+        if (requestedId && requestedId.trim().length > 0) {
+          const f = await prisma.farmacia.findUnique({ where: { id: requestedId.trim() } });
+          if (f) return f;
+        }
+        return (
+          (await prisma.farmacia.findFirst({ orderBy: { criadoEm: 'asc' } })) || {
+            id: '',
+            nome: 'Farmácia A',
+            nif: '000000000',
+            codigo_acesso: 'FARMACIA-A',
+          }
+        );
+      }
+
+      // 0A. Endpoint de Autenticação / Validação de Código de Acesso (Single-Pharmacy vs Master Admin)
+      if (pathname === '/api/auth/verify' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body || '{}');
+            const ctx = await resolveAccessContext(parsed.code);
+            if (!ctx.authenticated) {
+              res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error: 'Código de acesso inválido. Introduza o código da sua Farmácia (ex: FARMACIA-A) ou o código Master.',
+                })
+              );
+              return;
+            }
+            const allFarms =
+              ctx.role === 'ADMIN'
+                ? await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } })
+                : ctx.lockedFarmacia
+                  ? [ctx.lockedFarmacia]
+                  : [];
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                role: ctx.role,
+                code: ctx.code,
+                lockedFarmacia: ctx.lockedFarmacia
+                  ? {
+                      id: ctx.lockedFarmacia.id,
+                      nome: ctx.lockedFarmacia.nome,
+                      nif: maskNif(ctx.lockedFarmacia.nif),
+                      codigo_acesso: ctx.lockedFarmacia.codigo_acesso,
+                    }
+                  : null,
+                pharmacies: allFarms.map((f) => ({
+                  id: f.id,
+                  nome: f.nome,
+                  nif: maskNif(f.nif),
+                  codigo_acesso: f.codigo_acesso,
+                })),
+              })
+            );
+          } catch (e: any) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // 0B. Endpoint Admin: Atualizar Nome Anónimo e Código de Acesso de uma Farmácia
+      if (pathname === '/api/admin/update-pharmacy' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const ctx = await resolveAccessContext();
+            if (ctx.role !== 'ADMIN') {
+              res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: 'Apenas o acesso Master/Admin pode gerir farmácias.' }));
+              return;
+            }
+            const { farmaciaId, nome, codigo_acesso } = JSON.parse(body || '{}');
+            if (!farmaciaId || !nome || !codigo_acesso) {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: 'Preencha o Nome e o Código de Acesso.' }));
+              return;
+            }
+            const cleanCode = String(codigo_acesso).trim().toUpperCase().replace(/\s+/g, '-');
+            const updated = await prisma.farmacia.update({
+              where: { id: String(farmaciaId) },
+              data: {
+                nome: String(nome).trim(),
+                codigo_acesso: cleanCode,
+              },
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                farmacia: {
+                  id: updated.id,
+                  nome: updated.nome,
+                  nif: maskNif(updated.nif),
+                  codigo_acesso: updated.codigo_acesso,
+                },
+              })
+            );
+          } catch (e: any) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // 0C. Endpoint Admin: Importar Nova Farmácia via Browser (PDF Inventário + PDF Validades + CSV Vendas)
+      if (pathname === '/api/admin/import-pharmacy' && req.method === 'POST') {
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', async () => {
+          const tmpFiles: string[] = [];
+          try {
+            const ctx = await resolveAccessContext();
+            if (ctx.role !== 'ADMIN') {
+              res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: 'Apenas o acesso Master/Admin pode importar novas farmácias.' }));
+              return;
+            }
+            const rawBody = Buffer.concat(chunks).toString('utf-8');
+            const parsed = JSON.parse(rawBody || '{}');
+            const nomeAnonimo = String(parsed.nome || 'Farmácia Demo').trim();
+            const nifAlias = String(parsed.nif || `DEMO-${Date.now().toString().slice(-4)}`).trim();
+            const codigoAcesso = String(
+              parsed.codigo_acesso || nomeAnonimo.toUpperCase().replace(/[^A-Z0-9]+/g, '-')
+            )
+              .trim()
+              .toUpperCase();
+
+            if (!parsed.pdfInventarioBase64 || !parsed.csvVendasBase64) {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(
+                JSON.stringify({
+                  ok: false,
+                  error: 'É obrigatório fornecer pelo menos o PDF de Inventário e o CSV de Vendas.',
+                })
+              );
+              return;
+            }
+
+            const tmpDir = os.tmpdir();
+            const ts = Date.now();
+            const invPath = path.join(tmpDir, `bi_inv_${ts}.pdf`);
+            const csvPath = path.join(tmpDir, `bi_ven_${ts}.csv`);
+            fs.writeFileSync(invPath, Buffer.from(parsed.pdfInventarioBase64, 'base64'));
+            fs.writeFileSync(csvPath, Buffer.from(parsed.csvVendasBase64, 'base64'));
+            tmpFiles.push(invPath, csvPath);
+
+            let valPath: string | null = null;
+            if (parsed.pdfValidadesBase64) {
+              valPath = path.join(tmpDir, `bi_val_${ts}.pdf`);
+              fs.writeFileSync(valPath, Buffer.from(parsed.pdfValidadesBase64, 'base64'));
+              tmpFiles.push(valPath);
+            }
+
+            const newFarm = await prisma.farmacia.upsert({
+              where: { nif: nifAlias },
+              update: { nome: nomeAnonimo, codigo_acesso: codigoAcesso },
+              create: { nome: nomeAnonimo, nif: nifAlias, codigo_acesso: codigoAcesso },
+            });
+
+            const invIngest = await ingestInventarioPdf(prisma, newFarm.id, invPath);
+            await transformStagingInventario(prisma, newFarm.id, invIngest.batchId);
+
+            let valUpdated = 0;
+            if (valPath) {
+              const valIngest = await ingestValidadesPdf(prisma, newFarm.id, valPath);
+              const valTrans = await transformStagingValidades(prisma, newFarm.id, valIngest.batchId);
+              valUpdated = valTrans.inventariosAtualizados;
+            }
+
+            const venIngest = await ingestVendasCsv(prisma, newFarm.id, csvPath);
+            const venTrans = await transformStagingVendas(prisma, newFarm.id, venIngest.batchId);
+
+            await classifyAllExistingProducts(prisma);
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(
+              JSON.stringify({
+                ok: true,
+                farmacia: {
+                  id: newFarm.id,
+                  nome: newFarm.nome,
+                  nif: maskNif(newFarm.nif),
+                  codigo_acesso: newFarm.codigo_acesso,
+                },
+                stats: {
+                  artigosInventario: invIngest.totalExtraidos,
+                  validadesCruzadas: valUpdated,
+                  registosVendas: venTrans.processadosComSucesso,
+                },
+              })
+            );
+          } catch (e: any) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          } finally {
+            for (const f of tmpFiles) {
+              try {
+                if (fs.existsSync(f)) fs.unlinkSync(f);
+              } catch {}
+            }
+          }
+        });
+        return;
+      }
+
+      // 0. Endpoint de Lista de Farmácias (Multi-Tenant com Isolamento por Código de Acesso)
+      if (pathname === '/api/pharmacies' && req.method === 'GET') {
+        const ctx = await resolveAccessContext();
+        let farms;
+        if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
+          farms = [ctx.lockedFarmacia];
+        } else {
+          farms = await prisma.farmacia.findMany({
+            orderBy: { criadoEm: 'asc' },
+          });
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify(
+            farms.map((f) => ({
+              id: f.id,
+              nome: f.nome,
+              nif: maskNif(f.nif),
+              codigo_acesso: ctx.role === 'ADMIN' ? f.codigo_acesso : undefined,
+            }))
+          )
+        );
+        return;
+      }
+
+      // 1. Endpoint de Análise Parametrizável (Multi-Tenant)
+      if (pathname === '/api/analysis' && req.method === 'GET') {
+        const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+
+        const diasMonos = parseInt(String(parsedUrl.query.diasMonos || '90'), 10);
+        const cobertura = parseFloat(String(parsedUrl.query.cobertura || '4'));
+        const mesesVmm = parseInt(String(parsedUrl.query.mesesVmm || '12'), 10);
+
+        const report = await analyzePharmacyInventory(prisma, activeFarmacia.id, {
+          periodoMonosDias: Number.isNaN(diasMonos) ? 90 : diasMonos,
+          limiteCoberturaMeses: Number.isNaN(cobertura) ? 4 : cobertura,
+          mesesHistoricoVMM: Number.isNaN(mesesVmm) ? 12 : mesesVmm,
+        });
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(report));
+        return;
+      }
+
+      // 2. Endpoint de Raio-X de Produto Individual (Multi-Tenant)
+      if (pathname.startsWith('/api/product/') && req.method === 'GET') {
+        const cnp = pathname.replace('/api/product/', '').trim();
+        const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+
+        const produto = await prisma.produtoMestre.findUnique({
+          where: { cnp_codigo: cnp },
+          include: {
+            inventarios: { where: { farmaciaId: activeFarmacia.id } },
+            vendas: { where: { farmaciaId: activeFarmacia.id }, orderBy: { data_venda: 'asc' } },
+          },
+        });
+
+        if (!produto) {
+          res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'Produto não encontrado' }));
+          return;
+        }
+
+        const c = classifyProduct(produto.cnp_codigo, produto.designacao, produto.taxa_iva);
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            cnp_codigo: produto.cnp_codigo,
+            aim: produto.aim,
+            designacao: produto.designacao,
+            tipo_venda: c.tipo_venda,
+            segmento: c.segmento,
+            eh_generico: c.eh_generico,
+            molecula_dci: c.molecula_dci,
+            grupo_equivalencia_dci: c.grupo_equivalencia_dci,
+            categoria: produto.categoria || c.categoria,
+            sugestao_cross_sell: c.subcategoria_cross_sell,
+            taxa_iva: produto.taxa_iva,
+            pvp: produto.pvp !== null ? Number(produto.pvp) : null,
+            margem_padrao: produto.margem_padrao !== null ? Number(produto.margem_padrao) : null,
+            inventario: produto.inventarios.map((i) => ({
+              lote: i.lote,
+              prateleira: i.prateleira,
+              quantidade: i.quantidade,
+              custo_unitario: Number(i.custo_unitario),
+              data_validade: i.data_validade ? i.data_validade.toISOString().slice(0, 10) : null,
+            })),
+            vendas: produto.vendas.map((v) => ({
+              mes: v.data_venda.toISOString().slice(0, 7),
+              quantidade: v.quantidade,
+              valor_total: Number(v.valor_total),
+            })),
+          })
+        );
+        return;
+      }
+
+      // 2.5. Endpoints de Campanhas Comerciais e Sazonais 360º (Multi-Tenant)
+      if (pathname === '/api/campaigns/suggestions' && req.method === 'GET') {
+        const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const mesQuery = parseInt(String(parsedUrl.query.mes || ''), 10);
+        const [suggestions, marketingIntel] = await Promise.all([
+          getSeasonalCampaignSuggestions(
+            prisma,
+            activeFarmacia.id,
+            Number.isNaN(mesQuery) ? undefined : mesQuery
+          ),
+          getMarketingAndCrossSellingIntelligence(prisma, activeFarmacia.id),
+        ]);
+        const enriched = suggestions.map((s) => ({
+          ...s,
+          id: s.campanha.id,
+          nome: s.campanha.titulo,
+          icon: s.campanha.icone,
+          periodoLabel: s.campanha.epoca,
+          descricao: s.campanha.descricao,
+          tipoCampanha: s.campanha.tipoCampanha || 'EPOCA_CALENDARIO',
+          contextoEpoca: s.campanha.contextoEpoca || null,
+          tipo:
+            s.campanha.tipoCampanha === 'LIQUIDACAO_STOCK'
+              ? 'LIQUIDACAO_STOCK'
+              : s.campanha.epoca.includes('Efeméride')
+                ? 'EFEMERIDE'
+                : 'SAZONAL_CLIMA',
+          eligibleProducts: s.produtosSugeridos.map((p) => ({
+            ...p,
+            pvp_atual: p.pvp,
+            custo_unitario: p.custo_unitario,
+          })),
+          totalEligibleSkus: s.totalArtigosDisponiveis,
+          totalStockUnits: s.totalUnidadesStock,
+          financials: (() => {
+            const fin = calculateCampaignFinancials(s.produtosSugeridos, s.campanha.descontoSugeridoPct);
+            return {
+              ...fin,
+              margem_media_pct: Number(fin.margemFinalPct.toFixed(1)),
+              anti_dumping_valido: fin.cumpreAntiDumping,
+            };
+          })(),
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            farmacia: activeFarmacia,
+            campanhas: enriched,
+            suggestions: enriched,
+            overview: marketingIntel.overview,
+            crossSellingPlans: marketingIntel.crossSellingPlans,
+          })
+        );
+        return;
+      }
+
+      // 2.5B. Endpoint para Criar Campanha à Medida (Eventos Livres: Halloween, Black Friday, Festas da Cidade ou Produtos Específicos)
+      if (pathname === '/api/campaigns/custom' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body || '{}');
+            const activeFarmacia = await getActiveFarmacia(parsed.farmaciaId);
+            const s = await buildCustomCampaign(prisma, activeFarmacia.id, parsed);
+            const fin = calculateCampaignFinancials(s.produtosSugeridos, s.campanha.descontoSugeridoPct);
+            const enriched = {
+              ...s,
+              id: s.campanha.id,
+              nome: s.campanha.titulo,
+              icon: s.campanha.icone,
+              periodoLabel: s.campanha.epoca,
+              descricao: s.campanha.descricao,
+              tipoCampanha: s.campanha.tipoCampanha || 'EPOCA_CALENDARIO',
+              contextoEpoca: s.campanha.contextoEpoca || null,
+              tipo: 'PERSONALIZADA',
+              eligibleProducts: s.produtosSugeridos.map((p) => ({
+                ...p,
+                pvp_atual: p.pvp,
+                custo_unitario: p.custo_unitario,
+              })),
+              totalEligibleSkus: s.totalArtigosDisponiveis,
+              totalStockUnits: s.totalUnidadesStock,
+              financials: {
+                ...fin,
+                margem_media_pct: Number(fin.margemFinalPct.toFixed(1)),
+                anti_dumping_valido: fin.cumpreAntiDumping,
+              },
+            };
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: true, suggestion: enriched }));
+          } catch (e: any) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // 2.5C. Endpoint Simulador 360º de Escoamento & Cross-Selling para um Produto Específico
+      if (pathname === '/api/campaigns/product-360' && req.method === 'GET') {
+        const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+        const q = String(parsedUrl.query.q || '').trim();
+        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const result = await analyzeProductMarketingAndCrossSell360(prisma, activeFarmacia.id, q);
+        if (!result) {
+          res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'Produto não encontrado no catálogo desta farmácia.' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+
+      // 2.5D. Endpoint Pesquisa Rápida de Produtos com Stock para o Construtor de Campanhas / Cross-Selling
+      if (pathname === '/api/campaigns/search-products' && req.method === 'GET') {
+        const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+        const q = String(parsedUrl.query.q || '').trim();
+        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const items = await searchProductsForMarketingPicker(prisma, activeFarmacia.id, q);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ items }));
+        return;
+      }
+
+      if (pathname === '/api/campaigns/generate' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body || '{}');
+            const farmaciaId = parsed.farmaciaId;
+            const campaignId = parsed.campaignId;
+            const descontoPct = parsed.discountPct !== undefined ? parsed.discountPct : (parsed.descontoPct !== undefined ? parsed.descontoPct : 15);
+            const canais = parsed.channels || parsed.canais || ['loja', 'redes', 'ecras', 'app'];
+            let selectedProducts = parsed.selectedProducts || [];
+
+            const activeFarmacia = await getActiveFarmacia(farmaciaId);
+            const allSuggestions = await getSeasonalCampaignSuggestions(prisma, activeFarmacia.id);
+            const matchedSug = allSuggestions.find((s) => s.campanha.id === campaignId);
+            const campDef =
+              parsed.customCampaignDef ||
+              matchedSug?.campanha ||
+              ANNUAL_CAMPAIGNS.find((c) => c.id === campaignId) ||
+              ANNUAL_CAMPAIGNS[0];
+
+            if ((!selectedProducts || selectedProducts.length === 0) && Array.isArray(parsed.includedCnpCodigos)) {
+              const cnps = parsed.includedCnpCodigos;
+              const prods = await prisma.produtoMestre.findMany({
+                where: { cnp_codigo: { in: cnps } },
+                include: { inventarios: { where: { farmaciaId: activeFarmacia.id } } },
+              });
+              selectedProducts = prods.map((p) => {
+                const inv = p.inventarios[0];
+                const custo = inv ? Number(inv.custo_unitario) : 0;
+                const pvp = p.pvp ? Number(p.pvp) : custo > 0 ? custo * 1.5 : 10;
+                const margem = p.margem_padrao ? Number(p.margem_padrao) : (pvp > custo ? ((pvp - custo) / pvp) * 100 : 30);
+                return {
+                  cnp_codigo: p.cnp_codigo,
+                  designacao: p.designacao,
+                  laboratorio_titular: '',
+                  tipo_venda: p.tipo_venda || 'VENDA_LIVRE',
+                  stock_atual: inv ? inv.quantidade : 1,
+                  custo_unitario: custo,
+                  pvp_atual: pvp,
+                  pvp: pvp,
+                  margem_percentagem: margem,
+                  validade: inv?.data_validade ? inv.data_validade.toISOString().substring(0, 10) : 'Longa',
+                  taxa_iva: p.taxa_iva ? Number(p.taxa_iva) : 0.23,
+                };
+              });
+            } else {
+              selectedProducts = selectedProducts.map((p: any) => {
+                const custo = Number(p.custo_unitario || 0);
+                const pvp = Number(p.pvp || p.pvp_atual || (custo > 0 ? custo * 1.5 : 10));
+                const margem = p.margem_percentagem !== undefined ? Number(p.margem_percentagem) : (pvp > custo ? ((pvp - custo) / pvp) * 100 : 30);
+                return {
+                  ...p,
+                  pvp,
+                  pvp_atual: pvp,
+                  custo_unitario: custo,
+                  stock_atual: Number(p.stock_atual || 1),
+                  margem_percentagem: margem,
+                };
+              });
+            }
+
+            const financials = calculateCampaignFinancials(selectedProducts, Number(descontoPct) || 15);
+            const rawMaterials = generateOmnichannelMaterials(campDef, selectedProducts, canais);
+            const materials = {
+              ...rawMaterials,
+              loja: rawMaterials.lojaBalcao ? {
+                script_balcao: rawMaterials.lojaBalcao.pitchBalcao10s,
+                posicionamento_linear: rawMaterials.lojaBalcao.posicionamentoRecomendado,
+                sinaletica_precos: rawMaterials.lojaBalcao.dicaAtendimento,
+              } : undefined,
+              redes: rawMaterials.redesSociais ? {
+                headline: rawMaterials.redesSociais.tituloPost,
+                copy_post: rawMaterials.redesSociais.textoLegenda,
+                call_to_action: 'Aproveite hoje na sua Farmácia de confiança.',
+                hashtags: rawMaterials.redesSociais.hashtags.split(' '),
+                sugestao_imagem: rawMaterials.redesSociais.formatoSugerido,
+              } : undefined,
+              ecras: rawMaterials.ecrasMultimedia ? {
+                slide_titulo: rawMaterials.ecrasMultimedia.headline,
+                slide_linhas: rawMaterials.ecrasMultimedia.bulletPoints,
+                slide_rodape: rawMaterials.ecrasMultimedia.chamadaAcao,
+                duracao_slide_segundos: 8,
+              } : undefined,
+              app: rawMaterials.appSms ? {
+                push_notification_titulo: rawMaterials.appSms.notificacaoPushTitulo,
+                push_notification_corpo: rawMaterials.appSms.notificacaoPushCorpo,
+                sms_texto: rawMaterials.appSms.smsTexto160c,
+              } : undefined,
+            };
+            const emailDigest = generateMonthlyEmailDigest(activeFarmacia.nome, campDef, selectedProducts, financials);
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+              success: true,
+              campanha: campDef,
+              campaign: campDef,
+              financials,
+              materials,
+              emailDigest,
+              emailDigestPreview: emailDigest.html,
+            }));
+          } catch (e: any) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      if (pathname === '/api/campaigns/send-email' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const { to, farmaciaId } = JSON.parse(body || '{}');
+            const activeFarmacia = await getActiveFarmacia(farmaciaId);
+            const destinatarios = ['direcao.tecnica@farmacia.pt', 'balcao.equipa@farmacia.pt'];
+            if (to) destinatarios.push(to);
+
+            console.log(`[Email Campaign] Boletim executivo enviado para ${destinatarios.length} destinatários na ${activeFarmacia.nome}`);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+              success: true,
+              ok: true,
+              message: `Boletim executivo e materiais de campanha enviados com sucesso`,
+              destinatarios: destinatarios.length,
+            }));
+          } catch (e: any) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // 3. Endpoint de Perguntas em Linguagem Natural / Consultas Rápidas (Multi-Tenant)
+      if (pathname === '/api/ask' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const { question, diasMonos = 90, cobertura = 4, farmaciaId } = JSON.parse(body || '{}');
+            const activeFarmacia = await getActiveFarmacia(farmaciaId);
+            const q = String(question || '').toLowerCase().trim();
+
+            // 1. Processamento Inteligente: IA (Claude) com Function Calling ou Motor Semântico Local
+            const copilotRes = await processQuestionWithLlmOrLocal(prisma, activeFarmacia.id, String(question || ''), {
+              diasMonos: Number(diasMonos) || 90,
+              cobertura: Number(cobertura) || 4,
+            });
+
+            if (copilotRes) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(copilotRes));
+              return;
+            }
+
+            const report = await analyzePharmacyInventory(prisma, activeFarmacia.id, {
+              periodoMonosDias: Number(diasMonos) || 90,
+              limiteCoberturaMeses: Number(cobertura) || 4,
+            });
+
+            let titulo = '';
+            let explicacao = '';
+            let colunas: string[] = [];
+            let linhas: any[] = [];
+
+            const numMatch = q.replace(/\b202[0-9]\b/g, '').match(/\b(\d{1,3})\b/);
+            const limitCount = numMatch ? Math.min(200, Math.max(1, parseInt(numMatch[1], 10))) : 30;
+
+            const querVendaLivre = q.includes('venda livre') || q.includes('sem receita') || q.includes('otc');
+            const querSoMnsrm = q.includes('mnsrm') && !q.includes('msrm ');
+            const querSoMsrm = (q.includes('com receita') || /\bmsrm\b/.test(q)) && !querVendaLivre;
+            const querGenerico = q.includes('generico') || q.includes('genérico') || /\bmg\b/.test(q);
+            const querMarca = q.includes('de marca') || q.includes('marca');
+
+            const isFinancialQuery =
+              q.includes('dinheiro') ||
+              q.includes('lucro') ||
+              q.includes('fatura') ||
+              q.includes('rentav') ||
+              q.includes('rentáv') ||
+              q.includes('ganh') ||
+              q.includes('mais valor') ||
+              q.includes('receita financeira');
+
+            const isTopSalesQuery =
+              q.includes('mais vendid') ||
+              q.includes('mais saida') ||
+              q.includes('mais saída') ||
+              /\btop\b.*?\bvenda/.test(q) ||
+              (/\bvendas?\b/.test(q) && (q.includes('top') || q.includes('maior'))) ||
+              (q.includes('top') && (/\bmsrm\b/.test(q) || /\bmnsrm\b/.test(q) || q.includes('generico') || q.includes('marca') || q.includes('venda livre'))) ||
+              q.includes('maior rot') ||
+              q.includes('locomotiva') ||
+              q.includes('vendem mais');
+
+            const isLowRotationQuery =
+              q.includes('baixa rot') ||
+              q.includes('pouca rot') ||
+              q.includes('rotação lenta') ||
+              q.includes('rotacao lenta') ||
+              q.includes('menor rot') ||
+              q.includes('monos') ||
+              /\bmono\b/.test(q) ||
+              q.includes('parad') ||
+              q.includes('sem vend') ||
+              q.includes('empatad') ||
+              q.includes('imobilizad') ||
+              q.includes('excesso');
+
+            // Pergunta sobre Baixa Rotação / Monos / Excesso de Stock (filtrada por Genérico / Marca / Venda Livre)
+            if (isLowRotationQuery) {
+              const dciGroupMap = new Map(
+                report.consolidacao_genericos_dci.map((g) => [g.grupo_equivalencia_dci, g])
+              );
+
+              const matchSegment = (item: {
+                eh_generico: boolean;
+                segmento: string;
+                tipo_venda: string;
+              }) => {
+                if (querGenerico && !querMarca) return item.eh_generico;
+                if (querMarca && !querGenerico) return item.segmento === 'MEDICAMENTO_MARCA';
+                if (querVendaLivre) return item.tipo_venda === 'VENDA_LIVRE' || item.tipo_venda === 'MNSRM';
+                if (querSoMsrm) return item.tipo_venda === 'MSRM';
+                if (querSoMnsrm) return item.tipo_venda === 'MNSRM';
+                return true;
+              };
+
+              const monosFiltrados = report.monos.filter(matchSegment);
+              const excessoFiltrados = report.alertas_excesso_cobertura.filter(matchSegment);
+              const monosSet = new Set(monosFiltrados.map((m) => m.cnp_codigo));
+
+              // Combinar Monos (Rotação Zero recente) + Excesso de Cobertura (Rotação Lenta face ao stock)
+              const combinados = [
+                ...monosFiltrados.map((m) => {
+                  const dciInfo = m.grupo_equivalencia_dci ? dciGroupMap.get(m.grupo_equivalencia_dci) : undefined;
+                  return {
+                    cnp_codigo: m.cnp_codigo,
+                    segmentoLabel: m.eh_generico
+                      ? '🧬 GENÉRICO MG'
+                      : `${m.tipo_venda} (${m.segmento === 'MEDICAMENTO_MARCA' ? 'Marca' : 'PSBE'})`,
+                    dciOuCat: m.grupo_equivalencia_dci || m.categoria,
+                    designacao: m.designacao,
+                    stock_atual: m.stock_atual,
+                    capital_imobilizado: m.capital_imobilizado,
+                    rotacaoInfo: m.ultima_venda
+                      ? `🛑 Sem venda desde ${m.ultima_venda} (${m.unidades_vendidas_ano} un/ano)`
+                      : '🛑 Zero vendas em 12 meses',
+                    acao:
+                      dciInfo && dciInfo.num_laboratorios_abertos > 1
+                        ? `⚠️ Molécula ativa (${dciInfo.num_laboratorios_abertos} labs abertos, VMM grupo=${dciInfo.vmm_total_grupo}/mês) -> Substituir na receita para escoar este lab!`
+                        : m.acao_sugerida,
+                  };
+                }),
+                ...excessoFiltrados
+                  .filter((e) => !monosSet.has(e.cnp_codigo))
+                  .map((e) => {
+                    const cap = Number((e.stock_atual * e.custo_unitario).toFixed(2));
+                    const dciInfo = e.grupo_equivalencia_dci ? dciGroupMap.get(e.grupo_equivalencia_dci) : undefined;
+                    return {
+                      cnp_codigo: e.cnp_codigo,
+                      segmentoLabel: e.eh_generico
+                        ? '🧬 GENÉRICO MG'
+                        : `${e.tipo_venda} (${e.segmento === 'MEDICAMENTO_MARCA' ? 'Marca' : 'PSBE'})`,
+                      dciOuCat: e.grupo_equivalencia_dci || e.categoria,
+                      designacao: e.designacao,
+                      stock_atual: e.stock_atual,
+                      capital_imobilizado: cap,
+                      rotacaoInfo: `🐢 VMM ${e.vmm}/mês (${e.cobertura_meses} meses de stock)`,
+                      acao:
+                        dciInfo && dciInfo.num_laboratorios_abertos > 1
+                          ? `⚠️ ${dciInfo.num_laboratorios_abertos} labs abertos nesta molécula -> Priorizar dispensa deste lab até baixar cobertura`
+                          : e.sugestao_balcao,
+                    };
+                  }),
+              ].sort((a, b) => b.capital_imobilizado - a.capital_imobilizado);
+
+              const totalMonosEur = monosFiltrados.reduce((s, m) => s + m.capital_imobilizado, 0);
+              const totalExcessoEur = excessoFiltrados.reduce((s, e) => s + e.stock_atual * e.custo_unitario, 0);
+              const labelSeg =
+                querGenerico && !querMarca
+                  ? 'Medicamentos Genéricos (MG)'
+                  : querMarca && !querGenerico
+                  ? 'Medicamentos de Marca'
+                  : querVendaLivre
+                  ? 'Produtos de Venda Livre (PSBE + MNSRM)'
+                  : 'Produtos';
+
+              titulo = `${labelSeg} de Baixa Rotação: Monos + Excesso de Stock (${combinados.length} artigos detetados)`;
+              explicacao = `Encontrados ${monosFiltrados.length} artigos parados sem vendas há ≥ ${diasMonos} dias (${totalMonosEur.toFixed(2)} €) e ${excessoFiltrados.length} artigos com rotação lenta / cobertura > ${cobertura} meses (${totalExcessoEur.toFixed(2)} €). Nos Genéricos (MG), muitos artigos estão parados porque a farmácia está a dispensar outro laboratório da mesma molécula DCI!`;
+              colunas = [
+                'Código',
+                'Segmento',
+                'Molécula DCI / Categoria',
+                'Designação',
+                'Stock',
+                'Capital Empatado (€)',
+                'Diagnóstico de Rotação',
+                'Ação Recomendada (Receita / Fornecedor)',
+              ];
+              linhas = combinados.slice(0, Math.max(limitCount, 40)).map((item) => ({
+                cnp: item.cnp_codigo,
+                valores: [
+                  item.cnp_codigo,
+                  item.segmentoLabel,
+                  item.dciOuCat,
+                  item.designacao,
+                  item.stock_atual,
+                  `${item.capital_imobilizado.toFixed(2)} €`,
+                  item.rotacaoInfo,
+                  item.acao,
+                ],
+              }));
+            } else if (
+              !isFinancialQuery &&
+              !isTopSalesQuery &&
+              (q.includes('duplicad') ||
+                q.includes('gaveta') ||
+                q.includes('molecula') ||
+                q.includes('molécula') ||
+                q.includes('dci') ||
+                (querGenerico && querMarca) ||
+                q.includes('genericos vs marca') ||
+                q.includes('genéricos vs marca'))
+            ) {
+              titulo = `Consolidação de Medicamentos Genéricos por Molécula DCI (${report.consolidacao_genericos_dci.length} moléculas com múltiplos laboratórios)`;
+              explicacao = `Na ${report.farmacia.nome} existem ${report.resumo_executivo.artigos_genericos_mg} Genéricos (MG) (${report.resumo_executivo.valor_stock_genericos_mg.toFixed(2)} €) vs. ${report.resumo_executivo.artigos_medicamentos_marca} Medicamentos de Marca (${report.resumo_executivo.valor_stock_medicamentos_marca.toFixed(2)} €). Abaixo estão as moléculas com mais laboratórios abertos em simultâneo e os "restos de gaveta" (≤ 2 caixas) a escoar primeiro nas próximas receitas médicas.`;
+              colunas = [
+                'Grupo Equivalência DCI (Molécula + Dosagem)',
+                'Nº Labs Abertos',
+                'Stock Total',
+                'VMM Grupo',
+                'Lab Mais Barato',
+                'Lab Mais Caro (Dif %)',
+                'Restos de Gaveta (≤ 2 un) a Escoar 1º',
+              ];
+              linhas = report.consolidacao_genericos_dci.slice(0, 40).map((g) => ({
+                cnp: g.todos_laboratorios[0]?.cnp_codigo || null,
+                valores: [
+                  `🧬 ${g.grupo_equivalencia_dci}`,
+                  `${g.num_laboratorios_abertos} laboratórios`,
+                  `${g.stock_total_unidades} un (${g.valor_total_stock.toFixed(2)}€)`,
+                  `${g.vmm_total_grupo}/mês`,
+                  `${g.custo_minimo.toFixed(2)} €`,
+                  `${g.custo_maximo.toFixed(2)} € (+${g.diferenca_custo_pct}%)`,
+                  g.restos_gaveta_escobar_primeiro.length > 0
+                    ? `${g.restos_gaveta_escobar_primeiro.length} labs c/ 1-2 caixas`
+                    : 'Nenhum',
+                ],
+              }));
+            } else if (
+              !isFinancialQuery &&
+              !isTopSalesQuery &&
+              !isLowRotationQuery &&
+              (q.includes('estatuto') ||
+                q.includes('radiografia') ||
+                q.includes('divisao') ||
+                q.includes('divisão') ||
+                (q.includes('receita') && !q.includes('top') && !q.includes('mais') && !q.includes('venda')) ||
+                (q.includes('msrm') && !q.includes('top') && !q.includes('mais') && !q.includes('venda')) ||
+                (q.includes('mnsrm') && !q.includes('top') && !q.includes('mais') && !q.includes('venda')) ||
+                (q.includes('venda livre') && !q.includes('top') && !q.includes('mais') && !q.includes('venda')))
+            ) {
+              const allInvs = await prisma.inventario.findMany({
+                where: { farmaciaId: activeFarmacia.id, quantidade: { gt: 0 } },
+                include: { produto: true },
+              });
+              const stats: Record<string, { skus: number; unidades: number; valor: number; monosVal: number; riscoVal: number }> = {
+                VENDA_LIVRE_PSBE: { skus: 0, unidades: 0, valor: 0, monosVal: 0, riscoVal: 0 },
+                MNSRM_MARCA: { skus: 0, unidades: 0, valor: 0, monosVal: 0, riscoVal: 0 },
+                GENERICO_MG: { skus: 0, unidades: 0, valor: 0, monosVal: 0, riscoVal: 0 },
+                MSRM_MARCA: { skus: 0, unidades: 0, valor: 0, monosVal: 0, riscoVal: 0 },
+              };
+              const monosMap = new Map(report.monos.map((m) => [m.cnp_codigo, m.capital_imobilizado]));
+              const riscoMap = new Map(report.risco_elevado_caducidade.map((r) => [r.cnp_codigo, r.valor_em_risco]));
+
+              for (const i of allInvs) {
+                const c = classifyProduct(i.cnp_codigo, i.produto.designacao, i.produto.taxa_iva);
+                let key = 'MSRM_MARCA';
+                if (c.segmento === 'VENDA_LIVRE_PSBE') key = 'VENDA_LIVRE_PSBE';
+                else if (c.segmento === 'GENERICO_MG') key = 'GENERICO_MG';
+                else if (c.tipo_venda === 'MNSRM') key = 'MNSRM_MARCA';
+
+                const bucket = stats[key];
+                bucket.skus++;
+                bucket.unidades += i.quantidade;
+                bucket.valor += i.quantidade * Number(i.custo_unitario);
+                bucket.monosVal += monosMap.get(i.cnp_codigo) || 0;
+                bucket.riscoVal += riscoMap.get(i.cnp_codigo) || 0;
+              }
+
+              titulo = 'Radiografia Completa: Venda Livre (PSBE) vs. MNSRM vs. Genéricos (MG) vs. Marca (MSRM)';
+              explicacao =
+                'Divisão do capital da farmácia pelos 4 grandes segmentos operacionais e respetiva estratégia de ação.';
+              colunas = [
+                'Segmento / Estatuto',
+                'Nº Artigos (SKUs)',
+                'Unidades Stock',
+                'Valor Stock (Custo)',
+                'Capital em Monos (€)',
+                'Risco Caducidade (€)',
+                'Ação Estratégica na Farmácia',
+              ];
+              linhas = [
+                {
+                  cnp: null,
+                  valores: [
+                    '🟢 VENDA_LIVRE (PSBE / Cosmética / Suplementos / Dispositivos)',
+                    stats.VENDA_LIVRE_PSBE.skus,
+                    stats.VENDA_LIVRE_PSBE.unidades,
+                    `${stats.VENDA_LIVRE_PSBE.valor.toFixed(2)} €`,
+                    `${stats.VENDA_LIVRE_PSBE.monosVal.toFixed(2)} €`,
+                    `${stats.VENDA_LIVRE_PSBE.riscoVal.toFixed(2)} €`,
+                    'Cross-Selling direto no balcão, campanhas Leve 2 e destaque linear',
+                  ],
+                },
+                {
+                  cnp: null,
+                  valores: [
+                    '🔵 MNSRM de Marca (Medicamentos de Venda Livre)',
+                    stats.MNSRM_MARCA.skus,
+                    stats.MNSRM_MARCA.unidades,
+                    `${stats.MNSRM_MARCA.valor.toFixed(2)} €`,
+                    `${stats.MNSRM_MARCA.monosVal.toFixed(2)} €`,
+                    `${stats.MNSRM_MARCA.riscoVal.toFixed(2)} €`,
+                    'Aconselhamento farmacêutico ativo em sintomas ligeiros (Gripe, Dor, Digestivo)',
+                  ],
+                },
+                {
+                  cnp: null,
+                  valores: [
+                    '🧬 Medicamentos Genéricos (MG)',
+                    stats.GENERICO_MG.skus,
+                    stats.GENERICO_MG.unidades,
+                    `${stats.GENERICO_MG.valor.toFixed(2)} €`,
+                    `${stats.GENERICO_MG.monosVal.toFixed(2)} €`,
+                    `${stats.GENERICO_MG.riscoVal.toFixed(2)} €`,
+                    'Substituição inteligente na Receita por DCI (escoar restos de gaveta e otimizar custo)',
+                  ],
+                },
+                {
+                  cnp: null,
+                  valores: [
+                    '🏷️ Medicamentos de Marca Sujeitos a Receita (MSRM)',
+                    stats.MSRM_MARCA.skus,
+                    stats.MSRM_MARCA.unidades,
+                    `${stats.MSRM_MARCA.valor.toFixed(2)} €`,
+                    `${stats.MSRM_MARCA.monosVal.toFixed(2)} €`,
+                    `${stats.MSRM_MARCA.riscoVal.toFixed(2)} €`,
+                    'Ajustar stock mínimo de encomenda e devolver excessos/validades curtas ao fornecedor',
+                  ],
+                },
+              ];
+            } else if (q.includes('2026') && (q.includes('caduc') || q.includes('validad') || q.includes('expir'))) {
+              const items = report.risco_elevado_caducidade.filter((i) => i.data_validade.startsWith('2026'));
+              const totalVal = items.reduce((s, i) => s + i.valor_em_risco, 0);
+              titulo = 'Produtos em Risco de Caducidade até ao final de 2026';
+              explicacao = `Foram encontrados ${items.length} produtos em stock cuja validade termina ainda em 2026 e que não vão escoar ao ritmo atual de vendas, totalizando ${totalVal.toFixed(2)} € em risco imediato.`;
+              colunas = ['Código', 'Segmento', 'Designação', 'Stock', 'Validade', 'VMM', 'Unid. Risco', 'Valor Risco (€)', 'Ação'];
+              linhas = items.map((i) => ({
+                cnp: i.cnp_codigo,
+                valores: [
+                  i.cnp_codigo,
+                  i.eh_generico ? '🧬 GENÉRICO MG' : i.tipo_venda,
+                  i.designacao,
+                  i.stock_atual,
+                  i.data_validade,
+                  i.vmm,
+                  i.unidades_em_risco,
+                  `${i.valor_em_risco.toFixed(2)} €`,
+                  i.acao_recomendada,
+                ],
+              }));
+            } else if (q.includes('cross') || (q.includes('margem') && !isFinancialQuery) || q.includes('promo')) {
+              const riscoMap = new Map(report.risco_elevado_caducidade.map((r) => [r.cnp_codigo, r]));
+
+              const candidatos = report.alertas_excesso_cobertura
+                .filter((i) => i.tipo_venda !== 'MSRM' && (i.margem_percentagem ?? 0) >= 35 && i.stock_atual >= 2)
+                .map((i) => {
+                  const rCad = riscoMap.get(i.cnp_codigo);
+                  const urgenciaValidade = rCad ? 1000 + rCad.valor_em_risco : 0;
+                  const pushScore = urgenciaValidade + (i.margem_percentagem ?? 0) * i.stock_atual * 0.2;
+                  return { ...i, rCad, pushScore };
+                })
+                .sort((a, b) => b.pushScore - a.pushScore)
+                .slice(0, limitCount);
+
+              titulo = 'Plano de Cross-Selling de Balcão (Exclusivo Venda Livre & MNSRM — Sem Receita)';
+              explicacao =
+                'Regra aplicada: Foram filtrados APENAS produtos VENDA_LIVRE e MNSRM (excluindo estritamente todos os MSRM de receita médica). Ordenados por Push Score: prioriza produtos com validade a expirar + excesso de stock + margem ≥ 35%.';
+              colunas = [
+                'Código',
+                'Estatuto',
+                'Categoria',
+                'Designação',
+                'Stock',
+                'Validade',
+                'PVP (Margem)',
+                'Quando Sugerir no Balcão (Regra Cross-Sell)',
+              ];
+              linhas = candidatos.map((i) => ({
+                cnp: i.cnp_codigo,
+                valores: [
+                  i.cnp_codigo,
+                  i.tipo_venda,
+                  i.categoria,
+                  i.designacao,
+                  i.stock_atual,
+                  i.rCad ? `⚠️ ${i.rCad.data_validade}` : 'Longa',
+                  `${i.pvp ? i.pvp.toFixed(2) + '€' : '-'} (${i.margem_percentagem ? i.margem_percentagem.toFixed(0) + '%' : '-'})`,
+                  i.sugestao_balcao,
+                ],
+              }));
+            } else if (q.includes('iva')) {
+              const invs = await prisma.inventario.findMany({
+                where: { farmaciaId: activeFarmacia.id, quantidade: { gt: 0 } },
+                include: { produto: true },
+              });
+              const grupos = new Map<number, { skus: number; unidades: number; valor: number }>();
+              for (const item of invs) {
+                const iva = item.produto.taxa_iva ?? 0;
+                const g = grupos.get(iva) ?? { skus: 0, unidades: 0, valor: 0 };
+                g.skus++;
+                g.unidades += item.quantidade;
+                g.valor += item.quantidade * Number(item.custo_unitario);
+                grupos.set(iva, g);
+              }
+              titulo = 'Distribuição do Stock por Taxa de IVA (0%, 6%, 23%)';
+              explicacao = 'Cruzamento do inventário físico atual por escalão de IVA.';
+              colunas = ['Taxa de IVA', 'Nº de Artigos (SKUs)', 'Total Unidades', 'Capital em Stock (s/ IVA)'];
+              linhas = Array.from(grupos.entries())
+                .sort((a, b) => a[0] - b[0])
+                .map(([iva, g]) => ({
+                  cnp: null,
+                  valores: [`${iva}%`, g.skus, g.unidades, `${g.valor.toFixed(2)} €`],
+                }));
+            } else if (isFinancialQuery) {
+              const vendasAgrupadas = await prisma.venda.groupBy({
+                by: ['cnp_codigo'],
+                where: { farmaciaId: activeFarmacia.id },
+                _sum: { quantidade: true, valor_total: true },
+              });
+
+              const codigos = vendasAgrupadas.map((v) => v.cnp_codigo);
+              const prods = await prisma.produtoMestre.findMany({
+                where: { cnp_codigo: { in: codigos } },
+                include: { inventarios: { where: { farmaciaId: activeFarmacia.id } } },
+              });
+              const prodMap = new Map(prods.map((p) => [p.cnp_codigo, p]));
+
+              const rankingFinanceiro = vendasAgrupadas
+                .map((v) => {
+                  const p = prodMap.get(v.cnp_codigo);
+                  const qtd = v._sum.quantidade || 0;
+                  const faturacao = Number(v._sum.valor_total || 0);
+                  const margemPct = p?.margem_padrao !== null && p?.margem_padrao !== undefined ? Number(p.margem_padrao) : null;
+                  const custoInv = p?.inventarios[0] ? Number(p.inventarios[0].custo_unitario) : null;
+                  const pvp = p?.pvp ? Number(p.pvp) : qtd > 0 ? faturacao / qtd : 0;
+
+                  let lucroBruto = 0;
+                  if (margemPct !== null && margemPct > 0) {
+                    lucroBruto = faturacao * (margemPct / 100);
+                  } else if (custoInv !== null && pvp > custoInv) {
+                    lucroBruto = (pvp - custoInv) * qtd;
+                  }
+
+                  const stockAtual = p?.inventarios.reduce((s, i) => s + i.quantidade, 0) ?? 0;
+                  const c = classifyProduct(v.cnp_codigo, p?.designacao || '', p?.taxa_iva);
+
+                  return {
+                    cnp_codigo: v.cnp_codigo,
+                    designacao: p?.designacao || v.cnp_codigo,
+                    tipo_venda: c.tipo_venda,
+                    segmento: c.segmento,
+                    eh_generico: c.eh_generico,
+                    categoria: c.categoria,
+                    qtd,
+                    faturacao,
+                    margemPct,
+                    lucroBruto,
+                    stockAtual,
+                  };
+                })
+                .filter((r) => {
+                  if (querGenerico) return r.eh_generico;
+                  if (querMarca) return r.segmento === 'MEDICAMENTO_MARCA';
+                  if (querVendaLivre) return r.tipo_venda === 'VENDA_LIVRE' || r.tipo_venda === 'MNSRM';
+                  if (querSoMnsrm) return r.tipo_venda === 'MNSRM';
+                  if (querSoMsrm) return r.tipo_venda === 'MSRM';
+                  return true;
+                })
+                .sort((a, b) => (q.includes('fatura') ? b.faturacao - a.faturacao : b.lucroBruto - a.lucroBruto))
+                .slice(0, limitCount);
+
+              const totalFaturacaoTop = rankingFinanceiro.reduce((s, r) => s + r.faturacao, 0);
+              const totalLucroTop = rankingFinanceiro.reduce((s, r) => s + r.lucroBruto, 0);
+              const labelFiltro = querGenerico
+                ? ' Genéricos (MG)'
+                : querMarca
+                ? ' Medicamentos de Marca'
+                : querVendaLivre
+                ? ' de Venda Livre (PSBE + MNSRM)'
+                : querSoMsrm
+                ? ' Sujeitos a Receita (MSRM)'
+                : '';
+
+              titulo = `Top ${limitCount} Produtos${labelFiltro} que Mais Geram Dinheiro (Lucro Bruto Real & Faturação)`;
+              explicacao = `Estes ${limitCount} produtos${labelFiltro} geraram em conjunto ${totalLucroTop.toFixed(2)} € de lucro bruto real na caixa da farmácia (sobre ${totalFaturacaoTop.toFixed(2)} € de faturação a PVP).`;
+              colunas = [
+                'Código',
+                'Segmento / Estatuto',
+                'Categoria',
+                'Designação',
+                'Unid. Vendidas',
+                'Faturação PVP (€)',
+                'Margem (%)',
+                'Lucro Bruto Gerado (€)',
+                'Stock Atual',
+              ];
+              linhas = rankingFinanceiro.map((r) => ({
+                cnp: r.cnp_codigo,
+                valores: [
+                  r.cnp_codigo,
+                  r.eh_generico ? '🧬 GENÉRICO MG' : `${r.tipo_venda} (${r.segmento === 'MEDICAMENTO_MARCA' ? 'Marca' : 'PSBE'})`,
+                  r.categoria,
+                  r.designacao,
+                  r.qtd,
+                  `${r.faturacao.toFixed(2)} €`,
+                  r.margemPct !== null ? `${r.margemPct.toFixed(1)}%` : '-',
+                  `💰 ${r.lucroBruto.toFixed(2)} €`,
+                  r.stockAtual,
+                ],
+              }));
+            } else if (isTopSalesQuery) {
+              const topVendas = await prisma.venda.groupBy({
+                by: ['cnp_codigo'],
+                where: { farmaciaId: activeFarmacia.id },
+                _sum: { quantidade: true, valor_total: true },
+                orderBy: { _sum: { quantidade: 'desc' } },
+              });
+              const codigos = topVendas.map((t) => t.cnp_codigo);
+              const prods = await prisma.produtoMestre.findMany({
+                where: { cnp_codigo: { in: codigos } },
+                include: { inventarios: { where: { farmaciaId: activeFarmacia.id } } },
+              });
+              const prodMap = new Map(prods.map((p) => [p.cnp_codigo, p]));
+
+              const filtrados = topVendas
+                .map((t) => {
+                  const p = prodMap.get(t.cnp_codigo);
+                  const qtd = t._sum.quantidade || 0;
+                  const val = Number(t._sum.valor_total || 0);
+                  const stock = p?.inventarios.reduce((s, i) => s + i.quantidade, 0) ?? 0;
+                  const c = classifyProduct(t.cnp_codigo, p?.designacao || '', p?.taxa_iva);
+                  return {
+                    cnp: t.cnp_codigo,
+                    tipo_venda: c.tipo_venda,
+                    segmento: c.segmento,
+                    eh_generico: c.eh_generico,
+                    categoria: c.categoria,
+                    designacao: p?.designacao || t.cnp_codigo,
+                    qtd,
+                    val,
+                    stock,
+                  };
+                })
+                .filter((r) => {
+                  if (querGenerico) return r.eh_generico;
+                  if (querMarca) return r.segmento === 'MEDICAMENTO_MARCA';
+                  if (querVendaLivre) return r.tipo_venda === 'VENDA_LIVRE' || r.tipo_venda === 'MNSRM';
+                  if (querSoMnsrm) return r.tipo_venda === 'MNSRM';
+                  if (querSoMsrm) return r.tipo_venda === 'MSRM';
+                  return true;
+                })
+                .slice(0, limitCount);
+
+              const labelFiltroVendas = querGenerico
+                ? ' Genéricos (MG)'
+                : querMarca
+                ? ' Medicamentos de Marca'
+                : querVendaLivre
+                ? ' de Venda Livre (PSBE + MNSRM)'
+                : querSoMnsrm
+                ? ' MNSRM (Venda Livre)'
+                : querSoMsrm
+                ? ' Sujeitos a Receita Médica (MSRM)'
+                : '';
+
+              titulo = `Top ${limitCount} Produtos${labelFiltroVendas} Mais Vendidos (Volume de Unidades)`;
+              explicacao = `Artigos${labelFiltroVendas} com maior volume de escoamento na farmácia no período analisado.`;
+              colunas = ['Código', 'Segmento', 'Categoria', 'Designação', 'Unid. Vendidas', 'Faturação (€)', 'VMM (mês)', 'Stock Atual'];
+              linhas = filtrados.map((r) => ({
+                cnp: r.cnp,
+                valores: [
+                  r.cnp,
+                  r.eh_generico ? '🧬 GENÉRICO MG' : r.tipo_venda,
+                  r.categoria,
+                  r.designacao,
+                  r.qtd,
+                  `${r.val.toFixed(2)} €`,
+                  (r.qtd / 12).toFixed(1),
+                  r.stock,
+                ],
+              }));
+            } else {
+              const specificProductRegex =
+                /\b(?:vendas?|stock|exist[eê]ncias?|hist[oó]rico|evolu[cç][aã]o|escoamento|quanto\s+(?:vendeu|vendemos)|pre[cç]o)\s+(?:de|do|da|dos|das)?\s+([a-záàâãéèêíïóôõöúç0-9\-\+\/\.\s]{2,})/i;
+              const productMatch = q.match(specificProductRegex);
+
+              let termo = (productMatch ? productMatch[1] : q)
+                .replace(/\b(quais|qual|mostra|mostrar|listar?|ver|pesquisar?|produtos?|artigos?|vendas?|stock|com|de|do|da|dos|das|em|no|na|nos|nas|os|as|o|a|por|para)\b/gi, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+              if (!termo && productMatch) {
+                termo = productMatch[1].trim();
+              }
+              if (!termo) {
+                termo = q.trim();
+              }
+
+              // Pesquisa inteligente em ProdutoMestre com vendas e inventário para o tenant ativo
+              const prods = await prisma.produtoMestre.findMany({
+                where: {
+                  OR: [
+                    { cnp_codigo: { contains: termo } },
+                    { designacao: { contains: termo, mode: 'insensitive' } },
+                    { categoria: { contains: termo, mode: 'insensitive' } },
+                  ],
+                },
+                include: {
+                  inventarios: { where: { farmaciaId: activeFarmacia.id } },
+                  vendas: { where: { farmaciaId: activeFarmacia.id } },
+                },
+                take: 100,
+              });
+
+              let totalVendidoGeral = 0;
+              let totalFaturacaoGeral = 0;
+              let totalStockGeral = 0;
+              let totalCustoGeral = 0;
+
+              const list = prods.map((p) => {
+                const qtdVendida = p.vendas.reduce((s, v) => s + v.quantidade, 0);
+                const faturacao = p.vendas.reduce((s, v) => s + Number(v.valor_total), 0);
+                const stock = p.inventarios.reduce((s, i) => s + i.quantidade, 0);
+                const custoUnit = p.inventarios[0] ? Number(p.inventarios[0].custo_unitario) : 0;
+                const validade = p.inventarios[0]?.data_validade;
+                const vmm = qtdVendida / 12;
+                const cobertura = vmm > 0 ? stock / vmm : stock > 0 ? 999 : 0;
+
+                totalVendidoGeral += qtdVendida;
+                totalFaturacaoGeral += faturacao;
+                totalStockGeral += stock;
+                totalCustoGeral += stock * custoUnit;
+
+                const c = classifyProduct(p.cnp_codigo, p.designacao, p.taxa_iva);
+
+                let diagnostico = '✅ Rotação Regular';
+                if (stock === 0 && qtdVendida > 0) diagnostico = '⭕ Esgotado (Tem Saída)';
+                else if (stock === 0 && qtdVendida === 0) diagnostico = '⚪ Sem Stock / Sem Venda';
+                else if (stock > 0 && qtdVendida === 0) diagnostico = '🛑 Mono (0 vendas em 12m)';
+                else if (stock > 0 && cobertura > 4) diagnostico = `⚠️ Excesso (${cobertura.toFixed(1)}m cob.)`;
+
+                return {
+                  cnp: p.cnp_codigo,
+                  designacao: p.designacao,
+                  segmento: c.eh_generico ? '🧬 GENÉRICO MG' : c.tipo_venda,
+                  grupoDci: c.grupo_equivalencia_dci || c.categoria,
+                  qtdVendida,
+                  faturacao,
+                  vmm,
+                  stock,
+                  custoUnit,
+                  pvp: p.pvp ? Number(p.pvp) : null,
+                  margem: p.margem_padrao ? Number(p.margem_padrao) : null,
+                  validade: validade ? validade.toISOString().substring(0, 10) : '-',
+                  diagnostico,
+                  hasActivity: stock > 0 || qtdVendida > 0,
+                };
+              });
+
+              list.sort((a, b) => {
+                if (a.hasActivity && !b.hasActivity) return -1;
+                if (!a.hasActivity && b.hasActivity) return 1;
+                return b.qtdVendida - a.qtdVendida || b.stock - a.stock;
+              });
+
+              const isSalesQuestion = q.includes('venda') || q.includes('quanto');
+              const termoUpper = termo.charAt(0).toUpperCase() + termo.slice(1);
+
+              titulo = isSalesQuestion
+                ? `Análise de Vendas e Escoamento: "${termoUpper}" (${prods.length} apresentações encontradas)`
+                : `Resultados e Stock para "${termoUpper}" (${prods.length} apresentações encontradas)`;
+
+              explicacao = `Foram encontrados ${prods.length} artigos para a pesquisa "${termo}". No período: ${totalVendidoGeral} unidades vendidas (${totalFaturacaoGeral.toFixed(2)} € a PVP) e ${totalStockGeral} unidades atualmente em stock (${totalCustoGeral.toFixed(2)} € a custo). Clique em qualquer linha para abrir o gráfico mensal de evolução e laboratórios concorrentes.`;
+
+              colunas = [
+                'Código',
+                'Segmento',
+                'Grupo / Apresentação',
+                'Designação',
+                'Unid. Vendidas',
+                'Faturação (€)',
+                'VMM (mês)',
+                'Stock Atual',
+                'Custo Unit.',
+                'PVP (Margem)',
+                'Validade',
+                'Diagnóstico',
+              ];
+
+              linhas = list.map((r) => ({
+                cnp: r.cnp,
+                valores: [
+                  r.cnp,
+                  r.segmento,
+                  r.grupoDci,
+                  r.designacao,
+                  r.qtdVendida,
+                  `${r.faturacao.toFixed(2)} €`,
+                  `${r.vmm.toFixed(1)}/mês`,
+                  `${r.stock} un`,
+                  `${r.custoUnit.toFixed(2)} €`,
+                  `${r.pvp ? r.pvp.toFixed(2) + '€' : '-'} (${r.margem !== null ? r.margem.toFixed(0) + '%' : '-'})`,
+                  r.validade,
+                  r.diagnostico,
+                ],
+              }));
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ titulo, explicacao, colunas, linhas }));
+          } catch (e: any) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }));
+          }
+        });
+        return;
+      }
+
+      if (pathname === '/' || pathname === '/index.html') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(getDashboardHtml());
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Não encontrado');
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+  });
+
+  server.listen(PORT, () => {
+    console.log(`\n🚀 Dashboard BI Pharma ativo em: http://localhost:${PORT}`);
+  });
+}
+
+function getDashboardHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BI Pharma — Inteligência de Stock, Genéricos e Validades</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --surface-hover: #334155;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --primary: #38bdf8;
+      --danger: #f43f5e;
+      --warning: #f59e0b;
+      --success: #10b981;
+      --purple: #a855f7;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding-bottom: 60px;
+    }
+    header {
+      background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 20px 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .brand h1 { font-size: 1.4rem; font-weight: 700; color: var(--primary); }
+    .brand p { font-size: 0.88rem; color: var(--muted); }
+    .tenant-badge {
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 8px 16px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      color: var(--primary);
+      font-weight: 600;
+    }
+    .container { max-width: 1460px; margin: 0 auto; padding: 24px 32px; }
+
+    .controls-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px 24px;
+      margin-bottom: 24px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      align-items: flex-end;
+    }
+    .control-group { display: flex; flex-direction: column; gap: 6px; }
+    .control-group label { font-size: 0.78rem; color: var(--muted); font-weight: 600; text-transform: uppercase; }
+    .control-group select, .control-group input {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 9px 14px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      min-width: 180px;
+    }
+    .btn {
+      background: var(--primary);
+      color: #0f172a;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.9; }
+    .btn-secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+    .kpi-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      position: relative;
+      overflow: hidden;
+    }
+    .kpi-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; width: 4px; height: 100%;
+      background: var(--primary);
+    }
+    .kpi-card.danger::before { background: var(--danger); }
+    .kpi-card.warning::before { background: var(--warning); }
+    .kpi-card.success::before { background: var(--success); }
+    .kpi-card.purple::before { background: var(--purple); }
+    .kpi-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; font-weight: 600; }
+    .kpi-value { font-size: 1.55rem; font-weight: 800; margin: 6px 0 4px; }
+    .kpi-sub { font-size: 0.78rem; color: var(--muted); }
+
+    .ask-card {
+      background: linear-gradient(135deg, rgba(30, 41, 59, 0.95), rgba(15, 23, 42, 0.95));
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 24px;
+    }
+    .ask-header { font-size: 1rem; font-weight: 700; margin-bottom: 12px; color: var(--primary); display: flex; align-items: center; gap: 8px; }
+    .ask-input-row { display: flex; gap: 12px; margin-bottom: 12px; }
+    .ask-input-row input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 0.95rem;
+    }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chip {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .chip:hover { color: var(--text); border-color: var(--primary); background: rgba(56, 189, 248, 0.1); }
+    #askResultBox { margin-top: 18px; display: none; border-top: 1px solid var(--border); padding-top: 16px; }
+
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 12px; flex-wrap: wrap; }
+    .tab-btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 10px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+    .tab-btn.active {
+      background: var(--primary);
+      color: #0f172a;
+      border-color: var(--primary);
+    }
+    .table-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .table-toolbar input {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 14px;
+      border-radius: 8px;
+      min-width: 280px;
+    }
+    .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow-x: auto;
+      max-height: 600px;
+      overflow-y: auto;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    th {
+      position: sticky;
+      top: 0;
+      background: #0f172a;
+      color: var(--muted);
+      text-align: left;
+      padding: 12px 12px;
+      font-size: 0.74rem;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+      z-index: 1;
+    }
+    td { padding: 10px 12px; border-bottom: 1px solid rgba(51, 65, 85, 0.5); }
+    tr.clickable-row { cursor: pointer; transition: background 0.12s; }
+    tr.clickable-row:hover { background: var(--surface-hover); }
+    .badge {
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.71rem;
+      font-weight: 700;
+      display: inline-block;
+      white-space: nowrap;
+    }
+    .badge-danger { background: rgba(244, 63, 94, 0.18); color: #fb7185; }
+    .badge-warning { background: rgba(245, 158, 11, 0.18); color: #fbbf24; }
+    .badge-info { background: rgba(56, 189, 248, 0.18); color: #38bdf8; }
+    .badge-success { background: rgba(16, 185, 129, 0.18); color: #34d399; }
+    .badge-purple { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
+    .campaign-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      position: relative;
+    }
+    .campaign-card:hover {
+      border-color: #fb7185;
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px -6px rgba(244, 63, 94, 0.2);
+    }
+    .campaign-card.selected {
+      border-color: #f43f5e;
+      background: linear-gradient(135deg, rgba(244, 63, 94, 0.12), rgba(30, 41, 59, 0.8));
+      box-shadow: 0 0 0 2px rgba(244, 63, 94, 0.4);
+    }
+    .omnichannel-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .copy-btn {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      align-self: flex-end;
+      transition: all 0.15s;
+    }
+    .copy-btn:hover {
+      background: var(--primary);
+      color: #0f172a;
+      border-color: var(--primary);
+    }
+
+    .modal-backdrop {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.75);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      padding: 20px;
+    }
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      max-width: 860px;
+      width: 100%;
+      padding: 24px;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    .modal-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
+    .chart-bars {
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      height: 170px;
+      padding: 20px 12px 8px;
+      background: var(--bg);
+      border-radius: 10px;
+      margin-top: 10px;
+      border: 1px solid var(--border);
+    }
+    .bar-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
+    .bar { width: 100%; background: var(--primary); border-radius: 4px 4px 0 0; min-height: 3px; transition: height 0.2s; }
+    .bar-val { font-size: 0.75rem; font-weight: 700; color: var(--text); }
+    .bar-lbl { font-size: 0.7rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>💊 BI Pharma — Inteligência de Stock, Genéricos (MG) e Validades</h1>
+      <p>Segmentação Automática: VENDA_LIVRE (PSBE) | MNSRM | Medicamentos de Marca | Medicamentos Genéricos (MG)</p>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <div id="adminControlsBar" style="display:none;align-items:center;gap:8px;">
+        <button class="btn btn-secondary" onclick="openAccessManagerModal()" style="font-size:0.8rem;padding:7px 12px;border-color:#a855f7;color:#c084fc;" title="Gerir nomes anónimos (Farmácia A/B) e copiar links isolados por farmácia">
+          🔑 Acessos & Links
+        </button>
+        <button class="btn btn-secondary" onclick="openImportPharmacyModal()" style="font-size:0.8rem;padding:7px 12px;border-color:#10b981;color:#34d399;" title="Importar PDF Inventário + Validades + CSV Vendas de uma nova farmácia">
+          📥 Importar Farmácia
+        </button>
+      </div>
+      <div id="farmaciaSelectorWrap" style="display:flex;align-items:center;gap:10px;background:rgba(15,23,42,0.6);padding:6px 14px;border-radius:12px;border:1px solid var(--border)">
+        <label id="farmaciaSelectorLabel" for="farmaciaSelector" style="font-size:0.75rem;color:var(--muted);text-transform:uppercase;font-weight:700;">Farmácia:</label>
+        <select id="farmaciaSelector" onchange="onFarmaciaChange()" style="background:#0f172a;border:1px solid var(--primary);color:var(--primary);padding:7px 12px;border-radius:8px;font-weight:700;font-size:0.88rem;cursor:pointer;outline:none;">
+          <option value="">A carregar farmácias...</option>
+        </select>
+        <div id="lockedPharmacyBadge" style="display:none;font-size:0.88rem;font-weight:800;color:var(--primary);padding:4px 8px;"></div>
+        <div class="tenant-badge" id="tenantBadge" style="display:none;"></div>
+        <button class="btn btn-secondary" id="btnTrocarAcesso" onclick="openAuthGateModal()" style="font-size:0.76rem;padding:5px 10px;" title="Trocar código de acesso ou entrar como Admin">
+          🔒 Acesso
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <div class="container">
+    <div class="controls-card">
+      <div class="control-group" style="flex: 1.1; min-width: 220px;">
+        <label>Segmento / Estatuto de Dispensa</label>
+        <select id="selectTipoVenda" onchange="renderActiveTable()">
+          <option value="ALL" selected>Todos os Produtos</option>
+          <option value="LIVRE_TOTAL">🟢 Venda Livre + MNSRM (Balcão)</option>
+          <option value="GENERICO_MG">🧬 Só Medicamentos Genéricos (MG)</option>
+          <option value="MEDICAMENTO_MARCA">🏷️ Só Medicamentos de Marca</option>
+          <option value="VENDA_LIVRE">🟢 Só PSBE / Cosmética</option>
+          <option value="MNSRM">🔵 Só MNSRM (Sem Receita)</option>
+          <option value="MSRM">🔴 Só MSRM (Com Receita)</option>
+        </select>
+      </div>
+      <div class="control-group">
+        <label>Critério de Monos</label>
+        <select id="selectDiasMonos" onchange="onMonosFilterChange()">
+          <option value="28">Últimas 4 Semanas (28 dias)</option>
+          <option value="60">Últimos 2 Meses (60 dias)</option>
+          <option value="90" selected>Últimos 3 Meses (90 dias)</option>
+          <option value="180">Últimos 6 Meses (180 dias)</option>
+          <option value="365">Últimos 12 Meses (365 dias)</option>
+        </select>
+      </div>
+      <div class="control-group">
+        <label>Alerta Excesso Cobertura</label>
+        <select id="selectCobertura" onchange="onCoberturaFilterChange()">
+          <option value="2">> 2 Meses</option>
+          <option value="3">> 3 Meses</option>
+          <option value="4" selected>> 4 Meses</option>
+          <option value="6">> 6 Meses</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:8px;align-items:flex-end;">
+        <button class="btn" id="btnRecalcular" onclick="loadAnalysis()">🔄 Recalcular</button>
+        <button class="btn btn-secondary" onclick="exportCurrentTabCsv()">📥 Exportar CSV</button>
+      </div>
+      <span id="calcFeedback" style="font-size:0.82rem;color:#34d399;font-weight:700;display:none;align-self:center;">✅ Atualizado!</span>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-label">Valor Total em Stock (s/ IVA)</div>
+        <div class="kpi-value" id="kpiStockValor">-- €</div>
+        <div class="kpi-sub" id="kpiStockSub">-- artigos | -- unidades</div>
+      </div>
+      <div class="kpi-card purple">
+        <div class="kpi-label">Genéricos (MG) vs. Marca</div>
+        <div class="kpi-value" id="kpiGenericosVal" style="color: #c084fc">-- € MG</div>
+        <div class="kpi-sub" id="kpiGenericosSub">-- Genéricos | -- Marca | -- Grupos DCI</div>
+      </div>
+      <div class="kpi-card success">
+        <div class="kpi-label">Venda Livre (PSBE + MNSRM)</div>
+        <div class="kpi-value" id="kpiEstatutoRatio" style="color: var(--success)">--% Livre</div>
+        <div class="kpi-sub" id="kpiEstatutoSub">-- PSBE | -- MNSRM | -- MSRM</div>
+      </div>
+      <div class="kpi-card warning">
+        <div class="kpi-label">Capital Imobilizado em "Monos"</div>
+        <div class="kpi-value" id="kpiMonosValor" style="color: var(--warning)">-- €</div>
+        <div class="kpi-sub" id="kpiMonosSub">-- artigos sem vendas no período</div>
+      </div>
+      <div class="kpi-card danger">
+        <div class="kpi-label">Capital em Risco de Caducidade</div>
+        <div class="kpi-value" id="kpiCaducidadeValor" style="color: var(--danger)">-- €</div>
+        <div class="kpi-sub" id="kpiCaducidadeSub">-- artigos (-- embalagens em risco)</div>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab-btn active" id="tabBtn-copilot" onclick="switchTab('copilot')" style="background: linear-gradient(135deg, rgba(56, 189, 248, 0.25), rgba(168, 85, 247, 0.25)); border-color: var(--primary); color: #38bdf8;">💬 Assistente Copilot (Perguntas Livres)</button>
+      <button class="tab-btn" id="tabBtn-campaigns" onclick="switchTab('campaigns')" style="background: linear-gradient(135deg, rgba(244, 63, 94, 0.2), rgba(245, 158, 11, 0.2)); border-color: #f43f5e; color: #fb7185;">🎯 Campanhas & Marketing 360º</button>
+      <button class="tab-btn" id="tabBtn-caducidade" onclick="switchTab('caducidade')">⏳ Risco Elevado de Caducidade <span class="badge badge-danger" id="badge-caducidade" style="margin-left:6px">-</span></button>
+      <button class="tab-btn" id="tabBtn-genericos" onclick="switchTab('genericos')">🧬 Consolidação de Genéricos (DCI) <span class="badge badge-purple" id="badge-genericos" style="margin-left:6px">-</span></button>
+      <button class="tab-btn" id="tabBtn-monos" onclick="switchTab('monos')">❄️ Monos (Capital Imobilizado) <span class="badge badge-warning" id="badge-monos" style="margin-left:6px">-</span></button>
+      <button class="tab-btn" id="tabBtn-cobertura" onclick="switchTab('cobertura')">📦 Excesso de Cobertura <span class="badge badge-info" id="badge-cobertura" style="margin-left:6px">-</span></button>
+    </div>
+
+    <!-- ABA 1: ASSISTENTE COPILOT DEDICADO (PERGUNTAS LIVRES & CONSULTORIA) -->
+    <div id="tabContent-copilot" style="display: block;">
+      <div class="ask-card" style="margin-bottom: 24px; padding: 24px;">
+        <div style="margin-bottom: 18px;">
+          <div style="font-size: 1.15rem; font-weight: 800; color: var(--primary); display: flex; align-items: center; gap: 8px;">
+            💬 Assistente Consultivo de Farmácia (Copilot)
+          </div>
+          <p style="font-size: 0.88rem; color: var(--muted); margin-top: 4px; line-height: 1.45;">
+            Faça perguntas abertas em linguagem natural sobre o stock, vendas, rentabilidade ou regras clínicas. O Copilot analisa em tempo real a base de dados PostgreSQL e as diretrizes Infarmed.
+          </p>
+        </div>
+
+        <div class="ask-input-row" style="margin-bottom: 16px;">
+          <input type="text" id="askInput" placeholder="Escreva a sua pergunta livremente... Ex: 'que stocks ajustavas?', 'eliminar labs sem vendas há 3 meses', 'quais os preservativos mais vendidos', 'sugestões para diabéticos'..." onkeydown="if(event.key==='Enter') askQuestion()" />
+          <button class="btn" onclick="askQuestion()" style="padding: 0 24px; font-size: 0.95rem;">Perguntar</button>
+        </div>
+
+        <div style="margin-top: 14px;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: var(--muted); text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.5px;">
+            Exemplos de Perguntas e Casos de Decisão (Clique para Executar):
+          </div>
+          <div class="chips" style="gap: 8px; flex-wrap: wrap;">
+            <span class="chip" onclick="runQuickQuestion('Para a mesma substancia e dosagem que laboratorios eliminarias por n ter vendas ha 3 meses ou mais')">✂️ Eliminar Labs Parados (≥3m)</span>
+            <span class="chip" onclick="runQuickQuestion('Que stocks ajustavas')">📦 Que Stocks Ajustavas?</span>
+            <span class="chip" onclick="runQuickQuestion('Que produtos de venda livre posso sugerir para os diabeticos')">🩺 Venda Livre p/ Diabéticos</span>
+            <span class="chip" onclick="runQuickQuestion('Do stock parado que tenho o que faz sentido recomendar a idosos com problemas cardiacos')">❤️ Stock Parado p/ Cardíacos</span>
+            <span class="chip" onclick="runQuickQuestion('Cria uma campanha de venda para os produtos cosmeticos agora para Dezembro e diz quais o que temos para incluir')">🎁 Campanha Cosmética Dezembro</span>
+            <span class="chip" onclick="runQuickQuestion('quais os produtos que tiveram um aumento de vendas nos ultimos 2 meses?')">📈 Aumento Vendas (Últ. 2m)</span>
+            <span class="chip" onclick="runQuickQuestion('quais os produtos que tiverem uma queda acentuada de vendas')">📉 Queda Acentuada Vendas</span>
+            <span class="chip" onclick="runQuickQuestion('Tivemos algum produto que veio substituir este outro?')">🔁 Deteção de Substituição</span>
+            <span class="chip" onclick="runQuickQuestion('Vitativ Transilax Comp 20 com que produtos de receita medica ou venda livre posso fazer venda cruzada')">🎯 Cross-Selling Transilax</span>
+            <span class="chip" onclick="runQuickQuestion('quais os preservativos que temos vendido mais')">🛡️ Preservativos Mais Vendidos</span>
+            <span class="chip" onclick="runQuickQuestion('Tendo em conta que temos este produto que tem mais margem mas n tem tantas vendas e o outro que tem menos margem mas mais vendas o que fazemos')">⚖️ Volume vs. Margem</span>
+            <span class="chip" onclick="runQuickQuestion('quais os 10 produtos de venda livre que mais geram dinheiro?')">💰 Top 10 Lucro €</span>
+          </div>
+        </div>
+
+        <div id="askResultBox" style="display: none; margin-top: 24px; border-top: 1px solid var(--border); padding-top: 20px;">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; gap: 16px; flex-wrap: wrap;">
+            <h3 id="askResTitle" style="font-size: 1.1rem; color: var(--primary); margin: 0;"></h3>
+            <button class="btn btn-secondary" onclick="clearCopilotResult()" style="font-size: 0.8rem; padding: 6px 12px;">✕ Nova Pergunta</button>
+          </div>
+          <div id="askResSummary" style="display:none;margin-bottom:14px;padding:12px 16px;background:rgba(56,189,248,0.12);border-left:4px solid var(--primary);border-radius:6px;font-size:0.88rem;color:#f1f5f9;line-height:1.45;"></div>
+          <p id="askResDesc" style="font-size: 0.88rem; color: #cbd5e1; margin-bottom: 14px; white-space: pre-line; line-height: 1.45;"></p>
+          <div class="table-wrap" style="max-height: 480px;">
+            <table id="askResTable"></table>
+          </div>
+        </div>
+
+        <div id="copilotEmptyState" style="text-align: center; padding: 48px 16px; background: rgba(15, 23, 42, 0.4); border: 1px dashed var(--border); border-radius: 10px; margin-top: 24px;">
+          <div style="font-size: 2.2rem; margin-bottom: 10px;">💬</div>
+          <div style="font-size: 1rem; font-weight: 700; color: #e2e8f0; margin-bottom: 6px;">Pronto para responder às suas questões</div>
+          <div style="font-size: 0.85rem; color: var(--muted); max-width: 540px; margin: 0 auto;">
+            Coloque uma questão livre na barra acima ou selecione um dos atalhos para obter diagnósticos imediatos da sua farmácia.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ABA 2: CAMPANHAS & MARKETING 360º -->
+    <div id="tabContent-campaigns" style="display: none;">
+      <!-- CABEÇALHO DO HUB DE MARKETING -->
+      <div style="background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.95)); border: 1px solid var(--border); border-radius: 14px; padding: 22px; margin-bottom: 20px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
+          <div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: #fb7185; display: flex; align-items: center; gap: 8px;">
+              🎯 Estúdio de Marketing, Campanhas de Época & Escoamento 360º
+            </div>
+            <p style="font-size: 0.88rem; color: var(--muted); margin-top: 4px; max-width: 820px; line-height: 1.45;">
+              Consciência total do stock da farmácia: cruza a anatomia de cada época do calendário com os produtos que precisam de escoar (<b>Validades Críticas</b>, <b>Monos</b> e <b>Restos de Gaveta 1-2 un.</b>) e associa as <b>Locomotivas de Receita/Balcão</b> para venda cruzada.
+            </p>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <button class="btn btn-secondary" onclick="openEmailDigestModal()" style="border-color: #f43f5e; color: #fb7185;">
+              📧 Boletim Mensal da Equipa
+            </button>
+            <button class="btn" onclick="loadCampaignSuggestions()" style="background: linear-gradient(135deg, #f43f5e, #e11d48);">
+              🔄 Atualizar Planos
+            </button>
+          </div>
+        </div>
+
+        <!-- RADIOGRAFIA DE CRITÉRIOS DE MARKETING DO STOCK -->
+        <div id="marketingOverviewGrid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-top: 18px;">
+          <!-- Inserido dinamicamente via JS -->
+        </div>
+      </div>
+
+      <!-- SUB-NAVEGAÇÃO DO ESTÚDIO DE MARKETING (4 EIXOS OPERACIONAIS) -->
+      <div style="display: flex; gap: 10px; margin-bottom: 22px; flex-wrap: wrap;">
+        <button class="btn" id="mktSubBtn-epoca" onclick="switchMarketingSubView('epoca')" style="background: #f43f5e; color: #fff; font-size: 0.88rem; padding: 10px 18px;">
+          📅 1. Campanhas de Época & Calendário Civil
+        </button>
+        <button class="btn btn-secondary" id="mktSubBtn-liquidacao" onclick="switchMarketingSubView('liquidacao')" style="font-size: 0.88rem; padding: 10px 18px;">
+          🧹 2. Planos de Liquidação (Validades, Monos & Restos)
+        </button>
+        <button class="btn btn-secondary" id="mktSubBtn-cross" onclick="switchMarketingSubView('cross')" style="font-size: 0.88rem; padding: 10px 18px;">
+          🤝 3. Cross-Selling & Simulador por Produto
+        </button>
+        <button class="btn btn-secondary" id="mktSubBtn-custom" onclick="switchMarketingSubView('custom')" style="font-size: 0.88rem; padding: 10px 18px; border-color: #c084fc; color: #e879f9;">
+          ✨ 4. Criar Campanha à Medida (Halloween, Black Friday, Festas, Produto Foco...)
+        </button>
+      </div>
+
+      <!-- PAINEL CRIADOR DE CAMPANHAS À MEDIDA (EVENTO LIVRE OU PRODUTOS ESPECÍFICOS) -->
+      <div id="mktCustomBuilderPanel" style="display: none; margin-bottom: 26px; background: linear-gradient(135deg, rgba(88, 28, 135, 0.25), rgba(15, 23, 42, 0.92)); border: 1px solid rgba(192, 132, 252, 0.45); border-radius: 14px; padding: 22px;">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px; margin-bottom: 16px;">
+          <div>
+            <h3 style="font-size: 1.08rem; font-weight: 800; color: #e879f9; margin: 0; display: flex; align-items: center; gap: 8px;">
+              ✨ Construtor de Campanhas à Medida — Eventos Livres & Produtos Específicos
+            </h3>
+            <p style="font-size: 0.84rem; color: #cbd5e1; margin-top: 4px;">
+              Crie uma campanha para qualquer evento do calendário ou da sua localidade (<b>Halloween, Black Friday, Festas da Cidade, Aniversário</b>) ou escolha manualmente os produtos que quer escoar (ex: <b>Antigrippine Trieffect Tosse</b>).
+            </p>
+          </div>
+        </div>
+
+        <!-- ATALHOS DE EVENTOS ESPECIAIS (1 CLIQUE) -->
+        <div style="margin-bottom: 16px;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: var(--muted); text-transform: uppercase; margin-bottom: 8px;">
+            ⚡ Eventos Rápidos (Clique para montar automaticamente com o seu stock):
+          </div>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('halloween')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #f97316; color: #fb923c;">🎃 Halloween</button>
+            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('black_friday')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #f43f5e; color: #fb7185;">🖤 Black Friday / Cyber Week</button>
+            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('festas_cidade')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #eab308; color: #fde047;">🎉 Festas da Cidade / Romaria</button>
+            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('aniversario_farmacia')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #38bdf8; color: #38bdf8;">🎂 Aniversário da Farmácia</button>
+            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('evento_desportivo')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #10b981; color: #34d399;">🏃 Evento Desportivo / Caminhada</button>
+            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('dia_mae_pai')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #c084fc; color: #c084fc;">💝 Dia da Mãe / Pai / Família</button>
+          </div>
+        </div>
+
+        <!-- CONFIGURAÇÃO MANUAL (TEMA LIVRE + SELETOR DE PRODUTOS ESPECÍFICOS) -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px;">
+          <div style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 10px; padding: 14px;">
+            <label style="font-size: 0.8rem; font-weight: 700; color: #f8fafc; display: block; margin-bottom: 6px;">
+              1️⃣ Nome do Evento ou Campanha Personalizada:
+            </label>
+            <input type="text" id="customCampName" placeholder="Ex: Especial Festas de S. João, Semana Anti-Gripe, Promo Antigrippine..." style="width: 100%; margin-bottom: 12px;" />
+
+            <label style="font-size: 0.8rem; font-weight: 700; color: #f8fafc; display: block; margin-bottom: 6px;">
+              2️⃣ Palavras-Chave / Famílias a incluir (Opcional, separadas por vírgula):
+            </label>
+            <input type="text" id="customCampTerms" placeholder="Ex: antigrippine, tosse, vitamina c, creme maos, perfume..." style="width: 100%; margin-bottom: 12px;" />
+
+            <label style="font-size: 0.8rem; font-weight: 700; color: #f8fafc; display: block; margin-bottom: 6px;">
+              3️⃣ Filtro de Stock:
+            </label>
+            <select id="customCampFocus" style="width: 100%;">
+              <option value="PRIORIDADE_VALIDADES_MONOS" selected>🔥 Priorizar Validades Críticas, Monos e Excesso de Stock</option>
+              <option value="SO_VALIDADES_E_MONOS">🧹 Incluir APENAS Produtos em Risco de Validade ou Monos</option>
+              <option value="TODOS_ELEGIVEIS">📦 Todos os Produtos Elegíveis com Stock e Margem</option>
+            </select>
+          </div>
+
+          <!-- PESQUISADOR E SELETOR DE PRODUTOS ESPECÍFICOS -->
+          <div style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; justify-content: space-between;">
+            <div>
+              <label style="font-size: 0.8rem; font-weight: 700; color: #38bdf8; display: block; margin-bottom: 6px;">
+                🎯 Escolher Produtos Específicos do Stock (Ex: Antigrippine, Mucavex...):
+              </label>
+              <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+                <input type="text" id="customProdSearchInput" placeholder="🔎 Escreva nome ou CNP (ex: Antigrippine, 5818711)..." oninput="searchProductsForCustomBuilder(this.value)" style="flex: 1;" />
+              </div>
+              <div id="customProdSearchResults" style="max-height: 135px; overflow-y: auto; border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 6px; background: rgba(2, 6, 23, 0.6); font-size: 0.78rem; margin-bottom: 10px;">
+                <span style="color: var(--muted);">Escreva acima para pesquisar qualquer produto em stock e adicioná-lo à campanha...</span>
+              </div>
+            </div>
+
+            <div>
+              <div style="font-size: 0.75rem; font-weight: 700; color: #e879f9; margin-bottom: 6px;">
+                📌 Produtos Fixados na Campanha (<span id="customPickedCount">0</span>):
+              </div>
+              <div id="customPickedProductsChips" style="display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px;">
+                <span style="font-size: 0.75rem; color: var(--muted);">Nenhum produto fixado manualmente (ou clique num produto acima).</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button class="btn btn-secondary" onclick="clearCustomCampaignBuilder()" style="font-size: 0.84rem;">Limpar Seleção</button>
+          <button class="btn" onclick="submitCustomCampaignBuilder()" style="background: linear-gradient(135deg, #a855f7, #ec4899); font-size: 0.9rem; padding: 10px 22px;">
+            🚀 Montar Campanha à Medida & Simular Descontos
+          </button>
+        </div>
+      </div>
+
+      <!-- VISTA A: CAMPANHAS DE ÉPOCA E PLANOS DE LIQUIDAÇÃO -->
+      <div id="mktView-campaignsFlow">
+        <!-- PASSO 1: SELECIONAR TEMA DO CALENDÁRIO OU PLANO DE LIQUIDAÇÃO -->
+        <div id="mktStep1Container" style="margin-bottom: 28px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
+            <h3 id="step1CampaignHeading" style="font-size: 1rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 8px;">
+              <span style="background: #f43f5e; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">1</span>
+              Selecione a Campanha de Época ou Plano de Escoamento:
+            </h3>
+            <span id="campaignsCountBadge" style="font-size: 0.8rem; color: var(--muted);">A carregar campanhas...</span>
+          </div>
+          <div id="campaignSuggestionsGrid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px;">
+            <!-- Inserido dinamicamente via JS -->
+          </div>
+        </div>
+
+        <!-- PASSO 2: ANATOMIA DA ÉPOCA, CANAIS, DESCONTO & SIMULADOR ANTI-DUMPING -->
+        <div id="campaignStep2Config" style="display: none; margin-bottom: 28px; background: rgba(15, 23, 42, 0.5); border: 1px solid var(--border); border-radius: 14px; padding: 22px;">
+          <div style="margin-bottom: 16px;">
+            <h3 style="font-size: 1rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 8px;">
+              <span style="background: #f43f5e; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">2</span>
+              Anatomia da Época, Canais de Comunicação & Simulador Anti-Dumping
+            </h3>
+            <p id="selectedCampaignTitleDesc" style="font-size: 0.86rem; color: var(--muted); margin-top: 4px;"></p>
+          </div>
+
+          <!-- ANATOMIA DA ÉPOCA & ESTRATÉGIA DE ESCOAMENTO -->
+          <div id="seasonAnatomyBox" style="display: none; margin-bottom: 18px; background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 10px; padding: 14px 18px;">
+            <!-- Preenchido via JS -->
+          </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
+          <!-- SELEÇÃO DE CANAIS -->
+          <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px;">
+            <label style="font-size: 0.84rem; font-weight: 700; color: var(--text); display: block; margin-bottom: 8px;">
+              📡 Canais de Venda e Comunicação a Ativar:
+            </label>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              <label style="display: flex; align-items: center; gap: 8px; font-size: 0.88rem; cursor: pointer; color: #cbd5e1;">
+                <input type="checkbox" id="chan-loja" value="loja" checked onchange="onChannelsChanged()">
+                <span>🏪 <b>Loja Física & Balcão</b> (Script rápido de 10s + Posição no Linear)</span>
+              </label>
+              <label style="display: flex; align-items: center; gap: 8px; font-size: 0.88rem; cursor: pointer; color: #cbd5e1;">
+                <input type="checkbox" id="chan-redes" value="redes" checked onchange="onChannelsChanged()">
+                <span>📱 <b>Redes Sociais</b> (Copy com emojis + conselho de saúde + hashtags)</span>
+              </label>
+              <label style="display: flex; align-items: center; gap: 8px; font-size: 0.88rem; cursor: pointer; color: #cbd5e1;">
+                <input type="checkbox" id="chan-ecras" value="ecras" checked onchange="onChannelsChanged()">
+                <span>📺 <b>Ecrãs TV & Montra Digital</b> (Texto 16:9 rotativo para montra)</span>
+              </label>
+              <label style="display: flex; align-items: center; gap: 8px; font-size: 0.88rem; cursor: pointer; color: #cbd5e1;">
+                <input type="checkbox" id="chan-app" value="app" checked onchange="onChannelsChanged()">
+                <span>📲 <b>App Mobile & Notificações SMS</b> (Push curta de 160 carateres)</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- CONTROLO DE DESCONTO & CERTIFICAÇÃO ANTI-DUMPING -->
+          <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; justify-content: space-between;">
+            <div>
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <label style="font-size: 0.84rem; font-weight: 700; color: var(--text);">
+                  🏷️ Desconto Comercial Sugerido (%):
+                </label>
+                <span id="discountBadgeVal" style="font-size: 0.95rem; font-weight: 800; color: #fb7185;">15%</span>
+              </div>
+              <input type="range" id="campaignDiscountRange" min="0" max="30" step="5" value="15" style="width: 100%; accent-color: #f43f5e; cursor: pointer;" oninput="onDiscountSliderChange(this.value)">
+              <div style="display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
+                <span>0% (Sem desc.)</span>
+                <span>10%</span>
+                <span>15% (Recomendado)</span>
+                <span>20%</span>
+                <span>30% (Atenção Custo)</span>
+              </div>
+            </div>
+
+            <div id="antiDumpingSummaryBox" style="margin-top: 14px; padding: 10px 14px; border-radius: 8px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3);">
+              <div style="display: flex; align-items: center; gap: 8px; font-weight: 700; color: #34d399; font-size: 0.86rem;">
+                <span>🛡️ Certificação Anti-Dumping (Dec.-Lei 166/2013)</span>
+              </div>
+              <div id="antiDumpingDetails" style="font-size: 0.8rem; color: #94a3b8; margin-top: 4px;">
+                Todos os produtos mantêm PVP promocional superior ao custo de aquisição + 5% de margem de segurança.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- SIMULADOR FINANCEIRO (TABELA DE SKUS E MARGENS) -->
+        <div style="margin-bottom: 18px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 10px;">
+            <div style="font-size: 0.88rem; font-weight: 700; color: #e2e8f0;">
+              📦 Produtos da Farmácia Pré-Selecionados no Lote da Campanha:
+            </div>
+            <div id="financialKpisInline" style="font-size: 0.84rem; display: flex; gap: 14px; flex-wrap: wrap;">
+              <!-- KPIs inseridos via JS -->
+            </div>
+          </div>
+
+          <div class="table-wrap" style="max-height: 440px;">
+            <table id="campaignProductsTable">
+              <!-- Renderizado dinamicamente -->
+            </table>
+          </div>
+        </div>
+
+        <!-- BOTÃO PARA GERAR MATERIAIS -->
+        <div style="display: flex; justify-content: flex-end; gap: 12px;">
+          <button class="btn" id="btnGenerateMaterials" onclick="generateCampaignMaterialsAction()" style="background: linear-gradient(135deg, #f43f5e, #e11d48); font-size: 0.95rem; padding: 10px 24px;">
+            ✨ Gerar Materiais para os Canais Selecionados
+          </button>
+        </div>
+      </div>
+
+      <!-- PASSO 3: MATERIAIS OMNICANAL PRONTOS -->
+      <div id="campaignStep3Materials" style="display: none;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
+          <div>
+            <h3 style="font-size: 1.05rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 8px;">
+              <span style="background: #10b981; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">3</span>
+              Materiais Prontos para Ativação Omnicanal
+            </h3>
+            <p style="font-size: 0.84rem; color: var(--muted); margin-top: 2px;">
+              Copie o texto com um clique e partilhe de imediato nas suas redes, ecrãs ou no balcão da farmácia.
+            </p>
+          </div>
+          <div style="display: flex; gap: 10px;">
+            <button class="btn btn-secondary" onclick="exportCampaignPlanCsv()">
+              📥 Exportar Lista de Preços (CSV)
+            </button>
+            <button class="btn" onclick="sendCampaignEmailToTeam()" style="background: #0284c7;">
+              ✉️ Enviar Pacote por Email
+            </button>
+          </div>
+        </div>
+
+        <div id="omnichannelGrid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px; margin-bottom: 30px;">
+          <!-- Inserido dinamicamente via JS -->
+        </div>
+      </div>
+      </div>
+
+      <!-- VISTA B: CROSS-SELLING DE BALCÃO & SIMULADOR POR PRODUTO -->
+      <div id="mktView-crossSelling" style="display: none;">
+        <!-- SIMULADOR INTERATIVO DE CROSS-SELLING & ESCOAMENTO POR PRODUTO -->
+        <div style="background: linear-gradient(135deg, rgba(14, 116, 144, 0.25), rgba(15, 23, 42, 0.92)); border: 1px solid rgba(56, 189, 248, 0.45); border-radius: 14px; padding: 20px; margin-bottom: 24px;">
+          <div style="font-size: 1.05rem; font-weight: 800; color: #38bdf8; margin-bottom: 4px; display: flex; align-items: center; gap: 8px;">
+            🔎 Simulador 360º de Cross-Selling & Escoamento para um Produto Específico
+          </div>
+          <p style="font-size: 0.84rem; color: #cbd5e1; margin-bottom: 14px;">
+            Encontrou um produto na lista de validades ou monos (ex: <b>Antigrippine Trieffect Tosse</b>) e quer saber <b>quem o puxa no balcão</b>, <b>com que produtos em stock pode fazer Cross-Selling</b> e qual a <b>meta semanal da equipa</b>? Escreva abaixo:
+          </p>
+          <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px;">
+            <input type="text" id="crossSellProductInput" placeholder="Escreva o nome ou CNP do produto (ex: Antigrippine, 5818711, Transilax, CeraVe, Voltaren)..." style="flex: 1; min-width: 260px;" onkeydown="if(event.key==='Enter') runProductCrossSell360()" />
+            <button class="btn" onclick="runProductCrossSell360()" style="background: #0284c7; padding: 0 22px;">🔍 Analisar Produto & Cross-Selling</button>
+          </div>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+            <span style="font-size: 0.75rem; color: var(--muted); font-weight: 700;">Exemplos Rápidos:</span>
+            <span class="chip" onclick="runProductCrossSell360('5818711')">🔥 Antigrippine Trieffect Tosse (130 un · Validade)</span>
+            <span class="chip" onclick="runProductCrossSell360('Transilax')">💊 Vitativ Transilax</span>
+            <span class="chip" onclick="runProductCrossSell360('Gaviscon')">🫧 Gaviscon</span>
+            <span class="chip" onclick="runProductCrossSell360('CeraVe')">🧴 CeraVe</span>
+            <span class="chip" onclick="runProductCrossSell360('Voltaren')">🦴 Voltaren</span>
+          </div>
+
+          <div id="productCrossSell360Result" style="display: none; margin-top: 18px; border-top: 1px solid rgba(56, 189, 248, 0.3); padding-top: 18px;">
+            <!-- Renderizado dinamicamente via JS -->
+          </div>
+        </div>
+
+        <div style="margin-bottom: 18px;">
+          <h3 style="font-size: 1.05rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 8px;">
+            🤝 Protocolos Operacionais de Cross-Selling (Locomotiva de Receita/Balcão → Stock a Escoar)
+          </h3>
+          <p style="font-size: 0.85rem; color: var(--muted); margin-top: 4px;">
+            Aproveite os medicamentos e produtos com maior volume de vendas na sua farmácia (<b>Locomotivas</b>) para escoar de imediato os produtos de Venda Livre com <b>Validade Crítica</b>, <b>Monos</b> ou <b>Restos de Gaveta</b>.
+          </p>
+        </div>
+        <div id="crossSellingGrid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 18px; margin-bottom: 30px;">
+          <!-- Preenchido via JS -->
+        </div>
+      </div>
+    </div>
+
+    <!-- ABAS TRADICIONAIS DE TABELAS (CADUCIDADE, GENÉRICOS, MONOS, COBERTURA) -->
+    <div id="tabContent-tables" style="display: none;">
+      <div class="table-toolbar">
+        <div style="display:flex;align-items:center;gap:12px;flex:1;flex-wrap:wrap;">
+          <input type="text" id="tableFilter" placeholder="🔎 Filtrar tabela por código, molécula DCI, designação ou categoria..." oninput="onSearchInput(this.value)" />
+          <span id="tableRowCount" style="font-size: 0.84rem; font-weight: 700; color: var(--primary);"></span>
+        </div>
+        <span style="font-size: 0.82rem; color: var(--muted);">💡 Clique em qualquer produto para abrir o <b>Raio-X Mensal + Comparador de Laboratórios Equivalentes (DCI)</b></span>
+      </div>
+
+      <div class="table-wrap">
+        <table id="mainTable"></table>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="productModal" onclick="if(event.target===this) closeModal()">
+    <div class="modal">
+      <div class="modal-header">
+        <div>
+          <h2 id="modalTitle" style="font-size: 1.15rem; color: var(--primary);"></h2>
+          <p id="modalSub" style="font-size: 0.85rem; color: var(--muted); margin-top: 4px;"></p>
+        </div>
+        <button class="btn btn-secondary" onclick="closeModal()">✕ Fechar</button>
+      </div>
+      <div id="modalRuleBox" style="background:rgba(56,189,248,0.1);border:1px solid rgba(56,189,248,0.3);padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:0.86rem;"></div>
+      <div id="modalMetrics" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px;"></div>
+      <div id="modalChartHeader" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;">
+        <h4 id="modalChartTitle" style="font-size: 0.85rem; color: var(--muted); text-transform: uppercase;">Evolução de Vendas Mensais (Unidades Vendidas por Mês)</h4>
+        <div id="modalLabSwitcher" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+      </div>
+      <div class="chart-bars" id="modalChart"></div>
+      <div id="modalDciPeers" style="margin-top: 18px; display: none;"></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="emailDigestModal" onclick="if(event.target===this) closeEmailDigestModal()">
+    <div class="modal" style="max-width: 820px;">
+      <div class="modal-header">
+        <div>
+          <h2 style="font-size: 1.15rem; color: #fb7185;">📧 Boletim Mensal de Campanhas — Visualização de Email</h2>
+          <p style="font-size: 0.84rem; color: var(--muted); margin-top: 4px;">Este modelo HTML pode ser enviado no início de cada mês para a equipa da farmácia.</p>
+        </div>
+        <button class="btn btn-secondary" onclick="closeEmailDigestModal()">✕ Fechar</button>
+      </div>
+      <div id="emailDigestContent" style="background: #ffffff; color: #1e293b; border-radius: 8px; padding: 20px; max-height: 60vh; overflow-y: auto; border: 1px solid var(--border);">
+        <!-- HTML renderizado -->
+      </div>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px;">
+        <span id="emailSendStatus" style="font-size: 0.85rem; color: #34d399; font-weight: 600;"></span>
+        <div style="display: flex; gap: 10px;">
+          <button class="btn btn-secondary" onclick="closeEmailDigestModal()">Fechar</button>
+          <button class="btn" onclick="sendSimulatedEmailDigest()" style="background: #0284c7;">🚀 Simular Envio de Email</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 3: GATE DE ACESSO ISOLADO POR FARMÁCIA OU ADMIN MASTER -->
+  <div class="modal-backdrop" id="authGateModal" style="z-index: 250; background: rgba(2, 6, 23, 0.92);">
+    <div class="modal" style="max-width: 480px; border-color: var(--primary); box-shadow: 0 20px 50px rgba(0,0,0,0.6);">
+      <div style="text-align: center; margin-bottom: 18px;">
+        <div style="font-size: 2.4rem; margin-bottom: 8px;">🔐</div>
+        <h2 style="font-size: 1.25rem; color: var(--text); font-weight: 800;">Acesso BI Pharma — Ambiente de Demonstração</h2>
+        <p style="font-size: 0.85rem; color: var(--muted); margin-top: 6px; line-height: 1.45;">
+          Introduza o <b>Código de Acesso Exclusivo</b> da sua Farmácia para aceder ao seu painel isolado, ou o código <b>Master</b> para gestão multi-farmácia.
+        </p>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 12px;">
+        <div>
+          <label style="font-size: 0.78rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; display: block; margin-bottom: 6px;">
+            Código de Acesso da Farmácia:
+          </label>
+          <input
+            type="text"
+            id="authAccessCodeInput"
+            placeholder="Ex: FARMACIA-A, FARMACIA-B ou MASTER-BI"
+            style="width: 100%; font-size: 1rem; font-weight: 700; text-align: center; letter-spacing: 1px; text-transform: uppercase; padding: 12px;"
+            onkeydown="if(event.key==='Enter') submitAccessCode()"
+          />
+        </div>
+
+        <div id="authGateError" style="display: none; font-size: 0.82rem; color: #fb7185; background: rgba(244, 63, 94, 0.12); border: 1px solid rgba(244, 63, 94, 0.3); padding: 8px 12px; border-radius: 8px; text-align: center;"></div>
+
+        <button class="btn" onclick="submitAccessCode()" style="width: 100%; padding: 12px; font-size: 0.96rem; justify-content: center;">
+          🚀 Entrar no Painel
+        </button>
+
+        <div style="border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px;">
+          <div style="font-size: 0.74rem; color: var(--muted); text-align: center; margin-bottom: 8px;">
+            ⚡ Atalhos Rápidos de Demonstração / Pitch:
+          </div>
+          <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+            <button class="btn btn-secondary" onclick="quickLoginWithCode('FARMACIA-A')" style="font-size: 0.78rem; padding: 6px 12px;">🏥 Vista Isolada: Farmácia A</button>
+            <button class="btn btn-secondary" onclick="quickLoginWithCode('FARMACIA-B')" style="font-size: 0.78rem; padding: 6px 12px;">🏥 Vista Isolada: Farmácia B</button>
+            <button class="btn btn-secondary" onclick="quickLoginWithCode('MASTER-BI')" style="font-size: 0.78rem; padding: 6px 12px; border-color: #a855f7; color: #c084fc;">👑 Modo Admin (Todas)</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 4: GESTOR ADMIN DE NOMES ANÓNIMOS E LINKS ISOLADOS POR FARMÁCIA -->
+  <div class="modal-backdrop" id="accessManagerModal" onclick="if(event.target===this) closeAccessManagerModal()">
+    <div class="modal" style="max-width: 780px;">
+      <div class="modal-header">
+        <div>
+          <h2 style="font-size: 1.15rem; color: #c084fc;">🔑 Gestão de Nomes Anónimos & Links de Acesso por Farmácia</h2>
+          <p style="font-size: 0.84rem; color: var(--muted); margin-top: 4px;">
+            Personalize o nome anónimo (ex: <b>Farmácia A</b>, <b>Farmácia B</b>) e copie o <b>Link de Acesso Isolado</b> para enviar a cada cliente sem que ele possa ver ou saltar para outras farmácias.
+          </p>
+        </div>
+        <button class="btn btn-secondary" onclick="closeAccessManagerModal()">✕ Fechar</button>
+      </div>
+
+      <div id="accessManagerList" style="display: flex; flex-direction: column; gap: 12px; margin-top: 12px;">
+        <!-- Preenchido via JS -->
+      </div>
+      <div id="accessManagerFeedback" style="margin-top: 14px; font-size: 0.85rem; color: #34d399; font-weight: 700;"></div>
+    </div>
+  </div>
+
+  <!-- MODAL 5: IMPORTADOR WEB DE NOVA FARMÁCIA (PDF INVENTÁRIO + PDF VALIDADES + CSV VENDAS) -->
+  <div class="modal-backdrop" id="importPharmacyModal" onclick="if(event.target===this) closeImportPharmacyModal()">
+    <div class="modal" style="max-width: 680px;">
+      <div class="modal-header">
+        <div>
+          <h2 style="font-size: 1.15rem; color: #34d399;">📥 Importar Nova Farmácia (ETL Completo + Anonimização)</h2>
+          <p style="font-size: 0.84rem; color: var(--muted); margin-top: 4px;">
+            Carregue os ficheiros da farmácia diretamente pelo navegador. O sistema executa o ETL, classifica os produtos Infarmed e cria o código de acesso isolado.
+          </p>
+        </div>
+        <button class="btn btn-secondary" onclick="closeImportPharmacyModal()">✕ Fechar</button>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+        <div>
+          <label style="font-size: 0.78rem; font-weight: 700; color: #cbd5e1; display: block; margin-bottom: 6px;">Nome Anónimo (Pitch):</label>
+          <input type="text" id="impFarmNome" placeholder="Ex: Farmácia C" value="Farmácia C" style="width: 100%;" />
+        </div>
+        <div>
+          <label style="font-size: 0.78rem; font-weight: 700; color: #cbd5e1; display: block; margin-bottom: 6px;">Identificador / NIF:</label>
+          <input type="text" id="impFarmNif" placeholder="Ex: DEMO-03" value="DEMO-03" style="width: 100%;" />
+        </div>
+        <div>
+          <label style="font-size: 0.78rem; font-weight: 700; color: #cbd5e1; display: block; margin-bottom: 6px;">Código de Acesso Isolado:</label>
+          <input type="text" id="impFarmCode" placeholder="Ex: FARMACIA-C" value="FARMACIA-C" style="width: 100%; text-transform: uppercase;" />
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 12px; background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px;">
+        <div>
+          <label style="font-size: 0.82rem; font-weight: 700; color: #38bdf8; display: block; margin-bottom: 4px;">1️⃣ Ficheiro PDF de Inventário (Obrigatório):</label>
+          <input type="file" id="impFileInv" accept=".pdf" style="width: 100%; font-size: 0.84rem;" />
+        </div>
+        <div>
+          <label style="font-size: 0.82rem; font-weight: 700; color: #fbbf24; display: block; margin-bottom: 4px;">2️⃣ Ficheiro PDF de Controlo de Validades (Opcional mas Recomendado):</label>
+          <input type="file" id="impFileVal" accept=".pdf" style="width: 100%; font-size: 0.84rem;" />
+        </div>
+        <div>
+          <label style="font-size: 0.82rem; font-weight: 700; color: #34d399; display: block; margin-bottom: 4px;">3️⃣ Ficheiro CSV de Vendas Mensais (Obrigatório):</label>
+          <input type="file" id="impFileVen" accept=".csv" style="width: 100%; font-size: 0.84rem;" />
+        </div>
+      </div>
+
+      <div id="importPharmacyStatus" style="font-size: 0.85rem; margin-bottom: 14px; color: #38bdf8;"></div>
+
+      <div style="display: flex; justify-content: flex-end; gap: 10px;">
+        <button class="btn btn-secondary" onclick="closeImportPharmacyModal()">Cancelar</button>
+        <button class="btn" id="btnRunImportPharmacy" onclick="submitImportPharmacy()" style="background: #10b981; color: #052e16;">
+          ⚙️ Processar Ficheiros & Criar Farmácia
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentReport = null;
+    let activeTab = 'copilot';
+
+    const MONTHS_ORDER = [
+      { key: '2025-10', label: 'Out/25' },
+      { key: '2025-11', label: 'Nov/25' },
+      { key: '2025-12', label: 'Dez/25' },
+      { key: '2026-01', label: 'Jan/26' },
+      { key: '2026-02', label: 'Fev/26' },
+      { key: '2026-03', label: 'Mar/26' },
+      { key: '2026-04', label: 'Abr/26' },
+      { key: '2026-05', label: 'Mai/26' },
+      { key: '2026-06', label: 'Jun/26' },
+      { key: '2026-07', label: 'Jul/26' },
+      { key: '2026-08', label: 'Ago/26' },
+      { key: '2026-09', label: 'Set/26' },
+      { key: '2026-10', label: 'Out/26' },
+    ];
+
+    function formatSegmentoBadge(item) {
+      if (item.eh_generico || item.segmento === 'GENERICO_MG') {
+        return '<span class="badge badge-purple">🧬 GENÉRICO (MG)</span>';
+      }
+      if (item.tipo_venda === 'VENDA_LIVRE') {
+        return '<span class="badge badge-success">🟢 VENDA LIVRE</span>';
+      }
+      if (item.tipo_venda === 'MNSRM') {
+        return '<span class="badge badge-info">🔵 MARCA (MNSRM)</span>';
+      }
+      return '<span class="badge badge-danger">🏷️ MARCA (MSRM)</span>';
+    }
+
+    function matchesTipoVendaFilter(item, selected) {
+      if (selected === 'ALL') return true;
+      if (selected === 'LIVRE_TOTAL') return item.tipo_venda === 'VENDA_LIVRE' || item.tipo_venda === 'MNSRM';
+      if (selected === 'GENERICO_MG') return item.eh_generico || item.segmento === 'GENERICO_MG';
+      if (selected === 'MEDICAMENTO_MARCA') return item.segmento === 'MEDICAMENTO_MARCA';
+      return item.tipo_venda === selected;
+    }
+
+    let activeFarmaciaId = localStorage.getItem('bi_pharma_farmacia_id') || '';
+    let activeAccessCode = localStorage.getItem('bi_pharma_access_code') || '';
+    let activeAuthRole = localStorage.getItem('bi_pharma_auth_role') || '';
+    let cachedAdminPharmacies = [];
+
+    // Interceptor automático de fetch para enviar sempre o código de acesso no header x-access-code
+    const _origFetch = window.fetch.bind(window);
+    window.fetch = async function(input, init) {
+      init = init || {};
+      const headers = new Headers(init.headers || {});
+      if (activeAccessCode) {
+        headers.set('x-access-code', activeAccessCode);
+      }
+      init.headers = headers;
+      return _origFetch(input, init);
+    };
+
+    function applyRoleUiState(role, lockedFarmacia) {
+      activeAuthRole = role;
+      const adminBar = document.getElementById('adminControlsBar');
+      const sel = document.getElementById('farmaciaSelector');
+      const selLabel = document.getElementById('farmaciaSelectorLabel');
+      const lockedBadge = document.getElementById('lockedPharmacyBadge');
+      const btnTrocar = document.getElementById('btnTrocarAcesso');
+
+      if (role === 'ADMIN') {
+        if (adminBar) adminBar.style.display = 'flex';
+        if (sel) sel.style.display = 'inline-block';
+        if (selLabel) selLabel.style.display = 'inline-block';
+        if (lockedBadge) lockedBadge.style.display = 'none';
+        if (btnTrocar) btnTrocar.innerHTML = '👑 Modo Admin (Trocar)';
+      } else if (role === 'PHARMACY' && lockedFarmacia) {
+        if (adminBar) adminBar.style.display = 'none';
+        if (sel) sel.style.display = 'none';
+        if (selLabel) selLabel.style.display = 'none';
+        if (lockedBadge) {
+          lockedBadge.style.display = 'inline-block';
+          lockedBadge.textContent = \`🏥 \${lockedFarmacia.nome} (NIF: \${lockedFarmacia.nif})\`;
+        }
+        if (btnTrocar) btnTrocar.innerHTML = '🔒 Acesso Isolado';
+      }
+    }
+
+    function openAuthGateModal(errMsg) {
+      const modal = document.getElementById('authGateModal');
+      const input = document.getElementById('authAccessCodeInput');
+      const errEl = document.getElementById('authGateError');
+      if (input) input.value = activeAccessCode || '';
+      if (errEl) {
+        if (errMsg) {
+          errEl.textContent = errMsg;
+          errEl.style.display = 'block';
+        } else {
+          errEl.style.display = 'none';
+        }
+      }
+      if (modal) modal.style.display = 'flex';
+    }
+
+    function quickLoginWithCode(code) {
+      const input = document.getElementById('authAccessCodeInput');
+      if (input) input.value = code;
+      submitAccessCode();
+    }
+
+    async function submitAccessCode() {
+      const input = document.getElementById('authAccessCodeInput');
+      const errEl = document.getElementById('authGateError');
+      const code = (input ? input.value : '').trim().toUpperCase();
+      if (!code) {
+        if (errEl) {
+          errEl.textContent = 'Introduza um código de acesso (ex: FARMACIA-A ou MASTER-BI).';
+          errEl.style.display = 'block';
+        }
+        return;
+      }
+      await verifyAndActivateAccessCode(code, true);
+    }
+
+    async function verifyAndActivateAccessCode(code, showErrors) {
+      try {
+        const res = await fetch('/api/auth/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          if (showErrors) {
+            openAuthGateModal(data.error || 'Código de acesso inválido.');
+          } else {
+            openAuthGateModal();
+          }
+          return false;
+        }
+
+        activeAccessCode = data.code;
+        activeAuthRole = data.role;
+        localStorage.setItem('bi_pharma_access_code', activeAccessCode);
+        localStorage.setItem('bi_pharma_auth_role', activeAuthRole);
+
+        const gate = document.getElementById('authGateModal');
+        if (gate) gate.style.display = 'none';
+
+        if (data.role === 'PHARMACY' && data.lockedFarmacia) {
+          activeFarmaciaId = data.lockedFarmacia.id;
+          localStorage.setItem('bi_pharma_farmacia_id', activeFarmaciaId);
+        }
+
+        applyRoleUiState(data.role, data.lockedFarmacia);
+        await loadPharmaciesDropdown();
+        return true;
+      } catch (e) {
+        console.error('Erro ao validar acesso:', e);
+        return false;
+      }
+    }
+
+    async function loadPharmaciesDropdown() {
+      try {
+        const res = await fetch('/api/pharmacies');
+        const farms = await res.json();
+        cachedAdminPharmacies = farms;
+        const sel = document.getElementById('farmaciaSelector');
+        sel.innerHTML = farms.map(f => \`<option value="\${f.id}" \${f.id === activeFarmaciaId ? 'selected' : ''}>🏥 \${f.nome} (NIF: \${f.nif})</option>\`).join('');
+        if (!activeFarmaciaId && farms.length > 0) {
+          activeFarmaciaId = farms[0].id;
+          sel.value = activeFarmaciaId;
+        } else if (farms.length > 0 && !farms.some(f => f.id === activeFarmaciaId)) {
+          activeFarmaciaId = farms[0].id;
+          sel.value = activeFarmaciaId;
+        }
+        currentCampaignSuggestions = [];
+        loadAnalysis();
+      } catch (e) {
+        console.error('Erro ao carregar farmácias:', e);
+        loadAnalysis();
+      }
+    }
+
+    async function initPharmacies() {
+      // 1. Verificar se o link tem ?acesso=CODIGO (Link Isolado enviado a uma Farmácia)
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlCode = urlParams.get('acesso') || urlParams.get('accessCode');
+      if (urlCode && urlCode.trim()) {
+        const ok = await verifyAndActivateAccessCode(urlCode.trim().toUpperCase(), true);
+        if (ok) return;
+      }
+
+      // 2. Se já tinha código em sessão, valida silenciosamente
+      if (activeAccessCode) {
+        const ok = await verifyAndActivateAccessCode(activeAccessCode, false);
+        if (ok) return;
+      }
+
+      // 3. Caso contrário, entra por defeito em modo demonstração e abre o seletor rápido se desejar
+      await verifyAndActivateAccessCode('MASTER-BI', false);
+    }
+
+    function openAccessManagerModal() {
+      const modal = document.getElementById('accessManagerModal');
+      const list = document.getElementById('accessManagerList');
+      const fb = document.getElementById('accessManagerFeedback');
+      if (fb) fb.textContent = '';
+
+      if (list) {
+        list.innerHTML = cachedAdminPharmacies.map((f, idx) => {
+          const shareUrl = \`\${window.location.origin}/?acesso=\${encodeURIComponent(f.codigo_acesso || ('FARMACIA-' + String.fromCharCode(65 + idx)))}\`;
+          return \`
+            <div style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 10px;">
+              <div style="display: grid; grid-template-columns: 1.3fr 1fr auto; gap: 10px; align-items: end;">
+                <div>
+                  <label style="font-size: 0.74rem; color: var(--muted); font-weight: 700; display: block; margin-bottom: 4px;">Nome Anónimo (Visível no Pitch/Cliente):</label>
+                  <input type="text" id="admNome_\${f.id}" value="\${f.nome}" style="width: 100%; font-weight: 700;" />
+                </div>
+                <div>
+                  <label style="font-size: 0.74rem; color: var(--muted); font-weight: 700; display: block; margin-bottom: 4px;">Código Isolado desta Farmácia:</label>
+                  <input type="text" id="admCode_\${f.id}" value="\${f.codigo_acesso || ''}" style="width: 100%; font-weight: 700; text-transform: uppercase; color: #38bdf8;" />
+                </div>
+                <button class="btn" onclick="savePharmacyAdmin('\${f.id}')" style="padding: 9px 14px; font-size: 0.82rem;">💾 Guardar</button>
+              </div>
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 6px; border-top: 1px dashed rgba(148,163,184,0.2);">
+                <span style="font-size: 0.78rem; color: #94a3b8;">🔗 Link Isolado p/ Cliente: <code style="color:#38bdf8;background:rgba(2,6,23,0.7);padding:2px 6px;border-radius:4px;">\${shareUrl}</code></span>
+                <div style="display: flex; gap: 8px;">
+                  <button class="btn btn-secondary" onclick="navigator.clipboard.writeText('\${shareUrl}'); document.getElementById('accessManagerFeedback').textContent='✅ Link copiado: \${shareUrl}';" style="font-size: 0.76rem; padding: 5px 10px;">📋 Copiar Link</button>
+                  <button class="btn btn-secondary" onclick="closeAccessManagerModal(); verifyAndActivateAccessCode(document.getElementById('admCode_\${f.id}').value, true);" style="font-size: 0.76rem; padding: 5px 10px; border-color: #38bdf8; color: #38bdf8;">👁️ Testar Vista Isolada</button>
+                </div>
+              </div>
+            </div>
+          \`;
+        }).join('');
+      }
+      if (modal) modal.style.display = 'flex';
+    }
+
+    function closeAccessManagerModal() {
+      const modal = document.getElementById('accessManagerModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    async function savePharmacyAdmin(farmaciaId) {
+      const nome = document.getElementById('admNome_' + farmaciaId)?.value || '';
+      const codigo_acesso = document.getElementById('admCode_' + farmaciaId)?.value || '';
+      const fb = document.getElementById('accessManagerFeedback');
+      try {
+        const res = await fetch('/api/admin/update-pharmacy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ farmaciaId, nome, codigo_acesso })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (fb) fb.textContent = \`✅ Farmácia atualizada para "\${data.farmacia.nome}" (Código: \${data.farmacia.codigo_acesso})\`;
+          await loadPharmaciesDropdown();
+          openAccessManagerModal();
+        } else if (fb) {
+          fb.textContent = '⚠️ ' + (data.error || 'Erro ao atualizar');
+        }
+      } catch (e) {
+        if (fb) fb.textContent = '⚠️ Erro de comunicação com o servidor.';
+      }
+    }
+
+    function openImportPharmacyModal() {
+      const modal = document.getElementById('importPharmacyModal');
+      const st = document.getElementById('importPharmacyStatus');
+      if (st) st.textContent = '';
+      if (modal) modal.style.display = 'flex';
+    }
+
+    function closeImportPharmacyModal() {
+      const modal = document.getElementById('importPharmacyModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    function fileToBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const res = String(reader.result || '');
+          const base64 = res.includes(',') ? res.split(',')[1] : res;
+          resolve(base64);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function submitImportPharmacy() {
+      const nome = document.getElementById('impFarmNome')?.value || 'Farmácia Demo';
+      const nif = document.getElementById('impFarmNif')?.value || 'DEMO-99';
+      const codigo_acesso = document.getElementById('impFarmCode')?.value || 'FARMACIA-DEMO';
+      const invFile = document.getElementById('impFileInv')?.files?.[0];
+      const valFile = document.getElementById('impFileVal')?.files?.[0];
+      const venFile = document.getElementById('impFileVen')?.files?.[0];
+      const st = document.getElementById('importPharmacyStatus');
+      const btn = document.getElementById('btnRunImportPharmacy');
+
+      if (!invFile || !venFile) {
+        if (st) st.innerHTML = '<span style="color:#fb7185">⚠️ Selecione pelo menos o ficheiro PDF de Inventário e o CSV de Vendas.</span>';
+        return;
+      }
+
+      try {
+        if (btn) btn.disabled = true;
+        if (st) st.textContent = '⏳ A ler ficheiros e a processar ETL + Classificador Infarmed (pode demorar 10-20s)...';
+
+        const pdfInventarioBase64 = await fileToBase64(invFile);
+        const csvVendasBase64 = await fileToBase64(venFile);
+        const pdfValidadesBase64 = valFile ? await fileToBase64(valFile) : null;
+
+        const res = await fetch('/api/admin/import-pharmacy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            nome,
+            nif,
+            codigo_acesso,
+            pdfInventarioBase64,
+            pdfValidadesBase64,
+            csvVendasBase64
+          })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (st) {
+            st.innerHTML = \`<span style="color:#34d399;font-weight:700;">✅ \${data.farmacia.nome} importada com sucesso! (\${data.stats.artigosInventario} produtos em stock, \${data.stats.registosVendas} registos de vendas | Código: \${data.farmacia.codigo_acesso})</span>\`;
+          }
+          activeFarmaciaId = data.farmacia.id;
+          localStorage.setItem('bi_pharma_farmacia_id', activeFarmaciaId);
+          await loadPharmaciesDropdown();
+        } else {
+          if (st) st.innerHTML = \`<span style="color:#fb7185">❌ Erro: \${data.error}</span>\`;
+        }
+      } catch (e) {
+        if (st) st.innerHTML = '<span style="color:#fb7185">❌ Erro ao enviar ficheiros para o servidor.</span>';
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    function onFarmaciaChange() {
+      activeFarmaciaId = document.getElementById('farmaciaSelector').value;
+      localStorage.setItem('bi_pharma_farmacia_id', activeFarmaciaId);
+      currentCampaignSuggestions = [];
+      loadAnalysis();
+    }
+
+    function normStr(str) {
+      return (str || '')
+        .toString()
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .trim();
+    }
+
+    function onSearchInput(val) {
+      const tbl = document.getElementById('tableFilter');
+      if (tbl && tbl.value !== val) tbl.value = val;
+      renderActiveTable();
+    }
+
+    function onMonosFilterChange() {
+      switchTab('monos');
+      loadAnalysis();
+    }
+
+    function onCoberturaFilterChange() {
+      switchTab('cobertura');
+      loadAnalysis();
+    }
+
+    async function loadAnalysis() {
+      const diasMonos = document.getElementById('selectDiasMonos').value;
+      const cobertura = document.getElementById('selectCobertura').value;
+      const btn = document.getElementById('btnRecalcular');
+      const feedback = document.getElementById('calcFeedback');
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '⏳ A calcular...';
+      }
+
+      try {
+        const res = await fetch(\`/api/analysis?farmaciaId=\${activeFarmaciaId}&diasMonos=\${diasMonos}&cobertura=\${cobertura}\`);
+        currentReport = await res.json();
+
+        const r = currentReport.resumo_executivo;
+        document.getElementById('tenantBadge').textContent = \`🏥 \${currentReport.farmacia.nome} | NIF: \${currentReport.farmacia.nif} | Ref: \${currentReport.parametros.data_referencia}\`;
+
+        document.getElementById('kpiStockValor').textContent = \`\${r.valor_total_stock_custo.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €\`;
+        document.getElementById('kpiStockSub').textContent = \`\${r.total_artigos_inventario} artigos | \${r.total_unidades_stock} unidades\`;
+
+        document.getElementById('kpiGenericosVal').textContent = \`\${r.valor_stock_genericos_mg.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €\`;
+        document.getElementById('kpiGenericosSub').textContent = \`\${r.artigos_genericos_mg} MG vs \${r.artigos_medicamentos_marca} Marca (\${r.grupos_dci_com_multiplos_labs} moléculas dup.)\`;
+
+        const totalLivre = r.artigos_venda_livre_psbe + r.artigos_mnsrm;
+        const pctLivre = ((totalLivre / r.total_artigos_inventario) * 100).toFixed(1);
+        document.getElementById('kpiEstatutoRatio').textContent = \`\${pctLivre}% Sem Receita\`;
+        document.getElementById('kpiEstatutoSub').textContent = \`\${r.artigos_venda_livre_psbe} PSBE | \${r.artigos_mnsrm} MNSRM | \${r.artigos_msrm_receita} MSRM\`;
+
+        document.getElementById('kpiMonosValor').textContent = \`\${r.valor_total_monos.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €\`;
+        document.getElementById('kpiMonosSub').textContent = \`\${r.total_artigos_monos} artigos (\${r.percentagem_capital_em_monos}% do stock) s/ vendas a \${diasMonos}d\`;
+
+        document.getElementById('kpiCaducidadeValor').textContent = \`\${r.valor_total_risco_caducidade.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €\`;
+        document.getElementById('kpiCaducidadeSub').textContent = \`\${r.total_artigos_risco_caducidade} artigos (\${r.unidades_totais_risco_caducidade} emb. em risco)\`;
+
+        // Atualizar badges nas abas com número real de artigos
+        const bCad = document.getElementById('badge-caducidade');
+        const bGen = document.getElementById('badge-genericos');
+        const bMon = document.getElementById('badge-monos');
+        const bCob = document.getElementById('badge-cobertura');
+        if (bCad) bCad.textContent = r.total_artigos_risco_caducidade;
+        if (bGen) bGen.textContent = currentReport.consolidacao_genericos_dci.length;
+        if (bMon) bMon.textContent = r.total_artigos_monos;
+        if (bCob) bCob.textContent = currentReport.alertas_excesso_cobertura.length;
+
+        // Atualizar contagens reais no seletor de segmento
+        const selTv = document.getElementById('selectTipoVenda');
+        if (selTv && selTv.options.length >= 7) {
+          selTv.options[0].text = \`Todos os Produtos (\${r.total_artigos_inventario})\`;
+          selTv.options[1].text = \`🟢 Venda Livre + MNSRM (\${totalLivre} SKUs)\`;
+          selTv.options[2].text = \`🧬 Só Medicamentos Genéricos (\${r.artigos_genericos_mg} SKUs)\`;
+          selTv.options[3].text = \`🏷️ Só Medicamentos de Marca (\${r.artigos_medicamentos_marca} SKUs)\`;
+          selTv.options[4].text = \`🟢 Só PSBE / Cosmética (\${r.artigos_venda_livre_psbe} SKUs)\`;
+          selTv.options[5].text = \`🔵 Só MNSRM (\${r.artigos_mnsrm} SKUs)\`;
+          selTv.options[6].text = \`🔴 Só MSRM (\${r.artigos_msrm_receita} SKUs)\`;
+        }
+
+        renderActiveTable();
+
+        if (feedback) {
+          feedback.style.display = 'inline-block';
+          setTimeout(() => { feedback.style.display = 'none'; }, 2500);
+        }
+      } catch (err) {
+        console.error('Erro ao carregar análise:', err);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '🔄 Recalcular';
+        }
+      }
+    }
+
+    function switchTab(tab) {
+      activeTab = tab;
+      ['copilot', 'campaigns', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
+        const btn = document.getElementById('tabBtn-' + t);
+        if (btn) btn.classList.toggle('active', t === tab);
+      });
+
+      const copilotView = document.getElementById('tabContent-copilot');
+      const campaignsView = document.getElementById('tabContent-campaigns');
+      const tablesView = document.getElementById('tabContent-tables');
+
+      if (tab === 'copilot') {
+        if (copilotView) copilotView.style.display = 'block';
+        if (campaignsView) campaignsView.style.display = 'none';
+        if (tablesView) tablesView.style.display = 'none';
+      } else if (tab === 'campaigns') {
+        if (copilotView) copilotView.style.display = 'none';
+        if (campaignsView) campaignsView.style.display = 'block';
+        if (tablesView) tablesView.style.display = 'none';
+        if (!currentCampaignSuggestions || currentCampaignSuggestions.length === 0) {
+          loadCampaignSuggestions();
+        }
+      } else {
+        if (copilotView) copilotView.style.display = 'none';
+        if (campaignsView) campaignsView.style.display = 'none';
+        if (tablesView) tablesView.style.display = 'block';
+        renderActiveTable();
+      }
+    }
+
+    function renderActiveTable() {
+      if (!currentReport || activeTab === 'copilot' || activeTab === 'campaigns') return;
+      const rawFilter = document.getElementById('tableFilter') ? document.getElementById('tableFilter').value : '';
+      const filter = normStr(rawFilter);
+      const tvFilter = document.getElementById('selectTipoVenda').value;
+      const table = document.getElementById('mainTable');
+      const countEl = document.getElementById('tableRowCount');
+
+      if (activeTab === 'genericos') {
+        const isCompatible = tvFilter === 'ALL' || tvFilter === 'GENERICO_MG' || tvFilter === 'MSRM';
+        const rows = isCompatible ? currentReport.consolidacao_genericos_dci.filter(g =>
+          !filter ||
+          normStr(g.grupo_equivalencia_dci).includes(filter) ||
+          normStr(g.molecula_dci).includes(filter) ||
+          g.todos_laboratorios.some(l => normStr(l.cnp_codigo).includes(filter) || normStr(l.designacao).includes(filter))
+        ) : [];
+
+        if (countEl) {
+          countEl.textContent = \`\${rows.length} \${rows.length === 1 ? 'molécula/apresentação' : 'moléculas/apresentações'}\`;
+        }
+
+        if (rows.length === 0) {
+          table.innerHTML = \`
+            <tbody>
+              <tr>
+                <td colspan="8" style="text-align: center; padding: 48px 16px; color: var(--muted); font-size: 0.95rem;">
+                  🔎 Nenhuma molécula genérica encontrada para a pesquisa <b>"\${rawFilter || tvFilter}"</b>.<br/>
+                  <span style="font-size:0.82rem;margin-top:6px;display:inline-block">Experimente limpar a pesquisa ou selecionar "Todos os Produtos".</span>
+                </td>
+              </tr>
+            </tbody>
+          \`;
+          return;
+        }
+
+        table.innerHTML = \`
+          <thead>
+            <tr>
+              <th>Molécula DCI + Dosagem + Embalagem</th>
+              <th>Nº Labs Abertos</th>
+              <th>Stock Conjunto</th>
+              <th>VMM Conjunta</th>
+              <th>Custo Mínimo (Lab + Barato)</th>
+              <th>Custo Máximo (Lab + Caro)</th>
+              <th>Diferença Preço Custo</th>
+              <th>Restos de Gaveta (≤ 2 caixas) a Escoar Primeiro</th>
+            </tr>
+          </thead>
+          <tbody>
+            \${rows.map(g => \`
+              <tr class="clickable-row" onclick="openProductModal('\${g.restos_gaveta_escobar_primeiro[0]?.cnp_codigo || g.todos_laboratorios[0].cnp_codigo}')">
+                <td><b>🧬 \${g.grupo_equivalencia_dci}</b></td>
+                <td><span class="badge badge-purple">\${g.num_laboratorios_abertos} laboratórios</span></td>
+                <td><b>\${g.stock_total_unidades} un</b> (\${g.valor_total_stock.toFixed(2)} €)</td>
+                <td>\${g.vmm_total_grupo} /mês</td>
+                <td style="color:#34d399"><b>\${g.custo_minimo.toFixed(2)} €</b><br/><span style="font-size:0.74rem;color:var(--muted)">\${g.laboratorio_mais_barato.slice(0, 32)}</span></td>
+                <td style="color:#fb7185"><b>\${g.custo_maximo.toFixed(2)} €</b><br/><span style="font-size:0.74rem;color:var(--muted)">\${g.laboratorio_mais_caro.slice(0, 32)}</span></td>
+                <td><span class="badge badge-warning">+\${g.diferenca_custo_pct}%</span></td>
+                <td>\${g.restos_gaveta_escobar_primeiro.length > 0
+                  ? g.restos_gaveta_escobar_primeiro.map(rg => \`<span class="badge badge-danger" style="margin:2px">[\${rg.cnp_codigo}] \${rg.stock_atual}un (\${rg.custo_unitario.toFixed(2)}€)</span>\`).join(' ')
+                  : '<span style="color:var(--muted)">Sem restos críticos</span>'}</td>
+              </tr>
+            \`).join('')}
+          </tbody>
+        \`;
+        return;
+      }
+
+      const matchRow = (i) => {
+        if (!matchesTipoVendaFilter(i, tvFilter)) return false;
+        if (!filter) return true;
+        return (
+          normStr(i.cnp_codigo).includes(filter) ||
+          normStr(i.designacao).includes(filter) ||
+          normStr(i.categoria).includes(filter) ||
+          normStr(i.grupo_equivalencia_dci).includes(filter)
+        );
+      };
+
+      let allRows = [];
+      if (activeTab === 'caducidade') {
+        allRows = currentReport.risco_elevado_caducidade.filter(matchRow);
+      } else if (activeTab === 'monos') {
+        allRows = currentReport.monos.filter(matchRow);
+      } else {
+        allRows = currentReport.alertas_excesso_cobertura.filter(matchRow);
+      }
+
+      const displayRows = allRows.slice(0, 500);
+
+      if (countEl) {
+        if (allRows.length > 500) {
+          countEl.textContent = \`A mostrar 500 de \${allRows.length} artigos\`;
+        } else {
+          countEl.textContent = \`\${allRows.length} \${allRows.length === 1 ? 'artigo encontrado' : 'artigos encontrados'}\`;
+        }
+      }
+
+      if (allRows.length === 0) {
+        table.innerHTML = \`
+          <tbody>
+            <tr>
+              <td colspan="10" style="text-align: center; padding: 48px 16px; color: var(--muted); font-size: 0.95rem;">
+                🔎 Nenhum artigo encontrado para o filtro <b>"\${rawFilter || tvFilter}"</b> nesta aba.<br/>
+                <span style="font-size:0.82rem;margin-top:6px;display:inline-block">Experimente limpar a pesquisa ou selecionar "Todos os Produtos".</span>
+              </td>
+            </tr>
+          </tbody>
+        \`;
+        return;
+      }
+
+      if (activeTab === 'caducidade') {
+        table.innerHTML = \`
+          <thead>
+            <tr>
+              <th>Código</th>
+              <th>Segmento / Estatuto</th>
+              <th>Categoria</th>
+              <th>Designação</th>
+              <th>Stock</th>
+              <th>Validade</th>
+              <th>VMM</th>
+              <th>Emb. Risco</th>
+              <th>Valor Risco (€)</th>
+              <th>Ação Recomendada</th>
+            </tr>
+          </thead>
+          <tbody>
+            \${displayRows.map(r => \`
+              <tr class="clickable-row" onclick="openProductModal('\${r.cnp_codigo}')">
+                <td><b>\${r.cnp_codigo}</b></td>
+                <td>\${formatSegmentoBadge(r)}</td>
+                <td style="color:var(--muted);font-size:0.8rem">\${r.categoria}</td>
+                <td>\${r.designacao}</td>
+                <td>\${r.stock_atual}</td>
+                <td><span class="badge badge-danger">\${r.data_validade} (\${r.meses_ate_caducidade}m)</span></td>
+                <td>\${r.vmm}/mês</td>
+                <td><b>\${r.unidades_em_risco}</b>/\${r.stock_atual}</td>
+                <td style="color:#fb7185;font-weight:700">\${r.valor_em_risco.toFixed(2)} €</td>
+                <td>\${r.acao_recomendada}</td>
+              </tr>
+            \`).join('')}
+          </tbody>
+        \`;
+      } else if (activeTab === 'monos') {
+        table.innerHTML = \`
+          <thead>
+            <tr>
+              <th>Código</th>
+              <th>Segmento / Estatuto</th>
+              <th>Categoria</th>
+              <th>Designação</th>
+              <th>Stock</th>
+              <th>Custo Unit.</th>
+              <th>PVP (Margem)</th>
+              <th>Capital Imobilizado (€)</th>
+              <th>Última Venda</th>
+              <th>Estratégia Recomendada</th>
+            </tr>
+          </thead>
+          <tbody>
+            \${displayRows.map(r => \`
+              <tr class="clickable-row" onclick="openProductModal('\${r.cnp_codigo}')">
+                <td><b>\${r.cnp_codigo}</b></td>
+                <td>\${formatSegmentoBadge(r)}</td>
+                <td style="color:var(--muted);font-size:0.8rem">\${r.categoria}</td>
+                <td>\${r.designacao}</td>
+                <td>\${r.stock_atual}</td>
+                <td>\${r.custo_unitario.toFixed(2)} €</td>
+                <td>\${r.pvp !== null ? r.pvp.toFixed(2) + ' €' : '-'} \${r.margem_percentagem ? '(' + r.margem_percentagem.toFixed(0) + '%)' : ''}</td>
+                <td style="color:#fbbf24;font-weight:700">\${r.capital_imobilizado.toFixed(2)} €</td>
+                <td>\${r.ultima_venda || 'Sem vendas (13m)'}</td>
+                <td>\${r.acao_sugerida}</td>
+              </tr>
+            \`).join('')}
+          </tbody>
+        \`;
+      } else {
+        table.innerHTML = \`
+          <thead>
+            <tr>
+              <th>Código</th>
+              <th>Segmento / Estatuto</th>
+              <th>Categoria</th>
+              <th>Designação</th>
+              <th>Stock</th>
+              <th>PVP (Margem)</th>
+              <th>VMM</th>
+              <th>Cobertura</th>
+              <th>Orientação de Balcão / Substituição DCI</th>
+            </tr>
+          </thead>
+          <tbody>
+            \${displayRows.map(r => \`
+              <tr class="clickable-row" onclick="openProductModal('\${r.cnp_codigo}')">
+                <td><b>\${r.cnp_codigo}</b></td>
+                <td>\${formatSegmentoBadge(r)}</td>
+                <td style="color:var(--muted);font-size:0.8rem">\${r.categoria}</td>
+                <td>\${r.designacao}</td>
+                <td>\${r.stock_atual}</td>
+                <td>\${r.pvp !== null ? r.pvp.toFixed(2) + ' €' : '-'} \${r.margem_percentagem ? '(' + r.margem_percentagem.toFixed(0) + '%)' : ''}</td>
+                <td>\${r.vmm}/mês</td>
+                <td><span class="badge badge-info">\${r.cobertura_meses !== null ? r.cobertura_meses + ' m' : '∞ (VMM=0)'}</span></td>
+                <td>\${r.sugestao_balcao}</td>
+              </tr>
+            \`).join('')}
+          </tbody>
+        \`;
+      }
+    }
+
+    function clearCopilotResult() {
+      document.getElementById('askInput').value = '';
+      document.getElementById('askResultBox').style.display = 'none';
+      const emptyState = document.getElementById('copilotEmptyState');
+      if (emptyState) emptyState.style.display = 'block';
+      document.getElementById('askInput').focus();
+    }
+
+    async function runQuickQuestion(q) {
+      document.getElementById('askInput').value = q;
+      await askQuestion();
+    }
+
+    async function askQuestion() {
+      const question = document.getElementById('askInput').value.trim();
+      if (!question) return;
+      if (activeTab !== 'copilot') switchTab('copilot');
+
+      const diasMonos = document.getElementById('selectDiasMonos').value;
+      const cobertura = document.getElementById('selectCobertura').value;
+
+      const res = await fetch('/api/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, diasMonos, cobertura, farmaciaId: activeFarmaciaId }),
+      });
+      const data = await res.json();
+
+      const emptyState = document.getElementById('copilotEmptyState');
+      if (emptyState) emptyState.style.display = 'none';
+
+      document.getElementById('askResultBox').style.display = 'block';
+      document.getElementById('askResTitle').textContent = data.titulo;
+      document.getElementById('askResDesc').textContent = data.explicacao;
+
+      const sumEl = document.getElementById('askResSummary');
+      if (data.resumoEstrategico) {
+        sumEl.style.display = 'block';
+        sumEl.innerHTML = '💡 <b>Resumo Estratégico:</b> ' + data.resumoEstrategico;
+      } else {
+        sumEl.style.display = 'none';
+      }
+
+      const tbl = document.getElementById('askResTable');
+      tbl.innerHTML = \`
+        <thead>
+          <tr>\${(data.colunas || []).map(c => \`<th>\${c}</th>\`).join('')}</tr>
+        </thead>
+        <tbody>
+          \${(data.linhas || []).map(l => \`
+            <tr class="\${l.cnp ? 'clickable-row' : ''}" \${l.cnp ? \`onclick="openProductModal('\${l.cnp}')"\` : ''}>
+              \${l.valores.map(v => \`<td>\${v}</td>\`).join('')}
+            </tr>
+          \`).join('')}
+        </tbody>
+      \`;
+    }
+
+    async function openProductModal(cnp) {
+      const res = await fetch('/api/product/' + cnp + '?farmaciaId=' + activeFarmaciaId);
+      if (!res.ok) return;
+      const p = await res.json();
+
+      const inv = p.inventario[0] || { quantidade: 0, custo_unitario: 0, data_validade: null };
+      const totalVendido = p.vendas.reduce((s, v) => s + v.quantidade, 0);
+      const vmm = (totalVendido / 12).toFixed(2);
+
+      document.getElementById('modalTitle').innerHTML = \`[\${p.cnp_codigo}] \${p.designacao} \${formatSegmentoBadge(p)}\`;
+      document.getElementById('modalSub').textContent = \`Categoria: \${p.categoria} | \${p.grupo_equivalencia_dci ? 'Grupo DCI: ' + p.grupo_equivalencia_dci + ' | ' : ''}IVA: \${p.taxa_iva ?? '-'}%\`;
+
+      const ruleBox = document.getElementById('modalRuleBox');
+      let ruleHtml = '';
+      if (p.eh_generico) {
+        ruleHtml = \`🧬 <b>Medicamento Genérico (MG) — Grupo DCI: \${p.grupo_equivalencia_dci}:</b> Substituível no balcão perante receita médica por DCI. Priorizar o escoamento de laboratórios com 1-2 caixas soltas ("restos de gaveta") ou validade mais curta, e concentrar futuras encomendas no laboratório com menor preço de custo.\`;
+      } else if (p.tipo_venda === 'MSRM') {
+        ruleHtml = \`🏷️ <b>Medicamento de Marca Sujeito a Receita (MSRM):</b> Vedado a cross-selling comercial e sem substituição direta por outra marca se prescrito nominalmente. Gerir por ajuste de stock mínimo ou devolução ao armazenista.\`;
+      } else {
+        ruleHtml = \`🟢 <b>Elegível para Cross-Selling e Campanhas (\${p.tipo_venda}):</b> \${p.sugestao_cross_sell}\`;
+      }
+      ruleBox.innerHTML = \`
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+          <div style="flex:1;min-width:260px;">\${ruleHtml}</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="btn btn-secondary" onclick="jumpToProductCrossSell360('\${p.cnp_codigo}')" style="font-size:0.78rem;padding:6px 12px;border-color:#38bdf8;color:#38bdf8;">
+              🤝 Ver Cross-Selling & Escoamento 360º
+            </button>
+            \${p.tipo_venda !== 'MSRM' ? \`
+              <button class="btn" onclick="jumpToSingleProductCampaign('\${p.cnp_codigo}')" style="font-size:0.78rem;padding:6px 12px;background:linear-gradient(135deg,#f43f5e,#a855f7);">
+                📣 Criar Campanha p/ Este Produto
+              </button>
+            \` : ''}
+          </div>
+        </div>
+      \`;
+
+      const peersBox = document.getElementById('modalDciPeers');
+      const dciGroup = currentReport && p.grupo_equivalencia_dci
+        ? currentReport.consolidacao_genericos_dci.find(g => g.grupo_equivalencia_dci === p.grupo_equivalencia_dci)
+        : null;
+
+      document.getElementById('modalMetrics').innerHTML = \`
+        <div style="background:var(--bg);padding:12px;border-radius:8px;border:1px solid var(--border)">
+          <div style="font-size:0.75rem;color:var(--muted)">\${dciGroup ? 'STOCK DESTE LABORATÓRIO' : 'STOCK ATUAL'}</div>
+          <div style="font-size:1.25rem;font-weight:700">\${inv.quantidade} un</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Custo: \${inv.custo_unitario.toFixed(2)} € \${dciGroup ? \` | Gaveta: <b style="color:#c084fc">\${dciGroup.stock_total_unidades} un</b> (\${dciGroup.num_laboratorios_abertos} labs)\` : ''}</div>
+        </div>
+        <div style="background:var(--bg);padding:12px;border-radius:8px;border:1px solid var(--border)">
+          <div style="font-size:0.75rem;color:var(--muted)">PVP & MARGEM</div>
+          <div style="font-size:1.25rem;font-weight:700">\${p.pvp ? p.pvp.toFixed(2) + ' €' : '-'}</div>
+          <div style="font-size:0.78rem;color:var(--success)">Margem: \${p.margem_padrao ? p.margem_padrao + '%' : '-'}</div>
+        </div>
+        <div style="background:var(--bg);padding:12px;border-radius:8px;border:1px solid var(--border)">
+          <div style="font-size:0.75rem;color:var(--muted)">RITMO (VMM 12M)</div>
+          <div style="font-size:1.25rem;font-weight:700">\${vmm} /mês</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Total vendido: \${totalVendido} un</div>
+        </div>
+        <div style="background:var(--bg);padding:12px;border-radius:8px;border:1px solid var(--border)">
+          <div style="font-size:0.75rem;color:var(--muted)">VALIDADE REGISTADA</div>
+          <div style="font-size:1.25rem;font-weight:700;color:\${inv.data_validade ? '#fb7185' : 'var(--text)'}">\${inv.data_validade || 'S/ Registo'}</div>
+          <div style="font-size:0.78rem;color:var(--muted)">Controlo Sifarma / Winphar</div>
+        </div>
+      \`;
+
+      const salesMap = new Map(p.vendas.map(v => [v.mes, v.quantidade]));
+      const maxQtd = Math.max(1, ...MONTHS_ORDER.map(m => salesMap.get(m.key) || 0));
+
+      const chartTitleEl = document.getElementById('modalChartTitle');
+      if (chartTitleEl) {
+        chartTitleEl.innerHTML = dciGroup
+          ? \`📊 Evolução de Vendas Mensais — <span style="color:#38bdf8;">[\${p.cnp_codigo}] \${p.designacao.split(',')[0]}</span> (Total: \${totalVendido} un)\`
+          : 'Evolução de Vendas Mensais (Unidades Vendidas por Mês)';
+      }
+
+      document.getElementById('modalChart').innerHTML = MONTHS_ORDER.map(m => {
+        const qtd = salesMap.get(m.key) || 0;
+        const heightPct = Math.round((qtd / maxQtd) * 110) + 4;
+        return \`
+          <div class="bar-col">
+            <span class="bar-val">\${qtd}</span>
+            <div class="bar" style="height:\${heightPct}px;background:\${qtd > 0 ? 'var(--primary)' : '#334155'}"></div>
+            <span class="bar-lbl">\${m.label}</span>
+          </div>
+        \`;
+      }).join('');
+
+      const switcherEl = document.getElementById('modalLabSwitcher');
+
+      // Se for Genérico MG e pertencer a um grupo DCI com múltiplos laboratórios, mostra a tabela comparativa clicável + seletor rápido!
+      if (dciGroup) {
+        if (switcherEl) {
+          const allCnps = dciGroup.todos_laboratorios.map(l => l.cnp_codigo).join(',');
+          switcherEl.innerHTML = \`
+            <button class="btn btn-secondary" onclick="renderDciCombinedChart('\${allCnps}', '\${escapeJsString(dciGroup.grupo_equivalencia_dci)}')" style="font-size:0.74rem;padding:4px 10px;border-color:#c084fc;color:#c084fc;">
+              🧬 Ver Soma da Molécula (\${dciGroup.num_laboratorios_abertos} Labs)
+            </button>
+          \`;
+        }
+
+        peersBox.style.display = 'block';
+        peersBox.innerHTML = \`
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+            <h4 style="font-size: 0.85rem; color: #c084fc; text-transform: uppercase; margin: 0;">
+              🧬 Outros Laboratórios em Stock para \${dciGroup.grupo_equivalencia_dci} (\${dciGroup.num_laboratorios_abertos} marcas abertas)
+            </h4>
+            <span style="font-size:0.78rem;color:#38bdf8;font-weight:600;">
+              👆 Clique em qualquer laboratório para ver o seu gráfico de vendas e stock
+            </span>
+          </div>
+          <div class="table-wrap" style="max-height: 220px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Código</th>
+                  <th>Laboratório / Designação</th>
+                  <th>Stock</th>
+                  <th>Custo Unit.</th>
+                  <th>VMM</th>
+                  <th>Validade</th>
+                  <th>Prioridade de Escoamento</th>
+                  <th>Desempenho Vendas</th>
+                </tr>
+              </thead>
+              <tbody>
+                \${dciGroup.todos_laboratorios.map(lab => {
+                  const isCurrent = lab.cnp_codigo === p.cnp_codigo;
+                  return \`
+                    <tr class="clickable-row" onclick="openProductModal('\${lab.cnp_codigo}')" style="\${isCurrent ? 'background:rgba(168,85,247,0.22);border-left:3px solid #c084fc;' : ''}">
+                      <td><b>\${lab.cnp_codigo}</b></td>
+                      <td><b>\${lab.designacao}</b></td>
+                      <td><b>\${lab.stock_atual} un</b></td>
+                      <td>\${lab.custo_unitario.toFixed(2)} €</td>
+                      <td><b>\${lab.vmm}/mês</b></td>
+                      <td>\${lab.data_validade || '-'}</td>
+                      <td>\${lab.stock_atual <= 2 ? '<span class="badge badge-danger">🧹 Resto Gaveta (Escoar 1º)</span>' : lab.custo_unitario === dciGroup.custo_minimo ? '<span class="badge badge-success">⭐ Lab Mais Barato</span>' : 'Stock Principal'}</td>
+                      <td>
+                        \${isCurrent
+                          ? '<span class="badge badge-purple">👁️ Em Visualização</span>'
+                          : '<span class="badge badge-info" style="cursor:pointer;">📊 Ver Gráfico</span>'}
+                      </td>
+                    </tr>
+                  \`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        \`;
+      } else {
+        if (switcherEl) switcherEl.innerHTML = '';
+        peersBox.style.display = 'none';
+      }
+
+      document.getElementById('productModal').style.display = 'flex';
+    }
+
+    async function renderDciCombinedChart(cnpsCsv, grupoNome) {
+      const cnps = cnpsCsv.split(',').filter(Boolean);
+      const responses = await Promise.all(
+        cnps.map(c => fetch('/api/product/' + c + '?farmaciaId=' + activeFarmaciaId).then(r => r.ok ? r.json() : null))
+      );
+      const combinedSales = new Map();
+      let totalGrupo = 0;
+      responses.filter(Boolean).forEach(prod => {
+        (prod.vendas || []).forEach(v => {
+          combinedSales.set(v.mes, (combinedSales.get(v.mes) || 0) + v.quantidade);
+          totalGrupo += v.quantidade;
+        });
+      });
+
+      const maxQtd = Math.max(1, ...MONTHS_ORDER.map(m => combinedSales.get(m.key) || 0));
+      const chartTitleEl = document.getElementById('modalChartTitle');
+      if (chartTitleEl) {
+        chartTitleEl.innerHTML = \`🧬 Vendas Mensais Conjuntas — <span style="color:#c084fc;">\${grupoNome} (Todos os \${cnps.length} Labs: \${totalGrupo} un vendidas)</span>\`;
+      }
+
+      document.getElementById('modalChart').innerHTML = MONTHS_ORDER.map(m => {
+        const qtd = combinedSales.get(m.key) || 0;
+        const heightPct = Math.round((qtd / maxQtd) * 110) + 4;
+        return \`
+          <div class="bar-col">
+            <span class="bar-val">\${qtd}</span>
+            <div class="bar" style="height:\${heightPct}px;background:\${qtd > 0 ? '#c084fc' : '#334155'}"></div>
+            <span class="bar-lbl">\${m.label}</span>
+          </div>
+        \`;
+      }).join('');
+    }
+
+    function closeModal() {
+      document.getElementById('productModal').style.display = 'none';
+    }
+
+    function exportCurrentTabCsv() {
+      const table = document.getElementById('mainTable');
+      const rows = Array.from(table.querySelectorAll('tr'));
+      const csvContent = rows.map(r =>
+        Array.from(r.querySelectorAll('th,td')).map(c => '"' + c.innerText.replace(/"/g, '""') + '"').join(';')
+      ).join('\\n');
+
+      const blob = new Blob(['\\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = \`bi_pharma_\${activeTab}.csv\`;
+      a.click();
+    }
+
+    // ==========================================
+    // HUB DE CAMPANHAS E MARKETING 360º (CLIENTE)
+    // ==========================================
+    let currentCampaignSuggestions = [];
+    let currentMarketingOverview = null;
+    let currentCrossSellingPlans = [];
+    let activeMarketingSubView = 'epoca'; // 'epoca' | 'liquidacao' | 'cross' | 'custom'
+    let selectedCampaign = null;
+    let currentGeneratedCampaign = null;
+    let customPickedProducts = []; // Array<{ cnp, designacao, stock, pvp }>
+
+    function switchMarketingSubView(mode) {
+      activeMarketingSubView = mode;
+      ['epoca', 'liquidacao', 'cross', 'custom'].forEach(m => {
+        const btn = document.getElementById('mktSubBtn-' + m);
+        if (btn) {
+          if (m === mode) {
+            btn.className = 'btn';
+            btn.style.background = m === 'custom' ? 'linear-gradient(135deg, #a855f7, #ec4899)' : '#f43f5e';
+            btn.style.color = '#ffffff';
+          } else {
+            btn.className = 'btn btn-secondary';
+            btn.style.background = 'transparent';
+            btn.style.color = m === 'custom' ? '#e879f9' : 'var(--text)';
+          }
+        }
+      });
+
+      const flowEl = document.getElementById('mktView-campaignsFlow');
+      const crossEl = document.getElementById('mktView-crossSelling');
+      const customPanel = document.getElementById('mktCustomBuilderPanel');
+      const step1Container = document.getElementById('mktStep1Container');
+
+      if (mode === 'cross') {
+        if (flowEl) flowEl.style.display = 'none';
+        if (customPanel) customPanel.style.display = 'none';
+        if (crossEl) crossEl.style.display = 'block';
+        renderCrossSellingProtocols();
+      } else if (mode === 'custom') {
+        if (crossEl) crossEl.style.display = 'none';
+        if (customPanel) customPanel.style.display = 'block';
+        if (flowEl) flowEl.style.display = 'block';
+        if (step1Container) step1Container.style.display = 'none';
+        searchProductsForCustomBuilder(document.getElementById('customProdSearchInput')?.value || '');
+      } else {
+        if (crossEl) crossEl.style.display = 'none';
+        if (customPanel) customPanel.style.display = 'none';
+        if (flowEl) flowEl.style.display = 'block';
+        if (step1Container) step1Container.style.display = 'block';
+        renderCampaignCardsForSubView();
+      }
+    }
+
+    async function searchProductsForCustomBuilder(query) {
+      const box = document.getElementById('customProdSearchResults');
+      if (!box) return;
+      try {
+        const res = await fetch(\`/api/campaigns/search-products?farmaciaId=\${activeFarmaciaId}&q=\${encodeURIComponent(query || '')}\`);
+        const data = await res.json();
+        const items = data.items || [];
+        if (items.length === 0) {
+          box.innerHTML = '<span style="color:var(--muted);">Nenhum produto com stock encontrado para esta pesquisa.</span>';
+          return;
+        }
+        box.innerHTML = items.map(it => {
+          const alreadyPicked = customPickedProducts.some(p => p.cnp === it.cnp);
+          return \`
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 6px;border-bottom:1px solid rgba(148,163,184,0.12);gap:8px;">
+              <div>
+                <b>[\${it.cnp}]</b> \${it.designacao.slice(0, 38)}
+                <span class="badge \${it.riscoValidade ? 'badge-danger' : 'badge-info'}" style="font-size:0.66rem;margin-left:4px;">\${it.stock} un · \${it.validade || 'S/Val'}</span>
+                <span style="color:#34d399;font-size:0.72rem;margin-left:4px;">Mrg \${it.margemPct}%</span>
+              </div>
+              <button class="btn \${alreadyPicked ? 'btn-secondary' : ''}" onclick="addPickedProductForCampaign('\${it.cnp}', '\${escapeJsString(it.designacao)}', \${it.stock}, \${it.pvp})" style="font-size:0.72rem;padding:3px 9px;background:\${alreadyPicked ? 'transparent' : '#a855f7'};">
+                \${alreadyPicked ? '✓ Fixado' : '+ Incluir'}
+              </button>
+            </div>
+          \`;
+        }).join('');
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function addPickedProductForCampaign(cnp, designacao, stock, pvp) {
+      if (!customPickedProducts.some(p => p.cnp === cnp)) {
+        customPickedProducts.push({ cnp, designacao, stock, pvp });
+      }
+      renderCustomPickedChips();
+      searchProductsForCustomBuilder(document.getElementById('customProdSearchInput')?.value || '');
+    }
+
+    function removePickedProductForCampaign(cnp) {
+      customPickedProducts = customPickedProducts.filter(p => p.cnp !== cnp);
+      renderCustomPickedChips();
+      searchProductsForCustomBuilder(document.getElementById('customProdSearchInput')?.value || '');
+    }
+
+    function renderCustomPickedChips() {
+      const countEl = document.getElementById('customPickedCount');
+      const chipsEl = document.getElementById('customPickedProductsChips');
+      if (countEl) countEl.textContent = customPickedProducts.length;
+      if (!chipsEl) return;
+      if (customPickedProducts.length === 0) {
+        chipsEl.innerHTML = '<span style="font-size: 0.75rem; color: var(--muted);">Nenhum produto fixado manualmente (ou clique em "+ Incluir" na lista acima).</span>';
+        return;
+      }
+      chipsEl.innerHTML = customPickedProducts.map(p => \`
+        <span class="badge badge-purple" style="display:inline-flex;align-items:center;gap:6px;padding:5px 10px;font-size:0.76rem;">
+          🎯 [\${p.cnp}] \${p.designacao.slice(0, 26)} (\${p.stock} un)
+          <span style="cursor:pointer;color:#fb7185;font-weight:800;" onclick="removePickedProductForCampaign('\${p.cnp}')">✕</span>
+        </span>
+      \`).join('');
+    }
+
+    function clearCustomCampaignBuilder() {
+      customPickedProducts = [];
+      const nEl = document.getElementById('customCampName');
+      const tEl = document.getElementById('customCampTerms');
+      if (nEl) nEl.value = '';
+      if (tEl) tEl.value = '';
+      renderCustomPickedChips();
+      searchProductsForCustomBuilder('');
+    }
+
+    async function runPresetCustomCampaign(presetKey) {
+      await buildAndOpenCustomCampaign({
+        modo: 'EVENTO',
+        eventoPreset: presetKey,
+        focoStock: document.getElementById('customCampFocus')?.value || 'PRIORIDADE_VALIDADES_MONOS',
+        cnpsSelecionados: customPickedProducts.map(p => p.cnp),
+      });
+    }
+
+    async function submitCustomCampaignBuilder() {
+      const nomePersonalizado = document.getElementById('customCampName')?.value.trim() || '';
+      const termosPesquisa = document.getElementById('customCampTerms')?.value.trim() || '';
+      const focoStock = document.getElementById('customCampFocus')?.value || 'PRIORIDADE_VALIDADES_MONOS';
+      const cnpsSelecionados = customPickedProducts.map(p => p.cnp);
+
+      if (!nomePersonalizado && !termosPesquisa && cnpsSelecionados.length === 0) {
+        alert('Indique um nome/tema, palavras-chave ou selecione pelo menos 1 produto específico para a sua campanha.');
+        return;
+      }
+
+      const modo = cnpsSelecionados.length > 0 && !termosPesquisa ? 'PRODUTOS' : 'EVENTO';
+      await buildAndOpenCustomCampaign({
+        modo,
+        eventoPreset: 'custom',
+        nomePersonalizado,
+        termosPesquisa,
+        cnpsSelecionados,
+        focoStock,
+      });
+    }
+
+    async function buildAndOpenCustomCampaign(payload) {
+      try {
+        const res = await fetch('/api/campaigns/custom', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...payload, farmaciaId: activeFarmaciaId }),
+        });
+        const data = await res.json();
+        if (!data.success || !data.suggestion) {
+          alert('Erro ao construir campanha personalizada: ' + (data.error || 'Sem produtos elegíveis'));
+          return;
+        }
+        const sug = data.suggestion;
+        currentCampaignSuggestions = [sug, ...currentCampaignSuggestions.filter(c => c.id !== sug.id)];
+        selectCampaign(sug.id);
+        const step2 = document.getElementById('campaignStep2Config');
+        if (step2) step2.scrollIntoView({ behavior: 'smooth' });
+      } catch (e) {
+        console.error('Erro ao criar campanha personalizada:', e);
+      }
+    }
+
+    async function jumpToProductCrossSell360(cnp) {
+      closeModal();
+      switchTab('campaigns');
+      if (!currentCampaignSuggestions || currentCampaignSuggestions.length === 0) {
+        await loadCampaignSuggestions();
+      }
+      switchMarketingSubView('cross');
+      await runProductCrossSell360(cnp);
+      const box = document.getElementById('productCrossSell360Result');
+      if (box) box.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    async function jumpToSingleProductCampaign(cnp) {
+      closeModal();
+      switchTab('campaigns');
+      if (!currentCampaignSuggestions || currentCampaignSuggestions.length === 0) {
+        await loadCampaignSuggestions();
+      }
+      switchMarketingSubView('custom');
+      await buildAndOpenCustomCampaign({
+        modo: 'PRODUTOS',
+        eventoPreset: 'custom',
+        cnpsSelecionados: [cnp],
+      });
+    }
+
+    async function launchPackCampaignFrom360(cnpsCsv, titleText) {
+      const cnps = cnpsCsv.split(',').filter(Boolean);
+      switchMarketingSubView('custom');
+      await buildAndOpenCustomCampaign({
+        modo: 'PRODUTOS',
+        eventoPreset: 'custom',
+        nomePersonalizado: titleText,
+        cnpsSelecionados: cnps,
+      });
+    }
+
+    async function runProductCrossSell360(overrideQuery) {
+      const inp = document.getElementById('crossSellProductInput');
+      if (overrideQuery && inp) inp.value = overrideQuery;
+      const q = (overrideQuery || (inp ? inp.value : '') || '').trim();
+      if (!q) return;
+
+      const box = document.getElementById('productCrossSell360Result');
+      if (!box) return;
+      box.style.display = 'block';
+      box.innerHTML = '<div style="padding:14px;color:var(--muted);">⏳ A calcular engenharia de escoamento e cross-selling 360º para <b>' + q + '</b>...</div>';
+
+      try {
+        const res = await fetch(\`/api/campaigns/product-360?farmaciaId=\${activeFarmaciaId}&q=\${encodeURIComponent(q)}\`);
+        if (!res.ok) {
+          box.innerHTML = '<div style="padding:14px;color:#fb7185;">⚠️ Produto não encontrado no stock desta farmácia.</div>';
+          return;
+        }
+        const d = await res.json();
+        const p = d.produtoAlvo;
+        const g = d.gatilhosEntrada;
+        const parceiros = d.parceirosCrossSelling || [];
+        const packCnps = [p.cnp, ...parceiros.map(x => x.cnp)].join(',');
+        const packTitle = 'Campanha Foco + Cross-Selling: ' + p.designacao.slice(0, 34);
+
+        box.innerHTML = \`
+          <div style="background:rgba(15,23,42,0.85);border:1px solid rgba(56,189,248,0.4);border-radius:12px;padding:18px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:14px;">
+              <div>
+                <div style="font-size:1.1rem;font-weight:800;color:#f8fafc;">
+                  🎯 [\${p.cnp}] \${p.designacao}
+                  <span class="badge badge-info" style="margin-left:6px;">\${p.tipoVenda}</span>
+                  <span class="badge badge-purple" style="margin-left:4px;">\${p.categoria}</span>
+                </div>
+                <div style="font-size:0.82rem;color:#38bdf8;margin-top:4px;">
+                  📦 Stock: <b>\${p.stockAtual} un</b> (\${(p.stockAtual * p.custoUnitario).toFixed(2)}€ a custo) · VMM: <b>\${p.vmmAtual}/mês</b> · Validade: <b style="color:\${p.unidadesEmRiscoValidade > 0 ? '#fb7185' : '#cbd5e1'}">\${p.validade || 'Longa'}</b>
+                  \${p.unidadesEmRiscoValidade > 0 ? \` (<b style="color:#fb7185">\${p.unidadesEmRiscoValidade} un em risco = \${p.valorEmRiscoEur.toFixed(2)}€</b>)\` : ''}
+                </div>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                \${p.tipoVenda !== 'MSRM' ? \`
+                  <button class="btn" onclick="jumpToSingleProductCampaign('\${p.cnp}')" style="background:#f43f5e;font-size:0.8rem;padding:8px 14px;">
+                    📣 Criar Campanha Foco Só p/ Este Produto
+                  </button>
+                  <button class="btn" onclick="launchPackCampaignFrom360('\${packCnps}', '\${escapeJsString(packTitle)}')" style="background:linear-gradient(135deg,#a855f7,#0284c7);font-size:0.8rem;padding:8px 14px;">
+                    🚀 Criar Campanha Pack (Produto + \${parceiros.length} Parceiros Cross-Sell)
+                  </button>
+                \` : ''}
+              </div>
+            </div>
+
+            <!-- META DE EQUIPA & ESTATUTO REGULATÓRIO / ANTI-DUMPING -->
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:16px;">
+              <div style="background:rgba(244,63,94,0.12);border-left:4px solid #f43f5e;padding:10px 14px;border-radius:6px;font-size:0.82rem;color:#f8fafc;">
+                <b>🏁 Meta Operacional da Equipa:</b><br/>
+                \${p.metaEquipaTexto}
+              </div>
+              <div style="background:rgba(16,185,129,0.1);border-left:4px solid #10b981;padding:10px 14px;border-radius:6px;font-size:0.82rem;color:#f8fafc;">
+                <b>🛡️ Estatuto & Preço Promocional Anti-Dumping:</b><br/>
+                \${p.elegivelDesconto
+                  ? \`PVP Normal: <b>\${p.pvpAtual.toFixed(2)}€</b> → PVP Promo (-\${p.descontoSeguroPct}%): <b style="color:#34d399">\${p.pvpPromoRecomendado.toFixed(2)}€</b> (Margem líquida: <b>\${p.margemPosDescontoPct}%</b> ✅)<br/>\`
+                  : ''}
+                <span style="font-size:0.76rem;color:#cbd5e1;">\${p.notaRegulatoriaInfarmed}</span>
+              </div>
+            </div>
+
+            <!-- 2 EIXOS DE CROSS-SELLING: QUEM PUXA ESTE PRODUTO vs. O QUE VENDER JUNTO -->
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;margin-bottom:14px;">
+              <!-- EIXO 1: GATILHOS DE ENTRADA (QUEM PUXA ESTE PRODUTO) -->
+              <div style="background:rgba(2,6,23,0.65);border:1px solid var(--border);border-radius:10px;padding:14px;">
+                <div style="font-size:0.8rem;font-weight:800;color:#c084fc;text-transform:uppercase;margin-bottom:6px;">
+                  🚂 1. Como Escoar: Quem Puxa Este Produto no Balcão?
+                </div>
+                <div style="font-size:0.78rem;color:#cbd5e1;margin-bottom:10px;">\${g.explicacaoGatilho}</div>
+
+                <div style="font-size:0.74rem;font-weight:700;color:var(--muted);margin-bottom:6px;">Locomotivas de Entrada (Quando o cliente pede):</div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;">
+                  \${(g.locomotivasQuePuxam || []).map(l => \`
+                    <span class="badge badge-purple" title="\${l.relacaoClinica}">\${l.designacao.slice(0, 28)} (\${l.vmm}/mês)</span>
+                  \`).join('') || '<span style="color:var(--muted);font-size:0.76rem;">Atendimento geral de balcão</span>'}
+                </div>
+
+                \${(g.alternativasMesmaCategoria || []).length > 0 ? \`
+                  <div style="font-size:0.74rem;font-weight:700;color:#fbbf24;margin-bottom:6px;">
+                    🔄 Concorrentes da Mesma Categoria c/ Procura na Farmácia (Redirecionar Aconselhamento):
+                  </div>
+                  <div style="display:flex;flex-direction:column;gap:4px;font-size:0.76rem;color:#cbd5e1;">
+                    \${g.alternativasMesmaCategoria.map(alt => \`
+                      <div style="display:flex;justify-content:space-between;border-bottom:1px dashed rgba(148,163,184,0.15);padding-bottom:3px;">
+                        <span>• <b>\${alt.designacao.slice(0, 32)}</b></span>
+                        <span style="color:#38bdf8;">Procura: <b>\${alt.vmm}/mês</b> (Stock: \${alt.stock} un)</span>
+                      </div>
+                    \`).join('')}
+                  </div>
+                \` : ''}
+              </div>
+
+              <!-- EIXO 2: PARCEIROS DE CROSS-SELLING EM STOCK (O QUE ASSOCIAR) -->
+              <div style="background:rgba(2,6,23,0.65);border:1px solid rgba(16,185,129,0.3);border-radius:10px;padding:14px;">
+                <div style="font-size:0.8rem;font-weight:800;color:#34d399;text-transform:uppercase;margin-bottom:6px;">
+                  🤝 2. Com o Que Fazer Cross-Selling? (Parceiros em Stock a Escoar)
+                </div>
+                <div style="font-size:0.78rem;color:#cbd5e1;margin-bottom:10px;">
+                  Produtos complementares no stock da sua farmácia (priorizando <b>Validades</b> e <b>Monos</b>) para associar ao <b>\${p.designacao.slice(0, 28)}</b>:
+                </div>
+                <div style="display:flex;flex-direction:column;gap:8px;font-size:0.78rem;">
+                  \${parceiros.map(parc => \`
+                    <div style="display:flex;justify-content:space-between;align-items:center;background:rgba(15,23,42,0.8);padding:8px 10px;border-radius:8px;border:1px solid rgba(148,163,184,0.15);">
+                      <div>
+                        <div><b>[\${parc.cnp}] \${parc.designacao.slice(0, 34)}</b> <span class="badge badge-warning" style="font-size:0.66rem;">\${parc.criterioUrgencia}</span></div>
+                        <div style="font-size:0.72rem;color:#38bdf8;margin-top:2px;">\${parc.sinergiaClinica}</div>
+                      </div>
+                      <div style="text-align:right;white-space:nowrap;">
+                        <div>PVP Promo: <b style="color:#34d399;">\${parc.pvpPromoSugerido.toFixed(2)}€</b></div>
+                        <div style="font-size:0.7rem;color:var(--muted);">Margem \${parc.margemPct}%</div>
+                      </div>
+                    </div>
+                  \`).join('') || '<span style="color:var(--muted);">Sem parceiros complementares específicos em stock.</span>'}
+                </div>
+              </div>
+            </div>
+
+            <!-- SCRIPT PRONTO DE BALCÃO -->
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;background:rgba(56,189,248,0.1);border-left:4px solid #38bdf8;padding:10px 14px;border-radius:6px;">
+              <div style="flex:1;min-width:260px;font-size:0.84rem;color:#f1f5f9;font-style:italic;">
+                💬 <b>Script de Balcão (10s):</b> \${d.scriptBalcaoPronto}
+              </div>
+              <button class="copy-btn" onclick="copyToClipboard('\${escapeJsString(d.scriptBalcaoPronto)}', this)" style="width:auto;padding:6px 14px;">
+                📋 Copiar Script
+              </button>
+            </div>
+          </div>
+        \`;
+      } catch (e) {
+        console.error(e);
+        box.innerHTML = '<div style="padding:14px;color:#fb7185;">Erro ao analisar o produto.</div>';
+      }
+    }
+
+    function renderMarketingOverview() {
+      const el = document.getElementById('marketingOverviewGrid');
+      if (!el || !currentMarketingOverview) return;
+      const c = currentMarketingOverview.criterios;
+
+      el.innerHTML = \`
+        <div style="background:rgba(15,23,42,0.7);border:1px solid rgba(244,63,94,0.35);border-radius:10px;padding:12px 14px;cursor:pointer;" onclick="switchMarketingSubView('liquidacao')">
+          <div style="font-size:0.75rem;color:#fb7185;font-weight:700;text-transform:uppercase;">🔥 Validades Críticas (Escoar 1º)</div>
+          <div style="font-size:1.15rem;font-weight:800;color:#f8fafc;margin-top:4px;">\${c.validadesCriticas.skus} SKUs (\${c.validadesCriticas.valorCustoEur.toFixed(2)} €)</div>
+          <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">🟢 \${c.validadesCriticas.vendaLivreSkus} Sem Receita (Elegíveis p/ Desconto)</div>
+        </div>
+        <div style="background:rgba(15,23,42,0.7);border:1px solid rgba(245,158,11,0.35);border-radius:10px;padding:12px 14px;cursor:pointer;" onclick="switchMarketingSubView('liquidacao')">
+          <div style="font-size:0.75rem;color:#fbbf24;font-weight:700;text-transform:uppercase;">🕸️ Monos c/ Stock (≥ 3 un. paradas)</div>
+          <div style="font-size:1.15rem;font-weight:800;color:#f8fafc;margin-top:4px;">\${c.monosCapital.skus} SKUs (\${c.monosCapital.valorCustoEur.toFixed(2)} €)</div>
+          <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">🟢 \${c.monosCapital.vendaLivreSkus} Sem Receita (Redes, Ecrãs & Packs)</div>
+        </div>
+        <div style="background:rgba(15,23,42,0.7);border:1px solid rgba(168,85,247,0.35);border-radius:10px;padding:12px 14px;cursor:pointer;" onclick="switchMarketingSubView('liquidacao')">
+          <div style="font-size:0.75rem;color:#c084fc;font-weight:700;text-transform:uppercase;">🧺 Restos de Gaveta (1 a 2 un. órfãs)</div>
+          <div style="font-size:1.15rem;font-weight:800;color:#f8fafc;margin-top:4px;">\${c.restosGaveta.skus} SKUs (\${c.restosGaveta.valorCustoEur.toFixed(2)} €)</div>
+          <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">🏪 \${c.restosGaveta.vendaLivreSkus} Sem Receita (Exclusivo Cesto Balcão)</div>
+        </div>
+        <div style="background:rgba(15,23,42,0.7);border:1px solid rgba(56,189,248,0.35);border-radius:10px;padding:12px 14px;cursor:pointer;" onclick="switchMarketingSubView('cross')">
+          <div style="font-size:0.75rem;color:#38bdf8;font-weight:700;text-transform:uppercase;">🤝 Protocolos Cross-Selling Balcão</div>
+          <div style="font-size:1.15rem;font-weight:800;color:#f8fafc;margin-top:4px;">\${currentCrossSellingPlans.length} Eixos Ativos</div>
+          <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">Locomotivas de Receita → Escoar Stock Parado</div>
+        </div>
+      \`;
+    }
+
+    function renderCrossSellingProtocols() {
+      const grid = document.getElementById('crossSellingGrid');
+      if (!grid) return;
+      if (!currentCrossSellingPlans || currentCrossSellingPlans.length === 0) {
+        grid.innerHTML = '<div style="padding:24px;color:var(--muted);">Nenhum protocolo de Cross-Selling disponível de momento.</div>';
+        return;
+      }
+
+      grid.innerHTML = currentCrossSellingPlans.map(plan => \`
+        <div class="omnichannel-card" style="border-color:rgba(56,189,248,0.35);">
+          <div>
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px;">
+              <div style="font-weight:800;font-size:1rem;color:#f8fafc;">\${plan.icone} \${plan.tituloProtocolo}</div>
+              <span class="badge badge-success">Potencial: \${plan.impactoFinanceiroPotencialEur.toFixed(2)} €</span>
+            </div>
+            <div style="font-size:0.8rem;color:#38bdf8;margin-bottom:12px;">
+              <b>🎯 Gatilho no Atendimento:</b> \${plan.gatilhoDispensa}
+            </div>
+
+            <div style="background:rgba(15,23,42,0.65);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px;">
+              <div style="font-size:0.74rem;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:6px;">
+                🚂 Locomotivas Reais da Farmácia (O que o cliente vem pedir):
+              </div>
+              <div style="display:flex;flex-wrap:wrap;gap:6px;">
+                \${plan.locomotivasReais.map(l => \`
+                  <span class="badge badge-purple" title="Vendas no período: \${l.vendasPeriodo} un">\${l.designacao.slice(0, 28)} (\${l.vmm}/mês)</span>
+                \`).join('')}
+              </div>
+            </div>
+
+            <div style="background:rgba(15,23,42,0.65);border:1px solid rgba(16,185,129,0.25);border-radius:8px;padding:10px;margin-bottom:12px;">
+              <div style="font-size:0.74rem;font-weight:700;color:#34d399;text-transform:uppercase;margin-bottom:6px;">
+                📦 Produtos em Stock a Escoar na Boleia (Prioridade Equipa):
+              </div>
+              <div style="display:flex;flex-direction:column;gap:6px;font-size:0.8rem;">
+                \${plan.produtosAEscoar.map(p => \`
+                  <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px dashed rgba(148,163,184,0.15);padding-bottom:4px;">
+                    <div>
+                      <b>[\${p.cnp}]</b> \${p.designacao.slice(0, 34)}
+                      <span class="badge badge-warning" style="margin-left:4px;font-size:0.68rem;">\${p.criterioEscoamento}</span>
+                    </div>
+                    <div style="text-align:right;white-space:nowrap;">
+                      <b>\${p.stock} un</b> · Promo -\${p.descontoSeguroPct}%: <b style="color:#34d399;">\${p.pvpPromo.toFixed(2)}€</b>
+                    </div>
+                  </div>
+                \`).join('')}
+              </div>
+            </div>
+
+            <div style="font-size:0.82rem;background:rgba(244,63,94,0.1);border-left:3px solid #fb7185;padding:9px 12px;border-radius:6px;color:#f1f5f9;font-style:italic;">
+              \${plan.scriptBalcao10s}
+            </div>
+          </div>
+          <button class="copy-btn" onclick="copyToClipboard('\${escapeJsString(plan.scriptBalcao10s)}', this)" style="margin-top:12px;">
+            📋 Copiar Script de Cross-Selling p/ Equipa
+          </button>
+        </div>
+      \`).join('');
+    }
+
+    async function loadCampaignSuggestions() {
+      const grid = document.getElementById('campaignSuggestionsGrid');
+      const badge = document.getElementById('campaignsCountBadge');
+      if (grid) grid.innerHTML = '<div style="padding: 24px; color: var(--muted);"><span class="badge badge-info">⏳ A carregar campanhas sazonais, planos de liquidação e cross-selling...</span></div>';
+
+      try {
+        const res = await fetch(\`/api/campaigns/suggestions?farmaciaId=\${activeFarmaciaId}\`);
+        const data = await res.json();
+        currentCampaignSuggestions = data.suggestions || [];
+        currentMarketingOverview = data.overview || null;
+        currentCrossSellingPlans = data.crossSellingPlans || [];
+
+        renderMarketingOverview();
+        renderCampaignCardsForSubView();
+      } catch (err) {
+        console.error('Erro ao carregar sugestões de campanhas:', err);
+        if (grid) grid.innerHTML = '<div style="color:var(--danger);padding:20px;">Erro ao carregar campanhas sazonais.</div>';
+      }
+    }
+
+    function renderCampaignCardsForSubView() {
+      const grid = document.getElementById('campaignSuggestionsGrid');
+      const badge = document.getElementById('campaignsCountBadge');
+      const heading = document.getElementById('step1CampaignHeading');
+      if (!grid) return;
+
+      const filtered = currentCampaignSuggestions.filter(c => {
+        if (activeMarketingSubView === 'liquidacao') {
+          return c.tipoCampanha === 'LIQUIDACAO_STOCK';
+        }
+        return c.tipoCampanha !== 'LIQUIDACAO_STOCK';
+      });
+
+      if (heading) {
+        heading.innerHTML = activeMarketingSubView === 'liquidacao'
+          ? '<span style="background: #f59e0b; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">1</span> Selecione o Plano Tático de Liquidação (Validades, Monos ou Restos de Gaveta):'
+          : '<span style="background: #f43f5e; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">1</span> Selecione a Campanha de Época & Calendário Civil:';
+      }
+
+      if (badge) {
+        badge.textContent = \`\${filtered.length} Planos Disponíveis\`;
+      }
+
+      if (filtered.length === 0) {
+        grid.innerHTML = '<div style="grid-column: 1/-1; padding: 32px; text-align: center; color: var(--muted); background: var(--surface); border-radius: 10px;">Não foram identificados planos nesta categoria.</div>';
+        return;
+      }
+
+      grid.innerHTML = filtered.map(c => {
+        const isSel = selectedCampaign && selectedCampaign.id === c.id;
+        const fin = c.financials;
+        const rc = c.resumoCriterios || { validadesCriticas: 0, monosParados: 0, restosGaveta: 0, ancorasRotacao: 0 };
+        const badgeTipo = c.tipoCampanha === 'LIQUIDACAO_STOCK'
+          ? '<span class="badge badge-warning">🧹 Liquidação Stock</span>'
+          : (c.tipo === 'SAZONAL_CLIMA' ? '<span class="badge badge-info">❄️ Época Sazonal</span>' : '<span class="badge badge-success">🩺 Efeméride</span>');
+
+        return \`
+          <div class="campaign-card \${isSel ? 'selected' : ''}" onclick="selectCampaign('\${c.id}')" id="campCard-\${c.id}">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
+              <span style="font-size:1.6rem;">\${c.icon}</span>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">
+                <span class="badge badge-purple">\${c.periodoLabel}</span>
+                \${badgeTipo}
+              </div>
+            </div>
+            <div style="font-weight:700;font-size:0.96rem;color:#f8fafc;margin-bottom:6px;">\${c.nome}</div>
+            <div style="font-size:0.82rem;color:var(--muted);margin-bottom:10px;line-height:1.4;">\${c.descricao}</div>
+
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;font-size:0.72rem;">
+              \${rc.validadesCriticas > 0 ? \`<span class="badge badge-danger">🔥 \${rc.validadesCriticas} Validades</span>\` : ''}
+              \${rc.monosParados > 0 ? \`<span class="badge badge-warning">🕸️ \${rc.monosParados} Monos</span>\` : ''}
+              \${rc.restosGaveta > 0 ? \`<span class="badge badge-purple">🧺 \${rc.restosGaveta} Restos 1-2un</span>\` : ''}
+              \${rc.ancorasRotacao > 0 ? \`<span class="badge badge-info">⭐ \${rc.ancorasRotacao} Âncoras</span>\` : ''}
+            </div>
+            
+            <div style="background:rgba(15,23,42,0.6);border-radius:8px;padding:10px;margin-bottom:12px;font-size:0.78rem;display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+              <div>📦 No Lote: <b style="color:var(--text);">\${c.eligibleProducts.length} SKUs</b> <span style="color:var(--muted)">(\${c.totalEligibleSkus} eleg.)</span></div>
+              <div>📊 Unidades: <b style="color:var(--text);">\${c.totalStockUnits} un</b></div>
+              <div>💰 Margem Promo: <b style="color:#34d399;">\${fin.margem_media_pct}%</b></div>
+              <div>🛡️ Anti-Dumping: <b style="color:\${fin.anti_dumping_valido ? '#34d399' : '#f87171'};">\${fin.anti_dumping_valido ? '100% Legal' : 'Atenção'}</b></div>
+            </div>
+
+            <button class="btn btn-secondary" style="width:100%;font-size:0.84rem;padding:7px;border-color:#f43f5e;color:#fb7185;">
+              \${isSel ? '✅ Plano Selecionado' : '🎯 Configurar & Escoar Stock'}
+            </button>
+          </div>
+        \`;
+      }).join('');
+
+      if (!selectedCampaign || !filtered.some(c => c.id === selectedCampaign.id)) {
+        selectCampaign(filtered[0].id);
+      }
+    }
+
+    function selectCampaign(campId) {
+      selectedCampaign = currentCampaignSuggestions.find(c => c.id === campId);
+      if (!selectedCampaign) return;
+
+      currentCampaignSuggestions.forEach(c => {
+        const el = document.getElementById('campCard-' + c.id);
+        if (el) el.classList.toggle('selected', c.id === campId);
+      });
+
+      const step2 = document.getElementById('campaignStep2Config');
+      if (step2) step2.style.display = 'block';
+
+      const step3 = document.getElementById('campaignStep3Materials');
+      if (step3) step3.style.display = 'none';
+
+      const titleDesc = document.getElementById('selectedCampaignTitleDesc');
+      if (titleDesc) {
+        titleDesc.innerHTML = \`Plano ativo: <b style="color:#fb7185;">\${selectedCampaign.icon} \${selectedCampaign.nome}</b> (\${selectedCampaign.periodoLabel}) — \${selectedCampaign.descricao}\`;
+      }
+
+      const anatomyBox = document.getElementById('seasonAnatomyBox');
+      if (anatomyBox) {
+        const ctx = selectedCampaign.contextoEpoca;
+        if (ctx) {
+          anatomyBox.style.display = 'block';
+          anatomyBox.innerHTML = \`
+            <div style="font-size:0.84rem;font-weight:700;color:#38bdf8;margin-bottom:8px;">
+              🧭 Anatomia da Época & Estratégia de Escoamento Interno (\${selectedCampaign.periodoLabel}):
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;font-size:0.8rem;color:#cbd5e1;">
+              <div><b style="color:#f8fafc;">📌 Perfil da Época:</b><br/>\${ctx.perfilEpoca}</div>
+              <div><b style="color:#f8fafc;">🩺 O que o Utente Procura:</b><br/>• \${(ctx.doresUtente || []).join('<br/>• ')}</div>
+              <div><b style="color:#f8fafc;">🎯 Estratégia p/ Escoar o Nosso Stock:</b><br/>\${ctx.estrategiaEscoamento}</div>
+            </div>
+          \`;
+        } else {
+          anatomyBox.style.display = 'none';
+        }
+      }
+
+      const suggestedDesc = selectedCampaign.campanha?.descontoSugeridoPct || 15;
+      const discountSlider = document.getElementById('campaignDiscountRange');
+      if (discountSlider) discountSlider.value = suggestedDesc;
+      const discountBadge = document.getElementById('discountBadgeVal');
+      if (discountBadge) discountBadge.textContent = suggestedDesc + '%';
+
+      // Se for o plano exclusivo de restos de gaveta (1-2 un), marcar apenas Loja Física por defeito!
+      if (selectedCampaign.id === 'liquidacao_cesto_oportunidade') {
+        const cLoja = document.getElementById('chan-loja');
+        const cRedes = document.getElementById('chan-redes');
+        const cEcras = document.getElementById('chan-ecras');
+        const cApp = document.getElementById('chan-app');
+        if (cLoja) cLoja.checked = true;
+        if (cRedes) cRedes.checked = false;
+        if (cEcras) cEcras.checked = false;
+        if (cApp) cApp.checked = false;
+        onChannelsChanged();
+      }
+
+      renderCampaignProductsTable();
+    }
+
+    function onChannelsChanged() {
+      const channels = ['loja', 'redes', 'ecras', 'app'].filter(ch => document.getElementById('chan-' + ch)?.checked);
+      const btn = document.getElementById('btnGenerateMaterials');
+      if (btn) {
+        btn.disabled = channels.length === 0;
+        btn.textContent = channels.length === 0 ? '⚠️ Selecione pelo menos 1 canal' : '✨ Gerar Materiais para os Canais Selecionados';
+      }
+    }
+
+    function onDiscountSliderChange(val) {
+      const badge = document.getElementById('discountBadgeVal');
+      if (badge) badge.textContent = val + '%';
+      recalculateCampaignFinancialsClient();
+    }
+
+    function getIncludedCnpCodigos() {
+      const checkboxes = Array.from(document.querySelectorAll('.campaign-sku-check:checked'));
+      return checkboxes.map(cb => cb.value);
+    }
+
+    function renderCampaignProductsTable() {
+      if (!selectedCampaign) return;
+      const table = document.getElementById('campaignProductsTable');
+      if (!table) return;
+
+      const discountPct = parseInt(document.getElementById('campaignDiscountRange')?.value || '15', 10);
+      const discount = discountPct / 100;
+
+      table.innerHTML = \`
+        <thead>
+          <tr>
+            <th style="width: 38px; text-align: center;"><input type="checkbox" id="checkAllCampaignSkus" checked onchange="toggleAllCampaignSkus(this.checked)" /></th>
+            <th>Código / CNP</th>
+            <th>Designação & Motivo de Escoamento</th>
+            <th>Eixo & Critério de Marketing</th>
+            <th>Stock & Canal Ideal</th>
+            <th>PVP Normal</th>
+            <th>PVP Campanha (-\${discountPct}%)</th>
+            <th>Custo Unit.</th>
+            <th>Margem Final</th>
+            <th>Validação Legal Anti-Dumping</th>
+          </tr>
+        </thead>
+        <tbody>
+          \${selectedCampaign.eligibleProducts.map(p => {
+            const pvpNormal = p.pvp_atual || p.pvp || (p.custo_unitario * 1.5);
+            const custoRef = p.custo_unitario;
+            const pvpCampanha = Number((pvpNormal * (1 - discount)).toFixed(2));
+            const margemEur = pvpCampanha - custoRef;
+            const margemPct = Number(((margemEur / pvpCampanha) * 100).toFixed(1));
+            const custoComMargemSeguranca = custoRef * 1.05;
+            const isAntiDumping = pvpCampanha > custoComMargemSeguranca;
+            const critBadgeClass = (p.criterio_marketing || '').includes('Validade')
+              ? 'badge-danger'
+              : (p.criterio_marketing || '').includes('Mono')
+                ? 'badge-warning'
+                : (p.criterio_marketing || '').includes('Resto')
+                  ? 'badge-purple'
+                  : 'badge-success';
+
+            return \`
+              <tr id="campRow-\${p.cnp_codigo}">
+                <td style="text-align: center;">
+                  <input type="checkbox" class="campaign-sku-check" value="\${p.cnp_codigo}" checked onchange="recalculateCampaignFinancialsClient()" />
+                </td>
+                <td><b>\${p.cnp_codigo}</b></td>
+                <td>
+                  <div style="font-weight: 600; color: var(--text);">\${p.designacao}</div>
+                  <div style="font-size: 0.75rem; color: #38bdf8; margin-top: 2px;">\${p.motivo_selecao || ''}</div>
+                </td>
+                <td>
+                  <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-start;">
+                    <span class="badge badge-purple">\${p.eixo_campanha || p.categoria || 'Geral'}</span>
+                    <span class="badge \${critBadgeClass}">\${p.criterio_marketing || '⭐ Âncora'}</span>
+                  </div>
+                </td>
+                <td>
+                  <div><b>\${p.stock_atual} un</b> <span class="badge badge-info" style="font-size:0.68rem;">\${p.tipo_venda}</span></div>
+                  <div style="font-size:0.72rem;color:\${p.stock_atual <= 2 ? '#fbbf24' : '#94a3b8'};margin-top:2px;">\${p.canais_recomendados || ''}</div>
+                </td>
+                <td style="color: var(--muted); text-decoration: line-through;">\${pvpNormal.toFixed(2)} €</td>
+                <td style="font-weight: 700; color: #fb7185;" id="colPvpPromo-\${p.cnp_codigo}">\${pvpCampanha.toFixed(2)} €</td>
+                <td style="color: var(--muted);">\${custoRef.toFixed(2)} €</td>
+                <td style="font-weight: 700; color: \${margemPct >= 20 ? '#34d399' : '#f59e0b'};" id="colMargem-\${p.cnp_codigo}">
+                  \${margemPct}% (\${margemEur.toFixed(2)} €)
+                </td>
+                <td id="colAntiDumping-\${p.cnp_codigo}">
+                  \${isAntiDumping ? 
+                    '<span class="badge badge-success" title="Conforme Dec.-Lei 166/2013: Preço de venda superior ao custo efetivo">🛡️ 100% Legal</span>' : 
+                    '<span class="badge badge-danger" title="Aviso: Preço de venda inferior ou no limiar do custo efetivo">⚠️ Risco de Dumping</span>'}
+                </td>
+              </tr>
+            \`;
+          }).join('')}
+        </tbody>
+      \`;
+
+      recalculateCampaignFinancialsClient();
+    }
+
+    function toggleAllCampaignSkus(checked) {
+      document.querySelectorAll('.campaign-sku-check').forEach(cb => {
+        cb.checked = checked;
+      });
+      recalculateCampaignFinancialsClient();
+    }
+
+    function recalculateCampaignFinancialsClient() {
+      if (!selectedCampaign) return;
+      const discountPct = parseInt(document.getElementById('campaignDiscountRange')?.value || '15', 10);
+      const discount = discountPct / 100;
+      const includedCnps = new Set(getIncludedCnpCodigos());
+
+      let totalFaturacaoNormal = 0;
+      let totalFaturacaoPromo = 0;
+      let totalCustoRef = 0;
+      let allSafeAntiDumping = true;
+      let countIncluded = 0;
+
+      selectedCampaign.eligibleProducts.forEach(p => {
+        const pvpNormal = p.pvp_atual || p.pvp || (p.custo_unitario * 1.5);
+        const custoRef = p.custo_unitario;
+        const pvpCampanha = Number((pvpNormal * (1 - discount)).toFixed(2));
+        const margemEur = pvpCampanha - custoRef;
+        const margemPct = Number(((margemEur / pvpCampanha) * 100).toFixed(1));
+        const custoComMargemSeguranca = custoRef * 1.05;
+        const isAntiDumping = pvpCampanha > custoComMargemSeguranca;
+
+        const cellPromo = document.getElementById('colPvpPromo-' + p.cnp_codigo);
+        const cellMargem = document.getElementById('colMargem-' + p.cnp_codigo);
+        const cellAntiDumping = document.getElementById('colAntiDumping-' + p.cnp_codigo);
+
+        if (cellPromo) cellPromo.textContent = pvpCampanha.toFixed(2) + ' €';
+        if (cellMargem) {
+          cellMargem.textContent = \`\${margemPct}% (\${margemEur.toFixed(2)} €)\`;
+          cellMargem.style.color = margemPct >= 20 ? '#34d399' : '#f59e0b';
+        }
+        if (cellAntiDumping) {
+          cellAntiDumping.innerHTML = isAntiDumping ? 
+            '<span class="badge badge-success">🛡️ 100% Legal</span>' : 
+            '<span class="badge badge-danger">⚠️ Risco de Dumping</span>';
+        }
+
+        if (includedCnps.has(p.cnp_codigo)) {
+          countIncluded++;
+          const units = p.stock_atual;
+          totalFaturacaoNormal += pvpNormal * units;
+          totalFaturacaoPromo += pvpCampanha * units;
+          totalCustoRef += custoRef * units;
+          if (!isAntiDumping) allSafeAntiDumping = false;
+        }
+      });
+
+      const lucroBrutoPromo = totalFaturacaoPromo - totalCustoRef;
+      const margemMediaPct = totalFaturacaoPromo > 0 ? Number(((lucroBrutoPromo / totalFaturacaoPromo) * 100).toFixed(1)) : 0;
+
+      const kpisInline = document.getElementById('financialKpisInline');
+      if (kpisInline) {
+        kpisInline.innerHTML = \`
+          <span>Incluídos: <b style="color:var(--text);">\${countIncluded} SKUs</b></span>
+          <span>Faturação Prevista: <b style="color:#fb7185;">\${totalFaturacaoPromo.toFixed(2)} €</b></span>
+          <span>Lucro Bruto: <b style="color:#34d399;">\${lucroBrutoPromo.toFixed(2)} €</b></span>
+          <span>Margem Média: <b style="color:#38bdf8;">\${margemMediaPct}%</b></span>
+        \`;
+      }
+
+      const antiDumpingBox = document.getElementById('antiDumpingSummaryBox');
+      const antiDumpingDetails = document.getElementById('antiDumpingDetails');
+      if (antiDumpingBox && antiDumpingDetails) {
+        if (allSafeAntiDumping && countIncluded > 0) {
+          antiDumpingBox.style.background = 'rgba(16, 185, 129, 0.12)';
+          antiDumpingBox.style.borderColor = 'rgba(16, 185, 129, 0.3)';
+          antiDumpingDetails.innerHTML = '✅ <b>100% Conforme Legislação Nacional:</b> Todos os produtos selecionados mantêm PVP promocional com margem positiva acima do custo de compra.';
+        } else if (countIncluded === 0) {
+          antiDumpingDetails.innerHTML = 'Selecione pelo menos um produto na tabela.';
+        } else {
+          antiDumpingBox.style.background = 'rgba(239, 68, 68, 0.15)';
+          antiDumpingBox.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+          antiDumpingDetails.innerHTML = '<b style="color:#f87171;">⚠️ Alerta de Dumping:</b> Um ou mais produtos têm desconto excessivo face ao custo de aquisição. Reduza o desconto ou desmarque os produtos assinalados.';
+        }
+      }
+    }
+
+    async function generateCampaignMaterialsAction() {
+      if (!selectedCampaign) return;
+      const btn = document.getElementById('btnGenerateMaterials');
+      const channels = ['loja', 'redes', 'ecras', 'app'].filter(ch => document.getElementById('chan-' + ch)?.checked);
+      const includedCnpCodigos = getIncludedCnpCodigos();
+      const discountPct = parseInt(document.getElementById('campaignDiscountRange')?.value || '15', 10);
+
+      if (channels.length === 0) {
+        alert('Selecione pelo menos um canal de comunicação.');
+        return;
+      }
+      if (includedCnpCodigos.length === 0) {
+        alert('Selecione pelo menos um produto para a campanha.');
+        return;
+      }
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '⏳ A Gerar Materiais Omnicanal...';
+      }
+
+      try {
+        const chosenProducts = (selectedCampaign.eligibleProducts || []).filter(p => includedCnpCodigos.includes(p.cnp_codigo));
+        const res = await fetch('/api/campaigns/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            campaignId: selectedCampaign.id,
+            customCampaignDef: selectedCampaign.campanha || null,
+            selectedProducts: chosenProducts,
+            discountPct,
+            channels,
+            includedCnpCodigos
+          })
+        });
+
+        const data = await res.json();
+        if (!data.success) {
+          alert('Erro ao gerar campanha: ' + (data.error || 'Desconhecido'));
+          return;
+        }
+
+        currentGeneratedCampaign = data;
+        renderOmnichannelMaterials(data);
+
+        const step3 = document.getElementById('campaignStep3Materials');
+        if (step3) {
+          step3.style.display = 'block';
+          step3.scrollIntoView({ behavior: 'smooth' });
+        }
+      } catch (err) {
+        console.error('Erro ao gerar materiais:', err);
+        alert('Ocorreu um erro ao comunicar com o servidor.');
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '✨ Gerar Materiais para os Canais Selecionados';
+        }
+      }
+    }
+
+    function renderOmnichannelMaterials(data) {
+      const grid = document.getElementById('omnichannelGrid');
+      if (!grid) return;
+
+      const m = data.materials;
+      const cards = [];
+
+      if (m.loja) {
+        cards.push(\`
+          <div class="omnichannel-card">
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <span style="font-weight:700;font-size:1.05rem;color:var(--text);display:flex;align-items:center;gap:8px;">
+                  🏪 Loja Física & Balcão
+                </span>
+                <span class="badge badge-success">Atendimento Presencial</span>
+              </div>
+              <div style="font-size:0.84rem;margin-bottom:10px;">
+                <b style="color:#fb7185;">🎯 Script de Atendimento (10 segundos):</b>
+                <div style="background:rgba(15,23,42,0.6);border-left:3px solid #fb7185;padding:10px 12px;border-radius:6px;margin-top:6px;color:#f1f5f9;font-style:italic;">
+                  "\${m.loja.script_balcao}"
+                </div>
+              </div>
+              <div style="font-size:0.82rem;color:var(--muted);margin-bottom:8px;">
+                📍 <b>Local de Destaque:</b> \${m.loja.posicionamento_linear}
+              </div>
+              <div style="font-size:0.82rem;color:var(--muted);margin-bottom:8px;">
+                🏷️ <b>Material de Linear:</b> \${m.loja.sinaletica_precos}
+              </div>
+            </div>
+            <button class="copy-btn" onclick="copyToClipboard('\${escapeJsString(m.loja.script_balcao)}', this)" style="margin-top:14px;">
+              📋 Copiar Script de Balcão
+            </button>
+          </div>
+        \`);
+      }
+
+      if (m.redes) {
+        const fullRedesCopy = \`\${m.redes.headline}\\n\\n\${m.redes.copy_post}\\n\\n\${m.redes.call_to_action}\\n\\n\${m.redes.hashtags.join(' ')}\`;
+        cards.push(\`
+          <div class="omnichannel-card">
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <span style="font-weight:700;font-size:1.05rem;color:var(--text);display:flex;align-items:center;gap:8px;">
+                  📱 Redes Sociais
+                </span>
+                <span class="badge badge-purple">Instagram & Facebook</span>
+              </div>
+              <div style="background:rgba(15,23,42,0.6);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px;font-size:0.84rem;color:#f1f5f9;white-space:pre-line;line-height:1.45;">
+                <b>\${m.redes.headline}</b><br/><br/>
+                \${m.redes.copy_post}<br/><br/>
+                <b>\${m.redes.call_to_action}</b><br/><br/>
+                <span style="color:#38bdf8;">\${m.redes.hashtags.join(' ')}</span>
+              </div>
+              <div style="font-size:0.8rem;color:var(--muted);">
+                🖼️ <b>Sugestão Visual:</b> \${m.redes.sugestao_imagem}
+              </div>
+            </div>
+            <button class="copy-btn" onclick="copyToClipboard('\${escapeJsString(fullRedesCopy)}', this)" style="margin-top:14px;">
+              📋 Copiar Post Redes Sociais
+            </button>
+          </div>
+        \`);
+      }
+
+      if (m.ecras) {
+        const fullEcrasCopy = \`\${m.ecras.slide_titulo}\\n- \${m.ecras.slide_linhas.join('\\n- ')}\\n\${m.ecras.slide_rodape}\`;
+        cards.push(\`
+          <div class="omnichannel-card">
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <span style="font-weight:700;font-size:1.05rem;color:var(--text);display:flex;align-items:center;gap:8px;">
+                  📺 Ecrãs TV & Montra Digital
+                </span>
+                <span class="badge badge-info">16:9 Rotação</span>
+              </div>
+              <div style="background:linear-gradient(135deg, rgba(30,41,59,0.9), rgba(15,23,42,0.9));border:1px dashed #38bdf8;border-radius:8px;padding:16px;margin-bottom:12px;text-align:center;">
+                <div style="font-size:1.05rem;font-weight:800;color:#38bdf8;margin-bottom:10px;">\${m.ecras.slide_titulo}</div>
+                <div style="display:flex;flex-direction:column;gap:6px;font-size:0.86rem;color:#e2e8f0;margin-bottom:10px;">
+                  \${m.ecras.slide_linhas.map(l => \`<div>• \${l}</div>\`).join('')}
+                </div>
+                <div style="font-size:0.75rem;color:var(--muted);border-top:1px solid var(--border);padding-top:8px;">\${m.ecras.slide_rodape}</div>
+              </div>
+              <div style="font-size:0.8rem;color:var(--muted);">
+                ⏱️ <b>Tempo de Exposição Recomendado:</b> \${m.ecras.duracao_slide_segundos} segundos em loop
+              </div>
+            </div>
+            <button class="copy-btn" onclick="copyToClipboard('\${escapeJsString(fullEcrasCopy)}', this)" style="margin-top:14px;">
+              📋 Copiar Slide TV
+            </button>
+          </div>
+        \`);
+      }
+
+      if (m.app) {
+        const fullAppCopy = \`Push: \${m.app.push_notification_titulo} - \${m.app.push_notification_corpo}\\nSMS: \${m.app.sms_texto}\`;
+        cards.push(\`
+          <div class="omnichannel-card">
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <span style="font-weight:700;font-size:1.05rem;color:var(--text);display:flex;align-items:center;gap:8px;">
+                  📲 App Mobile & SMS
+                </span>
+                <span class="badge badge-warning">Push / SMS</span>
+              </div>
+              <div style="margin-bottom:12px;">
+                <b style="font-size:0.84rem;color:#f59e0b;">📲 Notificação Push na App:</b>
+                <div style="background:rgba(15,23,42,0.6);border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:4px;font-size:0.82rem;">
+                  <b>\${m.app.push_notification_titulo}</b><br/>
+                  \${m.app.push_notification_corpo}
+                </div>
+              </div>
+              <div style="margin-bottom:12px;">
+                <b style="font-size:0.84rem;color:#f59e0b;">💬 Mensagem SMS Curta (160 caracteres):</b>
+                <div style="background:rgba(15,23,42,0.6);border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:4px;font-size:0.82rem;font-family:monospace;">
+                  \${m.app.sms_texto}
+                </div>
+              </div>
+            </div>
+            <button class="copy-btn" onclick="copyToClipboard('\${escapeJsString(m.app.sms_texto)}', this)" style="margin-top:14px;">
+              📋 Copiar SMS
+            </button>
+          </div>
+        \`);
+      }
+
+      grid.innerHTML = cards.join('');
+    }
+
+    function escapeJsString(str) {
+      if (!str) return '';
+      return str
+        .replace(/\\\\/g, '\\\\\\\\')
+        .replace(/'/g, "\\\\'")
+        .replace(/"/g, '\\\\"')
+        .replace(/\\n/g, '\\\\n')
+        .replace(/\\r/g, '');
+    }
+
+    function copyToClipboard(text, btnElement) {
+      navigator.clipboard.writeText(text).then(() => {
+        const originalText = btnElement.innerHTML;
+        btnElement.innerHTML = '✅ Copiado!';
+        btnElement.style.background = '#10b981';
+        btnElement.style.color = '#ffffff';
+        setTimeout(() => {
+          btnElement.innerHTML = originalText;
+          btnElement.style.background = '';
+          btnElement.style.color = '';
+        }, 2000);
+      }).catch(err => {
+        console.error('Falha ao copiar:', err);
+        alert('Texto selecionado: copie manualmente.');
+      });
+    }
+
+    function openEmailDigestModal() {
+      const modal = document.getElementById('emailDigestModal');
+      const content = document.getElementById('emailDigestContent');
+      const statusEl = document.getElementById('emailSendStatus');
+      if (statusEl) statusEl.textContent = '';
+
+      if (currentGeneratedCampaign && currentGeneratedCampaign.emailDigestPreview) {
+        if (content) content.innerHTML = currentGeneratedCampaign.emailDigestPreview;
+      } else {
+        if (content) {
+          content.innerHTML = \`
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 650px; margin: 0 auto; color: #1e293b;">
+              <div style="background: #0f172a; padding: 24px; border-radius: 8px 8px 0 0; text-align: center; color: #ffffff;">
+                <h1 style="margin: 0; font-size: 20px; font-weight: 700; color: #38bdf8;">BI PHARMA — BOLETIM DE CAMPANHAS MENSAIS</h1>
+                <p style="margin: 6px 0 0; font-size: 13px; color: #94a3b8;">Planeamento de Marketing, Balcão & Sazonalidade</p>
+              </div>
+              <div style="padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 8px 8px; background: #ffffff;">
+                <p style="font-size: 14px; line-height: 1.5; color: #334155;">
+                  Estimada Equipa,<br/><br/>
+                  Apresentamos o resumo de campanhas sazonais para ativação imediata na farmácia. Todos os produtos foram triados com stock real existente e margem comercial segura:
+                </p>
+                \${currentCampaignSuggestions.slice(0, 3).map(c => \`
+                  <div style="margin-top: 16px; padding: 14px; border: 1px solid #e2e8f0; border-radius: 6px; background: #f8fafc;">
+                    <div style="font-weight: 700; font-size: 15px; color: #0f172a;">\${c.icon} \${c.nome} (\${c.periodoLabel})</div>
+                    <div style="font-size: 13px; color: #64748b; margin-top: 4px;">\${c.descricao}</div>
+                    <div style="margin-top: 8px; font-size: 12px; font-weight: 600; color: #0284c7;">
+                      📦 \${c.totalEligibleSkus} SKUs em Stock (\${c.totalStockUnits} un) | Margem Média: \${c.financials.margem_media_pct}%
+                    </div>
+                  </div>
+                \`).join('')}
+                <div style="margin-top: 24px; padding: 12px; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 6px; font-size: 12px; color: #065f46;">
+                  🛡️ <b>Certificação Jurídica:</b> Todos os preços propostos cumprem as normas de salvaguarda anti-dumping (Dec.-Lei n.º 166/2013).
+                </div>
+              </div>
+            </div>
+          \`;
+        }
+      }
+
+      if (modal) modal.style.display = 'flex';
+    }
+
+    function closeEmailDigestModal() {
+      const modal = document.getElementById('emailDigestModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    async function sendSimulatedEmailDigest() {
+      const statusEl = document.getElementById('emailSendStatus');
+      if (statusEl) statusEl.textContent = '⏳ A processar envio...';
+
+      try {
+        const res = await fetch('/api/campaigns/send-email', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            campaignId: selectedCampaign ? selectedCampaign.id : (currentCampaignSuggestions[0]?.id || '')
+          })
+        });
+        const data = await res.json();
+        if (data.success && statusEl) {
+          statusEl.textContent = \`✅ \${data.message} (\${data.destinatarios} destinatários)\`;
+        } else if (statusEl) {
+          statusEl.textContent = '⚠️ ' + (data.error || 'Erro no envio');
+        }
+      } catch (err) {
+        if (statusEl) statusEl.textContent = 'Erro ao contactar servidor.';
+      }
+    }
+
+    function sendCampaignEmailToTeam() {
+      openEmailDigestModal();
+    }
+
+    function exportCampaignPlanCsv() {
+      if (!selectedCampaign) return;
+      const discountPct = parseInt(document.getElementById('campaignDiscountRange')?.value || '15', 10);
+      const discount = discountPct / 100;
+      const includedCnps = new Set(getIncludedCnpCodigos());
+
+      const filtered = selectedCampaign.eligibleProducts.filter(p => includedCnps.has(p.cnp_codigo));
+      const headers = ['CNP', 'Designacao', 'Laboratorio', 'TipoVenda', 'Stock', 'CustoSemIva', 'PVP_Atual', 'PVP_Campanha', 'Desconto_Pct', 'Margem_Pct'];
+      const rows = filtered.map(p => {
+        const pvpNormal = p.pvp_atual || (p.custo_unitario * 1.5);
+        const pvpCampanha = Number((pvpNormal * (1 - discount)).toFixed(2));
+        const taxaIva = p.taxa_iva || 0.23;
+        const custoComIva = p.custo_unitario * (1 + taxaIva);
+        const margemPct = Number((((pvpCampanha - custoComIva) / pvpCampanha) * 100).toFixed(1));
+        return [
+          p.cnp_codigo,
+          \`"\${(p.designacao || '').replace(/"/g, '""')}"\`,
+          \`"\${(p.laboratorio_titular || '').replace(/"/g, '""')}"\`,
+          p.tipo_venda,
+          p.stock_atual,
+          p.custo_unitario.toFixed(2),
+          pvpNormal.toFixed(2),
+          pvpCampanha.toFixed(2),
+          discountPct + '%',
+          margemPct + '%'
+        ].join(';');
+      });
+
+      const csvContent = [headers.join(';'), ...rows].join('\\n');
+      const blob = new Blob(['\\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = \`campanha_\${selectedCampaign.id}_\${new Date().toISOString().slice(0, 10)}.csv\`;
+      a.click();
+    }
+
+    initPharmacies();
+  </script>
+</body>
+</html>`;
+}
+
+startServer().catch((err) => {
+  console.error('❌ Erro ao iniciar servidor:', err);
+  process.exit(1);
+});

@@ -1,0 +1,24 @@
+# Dependências e Build
+node_modules/
+dist/
+
+# Variáveis de Ambiente e Segredos (NUNCA enviar para o GitHub)
+.env
+.env.*
+!.env.example
+
+# Bases de Dados Locais Embebidas
+.pgdata/
+.pgdata_utf8/
+
+# Ficheiros Reais de Clientes / Relatórios Locais (Anonimização & RGPD)
+baptista/
+Avenida/
+output/
+*.pdf
+*.csv
+
+# Logs e Sistema
+*.log
+.DS_Store
+Thumbs.db

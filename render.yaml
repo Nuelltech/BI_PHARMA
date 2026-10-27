@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: bi-pharma-demo
+    runtime: node
+    plan: free
+    buildCommand: npm install && npx prisma generate
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        sync: false
+      - key: MASTER_ACCESS_CODE
+        value: MASTER-BI
+      - key: ANTHROPIC_API_KEY
+        sync: false

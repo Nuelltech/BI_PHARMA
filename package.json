@@ -1,0 +1,36 @@
+{
+  "name": "bi-pharma-etl",
+  "version": "1.0.0",
+  "description": "Motor de ETL e Inteligência de Inventário Farmacêutico (Fase 1 - Backend e Base de Dados)",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "build": "tsc",
+    "db:push": "prisma db push",
+    "db:generate": "prisma generate",
+    "etl": "tsx src/cli.ts etl",
+    "analyze": "tsx src/cli.ts analyze",
+    "pipeline": "tsx src/cli.ts pipeline",
+    "seed:supabase": "tsx src/seed_supabase.ts",
+    "dashboard": "tsx src/server.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.5.0",
+    "csv-parser": "^3.2.0",
+    "dotenv": "^16.4.7",
+    "iconv-lite": "^0.6.3",
+    "pdf-parse": "^1.1.1",
+    "prisma": "^6.5.0",
+    "tsx": "^4.19.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/pdf-parse": "^1.1.4",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  },
+  "optionalDependencies": {
+    "embedded-postgres": "latest"
+  }
+}
