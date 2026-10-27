@@ -12,6 +12,27 @@ try {
   console.warn('[Classifier] Dicionário FirstPharma não carregado:', e);
 }
 
+export interface TaxonomyEntry {
+  macro_area: string;
+  categoria: string;
+  subcategoria: string;
+  sazonalidade: string;
+  gh_codigo: string | null;
+  gh_switch_cnp: string | null;
+  gh_switch_nome: string | null;
+  gh_switch_margem_ganho: number | null;
+}
+
+let taxonomyDict: Record<string, TaxonomyEntry> = {};
+try {
+  const taxPath = path.join(__dirname, '../data/category_taxonomy_map.json');
+  if (fs.existsSync(taxPath)) {
+    taxonomyDict = JSON.parse(fs.readFileSync(taxPath, 'utf-8'));
+  }
+} catch (e) {
+  console.warn('[Classifier] Dicionário de taxonomia não carregado:', e);
+}
+
 export type TipoVenda = 'VENDA_LIVRE' | 'MNSRM' | 'MSRM';
 export type SegmentoProduto = 'GENERICO_MG' | 'MEDICAMENTO_MARCA' | 'VENDA_LIVRE_PSBE';
 
@@ -21,8 +42,33 @@ export interface ProductClassification {
   eh_generico: boolean;
   molecula_dci: string | null;
   grupo_equivalencia_dci: string | null;
+  macro_area?: string;
   categoria: string;
+  subcategoria?: string;
+  sazonalidade?: string;
+  gh_codigo?: string | null;
+  gh_switch_cnp?: string | null;
+  gh_switch_nome?: string | null;
+  gh_switch_margem_ganho?: number | null;
   subcategoria_cross_sell: string;
+}
+
+function enrichWithTaxonomy(res: ProductClassification, code: string): ProductClassification {
+  const tax = taxonomyDict[code];
+  if (tax) {
+    return {
+      ...res,
+      macro_area: tax.macro_area || res.macro_area,
+      categoria: tax.categoria || res.categoria,
+      subcategoria: tax.subcategoria || res.subcategoria,
+      sazonalidade: tax.sazonalidade || res.sazonalidade,
+      gh_codigo: tax.gh_codigo ?? res.gh_codigo,
+      gh_switch_cnp: tax.gh_switch_cnp ?? res.gh_switch_cnp,
+      gh_switch_nome: tax.gh_switch_nome ?? res.gh_switch_nome,
+      gh_switch_margem_ganho: tax.gh_switch_margem_ganho ?? res.gh_switch_margem_ganho,
+    };
+  }
+  return res;
 }
 
 const MNSRM_BRAND_PATTERNS: RegExp[] = [
@@ -131,6 +177,15 @@ export function classifyProduct(
   taxa_iva?: number | string | null
 ): ProductClassification {
   const code = (cnp_codigo || '').trim();
+  const raw = classifyProductInternal(code, designacao, taxa_iva);
+  return enrichWithTaxonomy(raw, code);
+}
+
+function classifyProductInternal(
+  code: string,
+  designacao: string,
+  taxa_iva?: number | string | null
+): ProductClassification {
   const desc = (designacao || '').trim();
   const iva = typeof taxa_iva === 'string' ? parseInt(taxa_iva, 10) : taxa_iva;
 
@@ -471,7 +526,18 @@ export async function classifyAllExistingProducts(prisma: PrismaClient): Promise
   let genericosMg = 0;
   let marca = 0;
 
-  const updatesNeeded: Array<{ cnp_codigo: string; tipo_venda: string; categoria: string }> = [];
+  const updatesNeeded: Array<{
+    cnp_codigo: string;
+    tipo_venda: string;
+    macro_area?: string;
+    categoria: string;
+    subcategoria?: string;
+    sazonalidade?: string;
+    gh_codigo?: string | null;
+    gh_switch_cnp?: string | null;
+    gh_switch_nome?: string | null;
+    gh_switch_margem_ganho?: number | null;
+  }> = [];
 
   for (const p of produtos) {
     const c = classifyProduct(p.cnp_codigo, p.designacao, p.taxa_iva);
@@ -482,25 +548,45 @@ export async function classifyAllExistingProducts(prisma: PrismaClient): Promise
     if (c.segmento === 'GENERICO_MG') genericosMg++;
     else if (c.segmento === 'MEDICAMENTO_MARCA') marca++;
 
-    if (p.tipo_venda !== c.tipo_venda || (!p.categoria && c.categoria)) {
+    if (
+      p.tipo_venda !== c.tipo_venda ||
+      p.categoria !== c.categoria ||
+      p.macro_area !== c.macro_area ||
+      p.subcategoria !== c.subcategoria ||
+      p.sazonalidade !== c.sazonalidade
+    ) {
       updatesNeeded.push({
         cnp_codigo: p.cnp_codigo,
         tipo_venda: c.tipo_venda,
+        macro_area: c.macro_area,
         categoria: c.categoria,
+        subcategoria: c.subcategoria,
+        sazonalidade: c.sazonalidade,
+        gh_codigo: c.gh_codigo,
+        gh_switch_cnp: c.gh_switch_cnp,
+        gh_switch_nome: c.gh_switch_nome,
+        gh_switch_margem_ganho: c.gh_switch_margem_ganho,
       });
     }
   }
 
-  const CHUNK_SIZE = 250;
+  const CHUNK_SIZE = 100;
   for (let i = 0; i < updatesNeeded.length; i += CHUNK_SIZE) {
     const chunk = updatesNeeded.slice(i, i + CHUNK_SIZE);
-    await prisma.$transaction(
+    await Promise.all(
       chunk.map((u) =>
         prisma.produtoMestre.update({
           where: { cnp_codigo: u.cnp_codigo },
           data: {
             tipo_venda: u.tipo_venda,
+            macro_area: u.macro_area,
             categoria: u.categoria,
+            subcategoria: u.subcategoria,
+            sazonalidade: u.sazonalidade,
+            gh_codigo: u.gh_codigo,
+            gh_switch_cnp: u.gh_switch_cnp,
+            gh_switch_nome: u.gh_switch_nome,
+            gh_switch_margem_ganho: u.gh_switch_margem_ganho,
           },
         })
       )

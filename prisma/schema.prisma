@@ -25,16 +25,23 @@ model Farmacia {
 }
 
 model ProdutoMestre {
-  cnp_codigo         String              @id
-  aim                String?
-  designacao         String
-  tipo_venda         String?             // MSRM ou MNSRM
-  categoria          String?
-  pvp                Decimal?            @db.Decimal(10, 2)
-  margem_padrao      Decimal?            @db.Decimal(10, 2)
-  taxa_iva           Int?
-  inventarios        Inventario[]
-  vendas             Venda[]
+  cnp_codigo              String              @id
+  aim                     String?
+  designacao              String
+  tipo_venda              String?             // MSRM, MNSRM, VENDA_LIVRE
+  macro_area              String?             // MSRM, MNSRM_OTC, DERMOCOSMETICA, NUTRICAO_SUPLEMENTOS, DISPOSITIVOS_SAUDE
+  categoria               String?             // Nível 2: Família (ex: Alívio da Dor & Febre, Gripes & Vias Respiratórias, etc.)
+  subcategoria            String?             // Nível 3: Subcategoria / Sintoma específico (ex: Dor Tópica, Antitússicos, Laxantes)
+  sazonalidade            String?             // INVERNO, PRIMAVERA, VERAO, TODO_O_ANO
+  gh_codigo               String?             // Código do Grupo Homogéneo
+  gh_switch_cnp           String?             // CNP da sugestão switch (maior margem)
+  gh_switch_nome          String?             // Designação da sugestão switch
+  gh_switch_margem_ganho  Decimal?            @db.Decimal(10, 2) // Ganho unitário (€) ou percentual
+  pvp                     Decimal?            @db.Decimal(10, 2)
+  margem_padrao           Decimal?            @db.Decimal(10, 2)
+  taxa_iva                Int?
+  inventarios             Inventario[]
+  vendas                  Venda[]
 }
 
 // ==========================================
