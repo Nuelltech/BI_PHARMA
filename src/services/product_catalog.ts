@@ -20,6 +20,8 @@ export interface CatalogItem {
   normCategoria: string;
   tipoVenda: string; // VENDA_LIVRE | MNSRM | MSRM
   ehGenerico: boolean;
+  moleculaDci?: string | null;
+  grupoDci?: string | null;
   stock: number;
   custo: number;
   pvp: number;
@@ -40,7 +42,7 @@ export interface CatalogSearchParams {
   limite?: number;
 }
 
-const CACHE_TTL_MS = 5 * 60 * 1000;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const catalogCache = new Map<string, { at: number; items: CatalogItem[] }>();
 
 export function normalizeText(str: string): string {
@@ -65,7 +67,7 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
   const cached = catalogCache.get(farmaciaId);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.items;
 
-  const [inventarios, vendas] = await Promise.all([
+  const [inventarios, vendas, precosFarmacia] = await Promise.all([
     prisma.inventario.findMany({
       where: { farmaciaId },
       select: { cnp_codigo: true, quantidade: true, custo_unitario: true, data_validade: true },
@@ -75,6 +77,12 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
       where: { farmaciaId },
       _sum: { quantidade: true, valor_total: true },
     }),
+    (prisma as any).precoFarmacia
+      ? (prisma as any).precoFarmacia.findMany({
+          where: { farmaciaId },
+          select: { cnp_codigo: true, pvp: true, margem: true },
+        })
+      : Promise.resolve([]),
   ]);
 
   const invMap = new Map<string, { stock: number; custo: number; validade: Date | null }>();
@@ -91,6 +99,14 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
     vendMap.set(v.cnp_codigo, { qtd: v._sum.quantidade || 0, fat: Number(v._sum.valor_total || 0) });
   }
 
+  const precoMap = new Map<string, { pvp: number | null; margem: number | null }>();
+  for (const pf of precosFarmacia as any[]) {
+    precoMap.set(pf.cnp_codigo, {
+      pvp: pf.pvp !== null && pf.pvp !== undefined ? Number(pf.pvp) : null,
+      margem: pf.margem !== null && pf.margem !== undefined ? Number(pf.margem) : null,
+    });
+  }
+
   const cnps = Array.from(new Set([...invMap.keys(), ...vendMap.keys()]));
   const produtos = await prisma.produtoMestre.findMany({
     where: { cnp_codigo: { in: cnps } },
@@ -100,13 +116,16 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
   const items: CatalogItem[] = produtos.map((p) => {
     const inv = invMap.get(p.cnp_codigo);
     const vend = vendMap.get(p.cnp_codigo);
+    const pf = precoMap.get(p.cnp_codigo);
     const c = classifyProduct(p.cnp_codigo, p.designacao, p.taxa_iva);
     const custo = inv?.custo || 0;
     const vendasQtd = vend?.qtd || 0;
     const faturacao = vend?.fat || 0;
-    const pvp = p.pvp ? Number(p.pvp) : vendasQtd > 0 ? faturacao / vendasQtd : custo * 1.4;
-    const margem = p.margem_padrao
-      ? Number(p.margem_padrao)
+    const rawPvp = pf?.pvp !== undefined && pf?.pvp !== null ? pf.pvp : p.pvp ? Number(p.pvp) : null;
+    const rawMargem = pf?.margem !== undefined && pf?.margem !== null ? pf.margem : p.margem_padrao ? Number(p.margem_padrao) : null;
+    const pvp = rawPvp ? rawPvp : vendasQtd > 0 ? faturacao / vendasQtd : custo * 1.4;
+    const margem = rawMargem !== null
+      ? rawMargem
       : pvp > custo && pvp > 0
         ? ((pvp - custo) / pvp) * 100
         : 0;
@@ -119,6 +138,8 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
       normCategoria: normalizeText(c.categoria || ''),
       tipoVenda: c.tipo_venda,
       ehGenerico: !!c.eh_generico,
+      moleculaDci: c.molecula_dci,
+      grupoDci: c.grupo_equivalencia_dci,
       stock: inv?.stock || 0,
       custo,
       pvp,

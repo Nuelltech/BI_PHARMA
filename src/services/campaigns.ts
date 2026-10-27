@@ -1947,7 +1947,7 @@ export async function analyzeProductMarketingAndCrossSell360(
       categoria: target.categoria,
       tipoVenda: target.ehGenerico ? 'GENERICO_MG' : target.tipoVenda,
       ehGenerico: target.ehGenerico,
-      grupoDci: target.grupoDci,
+      grupoDci: target.grupoDci || null,
       stockAtual: target.stock,
       vendasAno: target.vendasQtd,
       vmmAtual: vmm,

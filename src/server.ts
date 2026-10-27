@@ -3,9 +3,11 @@ import url from 'url';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 import { ensureDatabaseReady } from './db';
-import { analyzePharmacyInventory } from './services/analysis';
+import { analyzePharmacyInventory, PharmacyAnalysisReport } from './services/analysis';
 import { classifyAllExistingProducts, classifyProduct } from './services/classifier';
+import { getPharmacyCatalog, invalidateCatalog } from './services/product_catalog';
 import { processFreeformQuestion } from './services/copilot';
 import { processQuestionWithLlmOrLocal } from './services/llm_router';
 import {
@@ -32,7 +34,160 @@ import {
 } from './services/campaigns';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const MASTER_ACCESS_CODE = (process.env.MASTER_ACCESS_CODE || 'MASTER-BI').trim().toUpperCase();
+const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || 'Nuelltech#2026').trim();
+const ADMIN_SESSION_TOKEN =
+  'ADM_' +
+  crypto
+    .createHmac('sha256', ADMIN_PASSWORD)
+    .update('BI_PHARMA_ADMIN_SESSION_V1')
+    .digest('hex')
+    .slice(0, 32)
+    .toUpperCase();
+
+// ============================================================================
+// CACHE EM MEMÓRIA DO SERVIDOR + DEDUPLICAÇÃO DE PEDIDOS + PRÉ-AQUECIMENTO
+// ============================================================================
+const analysisCache = new Map<string, any>();
+const analysisInFlight = new Map<string, Promise<any>>();
+const campaignsCache = new Map<string, any>();
+const campaignsInFlight = new Map<string, Promise<any>>();
+
+function invalidateAllPharmacyCaches(farmaciaId?: string) {
+  invalidateCatalog(farmaciaId);
+  if (farmaciaId) {
+    for (const k of Array.from(analysisCache.keys())) {
+      if (k.startsWith(`${farmaciaId}:`)) analysisCache.delete(k);
+    }
+    campaignsCache.delete(farmaciaId);
+  } else {
+    analysisCache.clear();
+    campaignsCache.clear();
+  }
+}
+
+async function getCachedOrComputeAnalysis(
+  prisma: any,
+  farmaciaId: string,
+  diasMonos: number,
+  cobertura: number,
+  mesesVmm: number,
+  forceRefresh = false
+): Promise<PharmacyAnalysisReport> {
+  const key = `${farmaciaId}:${diasMonos}:${cobertura}:${mesesVmm}`;
+  if (!forceRefresh && analysisCache.has(key)) {
+    return analysisCache.get(key);
+  }
+  if (!forceRefresh && analysisInFlight.has(key)) {
+    return analysisInFlight.get(key)!;
+  }
+  const promise = analyzePharmacyInventory(prisma, farmaciaId, {
+    periodoMonosDias: diasMonos,
+    limiteCoberturaMeses: cobertura,
+    mesesHistoricoVMM: mesesVmm,
+  })
+    .then((rep) => {
+      analysisCache.set(key, rep);
+      analysisInFlight.delete(key);
+      return rep;
+    })
+    .catch((err) => {
+      analysisInFlight.delete(key);
+      throw err;
+    });
+  analysisInFlight.set(key, promise);
+  return promise;
+}
+
+async function getCachedOrComputeCampaignsPayload(
+  prisma: any,
+  activeFarmacia: any,
+  mesQuery?: number,
+  forceRefresh = false
+) {
+  const cacheKey = `${activeFarmacia.id}:${mesQuery || 'auto'}`;
+  if (!forceRefresh && campaignsCache.has(cacheKey)) {
+    return campaignsCache.get(cacheKey);
+  }
+  if (!forceRefresh && campaignsInFlight.has(cacheKey)) {
+    return campaignsInFlight.get(cacheKey)!;
+  }
+
+  const promise = (async () => {
+    if (forceRefresh) {
+      invalidateCatalog(activeFarmacia.id);
+    }
+    // Carrega o catálogo uma única vez antes de executar as duas análises em paralelo
+    await getPharmacyCatalog(prisma, activeFarmacia.id);
+    const [suggestions, marketingIntel] = await Promise.all([
+      getSeasonalCampaignSuggestions(prisma, activeFarmacia.id, mesQuery),
+      getMarketingAndCrossSellingIntelligence(prisma, activeFarmacia.id),
+    ]);
+
+    const enriched = suggestions.map((s) => ({
+      ...s,
+      id: s.campanha.id,
+      nome: s.campanha.titulo,
+      icon: s.campanha.icone,
+      periodoLabel: s.campanha.epoca,
+      descricao: s.campanha.descricao,
+      tipoCampanha: s.campanha.tipoCampanha || 'EPOCA_CALENDARIO',
+      contextoEpoca: s.campanha.contextoEpoca || null,
+      tipo:
+        s.campanha.tipoCampanha === 'LIQUIDACAO_STOCK'
+          ? 'LIQUIDACAO_STOCK'
+          : s.campanha.epoca.includes('Efeméride')
+            ? 'EFEMERIDE'
+            : 'SAZONAL_CLIMA',
+      eligibleProducts: s.produtosSugeridos.map((p) => ({
+        ...p,
+        pvp_atual: p.pvp,
+        custo_unitario: p.custo_unitario,
+      })),
+      totalEligibleSkus: s.totalArtigosDisponiveis,
+      totalStockUnits: s.totalUnidadesStock,
+      financials: (() => {
+        const fin = calculateCampaignFinancials(s.produtosSugeridos, s.campanha.descontoSugeridoPct);
+        return {
+          ...fin,
+          margem_media_pct: Number(fin.margemFinalPct.toFixed(1)),
+          anti_dumping_valido: fin.cumpreAntiDumping,
+        };
+      })(),
+    }));
+
+    const payload = {
+      farmacia: activeFarmacia,
+      campanhas: enriched,
+      suggestions: enriched,
+      overview: marketingIntel.overview,
+      crossSellingPlans: marketingIntel.crossSellingPlans,
+    };
+    campaignsCache.set(cacheKey, payload);
+    campaignsInFlight.delete(cacheKey);
+    return payload;
+  })().catch((err) => {
+    campaignsInFlight.delete(cacheKey);
+    throw err;
+  });
+
+  campaignsInFlight.set(cacheKey, promise);
+  return promise;
+}
+
+async function warmUpAllPharmacyCaches(prisma: any) {
+  try {
+    const farms = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
+    for (const f of farms) {
+      await getCachedOrComputeAnalysis(prisma, f.id, 90, 4, 12);
+      await getCachedOrComputeCampaignsPayload(prisma, f);
+    }
+    console.log(
+      `⚡ [Cache Warm-Up] ${farms.length} farmácia(s) pré-calculadas em memória RAM (Dashboard & Campanhas instantâneos < 10ms)!`
+    );
+  } catch (err: any) {
+    console.warn('[Cache Warm-Up] Aviso ao pré-aquecer cache:', err.message);
+  }
+}
 
 function maskNif(rawNif: string): string {
   const clean = (rawNif || '').trim();
@@ -42,12 +197,19 @@ function maskNif(rawNif: string): string {
   return clean;
 }
 
+const DEFAULT_SECURE_CODES: Record<string, string> = {
+  A: 'FARM-A-7842',
+  B: 'FARM-B-9315',
+  C: 'FARM-C-4629',
+  D: 'FARM-D-8154',
+};
+
 async function ensureAnonymizedTenantsAndAccessCodes(prisma: any) {
   const farms = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
   for (let idx = 0; idx < farms.length; idx++) {
     const f = farms[idx];
     const letter = String.fromCharCode(65 + idx); // A, B, C...
-    const defaultCode = `FARMACIA-${letter}`;
+    const secureDefault = DEFAULT_SECURE_CODES[letter] || `FARM-${letter}-${1000 + idx * 1337}`;
     const lowerNome = (f.nome || '').toLowerCase();
 
     let newNome = f.nome;
@@ -56,7 +218,10 @@ async function ensureAnonymizedTenantsAndAccessCodes(prisma: any) {
       newNome = `Farmácia ${letter}`;
     }
 
-    const newCode = f.codigo_acesso && f.codigo_acesso.trim() ? f.codigo_acesso.trim().toUpperCase() : defaultCode;
+    const currentCode = (f.codigo_acesso || '').trim().toUpperCase();
+    // Atualiza códigos previsíveis antigos (FARMACIA-A, FARMACIA-B) para códigos com PIN impossível de adivinhar
+    const isPredictableOldCode = !currentCode || /^FARMACIA-[A-Z]$/.test(currentCode);
+    const newCode = isPredictableOldCode ? secureDefault : currentCode;
 
     if (newNome !== f.nome || newCode !== f.codigo_acesso) {
       await prisma.farmacia.update({
@@ -67,11 +232,11 @@ async function ensureAnonymizedTenantsAndAccessCodes(prisma: any) {
   }
 
   const updated = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
-  console.log('\n🔐 [ACESSOS MULTI-TENANT E ANONIMIZAÇÃO PARA PITCH]:');
-  console.log(`   👑 Código Master (Admin / Multi-Farmácia): ${MASTER_ACCESS_CODE} (ou MASTER)`);
+  console.log('\n🔐 [ACESSOS MULTI-TENANT ISOLADOS & ADMIN PROTEGIDO POR PASSWORD]:');
+  console.log(`   👑 Acesso Admin (Requer Password): http://localhost:${PORT}/?admin=1 (Password configurada em ADMIN_PASSWORD)`);
   for (const uf of updated) {
     console.log(
-      `   🏥 ${uf.nome.padEnd(22)} | NIF: ${maskNif(uf.nif).padEnd(11)} | Código Isolado: ${(uf.codigo_acesso || '').padEnd(12)} | Link Direto: http://localhost:${PORT}/?acesso=${uf.codigo_acesso}`
+      `   🏥 ${uf.nome.padEnd(22)} | NIF: ${maskNif(uf.nif).padEnd(11)} | Código Exclusivo: ${(uf.codigo_acesso || '').padEnd(12)} | Link Cliente: http://localhost:${PORT}/?acesso=${uf.codigo_acesso}`
     );
   }
   console.log('');
@@ -90,12 +255,6 @@ async function startServer() {
     await ensureAnonymizedTenantsAndAccessCodes(prisma);
   }
 
-  console.log('[Classificador] A verificar e atualizar estatuto (VENDA_LIVRE / MNSRM / MSRM) e segmento (GENERICO_MG / MARCA)...');
-  const statsClass = await classifyAllExistingProducts(prisma);
-  console.log(
-    `[Classificador] ${statsClass.total} produtos caracterizados -> PSBE: ${statsClass.vendaLivre} | Genéricos MG: ${statsClass.genericosMg} | Marca: ${statsClass.marca}`
-  );
-
   const server = http.createServer(async (req, res) => {
     try {
       const parsedUrl = url.parse(req.url || '/', true);
@@ -112,28 +271,29 @@ async function startServer() {
       }
 
       async function resolveAccessContext(explicitCode?: string | null) {
+        const headerToken = String(req.headers['x-access-code'] || '').trim();
+        // O Modo Admin SÓ é aceite através do Token Assinado (gerado após validar a Password de Admin), NUNCA por query string no URL!
+        if (
+          headerToken.toUpperCase() === ADMIN_SESSION_TOKEN ||
+          (explicitCode && explicitCode.trim().toUpperCase() === ADMIN_SESSION_TOKEN)
+        ) {
+          return {
+            authenticated: true,
+            role: 'ADMIN' as const,
+            code: ADMIN_SESSION_TOKEN,
+            lockedFarmacia: null,
+          };
+        }
+
         const rawCode = String(
           explicitCode ||
-            req.headers['x-access-code'] ||
+            headerToken ||
             parsedUrl.query.accessCode ||
             parsedUrl.query.acesso ||
             ''
         )
           .trim()
           .toUpperCase();
-
-        if (
-          rawCode === MASTER_ACCESS_CODE ||
-          rawCode === 'MASTER' ||
-          rawCode === 'ADMIN-BI-2026'
-        ) {
-          return {
-            authenticated: true,
-            role: 'ADMIN' as const,
-            code: rawCode,
-            lockedFarmacia: null,
-          };
-        }
 
         if (rawCode.length > 0) {
           const matchedFarm = await prisma.farmacia.findFirst({
@@ -174,7 +334,8 @@ async function startServer() {
         if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
           return ctx.lockedFarmacia;
         }
-        if (requestedId && requestedId.trim().length > 0) {
+        // Apenas o ADMIN autenticado pode pedir uma farmácia específica ou listar
+        if (ctx.role === 'ADMIN' && requestedId && requestedId.trim().length > 0) {
           const f = await prisma.farmacia.findUnique({ where: { id: requestedId.trim() } });
           if (f) return f;
         }
@@ -183,25 +344,57 @@ async function startServer() {
             id: '',
             nome: 'Farmácia A',
             nif: '000000000',
-            codigo_acesso: 'FARMACIA-A',
+            codigo_acesso: 'FARM-A-7842',
           }
         );
       }
 
-      // 0A. Endpoint de Autenticação / Validação de Código de Acesso (Single-Pharmacy vs Master Admin)
+      // 0A. Endpoint de Autenticação / Validação (Código Exclusivo de Farmácia vs Password de Administrador)
       if (pathname === '/api/auth/verify' && req.method === 'POST') {
         let body = '';
         req.on('data', (chunk) => (body += chunk));
         req.on('end', async () => {
           try {
             const parsed = JSON.parse(body || '{}');
-            const ctx = await resolveAccessContext(parsed.code);
+            const adminPasswordInput = String(parsed.adminPassword || '').trim();
+            const rawCodeInput = String(parsed.code || '').trim();
+
+            let ctx;
+            if (adminPasswordInput.length > 0) {
+              if (adminPasswordInput === ADMIN_PASSWORD) {
+                ctx = {
+                  authenticated: true,
+                  role: 'ADMIN' as const,
+                  code: ADMIN_SESSION_TOKEN,
+                  lockedFarmacia: null,
+                };
+              } else {
+                res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(
+                  JSON.stringify({
+                    ok: false,
+                    error: 'Password de Administrador incorreta.',
+                  })
+                );
+                return;
+              }
+            } else if (rawCodeInput === ADMIN_PASSWORD) {
+              ctx = {
+                authenticated: true,
+                role: 'ADMIN' as const,
+                code: ADMIN_SESSION_TOKEN,
+                lockedFarmacia: null,
+              };
+            } else {
+              ctx = await resolveAccessContext(rawCodeInput);
+            }
+
             if (!ctx.authenticated) {
               res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
               res.end(
                 JSON.stringify({
                   ok: false,
-                  error: 'Código de acesso inválido. Introduza o código da sua Farmácia (ex: FARMACIA-A) ou o código Master.',
+                  error: 'Código de acesso inválido. Utilize o link ou código exclusivo atribuído à sua Farmácia.',
                 })
               );
               return;
@@ -224,14 +417,13 @@ async function startServer() {
                       id: ctx.lockedFarmacia.id,
                       nome: ctx.lockedFarmacia.nome,
                       nif: maskNif(ctx.lockedFarmacia.nif),
-                      codigo_acesso: ctx.lockedFarmacia.codigo_acesso,
                     }
                   : null,
                 pharmacies: allFarms.map((f) => ({
                   id: f.id,
                   nome: f.nome,
                   nif: maskNif(f.nif),
-                  codigo_acesso: f.codigo_acesso,
+                  codigo_acesso: ctx.role === 'ADMIN' ? f.codigo_acesso : undefined,
                 })),
               })
             );
@@ -252,7 +444,7 @@ async function startServer() {
             const ctx = await resolveAccessContext();
             if (ctx.role !== 'ADMIN') {
               res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-              res.end(JSON.stringify({ ok: false, error: 'Apenas o acesso Master/Admin pode gerir farmácias.' }));
+              res.end(JSON.stringify({ ok: false, error: 'Apenas o Administrador pode gerir farmácias.' }));
               return;
             }
             const { farmaciaId, nome, codigo_acesso } = JSON.parse(body || '{}');
@@ -269,6 +461,7 @@ async function startServer() {
                 codigo_acesso: cleanCode,
               },
             });
+            invalidateAllPharmacyCaches(updated.id);
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(
               JSON.stringify({
@@ -358,6 +551,9 @@ async function startServer() {
             const venTrans = await transformStagingVendas(prisma, newFarm.id, venIngest.batchId);
 
             await classifyAllExistingProducts(prisma);
+            invalidateAllPharmacyCaches(newFarm.id);
+            getCachedOrComputeAnalysis(prisma, newFarm.id, 90, 4, 12).catch(() => {});
+            getCachedOrComputeCampaignsPayload(prisma, newFarm).catch(() => {});
 
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(
@@ -393,6 +589,11 @@ async function startServer() {
       // 0. Endpoint de Lista de Farmácias (Multi-Tenant com Isolamento por Código de Acesso)
       if (pathname === '/api/pharmacies' && req.method === 'GET') {
         const ctx = await resolveAccessContext();
+        if (!ctx.authenticated) {
+          res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify([]));
+          return;
+        }
         let farms;
         if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
           farms = [ctx.lockedFarmacia];
@@ -415,7 +616,7 @@ async function startServer() {
         return;
       }
 
-      // 1. Endpoint de Análise Parametrizável (Multi-Tenant)
+      // 1. Endpoint de Análise Parametrizável (Multi-Tenant + Cache Instantânea)
       if (pathname === '/api/analysis' && req.method === 'GET') {
         const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
         const activeFarmacia = await getActiveFarmacia(farmIdQuery);
@@ -423,12 +624,16 @@ async function startServer() {
         const diasMonos = parseInt(String(parsedUrl.query.diasMonos || '90'), 10);
         const cobertura = parseFloat(String(parsedUrl.query.cobertura || '4'));
         const mesesVmm = parseInt(String(parsedUrl.query.mesesVmm || '12'), 10);
+        const forceRefresh = String(parsedUrl.query.refresh || '') === '1';
 
-        const report = await analyzePharmacyInventory(prisma, activeFarmacia.id, {
-          periodoMonosDias: Number.isNaN(diasMonos) ? 90 : diasMonos,
-          limiteCoberturaMeses: Number.isNaN(cobertura) ? 4 : cobertura,
-          mesesHistoricoVMM: Number.isNaN(mesesVmm) ? 12 : mesesVmm,
-        });
+        const report = await getCachedOrComputeAnalysis(
+          prisma,
+          activeFarmacia.id,
+          Number.isNaN(diasMonos) ? 90 : diasMonos,
+          Number.isNaN(cobertura) ? 4 : cobertura,
+          Number.isNaN(mesesVmm) ? 12 : mesesVmm,
+          forceRefresh
+        );
 
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify(report));
@@ -490,60 +695,21 @@ async function startServer() {
         return;
       }
 
-      // 2.5. Endpoints de Campanhas Comerciais e Sazonais 360º (Multi-Tenant)
+      // 2.5. Endpoints de Campanhas Comerciais e Sazonais 360º (Multi-Tenant + Cache Instantânea)
       if (pathname === '/api/campaigns/suggestions' && req.method === 'GET') {
         const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
         const activeFarmacia = await getActiveFarmacia(farmIdQuery);
         const mesQuery = parseInt(String(parsedUrl.query.mes || ''), 10);
-        const [suggestions, marketingIntel] = await Promise.all([
-          getSeasonalCampaignSuggestions(
-            prisma,
-            activeFarmacia.id,
-            Number.isNaN(mesQuery) ? undefined : mesQuery
-          ),
-          getMarketingAndCrossSellingIntelligence(prisma, activeFarmacia.id),
-        ]);
-        const enriched = suggestions.map((s) => ({
-          ...s,
-          id: s.campanha.id,
-          nome: s.campanha.titulo,
-          icon: s.campanha.icone,
-          periodoLabel: s.campanha.epoca,
-          descricao: s.campanha.descricao,
-          tipoCampanha: s.campanha.tipoCampanha || 'EPOCA_CALENDARIO',
-          contextoEpoca: s.campanha.contextoEpoca || null,
-          tipo:
-            s.campanha.tipoCampanha === 'LIQUIDACAO_STOCK'
-              ? 'LIQUIDACAO_STOCK'
-              : s.campanha.epoca.includes('Efeméride')
-                ? 'EFEMERIDE'
-                : 'SAZONAL_CLIMA',
-          eligibleProducts: s.produtosSugeridos.map((p) => ({
-            ...p,
-            pvp_atual: p.pvp,
-            custo_unitario: p.custo_unitario,
-          })),
-          totalEligibleSkus: s.totalArtigosDisponiveis,
-          totalStockUnits: s.totalUnidadesStock,
-          financials: (() => {
-            const fin = calculateCampaignFinancials(s.produtosSugeridos, s.campanha.descontoSugeridoPct);
-            return {
-              ...fin,
-              margem_media_pct: Number(fin.margemFinalPct.toFixed(1)),
-              anti_dumping_valido: fin.cumpreAntiDumping,
-            };
-          })(),
-        }));
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(
-          JSON.stringify({
-            farmacia: activeFarmacia,
-            campanhas: enriched,
-            suggestions: enriched,
-            overview: marketingIntel.overview,
-            crossSellingPlans: marketingIntel.crossSellingPlans,
-          })
+        const forceRefresh = String(parsedUrl.query.refresh || '') === '1';
+
+        const payload = await getCachedOrComputeCampaignsPayload(
+          prisma,
+          activeFarmacia,
+          Number.isNaN(mesQuery) ? undefined : mesQuery,
+          forceRefresh
         );
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(payload));
         return;
       }
 
@@ -775,10 +941,13 @@ async function startServer() {
               return;
             }
 
-            const report = await analyzePharmacyInventory(prisma, activeFarmacia.id, {
-              periodoMonosDias: Number(diasMonos) || 90,
-              limiteCoberturaMeses: Number(cobertura) || 4,
-            });
+            const report = await getCachedOrComputeAnalysis(
+              prisma,
+              activeFarmacia.id,
+              Number(diasMonos) || 90,
+              Number(cobertura) || 4,
+              12
+            );
 
             let titulo = '';
             let explicacao = '';
@@ -1477,6 +1646,19 @@ async function startServer() {
 
   server.listen(PORT, () => {
     console.log(`\n🚀 Dashboard BI Pharma ativo em: http://localhost:${PORT}`);
+    // Pré-aquecimento em background para o servidor responder logo às verificações de saúde do Render
+    (async () => {
+      try {
+        console.log('[Classificador] A verificar e atualizar estatuto (VENDA_LIVRE / MNSRM / MSRM) e segmento (GENERICO_MG / MARCA)...');
+        const statsClass = await classifyAllExistingProducts(prisma);
+        console.log(
+          `[Classificador] ${statsClass.total} produtos caracterizados -> PSBE: ${statsClass.vendaLivre} | Genéricos MG: ${statsClass.genericosMg} | Marca: ${statsClass.marca}`
+        );
+        await warmUpAllPharmacyCaches(prisma);
+      } catch (err: any) {
+        console.warn('⚠️ Aviso durante background startup warm-up:', err.message);
+      }
+    })();
   });
 }
 
@@ -1750,6 +1932,19 @@ function getDashboardHtml(): string {
       border-color: var(--primary);
     }
 
+    .weekly-task-item {
+      transition: all 0.2s ease;
+    }
+    .weekly-task-item.task-completed {
+      opacity: 0.55;
+      background: rgba(16, 185, 129, 0.08) !important;
+      border-color: rgba(16, 185, 129, 0.4) !important;
+      text-decoration: line-through;
+    }
+    .weekly-task-item.task-completed input {
+      accent-color: #10b981;
+    }
+
     .modal-backdrop {
       position: fixed; inset: 0;
       background: rgba(0,0,0,0.75);
@@ -1885,7 +2080,8 @@ function getDashboardHtml(): string {
     </div>
 
     <div class="tabs">
-      <button class="tab-btn active" id="tabBtn-copilot" onclick="switchTab('copilot')" style="background: linear-gradient(135deg, rgba(56, 189, 248, 0.25), rgba(168, 85, 247, 0.25)); border-color: var(--primary); color: #38bdf8;">💬 Assistente Copilot (Perguntas Livres)</button>
+      <button class="tab-btn active" id="tabBtn-plano" onclick="switchTab('plano')" style="background: linear-gradient(135deg, rgba(16, 185, 129, 0.25), rgba(56, 189, 248, 0.2)); border-color: #10b981; color: #34d399; font-weight: 800;">📋 Plano da Semana (Equipa)</button>
+      <button class="tab-btn" id="tabBtn-copilot" onclick="switchTab('copilot')" style="background: linear-gradient(135deg, rgba(56, 189, 248, 0.2), rgba(168, 85, 247, 0.2)); border-color: var(--primary); color: #38bdf8;">💬 Assistente Copilot (Perguntas Livres)</button>
       <button class="tab-btn" id="tabBtn-campaigns" onclick="switchTab('campaigns')" style="background: linear-gradient(135deg, rgba(244, 63, 94, 0.2), rgba(245, 158, 11, 0.2)); border-color: #f43f5e; color: #fb7185;">🎯 Campanhas & Marketing 360º</button>
       <button class="tab-btn" id="tabBtn-caducidade" onclick="switchTab('caducidade')">⏳ Risco Elevado de Caducidade <span class="badge badge-danger" id="badge-caducidade" style="margin-left:6px">-</span></button>
       <button class="tab-btn" id="tabBtn-genericos" onclick="switchTab('genericos')">🧬 Consolidação de Genéricos (DCI) <span class="badge badge-purple" id="badge-genericos" style="margin-left:6px">-</span></button>
@@ -1893,8 +2089,121 @@ function getDashboardHtml(): string {
       <button class="tab-btn" id="tabBtn-cobertura" onclick="switchTab('cobertura')">📦 Excesso de Cobertura <span class="badge badge-info" id="badge-cobertura" style="margin-left:6px">-</span></button>
     </div>
 
+    <!-- ABA 0: PLANO DE AÇÃO SEMANAL (MODO SIMPLES PARA A EQUIPA E DIRETOR) -->
+    <div id="tabContent-plano" style="display: block;">
+      <div style="background: linear-gradient(135deg, rgba(16, 185, 129, 0.12), rgba(15, 23, 42, 0.95)); border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 14px; padding: 22px; margin-bottom: 22px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
+          <div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: #34d399; display: flex; align-items: center; gap: 8px;">
+              📋 Folha de Ações da Semana — O que fazer hoje na Farmácia
+            </div>
+            <p style="font-size: 0.88rem; color: #cbd5e1; margin-top: 4px; max-width: 820px; line-height: 1.45;">
+              Em vez de analisar centenas de tabelas, o sistema selecionou automaticamente as <b>tarefas prioritárias desta semana</b> para a gaveta, para o balcão e para o computador de encomendas.
+            </p>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <span id="planoProgressText" style="font-size: 0.86rem; color: #34d399; font-weight: 700; background: rgba(16, 185, 129, 0.15); padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(16,185,129,0.3);">
+              ✅ 0 de 0 tarefas concluídas
+            </span>
+            <button class="btn" onclick="printWeeklyActionPlan()" style="background: linear-gradient(135deg, #10b981, #059669); color: #042f2e; font-weight: 700;">
+              🖨️ Imprimir Folha A4 para a Equipa
+            </button>
+            <button class="btn btn-secondary" onclick="resetWeeklyTasksProgress()" style="font-size: 0.8rem; padding: 7px 12px;" title="Limpar vistos marcados">
+              🔄 Limpar Vistos
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 20px; margin-bottom: 30px;">
+        <!-- CARTÃO 1: VALIDADES URGENTES NA GAVETA -->
+        <div style="background: var(--surface); border: 1px solid rgba(244, 63, 94, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <div style="font-size: 1.05rem; font-weight: 800; color: #fb7185; display: flex; align-items: center; gap: 8px;">
+              🔴 1. Gaveta & Prateleira: Top Validades a Escoar
+            </div>
+            <span id="planoCard1Count" class="badge badge-danger">8 prioritários</span>
+          </div>
+          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
+            Medicamentos e produtos com validade mais próxima. Ações imediatas de separação física:
+          </p>
+          <div id="planoCard1List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
+            <!-- Inserido dinamicamente via JS -->
+          </div>
+          <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); text-align: right;">
+            <button class="btn btn-secondary" onclick="switchTab('caducidade')" style="font-size: 0.76rem; padding: 5px 10px; border-color: #fb7185; color: #fb7185;">
+              Ver todos os produtos em risco de validade →
+            </button>
+          </div>
+        </div>
+
+        <!-- CARTÃO 2: TROCA DE GENÉRICOS NO BALCÃO -->
+        <div style="background: var(--surface); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <div style="font-size: 1.05rem; font-weight: 800; color: #c084fc; display: flex; align-items: center; gap: 8px;">
+              🟠 2. No Balcão: Troca de Marca nos Genéricos
+            </div>
+            <span id="planoCard2Count" class="badge badge-purple">5 moléculas</span>
+          </div>
+          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
+            Dispensar primeiro os laboratórios que estão empatados na gaveta em vez de encomendar sempre o habitual:
+          </p>
+          <div id="planoCard2List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
+            <!-- Inserido dinamicamente via JS -->
+          </div>
+          <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); text-align: right;">
+            <button class="btn btn-secondary" onclick="switchTab('genericos')" style="font-size: 0.76rem; padding: 5px 10px; border-color: #c084fc; color: #c084fc;">
+              Ver análise completa de Genéricos (DCI) →
+            </button>
+          </div>
+        </div>
+
+        <!-- CARTÃO 3: TRAVAR ENCOMENDAS NO SIFARMA -->
+        <div style="background: var(--surface); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <div style="font-size: 1.05rem; font-weight: 800; color: #fbbf24; display: flex; align-items: center; gap: 8px;">
+              🛑 3. Encomendas (Sifarma): Travar Compras
+            </div>
+            <span id="planoCard3Savings" class="badge badge-warning">-- € poupança</span>
+          </div>
+          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
+            Colocar o <b>Ponto de Encomenda / Stock Mínimo = 0</b> nestes códigos para evitar compras automáticas desnecessárias:
+          </p>
+          <div id="planoCard3List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
+            <!-- Inserido dinamicamente via JS -->
+          </div>
+          <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); text-align: right;">
+            <button class="btn btn-secondary" onclick="switchTab('cobertura')" style="font-size: 0.76rem; padding: 5px 10px; border-color: #fbbf24; color: #fbbf24;">
+              Ver todos os excessos de stock →
+            </button>
+          </div>
+        </div>
+
+        <!-- CARTÃO 4: DICAS DE VENDA CRUZADA (BALCÃO) -->
+        <div style="background: var(--surface); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <div style="font-size: 1.05rem; font-weight: 800; color: #38bdf8; display: flex; align-items: center; gap: 8px;">
+              🟢 4. Atendimento ao Balcão: 4 Associações da Semana
+            </div>
+            <span class="badge badge-info">Cross-Selling</span>
+          </div>
+          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
+            Aproveite os produtos que mais saem na farmácia para escoar artigos de venda livre que estão parados:
+          </p>
+          <div id="planoCard4List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
+            <!-- Inserido dinamicamente via JS -->
+          </div>
+          <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); text-align: right;">
+            <button class="btn btn-secondary" onclick="switchTab('campaigns')" style="font-size: 0.76rem; padding: 5px 10px; border-color: #38bdf8; color: #38bdf8;">
+              Abrir Estúdio de Campanhas & Marketing 360º →
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- ABA 1: ASSISTENTE COPILOT DEDICADO (PERGUNTAS LIVRES & CONSULTORIA) -->
-    <div id="tabContent-copilot" style="display: block;">
+    <div id="tabContent-copilot" style="display: none;">
       <div class="ask-card" style="margin-bottom: 24px; padding: 24px;">
         <div style="margin-bottom: 18px;">
           <div style="font-size: 1.15rem; font-weight: 800; color: var(--primary); display: flex; align-items: center; gap: 8px;">
@@ -2322,48 +2631,86 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
-  <!-- MODAL 3: GATE DE ACESSO ISOLADO POR FARMÁCIA OU ADMIN MASTER -->
-  <div class="modal-backdrop" id="authGateModal" style="z-index: 250; background: rgba(2, 6, 23, 0.92);">
-    <div class="modal" style="max-width: 480px; border-color: var(--primary); box-shadow: 0 20px 50px rgba(0,0,0,0.6);">
-      <div style="text-align: center; margin-bottom: 18px;">
-        <div style="font-size: 2.4rem; margin-bottom: 8px;">🔐</div>
-        <h2 style="font-size: 1.25rem; color: var(--text); font-weight: 800;">Acesso BI Pharma — Ambiente de Demonstração</h2>
-        <p style="font-size: 0.85rem; color: var(--muted); margin-top: 6px; line-height: 1.45;">
-          Introduza o <b>Código de Acesso Exclusivo</b> da sua Farmácia para aceder ao seu painel isolado, ou o código <b>Master</b> para gestão multi-farmácia.
-        </p>
-      </div>
-
-      <div style="display: flex; flex-direction: column; gap: 12px;">
-        <div>
-          <label style="font-size: 0.78rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; display: block; margin-bottom: 6px;">
-            Código de Acesso da Farmácia:
-          </label>
-          <input
-            type="text"
-            id="authAccessCodeInput"
-            placeholder="Ex: FARMACIA-A, FARMACIA-B ou MASTER-BI"
-            style="width: 100%; font-size: 1rem; font-weight: 700; text-align: center; letter-spacing: 1px; text-transform: uppercase; padding: 12px;"
-            onkeydown="if(event.key==='Enter') submitAccessCode()"
-          />
+  <!-- MODAL 3: GATE DE ACESSO ISOLADO POR FARMÁCIA OU ADMIN COM PASSWORD -->
+  <div class="modal-backdrop" id="authGateModal" style="z-index: 250; background: rgba(2, 6, 23, 0.94);">
+    <div class="modal" style="max-width: 460px; border-color: var(--primary); box-shadow: 0 20px 50px rgba(0,0,0,0.7);">
+      
+      <!-- VISTA A: ACESSO CLIENTE DE FARMÁCIA -->
+      <div id="authGatePharmacyView">
+        <div style="text-align: center; margin-bottom: 18px;">
+          <div style="font-size: 2.3rem; margin-bottom: 8px;">🏥</div>
+          <h2 style="font-size: 1.25rem; color: var(--text); font-weight: 800;">BI Pharma — Acesso da Farmácia</h2>
+          <p style="font-size: 0.85rem; color: var(--muted); margin-top: 6px; line-height: 1.45;">
+            Introduza o <b>Código de Acesso Exclusivo</b> da sua Farmácia para aceder ao seu painel isolado.
+          </p>
         </div>
 
-        <div id="authGateError" style="display: none; font-size: 0.82rem; color: #fb7185; background: rgba(244, 63, 94, 0.12); border: 1px solid rgba(244, 63, 94, 0.3); padding: 8px 12px; border-radius: 8px; text-align: center;"></div>
-
-        <button class="btn" onclick="submitAccessCode()" style="width: 100%; padding: 12px; font-size: 0.96rem; justify-content: center;">
-          🚀 Entrar no Painel
-        </button>
-
-        <div style="border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px;">
-          <div style="font-size: 0.74rem; color: var(--muted); text-align: center; margin-bottom: 8px;">
-            ⚡ Atalhos Rápidos de Demonstração / Pitch:
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label style="font-size: 0.78rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; display: block; margin-bottom: 6px;">
+              Código da Farmácia:
+            </label>
+            <input
+              type="text"
+              id="authAccessCodeInput"
+              placeholder="Introduza o código da sua farmácia"
+              style="width: 100%; font-size: 1rem; font-weight: 700; text-align: center; letter-spacing: 1px; text-transform: uppercase; padding: 12px;"
+              onkeydown="if(event.key==='Enter') submitPharmacyAccessCode()"
+            />
           </div>
-          <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
-            <button class="btn btn-secondary" onclick="quickLoginWithCode('FARMACIA-A')" style="font-size: 0.78rem; padding: 6px 12px;">🏥 Vista Isolada: Farmácia A</button>
-            <button class="btn btn-secondary" onclick="quickLoginWithCode('FARMACIA-B')" style="font-size: 0.78rem; padding: 6px 12px;">🏥 Vista Isolada: Farmácia B</button>
-            <button class="btn btn-secondary" onclick="quickLoginWithCode('MASTER-BI')" style="font-size: 0.78rem; padding: 6px 12px; border-color: #a855f7; color: #c084fc;">👑 Modo Admin (Todas)</button>
+
+          <div id="authGateError" style="display: none; font-size: 0.82rem; color: #fb7185; background: rgba(244, 63, 94, 0.12); border: 1px solid rgba(244, 63, 94, 0.3); padding: 8px 12px; border-radius: 8px; text-align: center;"></div>
+
+          <button class="btn" onclick="submitPharmacyAccessCode()" style="width: 100%; padding: 12px; font-size: 0.96rem; justify-content: center;">
+            🚀 Entrar no Painel da Farmácia
+          </button>
+
+          <div style="border-top: 1px solid var(--border); padding-top: 12px; margin-top: 8px; text-align: center;">
+            <button class="btn btn-secondary" onclick="toggleAuthGateMode('ADMIN')" style="font-size: 0.78rem; padding: 6px 14px; border-color: rgba(148,163,184,0.3); color: var(--muted);">
+              🔐 Área Reservada (Administração)
+            </button>
           </div>
         </div>
       </div>
+
+      <!-- VISTA B: ACESSO DE ADMINISTRAÇÃO (PASSWORD OBRIGATÓRIA) -->
+      <div id="authGateAdminView" style="display: none;">
+        <div style="text-align: center; margin-bottom: 18px;">
+          <div style="font-size: 2.3rem; margin-bottom: 8px;">👑</div>
+          <h2 style="font-size: 1.25rem; color: #c084fc; font-weight: 800;">Administração BI Pharma</h2>
+          <p style="font-size: 0.85rem; color: var(--muted); margin-top: 6px; line-height: 1.45;">
+            Área restrita de gestão multi-farmácia. Introduza a <b>Password de Administrador</b>.
+          </p>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label style="font-size: 0.78rem; font-weight: 700; color: #c084fc; text-transform: uppercase; display: block; margin-bottom: 6px;">
+              Password de Administrador:
+            </label>
+            <input
+              type="password"
+              id="authAdminPasswordInput"
+              placeholder="••••••••••••"
+              style="width: 100%; font-size: 1rem; font-weight: 700; text-align: center; letter-spacing: 2px; padding: 12px;"
+              onkeydown="if(event.key==='Enter') submitAdminPassword()"
+            />
+          </div>
+
+          <div id="authGateAdminError" style="display: none; font-size: 0.82rem; color: #fb7185; background: rgba(244, 63, 94, 0.12); border: 1px solid rgba(244, 63, 94, 0.3); padding: 8px 12px; border-radius: 8px; text-align: center;"></div>
+
+          <button class="btn" onclick="submitAdminPassword()" style="width: 100%; padding: 12px; font-size: 0.96rem; justify-content: center; background: linear-gradient(135deg, #a855f7, #7c3aed); border-color: #a855f7;">
+            🔓 Entrar como Administrador
+          </button>
+
+          <div style="border-top: 1px solid var(--border); padding-top: 12px; margin-top: 8px; text-align: center;">
+            <button class="btn btn-secondary" onclick="toggleAuthGateMode('PHARMACY')" style="font-size: 0.78rem; padding: 6px 14px; border-color: rgba(148,163,184,0.3); color: var(--muted);">
+              ← Voltar ao Acesso de Farmácia
+            </button>
+          </div>
+        </div>
+      </div>
+
     </div>
   </div>
 
@@ -2443,7 +2790,7 @@ function getDashboardHtml(): string {
 
   <script>
     let currentReport = null;
-    let activeTab = 'copilot';
+    let activeTab = 'plano';
 
     const MONTHS_ORDER = [
       { key: '2025-10', label: 'Out/25' },
@@ -2487,7 +2834,7 @@ function getDashboardHtml(): string {
     let activeAuthRole = localStorage.getItem('bi_pharma_auth_role') || '';
     let cachedAdminPharmacies = [];
 
-    // Interceptor automático de fetch para enviar sempre o código de acesso no header x-access-code
+    // Interceptor automático de fetch para enviar sempre o código/token de acesso no header x-access-code
     const _origFetch = window.fetch.bind(window);
     window.fetch = async function(input, init) {
       init = init || {};
@@ -2498,6 +2845,46 @@ function getDashboardHtml(): string {
       init.headers = headers;
       return _origFetch(input, init);
     };
+
+    function toggleAuthGateMode(mode) {
+      const pharmView = document.getElementById('authGatePharmacyView');
+      const adminView = document.getElementById('authGateAdminView');
+      const errEl = document.getElementById('authGateError');
+      const errAdm = document.getElementById('authGateAdminError');
+      if (errEl) errEl.style.display = 'none';
+      if (errAdm) errAdm.style.display = 'none';
+
+      if (mode === 'ADMIN') {
+        if (pharmView) pharmView.style.display = 'none';
+        if (adminView) adminView.style.display = 'block';
+        setTimeout(() => document.getElementById('authAdminPasswordInput')?.focus(), 50);
+      } else {
+        if (pharmView) pharmView.style.display = 'block';
+        if (adminView) adminView.style.display = 'none';
+        setTimeout(() => document.getElementById('authAccessCodeInput')?.focus(), 50);
+      }
+    }
+
+    function openAuthGateModal(errMsg, targetMode = 'PHARMACY') {
+      const modal = document.getElementById('authGateModal');
+      const input = document.getElementById('authAccessCodeInput');
+      const errEl = document.getElementById('authGateError');
+      const errAdm = document.getElementById('authGateAdminError');
+
+      toggleAuthGateMode(targetMode);
+
+      if (input && activeAuthRole === 'PHARMACY') input.value = activeAccessCode || '';
+      if (errMsg) {
+        if (targetMode === 'ADMIN' && errAdm) {
+          errAdm.textContent = errMsg;
+          errAdm.style.display = 'block';
+        } else if (errEl) {
+          errEl.textContent = errMsg;
+          errEl.style.display = 'block';
+        }
+      }
+      if (modal) modal.style.display = 'flex';
+    }
 
     function applyRoleUiState(role, lockedFarmacia) {
       activeAuthRole = role;
@@ -2512,68 +2899,76 @@ function getDashboardHtml(): string {
         if (sel) sel.style.display = 'inline-block';
         if (selLabel) selLabel.style.display = 'inline-block';
         if (lockedBadge) lockedBadge.style.display = 'none';
-        if (btnTrocar) btnTrocar.innerHTML = '👑 Modo Admin (Trocar)';
+        if (btnTrocar) {
+          btnTrocar.style.display = 'inline-block';
+          btnTrocar.innerHTML = '🚪 Sair de Admin';
+          btnTrocar.title = 'Terminar sessão de Administrador';
+          btnTrocar.onclick = logoutAdmin;
+        }
       } else if (role === 'PHARMACY' && lockedFarmacia) {
         if (adminBar) adminBar.style.display = 'none';
         if (sel) sel.style.display = 'none';
         if (selLabel) selLabel.style.display = 'none';
+        // Acesso estritamente isolado: esconder completamente o botão de trocar!
+        if (btnTrocar) btnTrocar.style.display = 'none';
         if (lockedBadge) {
           lockedBadge.style.display = 'inline-block';
           lockedBadge.textContent = \`🏥 \${lockedFarmacia.nome} (NIF: \${lockedFarmacia.nif})\`;
         }
-        if (btnTrocar) btnTrocar.innerHTML = '🔒 Acesso Isolado';
       }
     }
 
-    function openAuthGateModal(errMsg) {
-      const modal = document.getElementById('authGateModal');
-      const input = document.getElementById('authAccessCodeInput');
-      const errEl = document.getElementById('authGateError');
-      if (input) input.value = activeAccessCode || '';
-      if (errEl) {
-        if (errMsg) {
-          errEl.textContent = errMsg;
-          errEl.style.display = 'block';
-        } else {
-          errEl.style.display = 'none';
-        }
-      }
-      if (modal) modal.style.display = 'flex';
+    function logoutAdmin() {
+      localStorage.removeItem('bi_pharma_access_code');
+      localStorage.removeItem('bi_pharma_auth_role');
+      localStorage.removeItem('bi_pharma_farmacia_id');
+      activeAccessCode = '';
+      activeAuthRole = '';
+      activeFarmaciaId = '';
+      openAuthGateModal('Sessão de Administrador terminada.', 'ADMIN');
     }
 
-    function quickLoginWithCode(code) {
-      const input = document.getElementById('authAccessCodeInput');
-      if (input) input.value = code;
-      submitAccessCode();
-    }
-
-    async function submitAccessCode() {
+    async function submitPharmacyAccessCode() {
       const input = document.getElementById('authAccessCodeInput');
       const errEl = document.getElementById('authGateError');
       const code = (input ? input.value : '').trim().toUpperCase();
       if (!code) {
         if (errEl) {
-          errEl.textContent = 'Introduza um código de acesso (ex: FARMACIA-A ou MASTER-BI).';
+          errEl.textContent = 'Introduza o código exclusivo da sua Farmácia.';
           errEl.style.display = 'block';
         }
         return;
       }
-      await verifyAndActivateAccessCode(code, true);
+      await verifyAndActivateAccessCode({ code }, true, 'PHARMACY');
     }
 
-    async function verifyAndActivateAccessCode(code, showErrors) {
+    async function submitAdminPassword() {
+      const input = document.getElementById('authAdminPasswordInput');
+      const errEl = document.getElementById('authGateAdminError');
+      const password = (input ? input.value : '').trim();
+      if (!password) {
+        if (errEl) {
+          errEl.textContent = 'Introduza a Password de Administrador.';
+          errEl.style.display = 'block';
+        }
+        return;
+      }
+      await verifyAndActivateAccessCode({ adminPassword: password }, true, 'ADMIN');
+    }
+
+    async function verifyAndActivateAccessCode(payload, showErrors, targetMode = 'PHARMACY') {
       try {
         const res = await fetch('/api/auth/verify', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code })
+          body: JSON.stringify(payload)
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
           if (showErrors) {
-            openAuthGateModal(data.error || 'Código de acesso inválido.');
+            openAuthGateModal(data.error || 'Credenciais inválidas.', targetMode);
           } else {
-            openAuthGateModal();
+            openAuthGateModal(null, targetMode);
           }
           return false;
         }
@@ -2623,22 +3018,34 @@ function getDashboardHtml(): string {
     }
 
     async function initPharmacies() {
-      // 1. Verificar se o link tem ?acesso=CODIGO (Link Isolado enviado a uma Farmácia)
       const urlParams = new URLSearchParams(window.location.search);
       const urlCode = urlParams.get('acesso') || urlParams.get('accessCode');
+      const isAdminFlag = urlParams.get('admin') === '1';
+
+      // 1. Se abriu com ?admin=1, pede a Password de Administrador diretamente
+      if (isAdminFlag) {
+        openAuthGateModal(null, 'ADMIN');
+        return;
+      }
+
+      // 2. Se o link tem ?acesso=CODIGO (Link Isolado enviado a uma Farmácia)
       if (urlCode && urlCode.trim()) {
-        const ok = await verifyAndActivateAccessCode(urlCode.trim().toUpperCase(), true);
-        if (ok) return;
+        const ok = await verifyAndActivateAccessCode({ code: urlCode.trim().toUpperCase() }, true, 'PHARMACY');
+        if (ok) {
+          // Limpa o parâmetro da barra do browser para não ficar exposto caso alguém olhe por cima do ombro
+          window.history.replaceState({}, document.title, window.location.pathname);
+          return;
+        }
       }
 
-      // 2. Se já tinha código em sessão, valida silenciosamente
+      // 3. Se já tinha código válido guardado em sessão local
       if (activeAccessCode) {
-        const ok = await verifyAndActivateAccessCode(activeAccessCode, false);
+        const ok = await verifyAndActivateAccessCode({ code: activeAccessCode }, false, activeAuthRole === 'ADMIN' ? 'ADMIN' : 'PHARMACY');
         if (ok) return;
       }
 
-      // 3. Caso contrário, entra por defeito em modo demonstração e abre o seletor rápido se desejar
-      await verifyAndActivateAccessCode('MASTER-BI', false);
+      // 4. Caso contrário, abre a janela de login (NUNCA entra em Admin sem password!)
+      openAuthGateModal();
     }
 
     function openAccessManagerModal() {
@@ -2873,6 +3280,7 @@ function getDashboardHtml(): string {
         }
 
         renderActiveTable();
+        renderWeeklyActionPlan();
 
         if (feedback) {
           feedback.style.display = 'inline-block';
@@ -2890,20 +3298,29 @@ function getDashboardHtml(): string {
 
     function switchTab(tab) {
       activeTab = tab;
-      ['copilot', 'campaigns', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
+      ['plano', 'copilot', 'campaigns', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
         const btn = document.getElementById('tabBtn-' + t);
         if (btn) btn.classList.toggle('active', t === tab);
       });
 
+      const planoView = document.getElementById('tabContent-plano');
       const copilotView = document.getElementById('tabContent-copilot');
       const campaignsView = document.getElementById('tabContent-campaigns');
       const tablesView = document.getElementById('tabContent-tables');
 
-      if (tab === 'copilot') {
+      if (tab === 'plano') {
+        if (planoView) planoView.style.display = 'block';
+        if (copilotView) copilotView.style.display = 'none';
+        if (campaignsView) campaignsView.style.display = 'none';
+        if (tablesView) tablesView.style.display = 'none';
+        renderWeeklyActionPlan();
+      } else if (tab === 'copilot') {
+        if (planoView) planoView.style.display = 'none';
         if (copilotView) copilotView.style.display = 'block';
         if (campaignsView) campaignsView.style.display = 'none';
         if (tablesView) tablesView.style.display = 'none';
       } else if (tab === 'campaigns') {
+        if (planoView) planoView.style.display = 'none';
         if (copilotView) copilotView.style.display = 'none';
         if (campaignsView) campaignsView.style.display = 'block';
         if (tablesView) tablesView.style.display = 'none';
@@ -2911,6 +3328,7 @@ function getDashboardHtml(): string {
           loadCampaignSuggestions();
         }
       } else {
+        if (planoView) planoView.style.display = 'none';
         if (copilotView) copilotView.style.display = 'none';
         if (campaignsView) campaignsView.style.display = 'none';
         if (tablesView) tablesView.style.display = 'block';
@@ -2918,8 +3336,374 @@ function getDashboardHtml(): string {
       }
     }
 
+    // ========================================================================
+    // GESTOR DE TAREFAS SEMANAIS DA EQUIPA (PERSISTÊNCIA LOCAL + IMPRESSÃO A4)
+    // ========================================================================
+    function getDoneTasksMap() {
+      try {
+        return JSON.parse(localStorage.getItem('bi_pharma_weekly_done_' + activeFarmaciaId) || '{}');
+      } catch {
+        return {};
+      }
+    }
+
+    function toggleWeeklyTask(taskId) {
+      const map = getDoneTasksMap();
+      map[taskId] = !map[taskId];
+      localStorage.setItem('bi_pharma_weekly_done_' + activeFarmaciaId, JSON.stringify(map));
+      updateWeeklyTasksCounter();
+    }
+
+    function resetWeeklyTasksProgress() {
+      if (confirm('Tem a certeza que deseja limpar todos os vistos das tarefas desta semana?')) {
+        localStorage.removeItem('bi_pharma_weekly_done_' + activeFarmaciaId);
+        renderWeeklyActionPlan();
+      }
+    }
+
+    function updateWeeklyTasksCounter() {
+      const map = getDoneTasksMap();
+      const checkboxes = document.querySelectorAll('.weekly-task-checkbox');
+      let done = 0;
+      checkboxes.forEach(cb => {
+        if (map[cb.dataset.taskId]) {
+          cb.checked = true;
+          done++;
+          cb.closest('.weekly-task-item')?.classList.add('task-completed');
+        } else {
+          cb.checked = false;
+          cb.closest('.weekly-task-item')?.classList.remove('task-completed');
+        }
+      });
+      const txt = document.getElementById('planoProgressText');
+      if (txt) {
+        txt.textContent = \`✅ \${done} de \${checkboxes.length} tarefas concluídas pela equipa\`;
+      }
+    }
+
+    let currentWeeklyPlanData = {
+      card1: [],
+      card2: [],
+      card3: [],
+      card4: [],
+      card3TotalSavings: 0
+    };
+
+    function renderWeeklyActionPlan() {
+      if (!currentReport) return;
+      const doneMap = getDoneTasksMap();
+
+      // CARTÃO 1: Top 8 Validades Urgentes (prioriza prazos mais curtos e maior perda financeira)
+      const listCad = (currentReport.alertas_risco_caducidade || [])
+        .slice()
+        .sort((a, b) => {
+          if (a.data_validade !== b.data_validade) return a.data_validade.localeCompare(b.data_validade);
+          return (b.perda_potencial_imediata || b.valor_total_custo) - (a.perda_potencial_imediata || a.valor_total_custo);
+        })
+        .slice(0, 8);
+
+      currentWeeklyPlanData.card1 = listCad;
+
+      const c1El = document.getElementById('planoCard1List');
+      if (c1El) {
+        c1El.innerHTML = listCad.map((item, idx) => {
+          const taskId = \`cad_\${item.cnp_codigo}_\${item.lote || idx}\`;
+          const isDone = !!doneMap[taskId];
+          const isMsrm = item.tipo_venda === 'MSRM';
+          const pvpPromo = item.pvp ? (item.pvp * 0.8).toFixed(2) : null;
+          const instrucao = isMsrm
+            ? '🏷️ <b>MSRM (Receita):</b> Colocar elástico/etiqueta vermelha na gaveta. Dispensar com prioridade máxima na próxima receita ou verificar devolução ao armazenista.'
+            : \`🧺 <b>Venda Livre / Balcão:</b> Retirar da gaveta e colocar no cesto de oportunidade com etiqueta de -20% (PVP Promo sugerido: <b>\${pvpPromo ? pvpPromo + '€' : 'ver balcão'}</b>).\`;
+
+          return \`
+            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start;">
+              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\${taskId}')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #f43f5e;" />
+              <div style="flex: 1;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+                  <span style="font-weight: 700; color: #f8fafc; font-size: 0.88rem;">\${item.designacao}</span>
+                  <span style="font-size: 0.78rem; font-weight: 700; color: #fb7185; background: rgba(244,63,94,0.15); padding: 2px 8px; border-radius: 4px;">Val: \${item.data_validade} · \${item.quantidade} un (\${item.valor_total_custo.toFixed(2)} €)</span>
+                </div>
+                <div style="font-size: 0.78rem; color: #cbd5e1; margin-top: 5px; line-height: 1.4;">
+                  \${instrucao}
+                </div>
+                <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
+                  CNP: <code style="color:#38bdf8">\${item.cnp_codigo}</code> | Lote: \${item.lote || 'Geral'} | Local: \${item.prateleira || 'Gaveta'}
+                </div>
+              </div>
+            </div>
+          \`;
+        }).join('') || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem validades críticas registadas.</div>';
+      }
+
+      // CARTÃO 2: Top 5 Trocas de Genéricos no Balcão
+      const listGen = (currentReport.consolidacao_genericos_dci || [])
+        .filter(g => g.laboratorios_candidatos_eliminar && g.laboratorios_candidatos_eliminar.length > 0)
+        .slice()
+        .sort((a, b) => b.valor_stock_custo - a.valor_stock_custo)
+        .slice(0, 5);
+
+      currentWeeklyPlanData.card2 = listGen;
+
+      const c2El = document.getElementById('planoCard2List');
+      if (c2El) {
+        c2El.innerHTML = listGen.map(g => {
+          const taskId = \`gen_\${normStr(g.molecula_dci)}\`;
+          const isDone = !!doneMap[taskId];
+          const labsParados = g.laboratorios_candidatos_eliminar.map(l => \`<b>\${l.designacao.split(' ')[0]}</b> (\${l.stock_atual} un = \${l.valor_stock_custo.toFixed(2)}€)\`).join(', ');
+          const outrosLabs = g.todos_laboratorios.filter(l => !g.laboratorios_candidatos_eliminar.some(el => el.cnp_codigo === l.cnp_codigo)).map(l => l.designacao.split(' ')[0]).slice(0, 2).join('/');
+
+          return \`
+            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start;">
+              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\${taskId}')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #a855f7;" />
+              <div style="flex: 1;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+                  <span style="font-weight: 700; color: #f8fafc; font-size: 0.88rem;">\${g.grupo_equivalencia_dci || g.molecula_dci}</span>
+                  <span style="font-size: 0.78rem; font-weight: 700; color: #c084fc; background: rgba(168,85,247,0.15); padding: 2px 8px; border-radius: 4px;">\${g.total_unidades_stock} un em stock</span>
+                </div>
+                <div style="font-size: 0.78rem; color: #cbd5e1; margin-top: 5px; line-height: 1.4;">
+                  👉 <b>Ao Balcão:</b> Quando o utente pedir esta dosagem, dispensar primeiro o laboratório \${labsParados}. \${outrosLabs ? 'Pausar encomenda de <b>' + outrosLabs + '</b> até escoar as caixas paradas.' : ''}
+                </div>
+              </div>
+            </div>
+          \`;
+        }).join('') || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem duplicação crítica de laboratórios genéricos.</div>';
+      }
+
+      // CARTÃO 3: Top 8 Códigos para Travar no Sifarma (Excesso de stock e monos de valor elevado)
+      const poolTrav = [
+        ...(currentReport.alertas_excesso_cobertura || []).map(i => ({ ...i, tipoAlerta: 'Excesso de Cobertura', perda: i.valor_excesso_stock_custo || (i.stock_atual * i.custo_unitario) })),
+        ...(currentReport.alertas_monos || []).map(i => ({ ...i, tipoAlerta: 'Mono sem Vendas', perda: i.valor_stock_custo || (i.stock_atual * i.custo_unitario) }))
+      ];
+      // Deduplicar por CNP
+      const mapTrav = new Map();
+      for (const item of poolTrav) {
+        if (!mapTrav.has(item.cnp_codigo)) mapTrav.set(item.cnp_codigo, item);
+      }
+      const listTrav = Array.from(mapTrav.values())
+        .sort((a, b) => b.perda - a.perda)
+        .slice(0, 8);
+
+      currentWeeklyPlanData.card3 = listTrav;
+      const totalSavings = listTrav.reduce((s, i) => s + (i.perda || 0), 0);
+      currentWeeklyPlanData.card3TotalSavings = totalSavings;
+
+      const savBadge = document.getElementById('planoCard3Savings');
+      if (savBadge) savBadge.textContent = \`Poupança: \${totalSavings.toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €\`;
+
+      const c3El = document.getElementById('planoCard3List');
+      if (c3El) {
+        c3El.innerHTML = listTrav.map(item => {
+          const taskId = \`trav_\${item.cnp_codigo}\`;
+          const isDone = !!doneMap[taskId];
+          const motivo = item.cobertura_meses
+            ? \`Temos \${item.stock_atual} un em stock (\${item.cobertura_meses.toFixed(1)} meses de cobertura)\`
+            : \`Temos \${item.stock_atual} un paradas sem vendas\`;
+
+          return \`
+            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start;">
+              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\${taskId}')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #f59e0b;" />
+              <div style="flex: 1;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+                  <span style="font-weight: 700; color: #f8fafc; font-size: 0.88rem;">\${item.designacao}</span>
+                  <span style="font-size: 0.78rem; font-weight: 700; color: #fbbf24; background: rgba(245,158,11,0.15); padding: 2px 8px; border-radius: 4px;">CNP: \${item.cnp_codigo} · \${item.perda.toFixed(2)} €</span>
+                </div>
+                <div style="font-size: 0.78rem; color: #cbd5e1; margin-top: 5px; line-height: 1.4;">
+                  💻 <b>Ação no Sifarma:</b> Alterar Ponto de Encomenda / Stock Mínimo para <b>0</b> (\${motivo}).
+                </div>
+              </div>
+            </div>
+          \`;
+        }).join('') || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem compras excessivas a travar.</div>';
+      }
+
+      // CARTÃO 4: 4 Dicas da Semana de Cross-Selling
+      const crossSuggestions = (currentReport.sugestoes_cross_selling || []).slice(0, 4);
+      currentWeeklyPlanData.card4 = crossSuggestions;
+
+      const c4El = document.getElementById('planoCard4List');
+      if (c4El) {
+        c4El.innerHTML = crossSuggestions.map((item, idx) => {
+          const taskId = \`cross_\${item.cnp_codigo || idx}\`;
+          const isDone = !!doneMap[taskId];
+          return \`
+            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start;">
+              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\${taskId}')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #38bdf8;" />
+              <div style="flex: 1;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+                  <span style="font-weight: 700; color: #f8fafc; font-size: 0.88rem;">\${item.designacao}</span>
+                  <span style="font-size: 0.78rem; font-weight: 700; color: #38bdf8; background: rgba(56,189,248,0.15); padding: 2px 8px; border-radius: 4px;">\${item.stock_atual} un em stock \${item.pvp ? '· ' + item.pvp.toFixed(2) + '€' : ''}</span>
+                </div>
+                <div style="font-size: 0.78rem; color: #cbd5e1; margin-top: 5px; line-height: 1.4;">
+                  💬 <b>Dica no Atendimento:</b> \${item.sugestao_balcao || 'Recomendar a utentes de receitas médicas relacionadas para escoar o artigo com boa rentabilidade.'}
+                </div>
+              </div>
+            </div>
+          \`;
+        }).join('') || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Protocolos ativos na aba Campanhas & Marketing 360º.</div>';
+      }
+
+      updateWeeklyTasksCounter();
+    }
+
+    function printWeeklyActionPlan() {
+      if (!currentReport) return;
+      const farmNome = currentReport.farmacia?.nome || 'Farmácia';
+      const farmNif = currentReport.farmacia?.nif || '';
+      const dataRef = currentReport.parametros?.data_referencia || new Date().toISOString().slice(0, 10);
+
+      const html = \`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>Plano Semanal de Ação — \${farmNome}</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 24px; color: #111; line-height: 1.4; font-size: 12px; }
+            .header { border-bottom: 2px solid #000; padding-bottom: 10px; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: flex-end; }
+            h1 { margin: 0; font-size: 18px; text-transform: uppercase; }
+            h2 { font-size: 13px; margin: 16px 0 6px 0; background: #f0f0f0; padding: 6px 8px; border-left: 4px solid #111; }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 12px; font-size: 11px; }
+            th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
+            th { background: #fafafa; font-weight: 700; }
+            .box { width: 16px; height: 16px; border: 1.5px solid #111; display: inline-block; vertical-align: middle; margin-right: 6px; }
+            .footer { margin-top: 24px; padding-top: 10px; border-top: 1px dashed #888; font-size: 10px; display: flex; justify-content: space-between; }
+            @media print {
+              body { margin: 10mm; }
+              button { display: none; }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <div>
+              <h1>📋 Folha Semanal de Tarefas da Equipa</h1>
+              <div style="font-size: 12px; font-weight: bold; margin-top: 4px;">\${farmNome} (NIF: \${farmNif})</div>
+            </div>
+            <div style="text-align: right; font-size: 11px;">
+              <div>Data de Emissão: \${dataRef}</div>
+              <div>Semana Operacional</div>
+            </div>
+          </div>
+
+          <h2>1. GAVETA & PRATELEIRAS — TOP 8 VALIDADES URGENTES A ESCOAR</h2>
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 25px;">[ ]</th>
+                <th>Código / Lote</th>
+                <th>Designação do Produto</th>
+                <th style="width: 60px;">Qtd</th>
+                <th style="width: 70px;">Validade</th>
+                <th>Ação Prática a Tomar</th>
+              </tr>
+            </thead>
+            <tbody>
+              \${(currentWeeklyPlanData.card1 || []).map(i => \`
+                <tr>
+                  <td style="text-align: center;"><span class="box"></span></td>
+                  <td><b>\${i.cnp_codigo}</b><br/><span style="font-size:9px;color:#555;">Lote: \${i.lote || '-'}</span></td>
+                  <td><b>\${i.designacao}</b></td>
+                  <td>\${i.quantidade} un</td>
+                  <td><b>\${i.data_validade}</b></td>
+                  <td>\${i.tipo_venda === 'MSRM' ? 'Etiqueta vermelha / Prioridade na receita ou devolver armazenista' : 'Cesto de oportunidade no balcão (-20% desconto)'}</td>
+                </tr>
+              \`).join('')}
+            </tbody>
+          </table>
+
+          <h2>2. NO BALCÃO — TOP 5 TROCAS DE MARCA NOS GENÉRICOS</h2>
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 25px;">[ ]</th>
+                <th>Molécula / Apresentação</th>
+                <th>Stock</th>
+                <th>Laboratórios Parados (Dispensar Primeiro!)</th>
+                <th>Instrução ao Balcão</th>
+              </tr>
+            </thead>
+            <tbody>
+              \${(currentWeeklyPlanData.card2 || []).map(g => \`
+                <tr>
+                  <td style="text-align: center;"><span class="box"></span></td>
+                  <td><b>\${g.grupo_equivalencia_dci || g.molecula_dci}</b></td>
+                  <td>\${g.total_unidades_stock} un</td>
+                  <td><b>\${g.laboratorios_candidatos_eliminar.map(l => l.designacao.split(' ')[0] + ' (' + l.stock_atual + ' un)').join(', ')}</b></td>
+                  <td>Dar sempre prioridade na dispensa a estes laboratórios e não encomendar outros até esgotar.</td>
+                </tr>
+              \`).join('')}
+            </tbody>
+          </table>
+
+          <h2>3. NO COMPUTADOR DE COMPRAS (SIFARMA) — TOP 8 CÓDIGOS A TRAVAR ENCOMENDA</h2>
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 25px;">[ ]</th>
+                <th>Código CNP</th>
+                <th>Designação</th>
+                <th>Stock Atual</th>
+                <th>Capital Empatado</th>
+                <th>Ação Obrigatória no Sifarma</th>
+              </tr>
+            </thead>
+            <tbody>
+              \${(currentWeeklyPlanData.card3 || []).map(i => \`
+                <tr>
+                  <td style="text-align: center;"><span class="box"></span></td>
+                  <td><b>\${i.cnp_codigo}</b></td>
+                  <td>\${i.designacao}</td>
+                  <td>\${i.stock_atual} un</td>
+                  <td>\${(i.perda || 0).toFixed(2)} €</td>
+                  <td>Alterar Ponto de Encomenda / Stock Mínimo para ZERO.</td>
+                </tr>
+              \`).join('')}
+            </tbody>
+          </table>
+
+          <h2>4. ATENDIMENTO AO BALCÃO — DICAS DA SEMANA DE VENDA CRUZADA</h2>
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 25px;">[ ]</th>
+                <th>Produto a Escoar</th>
+                <th>Stock / PVP</th>
+                <th>Quando o Utente Levar...</th>
+                <th>Argumento de Balcão</th>
+              </tr>
+            </thead>
+            <tbody>
+              \${(currentWeeklyPlanData.card4 || []).map(i => \`
+                <tr>
+                  <td style="text-align: center;"><span class="box"></span></td>
+                  <td><b>\${i.designacao}</b></td>
+                  <td>\${i.stock_atual} un (\${i.pvp ? i.pvp.toFixed(2) + '€' : '-'})</td>
+                  <td>Receitas de classes associadas</td>
+                  <td>\${i.sugestao_balcao || 'Recomendar ativamente para escoar o lote com segurança clínica.'}</td>
+                </tr>
+              \`).join('')}
+            </tbody>
+          </table>
+
+          <div class="footer">
+            <div>Folha Operacional de Farmácia — Assinatura do Responsável: ___________________________</div>
+            <div>BI Pharma © Nuelltech</div>
+          </div>
+        </body>
+        </html>
+      \`;
+
+      const w = window.open('', '_blank');
+      if (w) {
+        w.document.write(html);
+        w.document.close();
+        w.focus();
+        setTimeout(() => { w.print(); }, 250);
+      }
+    }
+
     function renderActiveTable() {
-      if (!currentReport || activeTab === 'copilot' || activeTab === 'campaigns') return;
+      if (!currentReport || activeTab === 'plano' || activeTab === 'copilot' || activeTab === 'campaigns') return;
       const rawFilter = document.getElementById('tableFilter') ? document.getElementById('tableFilter').value : '';
       const filter = normStr(rawFilter);
       const tvFilter = document.getElementById('selectTipoVenda').value;
