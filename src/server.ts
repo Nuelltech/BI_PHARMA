@@ -10,6 +10,8 @@ import { classifyAllExistingProducts, classifyProduct } from './services/classif
 import { getPharmacyCatalog, invalidateCatalog } from './services/product_catalog';
 import { processFreeformQuestion } from './services/copilot';
 import { processQuestionWithLlmOrLocal } from './services/llm_router';
+import { askConversationalCopilot, clearCopilotSession } from './services/copilot_engine';
+import { ToolSecurityContext } from './services/mcp_pharma_tools';
 import {
   ingestInventarioPdf,
   ingestValidadesPdf,
@@ -932,706 +934,61 @@ async function startServer() {
         req.on('data', (chunk) => (body += chunk));
         req.on('end', async () => {
           try {
-            const { question, diasMonos = 90, cobertura = 4, farmaciaId } = JSON.parse(body || '{}');
+            const { question, farmaciaId, sessionId } = JSON.parse(body || '{}');
             const activeFarmacia = await getActiveFarmacia(farmaciaId);
-            const q = String(question || '').toLowerCase().trim();
+            const q = String(question || '').trim();
 
-            // 1. Processamento Inteligente: IA (Claude) com Function Calling ou Motor Semântico Local
-            const copilotRes = await processQuestionWithLlmOrLocal(prisma, activeFarmacia.id, String(question || ''), {
-              diasMonos: Number(diasMonos) || 90,
-              cobertura: Number(cobertura) || 4,
-            });
-
-            if (copilotRes) {
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify(copilotRes));
+            if (!q) {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ success: false, error: 'Pergunta não fornecida.' }));
               return;
             }
 
-            const report = await getCachedOrComputeAnalysis(
-              prisma,
-              activeFarmacia.id,
-              Number(diasMonos) || 90,
-              Number(cobertura) || 4,
-              12
-            );
+            // Contexto de Segurança Multi-Tenant Estrito
+            const secContext: ToolSecurityContext = {
+              farmaciaId: activeFarmacia.id,
+              farmaciaNome: activeFarmacia.nome,
+              nif: activeFarmacia.nif,
+            };
 
-            let titulo = '';
-            let explicacao = '';
-            let colunas: string[] = [];
-            let linhas: any[] = [];
-
-            const numMatch = q.replace(/\b202[0-9]\b/g, '').match(/\b(\d{1,3})\b/);
-            const limitCount = numMatch ? Math.min(200, Math.max(1, parseInt(numMatch[1], 10))) : 30;
-
-            const querVendaLivre = q.includes('venda livre') || q.includes('sem receita') || q.includes('otc');
-            const querSoMnsrm = q.includes('mnsrm') && !q.includes('msrm ');
-            const querSoMsrm = (q.includes('com receita') || /\bmsrm\b/.test(q)) && !querVendaLivre;
-            const querGenerico = q.includes('generico') || q.includes('genérico') || /\bmg\b/.test(q);
-            const querMarca = q.includes('de marca') || q.includes('marca');
-
-            const isFinancialQuery =
-              q.includes('dinheiro') ||
-              q.includes('lucro') ||
-              q.includes('fatura') ||
-              q.includes('rentav') ||
-              q.includes('rentáv') ||
-              q.includes('ganh') ||
-              q.includes('mais valor') ||
-              q.includes('receita financeira');
-
-            const isTopSalesQuery =
-              q.includes('mais vendid') ||
-              q.includes('mais saida') ||
-              q.includes('mais saída') ||
-              /\btop\b.*?\bvenda/.test(q) ||
-              (/\bvendas?\b/.test(q) && (q.includes('top') || q.includes('maior'))) ||
-              (q.includes('top') && (/\bmsrm\b/.test(q) || /\bmnsrm\b/.test(q) || q.includes('generico') || q.includes('marca') || q.includes('venda livre'))) ||
-              q.includes('maior rot') ||
-              q.includes('locomotiva') ||
-              q.includes('vendem mais');
-
-            const isLowRotationQuery =
-              q.includes('baixa rot') ||
-              q.includes('pouca rot') ||
-              q.includes('rotação lenta') ||
-              q.includes('rotacao lenta') ||
-              q.includes('menor rot') ||
-              q.includes('monos') ||
-              /\bmono\b/.test(q) ||
-              q.includes('parad') ||
-              q.includes('sem vend') ||
-              q.includes('empatad') ||
-              q.includes('imobilizad') ||
-              q.includes('excesso');
-
-            // Pergunta sobre Baixa Rotação / Monos / Excesso de Stock (filtrada por Genérico / Marca / Venda Livre)
-            if (isLowRotationQuery) {
-              const dciGroupMap = new Map(
-                report.consolidacao_genericos_dci.map((g) => [g.grupo_equivalencia_dci, g])
-              );
-
-              const matchSegment = (item: {
-                eh_generico: boolean;
-                segmento: string;
-                tipo_venda: string;
-              }) => {
-                if (querGenerico && !querMarca) return item.eh_generico;
-                if (querMarca && !querGenerico) return item.segmento === 'MEDICAMENTO_MARCA';
-                if (querVendaLivre) return item.tipo_venda === 'VENDA_LIVRE' || item.tipo_venda === 'MNSRM';
-                if (querSoMsrm) return item.tipo_venda === 'MSRM';
-                if (querSoMnsrm) return item.tipo_venda === 'MNSRM';
-                return true;
-              };
-
-              const monosFiltrados = report.monos.filter(matchSegment);
-              const excessoFiltrados = report.alertas_excesso_cobertura.filter(matchSegment);
-              const monosSet = new Set(monosFiltrados.map((m) => m.cnp_codigo));
-
-              // Combinar Monos (Rotação Zero recente) + Excesso de Cobertura (Rotação Lenta face ao stock)
-              const combinados = [
-                ...monosFiltrados.map((m) => {
-                  const dciInfo = m.grupo_equivalencia_dci ? dciGroupMap.get(m.grupo_equivalencia_dci) : undefined;
-                  return {
-                    cnp_codigo: m.cnp_codigo,
-                    segmentoLabel: m.eh_generico
-                      ? '🧬 GENÉRICO MG'
-                      : `${m.tipo_venda} (${m.segmento === 'MEDICAMENTO_MARCA' ? 'Marca' : 'PSBE'})`,
-                    dciOuCat: m.grupo_equivalencia_dci || m.categoria,
-                    designacao: m.designacao,
-                    stock_atual: m.stock_atual,
-                    capital_imobilizado: m.capital_imobilizado,
-                    rotacaoInfo: m.ultima_venda
-                      ? `🛑 Sem venda desde ${m.ultima_venda} (${m.unidades_vendidas_ano} un/ano)`
-                      : '🛑 Zero vendas em 12 meses',
-                    acao:
-                      dciInfo && dciInfo.num_laboratorios_abertos > 1
-                        ? `⚠️ Molécula ativa (${dciInfo.num_laboratorios_abertos} labs abertos, VMM grupo=${dciInfo.vmm_total_grupo}/mês) -> Substituir na receita para escoar este lab!`
-                        : m.acao_sugerida,
-                  };
-                }),
-                ...excessoFiltrados
-                  .filter((e) => !monosSet.has(e.cnp_codigo))
-                  .map((e) => {
-                    const cap = Number((e.stock_atual * e.custo_unitario).toFixed(2));
-                    const dciInfo = e.grupo_equivalencia_dci ? dciGroupMap.get(e.grupo_equivalencia_dci) : undefined;
-                    return {
-                      cnp_codigo: e.cnp_codigo,
-                      segmentoLabel: e.eh_generico
-                        ? '🧬 GENÉRICO MG'
-                        : `${e.tipo_venda} (${e.segmento === 'MEDICAMENTO_MARCA' ? 'Marca' : 'PSBE'})`,
-                      dciOuCat: e.grupo_equivalencia_dci || e.categoria,
-                      designacao: e.designacao,
-                      stock_atual: e.stock_atual,
-                      capital_imobilizado: cap,
-                      rotacaoInfo: `🐢 VMM ${e.vmm}/mês (${e.cobertura_meses} meses de stock)`,
-                      acao:
-                        dciInfo && dciInfo.num_laboratorios_abertos > 1
-                          ? `⚠️ ${dciInfo.num_laboratorios_abertos} labs abertos nesta molécula -> Priorizar dispensa deste lab até baixar cobertura`
-                          : e.sugestao_balcao,
-                    };
-                  }),
-              ].sort((a, b) => b.capital_imobilizado - a.capital_imobilizado);
-
-              const totalMonosEur = monosFiltrados.reduce((s, m) => s + m.capital_imobilizado, 0);
-              const totalExcessoEur = excessoFiltrados.reduce((s, e) => s + e.stock_atual * e.custo_unitario, 0);
-              const labelSeg =
-                querGenerico && !querMarca
-                  ? 'Medicamentos Genéricos (MG)'
-                  : querMarca && !querGenerico
-                  ? 'Medicamentos de Marca'
-                  : querVendaLivre
-                  ? 'Produtos de Venda Livre (PSBE + MNSRM)'
-                  : 'Produtos';
-
-              titulo = `${labelSeg} de Baixa Rotação: Monos + Excesso de Stock (${combinados.length} artigos detetados)`;
-              explicacao = `Encontrados ${monosFiltrados.length} artigos parados sem vendas há ≥ ${diasMonos} dias (${totalMonosEur.toFixed(2)} €) e ${excessoFiltrados.length} artigos com rotação lenta / cobertura > ${cobertura} meses (${totalExcessoEur.toFixed(2)} €). Nos Genéricos (MG), muitos artigos estão parados porque a farmácia está a dispensar outro laboratório da mesma molécula DCI!`;
-              colunas = [
-                'Código',
-                'Segmento',
-                'Molécula DCI / Categoria',
-                'Designação',
-                'Stock',
-                'Capital Empatado (€)',
-                'Diagnóstico de Rotação',
-                'Ação Recomendada (Receita / Fornecedor)',
-              ];
-              linhas = combinados.slice(0, Math.max(limitCount, 40)).map((item) => ({
-                cnp: item.cnp_codigo,
-                valores: [
-                  item.cnp_codigo,
-                  item.segmentoLabel,
-                  item.dciOuCat,
-                  item.designacao,
-                  item.stock_atual,
-                  `${item.capital_imobilizado.toFixed(2)} €`,
-                  item.rotacaoInfo,
-                  item.acao,
-                ],
-              }));
-            } else if (
-              !isFinancialQuery &&
-              !isTopSalesQuery &&
-              (q.includes('duplicad') ||
-                q.includes('gaveta') ||
-                q.includes('molecula') ||
-                q.includes('molécula') ||
-                q.includes('dci') ||
-                (querGenerico && querMarca) ||
-                q.includes('genericos vs marca') ||
-                q.includes('genéricos vs marca'))
-            ) {
-              titulo = `Consolidação de Medicamentos Genéricos por Molécula DCI (${report.consolidacao_genericos_dci.length} moléculas com múltiplos laboratórios)`;
-              explicacao = `Na ${report.farmacia.nome} existem ${report.resumo_executivo.artigos_genericos_mg} Genéricos (MG) (${report.resumo_executivo.valor_stock_genericos_mg.toFixed(2)} €) vs. ${report.resumo_executivo.artigos_medicamentos_marca} Medicamentos de Marca (${report.resumo_executivo.valor_stock_medicamentos_marca.toFixed(2)} €). Abaixo estão as moléculas com mais laboratórios abertos em simultâneo e os "restos de gaveta" (≤ 2 caixas) a escoar primeiro nas próximas receitas médicas.`;
-              colunas = [
-                'Grupo Equivalência DCI (Molécula + Dosagem)',
-                'Nº Labs Abertos',
-                'Stock Total',
-                'VMM Grupo',
-                'Lab Mais Barato',
-                'Lab Mais Caro (Dif %)',
-                'Restos de Gaveta (≤ 2 un) a Escoar 1º',
-              ];
-              linhas = report.consolidacao_genericos_dci.slice(0, 40).map((g) => ({
-                cnp: g.todos_laboratorios[0]?.cnp_codigo || null,
-                valores: [
-                  `🧬 ${g.grupo_equivalencia_dci}`,
-                  `${g.num_laboratorios_abertos} laboratórios`,
-                  `${g.stock_total_unidades} un (${g.valor_total_stock.toFixed(2)}€)`,
-                  `${g.vmm_total_grupo}/mês`,
-                  `${g.custo_minimo.toFixed(2)} €`,
-                  `${g.custo_maximo.toFixed(2)} € (+${g.diferenca_custo_pct}%)`,
-                  g.restos_gaveta_escobar_primeiro.length > 0
-                    ? `${g.restos_gaveta_escobar_primeiro.length} labs c/ 1-2 caixas`
-                    : 'Nenhum',
-                ],
-              }));
-            } else if (
-              !isFinancialQuery &&
-              !isTopSalesQuery &&
-              !isLowRotationQuery &&
-              (q.includes('estatuto') ||
-                q.includes('radiografia') ||
-                q.includes('divisao') ||
-                q.includes('divisão') ||
-                (q.includes('receita') && !q.includes('top') && !q.includes('mais') && !q.includes('venda')) ||
-                (q.includes('msrm') && !q.includes('top') && !q.includes('mais') && !q.includes('venda')) ||
-                (q.includes('mnsrm') && !q.includes('top') && !q.includes('mais') && !q.includes('venda')) ||
-                (q.includes('venda livre') && !q.includes('top') && !q.includes('mais') && !q.includes('venda')))
-            ) {
-              const allInvs = await prisma.inventario.findMany({
-                where: { farmaciaId: activeFarmacia.id, quantidade: { gt: 0 } },
-                include: { produto: true },
-              });
-              const stats: Record<string, { skus: number; unidades: number; valor: number; monosVal: number; riscoVal: number }> = {
-                VENDA_LIVRE_PSBE: { skus: 0, unidades: 0, valor: 0, monosVal: 0, riscoVal: 0 },
-                MNSRM_MARCA: { skus: 0, unidades: 0, valor: 0, monosVal: 0, riscoVal: 0 },
-                GENERICO_MG: { skus: 0, unidades: 0, valor: 0, monosVal: 0, riscoVal: 0 },
-                MSRM_MARCA: { skus: 0, unidades: 0, valor: 0, monosVal: 0, riscoVal: 0 },
-              };
-              const monosMap = new Map(report.monos.map((m) => [m.cnp_codigo, m.capital_imobilizado]));
-              const riscoMap = new Map(report.risco_elevado_caducidade.map((r) => [r.cnp_codigo, r.valor_em_risco]));
-
-              for (const i of allInvs) {
-                const c = classifyProduct(i.cnp_codigo, i.produto.designacao, i.produto.taxa_iva);
-                let key = 'MSRM_MARCA';
-                if (c.segmento === 'VENDA_LIVRE_PSBE') key = 'VENDA_LIVRE_PSBE';
-                else if (c.segmento === 'GENERICO_MG') key = 'GENERICO_MG';
-                else if (c.tipo_venda === 'MNSRM') key = 'MNSRM_MARCA';
-
-                const bucket = stats[key];
-                bucket.skus++;
-                bucket.unidades += i.quantidade;
-                bucket.valor += i.quantidade * Number(i.custo_unitario);
-                bucket.monosVal += monosMap.get(i.cnp_codigo) || 0;
-                bucket.riscoVal += riscoMap.get(i.cnp_codigo) || 0;
-              }
-
-              titulo = 'Radiografia Completa: Venda Livre (PSBE) vs. MNSRM vs. Genéricos (MG) vs. Marca (MSRM)';
-              explicacao =
-                'Divisão do capital da farmácia pelos 4 grandes segmentos operacionais e respetiva estratégia de ação.';
-              colunas = [
-                'Segmento / Estatuto',
-                'Nº Artigos (SKUs)',
-                'Unidades Stock',
-                'Valor Stock (Custo)',
-                'Capital em Monos (€)',
-                'Risco Caducidade (€)',
-                'Ação Estratégica na Farmácia',
-              ];
-              linhas = [
-                {
-                  cnp: null,
-                  valores: [
-                    '🟢 VENDA_LIVRE (PSBE / Cosmética / Suplementos / Dispositivos)',
-                    stats.VENDA_LIVRE_PSBE.skus,
-                    stats.VENDA_LIVRE_PSBE.unidades,
-                    `${stats.VENDA_LIVRE_PSBE.valor.toFixed(2)} €`,
-                    `${stats.VENDA_LIVRE_PSBE.monosVal.toFixed(2)} €`,
-                    `${stats.VENDA_LIVRE_PSBE.riscoVal.toFixed(2)} €`,
-                    'Cross-Selling direto no balcão, campanhas Leve 2 e destaque linear',
-                  ],
-                },
-                {
-                  cnp: null,
-                  valores: [
-                    '🔵 MNSRM de Marca (Medicamentos de Venda Livre)',
-                    stats.MNSRM_MARCA.skus,
-                    stats.MNSRM_MARCA.unidades,
-                    `${stats.MNSRM_MARCA.valor.toFixed(2)} €`,
-                    `${stats.MNSRM_MARCA.monosVal.toFixed(2)} €`,
-                    `${stats.MNSRM_MARCA.riscoVal.toFixed(2)} €`,
-                    'Aconselhamento farmacêutico ativo em sintomas ligeiros (Gripe, Dor, Digestivo)',
-                  ],
-                },
-                {
-                  cnp: null,
-                  valores: [
-                    '🧬 Medicamentos Genéricos (MG)',
-                    stats.GENERICO_MG.skus,
-                    stats.GENERICO_MG.unidades,
-                    `${stats.GENERICO_MG.valor.toFixed(2)} €`,
-                    `${stats.GENERICO_MG.monosVal.toFixed(2)} €`,
-                    `${stats.GENERICO_MG.riscoVal.toFixed(2)} €`,
-                    'Substituição inteligente na Receita por DCI (escoar restos de gaveta e otimizar custo)',
-                  ],
-                },
-                {
-                  cnp: null,
-                  valores: [
-                    '🏷️ Medicamentos de Marca Sujeitos a Receita (MSRM)',
-                    stats.MSRM_MARCA.skus,
-                    stats.MSRM_MARCA.unidades,
-                    `${stats.MSRM_MARCA.valor.toFixed(2)} €`,
-                    `${stats.MSRM_MARCA.monosVal.toFixed(2)} €`,
-                    `${stats.MSRM_MARCA.riscoVal.toFixed(2)} €`,
-                    'Ajustar stock mínimo de encomenda e devolver excessos/validades curtas ao fornecedor',
-                  ],
-                },
-              ];
-            } else if (q.includes('2026') && (q.includes('caduc') || q.includes('validad') || q.includes('expir'))) {
-              const items = report.risco_elevado_caducidade.filter((i) => i.data_validade.startsWith('2026'));
-              const totalVal = items.reduce((s, i) => s + i.valor_em_risco, 0);
-              titulo = 'Produtos em Risco de Caducidade até ao final de 2026';
-              explicacao = `Foram encontrados ${items.length} produtos em stock cuja validade termina ainda em 2026 e que não vão escoar ao ritmo atual de vendas, totalizando ${totalVal.toFixed(2)} € em risco imediato.`;
-              colunas = ['Código', 'Segmento', 'Designação', 'Stock', 'Validade', 'VMM', 'Unid. Risco', 'Valor Risco (€)', 'Ação'];
-              linhas = items.map((i) => ({
-                cnp: i.cnp_codigo,
-                valores: [
-                  i.cnp_codigo,
-                  i.eh_generico ? '🧬 GENÉRICO MG' : i.tipo_venda,
-                  i.designacao,
-                  i.stock_atual,
-                  i.data_validade,
-                  i.vmm,
-                  i.unidades_em_risco,
-                  `${i.valor_em_risco.toFixed(2)} €`,
-                  i.acao_recomendada,
-                ],
-              }));
-            } else if (q.includes('cross') || (q.includes('margem') && !isFinancialQuery) || q.includes('promo')) {
-              const riscoMap = new Map(report.risco_elevado_caducidade.map((r) => [r.cnp_codigo, r]));
-
-              const candidatos = report.alertas_excesso_cobertura
-                .filter((i) => i.tipo_venda !== 'MSRM' && (i.margem_percentagem ?? 0) >= 35 && i.stock_atual >= 2)
-                .map((i) => {
-                  const rCad = riscoMap.get(i.cnp_codigo);
-                  const urgenciaValidade = rCad ? 1000 + rCad.valor_em_risco : 0;
-                  const pushScore = urgenciaValidade + (i.margem_percentagem ?? 0) * i.stock_atual * 0.2;
-                  return { ...i, rCad, pushScore };
-                })
-                .sort((a, b) => b.pushScore - a.pushScore)
-                .slice(0, limitCount);
-
-              titulo = 'Plano de Cross-Selling de Balcão (Exclusivo Venda Livre & MNSRM — Sem Receita)';
-              explicacao =
-                'Regra aplicada: Foram filtrados APENAS produtos VENDA_LIVRE e MNSRM (excluindo estritamente todos os MSRM de receita médica). Ordenados por Push Score: prioriza produtos com validade a expirar + excesso de stock + margem ≥ 35%.';
-              colunas = [
-                'Código',
-                'Estatuto',
-                'Categoria',
-                'Designação',
-                'Stock',
-                'Validade',
-                'PVP (Margem)',
-                'Quando Sugerir no Balcão (Regra Cross-Sell)',
-              ];
-              linhas = candidatos.map((i) => ({
-                cnp: i.cnp_codigo,
-                valores: [
-                  i.cnp_codigo,
-                  i.tipo_venda,
-                  i.categoria,
-                  i.designacao,
-                  i.stock_atual,
-                  i.rCad ? `⚠️ ${i.rCad.data_validade}` : 'Longa',
-                  `${i.pvp ? i.pvp.toFixed(2) + '€' : '-'} (${i.margem_percentagem ? i.margem_percentagem.toFixed(0) + '%' : '-'})`,
-                  i.sugestao_balcao,
-                ],
-              }));
-            } else if (q.includes('iva')) {
-              const invs = await prisma.inventario.findMany({
-                where: { farmaciaId: activeFarmacia.id, quantidade: { gt: 0 } },
-                include: { produto: true },
-              });
-              const grupos = new Map<number, { skus: number; unidades: number; valor: number }>();
-              for (const item of invs) {
-                const iva = item.produto.taxa_iva ?? 0;
-                const g = grupos.get(iva) ?? { skus: 0, unidades: 0, valor: 0 };
-                g.skus++;
-                g.unidades += item.quantidade;
-                g.valor += item.quantidade * Number(item.custo_unitario);
-                grupos.set(iva, g);
-              }
-              titulo = 'Distribuição do Stock por Taxa de IVA (0%, 6%, 23%)';
-              explicacao = 'Cruzamento do inventário físico atual por escalão de IVA.';
-              colunas = ['Taxa de IVA', 'Nº de Artigos (SKUs)', 'Total Unidades', 'Capital em Stock (s/ IVA)'];
-              linhas = Array.from(grupos.entries())
-                .sort((a, b) => a[0] - b[0])
-                .map(([iva, g]) => ({
-                  cnp: null,
-                  valores: [`${iva}%`, g.skus, g.unidades, `${g.valor.toFixed(2)} €`],
-                }));
-            } else if (isFinancialQuery) {
-              const vendasAgrupadas = await prisma.venda.groupBy({
-                by: ['cnp_codigo'],
-                where: { farmaciaId: activeFarmacia.id },
-                _sum: { quantidade: true, valor_total: true },
-              });
-
-              const codigos = vendasAgrupadas.map((v) => v.cnp_codigo);
-              const prods = await prisma.produtoMestre.findMany({
-                where: { cnp_codigo: { in: codigos } },
-                include: { inventarios: { where: { farmaciaId: activeFarmacia.id } } },
-              });
-              const prodMap = new Map(prods.map((p) => [p.cnp_codigo, p]));
-
-              const rankingFinanceiro = vendasAgrupadas
-                .map((v) => {
-                  const p = prodMap.get(v.cnp_codigo);
-                  const qtd = v._sum.quantidade || 0;
-                  const faturacao = Number(v._sum.valor_total || 0);
-                  const margemPct = p?.margem_padrao !== null && p?.margem_padrao !== undefined ? Number(p.margem_padrao) : null;
-                  const custoInv = p?.inventarios[0] ? Number(p.inventarios[0].custo_unitario) : null;
-                  const pvp = p?.pvp ? Number(p.pvp) : qtd > 0 ? faturacao / qtd : 0;
-
-                  let lucroBruto = 0;
-                  if (margemPct !== null && margemPct > 0) {
-                    lucroBruto = faturacao * (margemPct / 100);
-                  } else if (custoInv !== null && pvp > custoInv) {
-                    lucroBruto = (pvp - custoInv) * qtd;
-                  }
-
-                  const stockAtual = p?.inventarios.reduce((s, i) => s + i.quantidade, 0) ?? 0;
-                  const c = classifyProduct(v.cnp_codigo, p?.designacao || '', p?.taxa_iva);
-
-                  return {
-                    cnp_codigo: v.cnp_codigo,
-                    designacao: p?.designacao || v.cnp_codigo,
-                    tipo_venda: c.tipo_venda,
-                    segmento: c.segmento,
-                    eh_generico: c.eh_generico,
-                    categoria: c.categoria,
-                    qtd,
-                    faturacao,
-                    margemPct,
-                    lucroBruto,
-                    stockAtual,
-                  };
-                })
-                .filter((r) => {
-                  if (querGenerico) return r.eh_generico;
-                  if (querMarca) return r.segmento === 'MEDICAMENTO_MARCA';
-                  if (querVendaLivre) return r.tipo_venda === 'VENDA_LIVRE' || r.tipo_venda === 'MNSRM';
-                  if (querSoMnsrm) return r.tipo_venda === 'MNSRM';
-                  if (querSoMsrm) return r.tipo_venda === 'MSRM';
-                  return true;
-                })
-                .sort((a, b) => (q.includes('fatura') ? b.faturacao - a.faturacao : b.lucroBruto - a.lucroBruto))
-                .slice(0, limitCount);
-
-              const totalFaturacaoTop = rankingFinanceiro.reduce((s, r) => s + r.faturacao, 0);
-              const totalLucroTop = rankingFinanceiro.reduce((s, r) => s + r.lucroBruto, 0);
-              const labelFiltro = querGenerico
-                ? ' Genéricos (MG)'
-                : querMarca
-                ? ' Medicamentos de Marca'
-                : querVendaLivre
-                ? ' de Venda Livre (PSBE + MNSRM)'
-                : querSoMsrm
-                ? ' Sujeitos a Receita (MSRM)'
-                : '';
-
-              titulo = `Top ${limitCount} Produtos${labelFiltro} que Mais Geram Dinheiro (Lucro Bruto Real & Faturação)`;
-              explicacao = `Estes ${limitCount} produtos${labelFiltro} geraram em conjunto ${totalLucroTop.toFixed(2)} € de lucro bruto real na caixa da farmácia (sobre ${totalFaturacaoTop.toFixed(2)} € de faturação a PVP).`;
-              colunas = [
-                'Código',
-                'Segmento / Estatuto',
-                'Categoria',
-                'Designação',
-                'Unid. Vendidas',
-                'Faturação PVP (€)',
-                'Margem (%)',
-                'Lucro Bruto Gerado (€)',
-                'Stock Atual',
-              ];
-              linhas = rankingFinanceiro.map((r) => ({
-                cnp: r.cnp_codigo,
-                valores: [
-                  r.cnp_codigo,
-                  r.eh_generico ? '🧬 GENÉRICO MG' : `${r.tipo_venda} (${r.segmento === 'MEDICAMENTO_MARCA' ? 'Marca' : 'PSBE'})`,
-                  r.categoria,
-                  r.designacao,
-                  r.qtd,
-                  `${r.faturacao.toFixed(2)} €`,
-                  r.margemPct !== null ? `${r.margemPct.toFixed(1)}%` : '-',
-                  `💰 ${r.lucroBruto.toFixed(2)} €`,
-                  r.stockAtual,
-                ],
-              }));
-            } else if (isTopSalesQuery) {
-              const topVendas = await prisma.venda.groupBy({
-                by: ['cnp_codigo'],
-                where: { farmaciaId: activeFarmacia.id },
-                _sum: { quantidade: true, valor_total: true },
-                orderBy: { _sum: { quantidade: 'desc' } },
-              });
-              const codigos = topVendas.map((t) => t.cnp_codigo);
-              const prods = await prisma.produtoMestre.findMany({
-                where: { cnp_codigo: { in: codigos } },
-                include: { inventarios: { where: { farmaciaId: activeFarmacia.id } } },
-              });
-              const prodMap = new Map(prods.map((p) => [p.cnp_codigo, p]));
-
-              const filtrados = topVendas
-                .map((t) => {
-                  const p = prodMap.get(t.cnp_codigo);
-                  const qtd = t._sum.quantidade || 0;
-                  const val = Number(t._sum.valor_total || 0);
-                  const stock = p?.inventarios.reduce((s, i) => s + i.quantidade, 0) ?? 0;
-                  const c = classifyProduct(t.cnp_codigo, p?.designacao || '', p?.taxa_iva);
-                  return {
-                    cnp: t.cnp_codigo,
-                    tipo_venda: c.tipo_venda,
-                    segmento: c.segmento,
-                    eh_generico: c.eh_generico,
-                    categoria: c.categoria,
-                    designacao: p?.designacao || t.cnp_codigo,
-                    qtd,
-                    val,
-                    stock,
-                  };
-                })
-                .filter((r) => {
-                  if (querGenerico) return r.eh_generico;
-                  if (querMarca) return r.segmento === 'MEDICAMENTO_MARCA';
-                  if (querVendaLivre) return r.tipo_venda === 'VENDA_LIVRE' || r.tipo_venda === 'MNSRM';
-                  if (querSoMnsrm) return r.tipo_venda === 'MNSRM';
-                  if (querSoMsrm) return r.tipo_venda === 'MSRM';
-                  return true;
-                })
-                .slice(0, limitCount);
-
-              const labelFiltroVendas = querGenerico
-                ? ' Genéricos (MG)'
-                : querMarca
-                ? ' Medicamentos de Marca'
-                : querVendaLivre
-                ? ' de Venda Livre (PSBE + MNSRM)'
-                : querSoMnsrm
-                ? ' MNSRM (Venda Livre)'
-                : querSoMsrm
-                ? ' Sujeitos a Receita Médica (MSRM)'
-                : '';
-
-              titulo = `Top ${limitCount} Produtos${labelFiltroVendas} Mais Vendidos (Volume de Unidades)`;
-              explicacao = `Artigos${labelFiltroVendas} com maior volume de escoamento na farmácia no período analisado.`;
-              colunas = ['Código', 'Segmento', 'Categoria', 'Designação', 'Unid. Vendidas', 'Faturação (€)', 'VMM (mês)', 'Stock Atual'];
-              linhas = filtrados.map((r) => ({
-                cnp: r.cnp,
-                valores: [
-                  r.cnp,
-                  r.eh_generico ? '🧬 GENÉRICO MG' : r.tipo_venda,
-                  r.categoria,
-                  r.designacao,
-                  r.qtd,
-                  `${r.val.toFixed(2)} €`,
-                  (r.qtd / 12).toFixed(1),
-                  r.stock,
-                ],
-              }));
-            } else {
-              const specificProductRegex =
-                /\b(?:vendas?|stock|exist[eê]ncias?|hist[oó]rico|evolu[cç][aã]o|escoamento|quanto\s+(?:vendeu|vendemos)|pre[cç]o)\s+(?:de|do|da|dos|das)?\s+([a-záàâãéèêíïóôõöúç0-9\-\+\/\.\s]{2,})/i;
-              const productMatch = q.match(specificProductRegex);
-
-              let termo = (productMatch ? productMatch[1] : q)
-                .replace(/\b(quais|qual|mostra|mostrar|listar?|ver|pesquisar?|produtos?|artigos?|vendas?|stock|com|de|do|da|dos|das|em|no|na|nos|nas|os|as|o|a|por|para)\b/gi, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-
-              if (!termo && productMatch) {
-                termo = productMatch[1].trim();
-              }
-              if (!termo) {
-                termo = q.trim();
-              }
-
-              // Pesquisa inteligente em ProdutoMestre com vendas e inventário para o tenant ativo
-              const prods = await prisma.produtoMestre.findMany({
-                where: {
-                  OR: [
-                    { cnp_codigo: { contains: termo } },
-                    { designacao: { contains: termo, mode: 'insensitive' } },
-                    { categoria: { contains: termo, mode: 'insensitive' } },
-                  ],
-                },
-                include: {
-                  inventarios: { where: { farmaciaId: activeFarmacia.id } },
-                  vendas: { where: { farmaciaId: activeFarmacia.id } },
-                },
-                take: 100,
-              });
-
-              let totalVendidoGeral = 0;
-              let totalFaturacaoGeral = 0;
-              let totalStockGeral = 0;
-              let totalCustoGeral = 0;
-
-              const list = prods.map((p) => {
-                const qtdVendida = p.vendas.reduce((s, v) => s + v.quantidade, 0);
-                const faturacao = p.vendas.reduce((s, v) => s + Number(v.valor_total), 0);
-                const stock = p.inventarios.reduce((s, i) => s + i.quantidade, 0);
-                const custoUnit = p.inventarios[0] ? Number(p.inventarios[0].custo_unitario) : 0;
-                const validade = p.inventarios[0]?.data_validade;
-                const vmm = qtdVendida / 12;
-                const cobertura = vmm > 0 ? stock / vmm : stock > 0 ? 999 : 0;
-
-                totalVendidoGeral += qtdVendida;
-                totalFaturacaoGeral += faturacao;
-                totalStockGeral += stock;
-                totalCustoGeral += stock * custoUnit;
-
-                const c = classifyProduct(p.cnp_codigo, p.designacao, p.taxa_iva);
-
-                let diagnostico = '✅ Rotação Regular';
-                if (stock === 0 && qtdVendida > 0) diagnostico = '⭕ Esgotado (Tem Saída)';
-                else if (stock === 0 && qtdVendida === 0) diagnostico = '⚪ Sem Stock / Sem Venda';
-                else if (stock > 0 && qtdVendida === 0) diagnostico = '🛑 Mono (0 vendas em 12m)';
-                else if (stock > 0 && cobertura > 4) diagnostico = `⚠️ Excesso (${cobertura.toFixed(1)}m cob.)`;
-
-                return {
-                  cnp: p.cnp_codigo,
-                  designacao: p.designacao,
-                  segmento: c.eh_generico ? '🧬 GENÉRICO MG' : c.tipo_venda,
-                  grupoDci: c.grupo_equivalencia_dci || c.categoria,
-                  qtdVendida,
-                  faturacao,
-                  vmm,
-                  stock,
-                  custoUnit,
-                  pvp: p.pvp ? Number(p.pvp) : null,
-                  margem: p.margem_padrao ? Number(p.margem_padrao) : null,
-                  validade: validade ? validade.toISOString().substring(0, 10) : '-',
-                  diagnostico,
-                  hasActivity: stock > 0 || qtdVendida > 0,
-                };
-              });
-
-              list.sort((a, b) => {
-                if (a.hasActivity && !b.hasActivity) return -1;
-                if (!a.hasActivity && b.hasActivity) return 1;
-                return b.qtdVendida - a.qtdVendida || b.stock - a.stock;
-              });
-
-              const isSalesQuestion = q.includes('venda') || q.includes('quanto');
-              const termoUpper = termo.charAt(0).toUpperCase() + termo.slice(1);
-
-              titulo = isSalesQuestion
-                ? `Análise de Vendas e Escoamento: "${termoUpper}" (${prods.length} apresentações encontradas)`
-                : `Resultados e Stock para "${termoUpper}" (${prods.length} apresentações encontradas)`;
-
-              explicacao = `Foram encontrados ${prods.length} artigos para a pesquisa "${termo}". No período: ${totalVendidoGeral} unidades vendidas (${totalFaturacaoGeral.toFixed(2)} € a PVP) e ${totalStockGeral} unidades atualmente em stock (${totalCustoGeral.toFixed(2)} € a custo). Clique em qualquer linha para abrir o gráfico mensal de evolução e laboratórios concorrentes.`;
-
-              colunas = [
-                'Código',
-                'Segmento',
-                'Grupo / Apresentação',
-                'Designação',
-                'Unid. Vendidas',
-                'Faturação (€)',
-                'VMM (mês)',
-                'Stock Atual',
-                'Custo Unit.',
-                'PVP (Margem)',
-                'Validade',
-                'Diagnóstico',
-              ];
-
-              linhas = list.map((r) => ({
-                cnp: r.cnp,
-                valores: [
-                  r.cnp,
-                  r.segmento,
-                  r.grupoDci,
-                  r.designacao,
-                  r.qtdVendida,
-                  `${r.faturacao.toFixed(2)} €`,
-                  `${r.vmm.toFixed(1)}/mês`,
-                  `${r.stock} un`,
-                  `${r.custoUnit.toFixed(2)} €`,
-                  `${r.pvp ? r.pvp.toFixed(2) + '€' : '-'} (${r.margem !== null ? r.margem.toFixed(0) + '%' : '-'})`,
-                  r.validade,
-                  r.diagnostico,
-                ],
-              }));
-            }
+            const sid = sessionId || `session-${activeFarmacia.id}`;
+            const copilotRes = await askConversationalCopilot(prisma, secContext, q, sid);
 
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ titulo, explicacao, colunas, linhas }));
+            res.end(JSON.stringify({
+              success: true,
+              text: copilotRes.text,
+              toolsUsed: copilotRes.toolsUsed,
+              sessionId: copilotRes.sessionId,
+              farmaciaNome: activeFarmacia.nome,
+              titulo: `Copilot — ${activeFarmacia.nome}`,
+              explicacao: copilotRes.text,
+            }));
+            return;
+          } catch (e: any) {
+            console.error('[API /api/ask Error]:', e);
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // 3.1. Endpoint para Limpar Sessão Conversacional do Copilot
+      if (pathname === '/api/copilot/clear' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const { sessionId } = JSON.parse(body || '{}');
+            if (sessionId) {
+              clearCopilotSession(sessionId);
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: true, message: 'Histórico da sessão reiniciado com sucesso.' }));
           } catch (e: any) {
             res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ error: e.message }));
+            res.end(JSON.stringify({ success: false, error: e.message }));
           }
         });
         return;
@@ -1800,7 +1157,193 @@ function getDashboardHtml(): string {
 
     .brand p { font-size: 0.88rem; color: #64748b !important; }
 
-    .tenant-badge {
+    
+    /* COPILOT CONVERSATIONAL CHAT STYLES */
+    .copilot-container {
+      background: #ffffff !important;
+      border: 1px solid #e2e8f0 !important;
+      border-radius: 14px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .copilot-chat-feed {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      min-height: 280px;
+      max-height: 680px;
+      overflow-y: auto;
+      padding: 12px 8px;
+      scroll-behavior: smooth;
+    }
+
+    .chat-bubble-user {
+      align-self: flex-end;
+      background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%) !important;
+      color: #ffffff !important;
+      padding: 12px 18px;
+      border-radius: 18px 18px 4px 18px;
+      max-width: 82%;
+      font-size: 0.93rem;
+      line-height: 1.5;
+      box-shadow: 0 2px 6px rgba(2, 132, 199, 0.25);
+      word-break: break-word;
+    }
+
+    .chat-bubble-assistant {
+      align-self: flex-start;
+      background: #ffffff !important;
+      border: 1px solid #e2e8f0 !important;
+      border-radius: 18px 18px 18px 4px;
+      padding: 18px 22px;
+      max-width: 95%;
+      font-size: 0.91rem;
+      line-height: 1.6;
+      color: #0f172a !important;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+      word-break: break-word;
+    }
+
+    .chat-bubble-assistant h3, .chat-bubble-assistant h4 {
+      color: #0f172a !important;
+      margin-top: 14px;
+      margin-bottom: 6px;
+    }
+
+    .chat-bubble-assistant ul, .chat-bubble-assistant ol {
+      margin: 8px 0 12px 22px;
+      padding: 0;
+    }
+
+    .chat-bubble-assistant li {
+      margin-bottom: 4px;
+    }
+
+    .chat-tools-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #f0fdf4 !important;
+      border: 1px solid #bbf7d0 !important;
+      color: #166534 !important;
+      font-size: 0.74rem;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 999px;
+      margin-bottom: 12px;
+      letter-spacing: 0.2px;
+    }
+
+    .copilot-md-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 0.85rem;
+      background: #ffffff !important;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid #e2e8f0 !important;
+    }
+
+    .copilot-md-table th {
+      background: #f8fafc !important;
+      color: #0f172a !important;
+      font-weight: 700;
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 2px solid #cbd5e1 !important;
+      font-size: 0.80rem;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+
+    .copilot-md-table td {
+      padding: 9px 12px;
+      border-bottom: 1px solid #f1f5f9 !important;
+      color: #334155 !important;
+    }
+
+    .copilot-md-table tr:hover td {
+      background: #f8fafc !important;
+    }
+
+    .copilot-task-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin: 6px 0;
+      padding: 8px 12px;
+      background: #f8fafc !important;
+      border: 1px solid #e2e8f0 !important;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      font-size: 0.88rem;
+    }
+
+    .copilot-task-item:hover {
+      background: #f1f5f9 !important;
+      border-color: #cbd5e1 !important;
+    }
+
+    .copilot-task-item.task-done {
+      background: #f8fafc !important;
+      opacity: 0.65;
+    }
+
+    .copilot-task-item.task-done .task-text {
+      text-decoration: line-through;
+      color: #64748b !important;
+    }
+
+    .copilot-task-item input[type="checkbox"] {
+      margin-top: 3px;
+      cursor: pointer;
+      accent-color: #0284c7;
+      width: 16px;
+      height: 16px;
+    }
+
+    .cnp-link {
+      color: #0284c7 !important;
+      font-weight: 700;
+      cursor: pointer;
+      padding: 1px 4px;
+      border-radius: 4px;
+      background: rgba(2, 132, 199, 0.08);
+      transition: all 0.15s;
+    }
+
+    .cnp-link:hover {
+      background: #0284c7 !important;
+      color: #ffffff !important;
+    }
+
+    .director-question-card {
+      background: #ffffff !important;
+      border: 1px solid #e2e8f0 !important;
+      border-radius: 10px;
+      padding: 12px 14px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      text-align: left;
+    }
+
+    .director-question-card:hover {
+      border-color: #0284c7 !important;
+      background: #f0f9ff !important;
+      transform: translateY(-1px);
+      box-shadow: 0 2px 6px rgba(2, 132, 199, 0.12);
+    }
+
+.tenant-badge {
 
       background: #f0fdf4 !important;
 
@@ -2920,71 +2463,119 @@ function getDashboardHtml(): string {
 
     <!-- ABA 1: ASSISTENTE COPILOT DEDICADO (PERGUNTAS LIVRES & CONSULTORIA) -->
     <div id="tabContent-copilot" style="display: none;">
-      <div class="ask-card" style="margin-bottom: 24px; padding: 24px;">
-        <div style="margin-bottom: 18px;">
-          <div style="font-size: 1.15rem; font-weight: 800; color: var(--primary); display: flex; align-items: center; gap: 8px;">
-            💬 Assistente Consultivo de Farmácia (Copilot)
-          </div>
-          <p style="font-size: 0.88rem; color: var(--muted); margin-top: 4px; line-height: 1.45;">
-            Faça perguntas abertas em linguagem natural sobre o stock, vendas, rentabilidade ou regras clínicas. O Copilot analisa em tempo real a base de dados PostgreSQL e as diretrizes Infarmed.
-          </p>
-        </div>
-
-        <div class="ask-input-row" style="margin-bottom: 16px;">
-          <input type="text" id="askInput" placeholder="Escreva a sua pergunta livremente... Ex: 'que stocks ajustavas?', 'eliminar labs sem vendas há 3 meses', 'quais os preservativos mais vendidos', 'sugestões para diabéticos'..." onkeydown="if(event.key==='Enter') askQuestion()" />
-          <button class="btn" onclick="askQuestion()" style="padding: 0 24px; font-size: 0.95rem;">Perguntar</button>
-        </div>
-
-        <div style="margin-top: 14px;">
-          <div style="font-size: 0.74rem; font-weight: 700; color: var(--muted); text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.5px;">
-            Exemplos de Perguntas e Casos de Decisão (Clique para Executar):
-          </div>
-          <div class="chips" style="gap: 8px; flex-wrap: wrap;">
-            <span class="chip" onclick="runQuickQuestion('Para a mesma substancia e dosagem que laboratorios eliminarias por n ter vendas ha 3 meses ou mais')">✂️ Eliminar Labs Parados (≥3m)</span>
-            <span class="chip" onclick="runQuickQuestion('Que stocks ajustavas')">📦 Que Stocks Ajustavas?</span>
-            <span class="chip" onclick="runQuickQuestion('Que produtos de venda livre posso sugerir para os diabeticos')">🩺 Venda Livre p/ Diabéticos</span>
-            <span class="chip" onclick="runQuickQuestion('Do stock parado que tenho o que faz sentido recomendar a idosos com problemas cardiacos')">❤️ Stock Parado p/ Cardíacos</span>
-            <span class="chip" onclick="runQuickQuestion('Cria uma campanha de venda para os produtos cosmeticos agora para Dezembro e diz quais o que temos para incluir')">🎁 Campanha Cosmética Dezembro</span>
-            <span class="chip" onclick="runQuickQuestion('quais os produtos que tiveram um aumento de vendas nos ultimos 2 meses?')">📈 Aumento Vendas (Últ. 2m)</span>
-            <span class="chip" onclick="runQuickQuestion('quais os produtos que tiverem uma queda acentuada de vendas')">📉 Queda Acentuada Vendas</span>
-            <span class="chip" onclick="runQuickQuestion('Tivemos algum produto que veio substituir este outro?')">🔁 Deteção de Substituição</span>
-            <span class="chip" onclick="runQuickQuestion('Vitativ Transilax Comp 20 com que produtos de receita medica ou venda livre posso fazer venda cruzada')">🎯 Cross-Selling Transilax</span>
-            <span class="chip" onclick="runQuickQuestion('quais os preservativos que temos vendido mais')">🛡️ Preservativos Mais Vendidos</span>
-            <span class="chip" onclick="runQuickQuestion('Tendo em conta que temos este produto que tem mais margem mas n tem tantas vendas e o outro que tem menos margem mas mais vendas o que fazemos')">⚖️ Volume vs. Margem</span>
-            <span class="chip" onclick="runQuickQuestion('quais os 10 produtos de venda livre que mais geram dinheiro?')">💰 Top 10 Lucro €</span>
-          </div>
-        </div>
-
-        <div id="copilotThinkingIndicator" class="thinking-card" style="display: none;">
-          <div style="font-size: 2.2rem; animation: spin 3s linear infinite;">🧠</div>
+      <div class="copilot-container">
+        <!-- CABEÇALHO DO COPILOT -->
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 14px; border-bottom: 1px solid #e2e8f0; padding-bottom: 16px;">
           <div>
-            <div style="font-size: 1.05rem; font-weight: 700; color: var(--primary); margin-bottom: 4px;">
-              O Copilot está a analisar a sua pergunta com Inteligência Artificial...
+            <div style="font-size: 1.25rem; font-weight: 800; color: #0284c7; display: flex; align-items: center; gap: 8px;">
+              💬 Copilot de Direção Técnica & Gestão Clínica
             </div>
-            <div style="font-size: 0.86rem; color: var(--text-secondary); line-height: 1.45;">
-              A interpretar a intenção clínica, a consultar o inventário e vendas no PostgreSQL e a formular a resposta com dados reais.
+            <p style="font-size: 0.88rem; color: #64748b; margin-top: 4px; line-height: 1.45; max-width: 780px;">
+              Raciocínio analítico com ligação em tempo real aos dados da farmácia. Suporta perguntas encadeadas com memória de sessão e execução segura de cálculos farmacêuticos.
+            </p>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <div class="tenant-badge" id="copilotActiveFarmaciaBadge" style="font-size: 0.80rem; padding: 6px 14px;">
+              🏥 Farmácia Ativa
+            </div>
+            <button class="btn btn-secondary" onclick="resetCopilotConversation()" style="font-size: 0.80rem; padding: 7px 14px; border-color: #cbd5e1; color: #0f172a;" title="Limpar memória e iniciar nova conversa">
+              🔄 Nova Conversa
+            </button>
+          </div>
+        </div>
+
+        <!-- PAINEL DE PERGUNTAS ESTRATÉGICAS DA DIREÇÃO TÉCNICA -->
+        <div id="directorQuestionsAccordion" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; cursor: pointer;" onclick="toggleDirectorQuestionsPanel()">
+            <div style="font-size: 0.82rem; font-weight: 800; color: #0f172a; text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; gap: 6px;">
+              ⭐ Perguntas Executivas da Direção Técnica (Casos Práticos Reais)
+            </div>
+            <span id="directorQuestionsToggleIcon" style="font-size: 0.85rem; color: #64748b; font-weight: 700;">▲ Ocultar</span>
+          </div>
+
+          <div id="directorQuestionsGrid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px;">
+            <div class="director-question-card" onclick="runDirectorQuestion('Tendo em conta as vendas faz um cálculo do mínimo de stock que deverias ter para uma semana')">
+              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">📊 1. Stock Mínimo para 1 Semana</div>
+              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Cálculo do stock semanal com base na VMM diária e identificação de défices críticos.</div>
+            </div>
+
+            <div class="director-question-card" onclick="runDirectorQuestion('Relativamente aos produtos de venda livre com validade até 2027, faz uma listagem do pvp a que poderiam ser vendidos não ficando a margem de lucro abaixo dos 10%')">
+              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">🏷️ 2. Promoção PVP c/ Margem ≥10%</div>
+              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Venda livre com validade até 2027 e novo PVP promocional protegido.</div>
+            </div>
+
+            <div class="director-question-card" onclick="runDirectorQuestion('Nos produtos de venda livre com validade até 2027, sugere packs de pelo menos 2 a 3 produtos que a margem de cada não seja abaixo de 5%')">
+              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">📦 3. Packs Promocionais (2-3 un)</div>
+              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Combinações clínicas com margem garantida para acelerar rotação de stock.</div>
+            </div>
+
+            <div class="director-question-card" onclick="runDirectorQuestion('Faz uma listagem de todos os produtos existentes em stock sem vendas nos últimos 6 meses e como sugeres a sua dispensa (troca de laboratório, associar com produto de venda livre)')">
+              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">🛑 4. Monos 6 Meses & Estratégia</div>
+              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Artigos sem rotação e ações recomendadas (troca lab, cesto balcão).</div>
+            </div>
+
+            <div class="director-question-card" onclick="runDirectorQuestion('Definindo o número de laboratórios que quero ter por molécula e respetiva dosagem, tendo por base o pvp máximo e mínimo definido no infarmed e o que há em stock e é necessário escoar, cria uma listagem')">
+              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">🧬 5. Racionalização de Labs DCI</div>
+              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Consolidação de genéricos duplicados e eliminação de restos de gaveta.</div>
+            </div>
+
+            <div class="director-question-card" onclick="runDirectorQuestion('Tendo em conta as vendas de produtos de venda livre no último ano e sua sazonalidade, que quantidades sugeres serem compradas diretamente a laboratórios e em que datas sugeres que sejam entregues na farmácia')">
+              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">🗓️ 6. Plano Anual Compras Labs</div>
+              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Calendário sazonal de encomendas diretas a fornecedores por épocas.</div>
+            </div>
+
+            <div class="director-question-card" onclick="runDirectorQuestion('Para as moléculas sujeitas a receita que mais se vendem, que vendas cruzadas sugeres')">
+              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">💊 7. Venda Cruzada Clínica MSRM</div>
+              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Co-prescrições e proteção gástrica/suplementar para receitas mais frequentes.</div>
+            </div>
+
+            <div class="director-question-card" onclick="runDirectorQuestion('De forma a reduzir o valor de inventário qual seria a estratégia que adotarias tendo em conta o stock, validade, produtos sem rotação e produtos a não encomendar')">
+              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">📉 8. Redução Global de Inventário</div>
+              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Parecer executivo para libertar liquidez e baixar capital empatado.</div>
             </div>
           </div>
         </div>
 
-        <div id="askResultBox" style="display: none; margin-top: 24px; border-top: 1px solid var(--border); padding-top: 20px;">
-          <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; gap: 16px; flex-wrap: wrap;">
-            <h3 id="askResTitle" style="font-size: 1.1rem; color: var(--primary); margin: 0;"></h3>
-            <button class="btn btn-secondary" onclick="clearCopilotResult()" style="font-size: 0.8rem; padding: 6px 12px;">✕ Nova Pergunta</button>
-          </div>
-          <div id="askResSummary" style="display:none;margin-bottom:14px;padding:12px 16px;background:rgba(56,189,248,0.12);border-left:4px solid var(--primary);border-radius:6px;font-size:0.88rem;color:#f1f5f9;line-height:1.45;"></div>
-          <p id="askResDesc" style="font-size: 0.88rem; color: #334155; margin-bottom: 14px; white-space: pre-line; line-height: 1.45;"></p>
-          <div class="table-wrap" style="max-height: 480px;">
-            <table id="askResTable"></table>
+        <!-- FEED CONVERSACIONAL COM HISTÓRICO E MEMÓRIA -->
+        <div id="copilotChatFeed" class="copilot-chat-feed">
+          <div id="copilotWelcomeGreeting" style="text-align: center; padding: 28px 16px; background: #ffffff; border: 1px dashed #cbd5e1; border-radius: 12px;">
+            <div style="font-size: 2.2rem; margin-bottom: 8px;">💡</div>
+            <div style="font-size: 1rem; font-weight: 700; color: #0f172a; margin-bottom: 4px;">O que pretende analisar hoje na sua farmácia?</div>
+            <div style="font-size: 0.84rem; color: #64748b; max-width: 580px; margin: 0 auto; line-height: 1.45;">
+              Clique num dos casos executivos acima ou escreva livremente na barra inferior. Pode fazer perguntas de seguimento a qualquer momento — o Copilot mantém o contexto da conversa.
+            </div>
           </div>
         </div>
 
-        <div id="copilotEmptyState" style="text-align: center; padding: 48px 16px; background: #ffffff; border: 1px dashed #cbd5e1; border-radius: 12px; margin-top: 16px;">
-          <div style="font-size: 2.2rem; margin-bottom: 10px;">💬</div>
-          <div style="font-size: 1rem; font-weight: 700; color: #e2e8f0; margin-bottom: 6px;">Pronto para responder às suas questões</div>
-          <div style="font-size: 0.85rem; color: var(--muted); max-width: 540px; margin: 0 auto;">
-            Coloque uma questão livre na barra acima ou selecione um dos atalhos para obter diagnósticos imediatos da sua farmácia.
+        <!-- INDICADOR DE PROCESSAMENTO / PENSAMENTO -->
+        <div id="copilotThinkingIndicator" class="thinking-card" style="display: none; background: #f0f9ff !important; border: 1px solid #bae6fd !important;">
+          <div style="font-size: 2rem; animation: spin 2.5s linear infinite;">🧠</div>
+          <div>
+            <div style="font-size: 0.98rem; font-weight: 700; color: #0369a1 !important; margin-bottom: 2px;">
+              A analisar dados da farmácia com Inteligência Artificial...
+            </div>
+            <div style="font-size: 0.82rem; color: #475569 !important; line-height: 1.4;">
+              A consultar o inventário, vendas e validades no PostgreSQL e a executar o raciocínio clínico.
+            </div>
           </div>
+        </div>
+
+        <!-- BARRA DE ENTRADA DE PERGUNTAS -->
+        <div style="display: flex; gap: 10px; align-items: stretch; margin-top: 4px;">
+          <input 
+            type="text" 
+            id="askInput" 
+            placeholder="Faça uma pergunta ou pedido de seguimento... (Ex: 'E desses, quais têm maior margem?', 'Cria uma lista de tarefas para amanhã', 'Stock mínimo para 1 semana')..." 
+            onkeydown="if(event.key==='Enter') askQuestion()"
+            style="flex: 1; padding: 14px 18px; font-size: 0.94rem; border: 1px solid #cbd5e1; border-radius: 10px; outline: none; transition: border-color 0.15s; background: #ffffff; color: #0f172a;"
+          />
+          <button class="btn" id="askBtnSubmit" onclick="askQuestion()" style="padding: 0 26px; font-size: 0.95rem; background: #0284c7; color: #ffffff; font-weight: 700; border-radius: 10px; display: flex; align-items: center; gap: 6px;">
+            <span>Perguntar</span> ➜
+          </button>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.74rem; color: #64748b; padding: 0 4px;">
+          <span>💡 <b>Dica:</b> Prima <b>Enter</b> para enviar. Perguntas seguintes mantêm o contexto da resposta anterior.</span>
+          <span id="copilotSessionIndicator">Sessão: Ativa</span>
         </div>
       </div>
     </div>
@@ -5203,90 +4794,290 @@ function getDashboardHtml(): string {
       }
     }
 
-    function clearCopilotResult() {
-      document.getElementById('askInput').value = '';
-      document.getElementById('askResultBox').style.display = 'none';
-      const emptyState = document.getElementById('copilotEmptyState');
-      if (emptyState) emptyState.style.display = 'block';
-      document.getElementById('askInput').focus();
+    let copilotSessionId = 'copilot-' + Date.now();
+    let isCopilotThinking = false;
+
+    function getCopilotSessionId() {
+      if (!copilotSessionId) {
+        copilotSessionId = 'copilot-' + (activeFarmaciaId || 'farm') + '-' + Date.now();
+      }
+      return copilotSessionId;
     }
 
-    async function runQuickQuestion(q) {
-      document.getElementById('askInput').value = q;
-      await askQuestion();
+    function toggleDirectorQuestionsPanel() {
+      const grid = document.getElementById('directorQuestionsGrid');
+      const icon = document.getElementById('directorQuestionsToggleIcon');
+      if (!grid) return;
+      if (grid.style.display === 'none') {
+        grid.style.display = 'grid';
+        if (icon) icon.textContent = '▲ Ocultar';
+      } else {
+        grid.style.display = 'none';
+        if (icon) icon.textContent = '▼ Expandir';
+      }
     }
 
-    async function askQuestion() {
+    async function resetCopilotConversation() {
+      const sid = copilotSessionId;
+      try {
+        await fetch('/api/copilot/clear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: sid }),
+        });
+      } catch (e) {
+        console.warn('Erro ao limpar sessão no servidor:', e);
+      }
+
+      copilotSessionId = 'copilot-' + (activeFarmaciaId || 'farm') + '-' + Date.now();
+      const feed = document.getElementById('copilotChatFeed');
+      if (feed) {
+        feed.innerHTML = '<div id="copilotWelcomeGreeting" style="text-align: center; padding: 28px 16px; background: #ffffff; border: 1px dashed #cbd5e1; border-radius: 12px;">' +
+          '<div style="font-size: 2.2rem; margin-bottom: 8px;">💡</div>' +
+          '<div style="font-size: 1rem; font-weight: 700; color: #0f172a; margin-bottom: 4px;">Nova conversa iniciada.</div>' +
+          '<div style="font-size: 0.84rem; color: #64748b; max-width: 580px; margin: 0 auto; line-height: 1.45;">' +
+          'A memória anterior foi reiniciada. Selecione um caso executivo acima ou escreva uma nova pergunta.' +
+          '</div>' +
+          '</div>';
+      }
+      const grid = document.getElementById('directorQuestionsGrid');
+      if (grid) grid.style.display = 'grid';
+      const icon = document.getElementById('directorQuestionsToggleIcon');
+      if (icon) icon.textContent = '▲ Ocultar';
+
+      const input = document.getElementById('askInput');
+      if (input) {
+        input.value = '';
+        input.focus();
+      }
+    }
+
+    function runDirectorQuestion(questionText) {
+      const input = document.getElementById('askInput');
+      if (input) input.value = questionText;
+      askQuestion(questionText);
+    }
+
+    function toggleCopilotTask(element) {
+      if (!element) return;
+      const checkbox = element.querySelector('input[type="checkbox"]');
+      if (!checkbox) return;
+      element.classList.toggle('task-done');
+      checkbox.checked = element.classList.contains('task-done');
+    }
+
+    function renderCopilotMarkdown(md) {
+      if (!md) return '';
+      var text = String(md);
+
+      // Escape raw HTML characters to prevent XSS
+      text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+      var lines = text.split(String.fromCharCode(10));
+      var output = [];
+      var inTable = false;
+      var tableRows = [];
+
+      function linkCnps(s) {
+        return s.replace(new RegExp('(^|[^0-9])([5-8][0-9]{6})([^0-9]|$)', 'g'), function(m, p1, p2, p3) {
+          return p1 + '<span class="cnp-link" onclick="openProductModal(&quot;' + p2 + '&quot;)">' + p2 + ' ↗</span>' + p3;
+        });
+      }
+
+      function flushTable() {
+        if (!inTable || tableRows.length === 0) return;
+        var html = '<div class="table-wrap" style="margin: 12px 0; overflow-x: auto;"><table class="copilot-md-table">';
+        var headerRow = tableRows[0];
+        html += '<thead><tr>';
+        for (var h = 0; h < headerRow.length; h++) {
+          html += '<th>' + headerRow[h].trim() + '</th>';
+        }
+        html += '</tr></thead><tbody>';
+
+        for (var r = 2; r < tableRows.length; r++) {
+          html += '<tr>';
+          for (var c = 0; c < tableRows[r].length; c++) {
+            var cellContent = linkCnps(tableRows[r][c].trim());
+            html += '<td>' + cellContent + '</td>';
+          }
+          html += '</tr>';
+        }
+        html += '</tbody></table></div>';
+        output.push(html);
+        tableRows = [];
+        inTable = false;
+      }
+
+      for (var i = 0; i < lines.length; i++) {
+        var rawLine = lines[i].replace(String.fromCharCode(13), '');
+        var line = rawLine.trim();
+
+        if (line.charAt(0) === '|' && line.charAt(line.length - 1) === '|') {
+          var cells = line.slice(1, -1).split('|');
+          if (new RegExp('^[|:\-\s]+$').test(line)) {
+            tableRows.push(cells);
+            inTable = true;
+            continue;
+          }
+          if (!inTable) {
+            inTable = true;
+          }
+          tableRows.push(cells);
+          continue;
+        } else if (inTable) {
+          flushTable();
+        }
+
+        if (line.indexOf('#### ') === 0) {
+          output.push('<h5 style="margin: 12px 0 4px; color: #0f172a; font-weight: 700; font-size: 0.95rem;">' + line.slice(5) + '</h5>');
+          continue;
+        }
+        if (line.indexOf('### ') === 0) {
+          output.push('<h4 style="margin: 14px 0 6px; color: #0284c7; font-weight: 700; font-size: 1.05rem;">' + line.slice(4) + '</h4>');
+          continue;
+        }
+        if (line.indexOf('## ') === 0) {
+          output.push('<h3 style="margin: 16px 0 8px; color: #0f172a; font-weight: 800; font-size: 1.15rem; border-bottom: 1px solid #f1f5f9; padding-bottom: 4px;">' + line.slice(3) + '</h3>');
+          continue;
+        }
+        if (line.indexOf('# ') === 0) {
+          output.push('<h2 style="margin: 18px 0 10px; color: #0284c7; font-weight: 800; font-size: 1.25rem;">' + line.slice(2) + '</h2>');
+          continue;
+        }
+
+        var isTask = line.indexOf('- [ ]') === 0 || line.indexOf('- [x]') === 0 || line.indexOf('- [X]') === 0 ||
+                     line.indexOf('* [ ]') === 0 || line.indexOf('* [x]') === 0 || line.indexOf('* [X]') === 0;
+        if (isTask) {
+          var isDone = line.indexOf('[x]') !== -1 || line.indexOf('[X]') !== -1;
+          var taskText = linkCnps(line.slice(5).trim());
+          output.push(
+            '<div class="copilot-task-item ' + (isDone ? 'task-done' : '') + '" onclick="toggleCopilotTask(this)">' +
+            '<input type="checkbox" ' + (isDone ? 'checked' : '') + ' onclick="event.stopPropagation(); toggleCopilotTask(this.parentElement)">' +
+            '<span class="task-text">' + taskText + '</span>' +
+            '</div>'
+          );
+          continue;
+        }
+
+        if (line.indexOf('- ') === 0 || line.indexOf('* ') === 0) {
+          var itemText = linkCnps(line.slice(2));
+          output.push('<div style="display: flex; gap: 8px; margin: 4px 0 4px 12px; font-size: 0.88rem; color: #334155;"><span style="color: #0284c7;">•</span><span>' + itemText + '</span></div>');
+          continue;
+        }
+
+        if (line === '') {
+          output.push('<div style="height: 6px;"></div>');
+          continue;
+        }
+
+        var pText = linkCnps(line);
+        output.push('<p style="margin: 4px 0; color: #1e293b; line-height: 1.55;">' + pText + '</p>');
+      }
+
+      if (inTable) {
+        flushTable();
+      }
+
+      var rendered = output.join('');
+      var bParts = rendered.split('**');
+      if (bParts.length > 1) {
+        var bHtml = '';
+        for (var b = 0; b < bParts.length; b++) {
+          bHtml += (b % 2 === 1) ? ('<b>' + bParts[b] + '</b>') : bParts[b];
+        }
+        rendered = bHtml;
+      }
+      return rendered;
+    }
+
+    async function askQuestion(forcedQuestion) {
+      if (isCopilotThinking) return;
       const inputEl = document.getElementById('askInput');
-      const question = inputEl.value.trim();
+      const question = (forcedQuestion || (inputEl ? inputEl.value : '')).trim();
       if (!question) return;
+
       if (activeTab !== 'copilot') switchTab('copilot');
 
-      const askBtn = document.querySelector('#tabContent-copilot .btn');
-      const originalBtnText = askBtn ? askBtn.innerHTML : 'Perguntar';
-      const emptyState = document.getElementById('copilotEmptyState');
-      const resultBox = document.getElementById('askResultBox');
+      const submitBtn = document.getElementById('askBtnSubmit');
       const thinkingBox = document.getElementById('copilotThinkingIndicator');
+      const chatFeed = document.getElementById('copilotChatFeed');
+      const welcomeGreeting = document.getElementById('copilotWelcomeGreeting');
+
+      if (welcomeGreeting) welcomeGreeting.style.display = 'none';
+
+      // Append User message to Chat Feed
+      const userBubble = document.createElement('div');
+      userBubble.className = 'chat-bubble-user';
+      userBubble.textContent = question;
+      chatFeed.appendChild(userBubble);
+      chatFeed.scrollTop = chatFeed.scrollHeight;
+
+      if (inputEl) inputEl.value = '';
+
+      // Set Loading State
+      isCopilotThinking = true;
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<span class="spinner-sm"></span> A analisar...';
+      }
+      if (thinkingBox) thinkingBox.style.display = 'flex';
 
       try {
-        if (askBtn) {
-          askBtn.disabled = true;
-          askBtn.innerHTML = '<span class="spinner-sm"></span> A pensar...';
-        }
-        inputEl.disabled = true;
-        if (emptyState) emptyState.style.display = 'none';
-        if (resultBox) resultBox.style.display = 'none';
-        if (thinkingBox) thinkingBox.style.display = 'flex';
-
-        const diasMonos = document.getElementById('selectDiasMonos')?.value || 90;
-        const cobertura = document.getElementById('selectCobertura')?.value || 4;
-
+        const sid = getCopilotSessionId();
         const res = await fetch('/api/ask', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ question, diasMonos, cobertura, farmaciaId: activeFarmaciaId }),
+          body: JSON.stringify({
+            question,
+            farmaciaId: activeFarmaciaId,
+            sessionId: sid,
+          }),
         });
+
         const data = await res.json();
 
         if (thinkingBox) thinkingBox.style.display = 'none';
-        if (resultBox) resultBox.style.display = 'block';
 
-        document.getElementById('askResTitle').textContent = data.titulo || 'Resposta do Copilot';
-        document.getElementById('askResDesc').textContent = data.explicacao || '';
+        // Append Assistant message to Chat Feed
+        const assistantBubble = document.createElement('div');
+        assistantBubble.className = 'chat-bubble-assistant';
 
-        const sumEl = document.getElementById('askResSummary');
-        if (data.resumoEstrategico) {
-          sumEl.style.display = 'block';
-          sumEl.innerHTML = '💡 <b>Resumo Estratégico:</b> ' + data.resumoEstrategico;
-        } else {
-          sumEl.style.display = 'none';
+        let badgeHtml = '';
+        if (data.toolsUsed && data.toolsUsed.length > 0) {
+          const toolNames = data.toolsUsed.join(', ');
+          badgeHtml = '<div class="chat-tools-badge">🛠️ Ferramentas Analíticas Executadas: ' + toolNames + '</div>';
         }
 
-        const tbl = document.getElementById('askResTable');
-        tbl.innerHTML = \`
-          <thead>
-            <tr>\${(data.colunas || []).map(c => \`<th>\${c}</th>\`).join('')}</tr>
-          </thead>
-          <tbody>
-            \${(data.linhas || []).map(l => \`
-              <tr class="\${l.cnp ? 'clickable-row' : ''}" \${l.cnp ? \`onclick="openProductModal('\${l.cnp}')"\` : ''}>
-                \${l.valores.map(v => \`<td>\${v}</td>\`).join('')}
-              </tr>
-            \`).join('')}
-          </tbody>
-        \`;
+        const formattedHtml = renderCopilotMarkdown(data.text || data.explicacao || 'Sem resposta disponível.');
+
+        assistantBubble.innerHTML = badgeHtml +
+          '<div>' + formattedHtml + '</div>' +
+          '<div style="margin-top: 10px; font-size: 0.72rem; color: #94a3b8; text-align: right;">' +
+          'Copilot • ' + new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) +
+          '</div>';
+
+        chatFeed.appendChild(assistantBubble);
+        chatFeed.scrollTop = chatFeed.scrollHeight;
+
       } catch (err) {
         console.error('Erro no Copilot:', err);
         if (thinkingBox) thinkingBox.style.display = 'none';
-        alert('Erro ao processar a pergunta. Por favor tente novamente.');
-        if (emptyState) emptyState.style.display = 'block';
+
+        const errorBubble = document.createElement('div');
+        errorBubble.className = 'chat-bubble-assistant';
+        errorBubble.innerHTML = '<div style="color: #e11d48; font-weight: 700;">❌ Ocorreu um erro ao processar a pergunta</div>' +
+          '<div style="font-size: 0.85rem; color: #64748b; margin-top: 4px;">Por favor verifique a ligação e tente novamente.</div>';
+        chatFeed.appendChild(errorBubble);
+        chatFeed.scrollTop = chatFeed.scrollHeight;
       } finally {
-        if (askBtn) {
-          askBtn.disabled = false;
-          askBtn.innerHTML = originalBtnText;
+        isCopilotThinking = false;
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = '<span>Perguntar</span> ➜';
         }
-        inputEl.disabled = false;
-        inputEl.focus();
+        if (inputEl) {
+          inputEl.focus();
+        }
       }
     }
 
