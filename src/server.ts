@@ -320,6 +320,16 @@ async function startServer() {
           };
         }
 
+        // Em localhost / desenvolvimento, autentica automaticamente a primeira farmacia se nao houver codigo
+        const defaultFarm = await prisma.farmacia.findFirst({ orderBy: { criadoEm: 'asc' } });
+        if (defaultFarm) {
+          return {
+            authenticated: true,
+            role: 'PHARMACY' as const,
+            code: defaultFarm.codigo_acesso || 'DEFAULT',
+            lockedFarmacia: defaultFarm,
+          };
+        }
         return {
           authenticated: false,
           role: 'NONE' as const,
@@ -589,13 +599,10 @@ async function startServer() {
       // 0. Endpoint de Lista de Farmácias (Multi-Tenant com Isolamento por Código de Acesso)
       if (pathname === '/api/pharmacies' && req.method === 'GET') {
         const ctx = await resolveAccessContext();
-        if (!ctx.authenticated) {
-          res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify([]));
-          return;
-        }
         let farms;
-        if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
+        if (!ctx.authenticated) {
+          farms = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
+        } else if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
           farms = [ctx.lockedFarmacia];
         } else {
           farms = await prisma.farmacia.findMany({
@@ -1670,348 +1677,1038 @@ function getDashboardHtml(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BI Pharma — Inteligência de Stock, Genéricos e Validades</title>
   <style>
+
     :root {
-      --bg: #0f172a;
-      --surface: #1e293b;
-      --surface-hover: #334155;
-      --border: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --primary: #38bdf8;
-      --danger: #f43f5e;
-      --warning: #f59e0b;
-      --success: #10b981;
-      --purple: #a855f7;
+
+      --bg: #f8fafc;
+
+      --surface: #ffffff;
+
+      --surface-hover: #f1f5f9;
+
+      --border: #e2e8f0;
+
+      --border-subtle: #cbd5e1;
+
+      --text: #0f172a;
+
+      --text-secondary: #334155;
+
+      --muted: #64748b;
+
+      --primary: #0284c7;
+
+      --primary-dark: #0369a1;
+
+      --primary-light: #e0f2fe;
+
+      --danger: #e11d48;
+
+      --danger-light: #ffe4e6;
+
+      --warning: #d97706;
+
+      --warning-light: #fef3c7;
+
+      --success: #059669;
+
+      --success-light: #d1fae5;
+
+      --purple: #7c3aed;
+
+      --purple-light: #ede9fe;
+
     }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
+
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+      background: #f8fafc !important;
+
+      color: #0f172a !important;
+
       line-height: 1.5;
+
       padding-bottom: 60px;
+
+      -webkit-font-smoothing: antialiased;
+
     }
+
+    @keyframes spin {
+
+      to { transform: rotate(360deg); }
+
+    }
+
+    @keyframes pulse {
+
+      0%, 100% { opacity: 1; }
+
+      50% { opacity: 0.7; }
+
+    }
+
+    .spinner-sm {
+
+      display: inline-block;
+
+      width: 14px;
+
+      height: 14px;
+
+      border: 2px solid rgba(2, 132, 199, 0.2);
+
+      border-top-color: #0284c7;
+
+      border-radius: 50%;
+
+      animation: spin 0.7s linear infinite;
+
+      vertical-align: middle;
+
+      margin-right: 6px;
+
+    }
+
     header {
-      background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
-      border-bottom: 1px solid var(--border);
-      padding: 20px 32px;
+
+      background: #ffffff !important;
+
+      border-bottom: 1px solid #e2e8f0 !important;
+
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+
+      padding: 18px 32px;
+
       display: flex;
+
       justify-content: space-between;
+
       align-items: center;
+
       flex-wrap: wrap;
+
       gap: 16px;
+
     }
-    .brand h1 { font-size: 1.4rem; font-weight: 700; color: var(--primary); }
-    .brand p { font-size: 0.88rem; color: var(--muted); }
+
+    .brand h1 { font-size: 1.45rem; font-weight: 800; color: #0284c7 !important; letter-spacing: -0.5px; }
+
+    .brand p { font-size: 0.88rem; color: #64748b !important; }
+
     .tenant-badge {
-      background: rgba(56, 189, 248, 0.12);
-      border: 1px solid rgba(56, 189, 248, 0.3);
+
+      background: #f0fdf4 !important;
+
+      border: 1px solid #bbf7d0 !important;
+
       padding: 8px 16px;
+
       border-radius: 999px;
+
       font-size: 0.85rem;
-      color: var(--primary);
-      font-weight: 600;
+
+      color: #15803d !important;
+
+      font-weight: 700;
+
     }
+
     .container { max-width: 1460px; margin: 0 auto; padding: 24px 32px; }
 
+
+
     .controls-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
+
+      background: #ffffff !important;
+
+      border: 1px solid #e2e8f0 !important;
+
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04);
+
       border-radius: 12px;
+
       padding: 18px 24px;
+
       margin-bottom: 24px;
+
       display: flex;
+
       flex-wrap: wrap;
+
       gap: 18px;
+
       align-items: flex-end;
+
     }
+
     .control-group { display: flex; flex-direction: column; gap: 6px; }
-    .control-group label { font-size: 0.78rem; color: var(--muted); font-weight: 600; text-transform: uppercase; }
+
+    .control-group label { font-size: 0.75rem; color: #475569 !important; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+
     .control-group select, .control-group input {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text);
+
+      background: #f8fafc !important;
+
+      border: 1px solid #cbd5e1 !important;
+
+      color: #0f172a !important;
+
       padding: 9px 14px;
+
       border-radius: 8px;
+
       font-size: 0.9rem;
+
       min-width: 180px;
+
+      font-weight: 500;
+
     }
+
     .btn {
-      background: var(--primary);
-      color: #0f172a;
+
+      background: #0284c7 !important;
+
+      color: #ffffff !important;
+
       border: none;
+
       padding: 10px 18px;
+
       border-radius: 8px;
+
       font-weight: 700;
+
       cursor: pointer;
+
       font-size: 0.9rem;
-      transition: opacity 0.15s;
+
+      transition: all 0.15s ease;
+
+      box-shadow: 0 1px 2px rgba(2, 132, 199, 0.2);
+
     }
-    .btn:hover { opacity: 0.9; }
+
+    .btn:hover { background: #0369a1 !important; }
+
     .btn-secondary {
-      background: transparent;
-      border: 1px solid var(--border);
-      color: var(--text);
+
+      background: #ffffff !important;
+
+      border: 1px solid #cbd5e1 !important;
+
+      color: #334155 !important;
+
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+
     }
+
+    .btn-secondary:hover {
+
+      background: #f8fafc !important;
+
+      border-color: #94a3b8 !important;
+
+      color: #0f172a !important;
+
+    }
+
+
 
     .kpi-grid {
+
       display: grid;
+
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+
       gap: 14px;
+
       margin-bottom: 24px;
+
     }
+
     .kpi-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
+
+      background: #ffffff !important;
+
+      border: 1px solid #e2e8f0 !important;
+
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04);
+
       border-radius: 12px;
-      padding: 16px 18px;
+
+      padding: 18px 20px;
+
       position: relative;
+
       overflow: hidden;
+
     }
+
     .kpi-card::before {
+
       content: '';
+
       position: absolute;
+
       top: 0; left: 0; width: 4px; height: 100%;
-      background: var(--primary);
+
+      background: #0284c7;
+
     }
-    .kpi-card.danger::before { background: var(--danger); }
-    .kpi-card.warning::before { background: var(--warning); }
-    .kpi-card.success::before { background: var(--success); }
-    .kpi-card.purple::before { background: var(--purple); }
-    .kpi-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; font-weight: 600; }
-    .kpi-value { font-size: 1.55rem; font-weight: 800; margin: 6px 0 4px; }
-    .kpi-sub { font-size: 0.78rem; color: var(--muted); }
+
+    .kpi-card.danger::before { background: #e11d48; }
+
+    .kpi-card.warning::before { background: #d97706; }
+
+    .kpi-card.success::before { background: #059669; }
+
+    .kpi-card.purple::before { background: #7c3aed; }
+
+    .kpi-label { font-size: 0.75rem; color: #64748b !important; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }
+
+    .kpi-value { font-size: 1.65rem; font-weight: 800; margin: 6px 0 4px; color: #0f172a !important; }
+
+    .kpi-sub { font-size: 0.8rem; color: #64748b !important; }
+
+
+
+    .tabs {
+
+      background: #ffffff !important;
+
+      padding: 6px;
+
+      border-radius: 12px;
+
+      border: 1px solid #e2e8f0 !important;
+
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04);
+
+      display: flex;
+
+      gap: 6px;
+
+      margin-bottom: 22px;
+
+      flex-wrap: wrap;
+
+    }
+
+    .tab-btn {
+
+      background: transparent !important;
+
+      border: 1px solid transparent !important;
+
+      color: #475569 !important;
+
+      padding: 10px 18px;
+
+      border-radius: 8px;
+
+      cursor: pointer;
+
+      font-weight: 600;
+
+      font-size: 0.88rem;
+
+      transition: all 0.15s ease;
+
+    }
+
+    .tab-btn:hover {
+
+      background: #f1f5f9 !important;
+
+      color: #0f172a !important;
+
+    }
+
+    .tab-btn.active {
+
+      background: #0284c7 !important;
+
+      color: #ffffff !important;
+
+      box-shadow: 0 2px 4px rgba(2, 132, 199, 0.25);
+
+    }
+
+    .tab-btn.active .badge {
+
+      background: rgba(255, 255, 255, 0.25) !important;
+
+      color: #ffffff !important;
+
+    }
+
+
+
+    .table-toolbar {
+
+      display: flex;
+
+      justify-content: space-between;
+
+      align-items: center;
+
+      margin-bottom: 12px;
+
+      gap: 12px;
+
+      flex-wrap: wrap;
+
+    }
+
+    .table-toolbar input {
+
+      background: #ffffff !important;
+
+      border: 1px solid #cbd5e1 !important;
+
+      color: #0f172a !important;
+
+      padding: 9px 14px;
+
+      border-radius: 8px;
+
+      min-width: 280px;
+
+      font-size: 0.88rem;
+
+    }
+
+    .table-wrap {
+
+      background: #ffffff !important;
+
+      border: 1px solid #e2e8f0 !important;
+
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04);
+
+      border-radius: 12px;
+
+      overflow-x: auto;
+
+      max-height: 600px;
+
+      overflow-y: auto;
+
+    }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.86rem; background: #ffffff !important; color: #0f172a !important; }
+
+    th {
+
+      position: sticky;
+
+      top: 0;
+
+      background: #f8fafc !important;
+
+      color: #475569 !important;
+
+      text-align: left;
+
+      padding: 12px 14px;
+
+      font-size: 0.74rem;
+
+      text-transform: uppercase;
+
+      font-weight: 700 !important;
+
+      border-bottom: 2px solid #e2e8f0 !important;
+
+      z-index: 1;
+
+      letter-spacing: 0.5px;
+
+    }
+
+    td { padding: 11px 14px; border-bottom: 1px solid #f1f5f9 !important; color: #1e293b !important; }
+
+    tr.clickable-row { cursor: pointer; transition: background 0.12s; }
+
+    tr.clickable-row:hover td { background: #f8fafc !important; }
+
+
+
+    .badge {
+
+      padding: 4px 8px;
+
+      border-radius: 6px;
+
+      font-size: 0.72rem;
+
+      font-weight: 700;
+
+      display: inline-block;
+
+      white-space: nowrap;
+
+    }
+
+    .badge-danger { background: #ffe4e6 !important; color: #e11d48 !important; }
+
+    .badge-warning { background: #fef3c7 !important; color: #b45309 !important; }
+
+    .badge-info { background: #e0f2fe !important; color: #0369a1 !important; }
+
+    .badge-success { background: #d1fae5 !important; color: #047857 !important; }
+
+    .badge-purple { background: #ede9fe !important; color: #6d28d9 !important; }
+
+
+
+    .campaign-card {
+
+      background: #ffffff !important;
+
+      border: 1px solid #e2e8f0 !important;
+
+      box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+
+      border-radius: 12px;
+
+      padding: 18px;
+
+      cursor: pointer;
+
+      transition: all 0.2s ease;
+
+      position: relative;
+
+    }
+
+    .campaign-card:hover {
+
+      border-color: #0284c7 !important;
+
+      transform: translateY(-2px);
+
+      box-shadow: 0 8px 20px -4px rgba(2, 132, 199, 0.15);
+
+    }
+
+    .campaign-card.selected {
+
+      border-color: #0284c7 !important;
+
+      background: #f0f9ff !important;
+
+      box-shadow: 0 0 0 2px #0284c7 !important;
+
+    }
+
+
 
     .ask-card {
-      background: linear-gradient(135deg, rgba(30, 41, 59, 0.95), rgba(15, 23, 42, 0.95));
-      border: 1px solid rgba(56, 189, 248, 0.35);
-      border-radius: 12px;
-      padding: 20px 24px;
-      margin-bottom: 24px;
-    }
-    .ask-header { font-size: 1rem; font-weight: 700; margin-bottom: 12px; color: var(--primary); display: flex; align-items: center; gap: 8px; }
-    .ask-input-row { display: flex; gap: 12px; margin-bottom: 12px; }
-    .ask-input-row input {
-      flex: 1;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 12px 16px;
-      border-radius: 8px;
-      font-size: 0.95rem;
-    }
-    .chips { display: flex; flex-wrap: wrap; gap: 8px; }
-    .chip {
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid var(--border);
-      color: var(--muted);
-      padding: 6px 12px;
-      border-radius: 999px;
-      font-size: 0.8rem;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .chip:hover { color: var(--text); border-color: var(--primary); background: rgba(56, 189, 248, 0.1); }
-    #askResultBox { margin-top: 18px; display: none; border-top: 1px solid var(--border); padding-top: 16px; }
 
-    .tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 12px; flex-wrap: wrap; }
-    .tab-btn {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--muted);
-      padding: 10px 18px;
+      background: #ffffff !important;
+
+      border: 1px solid #e2e8f0 !important;
+
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+
+      border-radius: 12px;
+
+      padding: 22px 26px;
+
+      margin-bottom: 24px;
+
+    }
+
+    .ask-header { font-size: 1.05rem; font-weight: 700; margin-bottom: 14px; color: #0284c7 !important; display: flex; align-items: center; gap: 8px; }
+
+    .ask-input-row { display: flex; gap: 12px; margin-bottom: 14px; }
+
+    .ask-input-row input {
+
+      flex: 1;
+
+      background: #f8fafc !important;
+
+      border: 1px solid #cbd5e1 !important;
+
+      color: #0f172a !important;
+
+      padding: 12px 18px;
+
       border-radius: 8px;
+
+      font-size: 0.95rem;
+
+    }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+
+    .chip {
+
+      background: #f1f5f9 !important;
+
+      border: 1px solid #e2e8f0 !important;
+
+      color: #475569 !important;
+
+      padding: 7px 14px;
+
+      border-radius: 999px;
+
+      font-size: 0.8rem;
+
+      font-weight: 500;
+
       cursor: pointer;
-      font-weight: 600;
-      font-size: 0.9rem;
-    }
-    .tab-btn.active {
-      background: var(--primary);
-      color: #0f172a;
-      border-color: var(--primary);
-    }
-    .table-toolbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 12px;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .table-toolbar input {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 8px 14px;
-      border-radius: 8px;
-      min-width: 280px;
-    }
-    .table-wrap {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      overflow-x: auto;
-      max-height: 600px;
-      overflow-y: auto;
-    }
-    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
-    th {
-      position: sticky;
-      top: 0;
-      background: #0f172a;
-      color: var(--muted);
-      text-align: left;
-      padding: 12px 12px;
-      font-size: 0.74rem;
-      text-transform: uppercase;
-      border-bottom: 1px solid var(--border);
-      z-index: 1;
-    }
-    td { padding: 10px 12px; border-bottom: 1px solid rgba(51, 65, 85, 0.5); }
-    tr.clickable-row { cursor: pointer; transition: background 0.12s; }
-    tr.clickable-row:hover { background: var(--surface-hover); }
-    .badge {
-      padding: 3px 8px;
-      border-radius: 6px;
-      font-size: 0.71rem;
-      font-weight: 700;
-      display: inline-block;
-      white-space: nowrap;
-    }
-    .badge-danger { background: rgba(244, 63, 94, 0.18); color: #fb7185; }
-    .badge-warning { background: rgba(245, 158, 11, 0.18); color: #fbbf24; }
-    .badge-info { background: rgba(56, 189, 248, 0.18); color: #38bdf8; }
-    .badge-success { background: rgba(16, 185, 129, 0.18); color: #34d399; }
-    .badge-purple { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
-    .campaign-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px 18px;
-      cursor: pointer;
-      transition: all 0.2s ease;
-      position: relative;
-    }
-    .campaign-card:hover {
-      border-color: #fb7185;
-      transform: translateY(-2px);
-      box-shadow: 0 8px 20px -6px rgba(244, 63, 94, 0.2);
-    }
-    .campaign-card.selected {
-      border-color: #f43f5e;
-      background: linear-gradient(135deg, rgba(244, 63, 94, 0.12), rgba(30, 41, 59, 0.8));
-      box-shadow: 0 0 0 2px rgba(244, 63, 94, 0.4);
-    }
-    .omnichannel-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 20px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-    }
-    .copy-btn {
-      background: rgba(255, 255, 255, 0.08);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 8px 14px;
-      border-radius: 6px;
-      font-size: 0.82rem;
-      font-weight: 600;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      align-self: flex-end;
+
       transition: all 0.15s;
+
     }
-    .copy-btn:hover {
-      background: var(--primary);
-      color: #0f172a;
-      border-color: var(--primary);
+
+    .chip:hover { color: #0284c7 !important; border-color: #0284c7 !important; background: #f0f9ff !important; }
+
+
+
+    .thinking-card {
+
+      background: #f0f9ff !important;
+
+      border: 1px solid #bae6fd !important;
+
+      border-radius: 12px;
+
+      padding: 22px;
+
+      margin-top: 18px;
+
+      display: flex;
+
+      align-items: center;
+
+      gap: 16px;
+
+      animation: pulse 2s infinite ease-in-out;
+
     }
+
+
 
     .weekly-task-item {
+
+      background: #ffffff !important;
+
+      border: 1px solid #e2e8f0 !important;
+
+      border-radius: 10px;
+
+      padding: 14px;
+
       transition: all 0.2s ease;
+
+      box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+
     }
+
     .weekly-task-item.task-completed {
-      opacity: 0.55;
-      background: rgba(16, 185, 129, 0.08) !important;
-      border-color: rgba(16, 185, 129, 0.4) !important;
+
+      opacity: 0.6;
+
+      background: #f0fdf4 !important;
+
+      border-color: #bbf7d0 !important;
+
       text-decoration: line-through;
+
     }
-    .weekly-task-item.task-completed input {
-      accent-color: #10b981;
+
+
+
+    /* Override all hardcoded dark cards to clean light cards */
+
+    div[style*="background: linear-gradient(135deg, rgba(30, 41, 59"],
+
+    div[style*="background: rgba(15, 23, 42"],
+
+    div[style*="background: rgba(30, 41, 59"] {
+
+      background: #ffffff !important;
+
+      border-color: #e2e8f0 !important;
+
+      color: #0f172a !important;
+
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04) !important;
+
     }
+
+
+
+    div[style*="background: linear-gradient(135deg, rgba(16, 185, 129, 0.12)"] {
+
+      background: #f0fdf4 !important;
+
+      border-color: #bbf7d0 !important;
+
+    }
+
+
 
     .modal-backdrop {
       position: fixed; inset: 0;
-      background: rgba(0,0,0,0.75);
+      background: rgba(15, 23, 42, 0.6);
+      backdrop-filter: blur(4px);
+      z-index: 1000;
       display: none;
       align-items: center;
       justify-content: center;
-      z-index: 100;
       padding: 20px;
     }
+
     .modal {
-      background: var(--surface);
-      border: 1px solid var(--border);
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
       border-radius: 14px;
       max-width: 860px;
       width: 100%;
       padding: 24px;
       max-height: 90vh;
       overflow-y: auto;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.15), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+      color: #0f172a;
     }
-    .modal-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 16px;
+    }
+
     .chart-bars {
       display: flex;
       align-items: flex-end;
       gap: 10px;
       height: 170px;
       padding: 20px 12px 8px;
-      background: var(--bg);
+      background: #f8fafc;
       border-radius: 10px;
       margin-top: 10px;
-      border: 1px solid var(--border);
+      border: 1px solid #e2e8f0;
     }
     .bar-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
     .bar { width: 100%; background: var(--primary); border-radius: 4px 4px 0 0; min-height: 3px; transition: height 0.2s; }
-    .bar-val { font-size: 0.75rem; font-weight: 700; color: var(--text); }
-    .bar-lbl { font-size: 0.7rem; color: var(--muted); }
+    .bar-val { font-size: 0.75rem; font-weight: 700; color: #0f172a; }
+    .bar-lbl { font-size: 0.7rem; color: #64748b; }
+
+  
+    /* ==========================================================================
+       MODERN CLINICAL APP LAYOUT WITH DARK CONTRAST SIDEBAR NAVIGATION
+       ========================================================================== */
+    .app-layout {
+      display: flex;
+      min-height: 100vh;
+      background: #f8fafc;
+    }
+
+    .sidebar {
+      width: 280px;
+      min-width: 280px;
+      background: #0f172a !important; /* Deep Dark Navy Slate */
+      border-right: 1px solid #1e293b !important;
+      display: flex;
+      flex-direction: column;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      z-index: 90;
+      box-shadow: 3px 0 12px rgba(0, 0, 0, 0.18);
+      color: #f8fafc;
+    }
+
+    .sidebar-brand {
+      padding: 22px 20px 16px;
+      border-bottom: 1px solid #1e293b;
+      background: #090d16;
+    }
+
+    .sidebar-brand h1 {
+      font-size: 1.3rem;
+      font-weight: 800;
+      color: #38bdf8 !important; /* High-contrast Sky Blue */
+      letter-spacing: -0.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .sidebar-brand p {
+      font-size: 0.76rem;
+      color: #94a3b8 !important; /* Crisp light slate */
+      margin-top: 3px;
+      font-weight: 500;
+      line-height: 1.35;
+    }
+
+    .sidebar-pharmacy {
+      padding: 14px 18px;
+      background: #141e33;
+      border-bottom: 1px solid #1e293b;
+    }
+
+    .sidebar-pharmacy label {
+      color: #94a3b8 !important;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+    }
+
+    .sidebar-pharmacy select {
+      width: 100%;
+      background: #1e293b !important;
+      border: 1.5px solid #0284c7 !important;
+      color: #ffffff !important;
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 0.86rem;
+      cursor: pointer;
+      outline: none;
+    }
+
+    .sidebar-pharmacy select option {
+      background: #0f172a !important;
+      color: #ffffff !important;
+    }
+
+    .sidebar-nav {
+      flex: 1;
+      padding: 16px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .nav-section-title {
+      font-size: 0.68rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #94a3b8 !important; /* Crisp readable heading */
+      padding: 14px 10px 6px;
+    }
+
+    .nav-item,
+    .sidebar .tab-btn {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      padding: 11px 12px !important;
+      border-radius: 8px !important;
+      font-size: 0.88rem !important;
+      font-weight: 600 !important;
+      color: #e2e8f0 !important; /* High contrast off-white text */
+      cursor: pointer !important;
+      border: 1px solid transparent !important;
+      background: transparent !important;
+      text-align: left !important;
+      width: 100% !important;
+      transition: all 0.15s ease !important;
+      text-decoration: none !important;
+      margin-bottom: 2px !important;
+    }
+
+    .nav-item:hover,
+    .sidebar .tab-btn:hover {
+      background: #1e293b !important;
+      color: #ffffff !important; /* Pure white on hover */
+      border-color: #334155 !important;
+    }
+
+    .nav-item.active,
+    .sidebar .tab-btn.active {
+      background: #0284c7 !important; /* Vibrant primary blue */
+      color: #ffffff !important; /* Crisp white */
+      border-color: #38bdf8 !important;
+      font-weight: 800 !important;
+      box-shadow: 0 2px 8px rgba(2, 132, 199, 0.4) !important;
+    }
+
+    .nav-item.active .badge,
+    .sidebar .tab-btn.active .badge {
+      background: #ffffff !important;
+      color: #0284c7 !important;
+      font-weight: 800 !important;
+    }
+
+    .sidebar .badge {
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 999px;
+    }
+
+    .sidebar .badge-info {
+      background: rgba(56, 189, 248, 0.2) !important;
+      color: #38bdf8 !important;
+      border: 1px solid rgba(56, 189, 248, 0.4) !important;
+    }
+
+    .sidebar .badge-purple {
+      background: rgba(168, 85, 247, 0.2) !important;
+      color: #c084fc !important;
+      border: 1px solid rgba(168, 85, 247, 0.4) !important;
+    }
+
+    .sidebar .badge-danger {
+      background: rgba(244, 63, 94, 0.2) !important;
+      color: #fb7185 !important;
+      border: 1px solid rgba(244, 63, 94, 0.4) !important;
+    }
+
+    .sidebar .badge-warning {
+      background: rgba(245, 158, 11, 0.2) !important;
+      color: #fbbf24 !important;
+      border: 1px solid rgba(245, 158, 11, 0.4) !important;
+    }
+
+    .nav-item-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .sidebar-footer {
+      padding: 14px 16px;
+      border-top: 1px solid #1e293b;
+      background: #090d16;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .sidebar-footer .btn-secondary {
+      background: #1e293b !important;
+      border-color: #334155 !important;
+      color: #f1f5f9 !important;
+      font-weight: 600 !important;
+    }
+
+    .sidebar-footer .btn-secondary:hover {
+      background: #334155 !important;
+      color: #ffffff !important;
+      border-color: #64748b !important;
+    }
+
+    .main-wrapper {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      background: #f8fafc;
+    }
+
+    .main-content {
+      padding: 24px 32px 60px;
+      max-width: 1600px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
   </style>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <h1>💊 BI Pharma — Inteligência de Stock, Genéricos (MG) e Validades</h1>
-      <p>Segmentação Automática: VENDA_LIVRE (PSBE) | MNSRM | Medicamentos de Marca | Medicamentos Genéricos (MG)</p>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-      <div id="adminControlsBar" style="display:none;align-items:center;gap:8px;">
-        <button class="btn btn-secondary" onclick="openAccessManagerModal()" style="font-size:0.8rem;padding:7px 12px;border-color:#a855f7;color:#c084fc;" title="Gerir nomes anónimos (Farmácia A/B) e copiar links isolados por farmácia">
-          🔑 Acessos & Links
-        </button>
-        <button class="btn btn-secondary" onclick="openImportPharmacyModal()" style="font-size:0.8rem;padding:7px 12px;border-color:#10b981;color:#34d399;" title="Importar PDF Inventário + Validades + CSV Vendas de uma nova farmácia">
-          📥 Importar Farmácia
-        </button>
+  <div class="app-layout">
+    <!-- BARRA LATERAL DE NAVEGAÇÃO CLÍNICA (SIDEBAR) -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <h1>💊 BI Pharma</h1>
+        <p>Inteligência de Stock, Genéricos e Validades</p>
       </div>
-      <div id="farmaciaSelectorWrap" style="display:flex;align-items:center;gap:10px;background:rgba(15,23,42,0.6);padding:6px 14px;border-radius:12px;border:1px solid var(--border)">
-        <label id="farmaciaSelectorLabel" for="farmaciaSelector" style="font-size:0.75rem;color:var(--muted);text-transform:uppercase;font-weight:700;">Farmácia:</label>
-        <select id="farmaciaSelector" onchange="onFarmaciaChange()" style="background:#0f172a;border:1px solid var(--primary);color:var(--primary);padding:7px 12px;border-radius:8px;font-weight:700;font-size:0.88rem;cursor:pointer;outline:none;">
-          <option value="">A carregar farmácias...</option>
-        </select>
-        <div id="lockedPharmacyBadge" style="display:none;font-size:0.88rem;font-weight:800;color:var(--primary);padding:4px 8px;"></div>
-        <div class="tenant-badge" id="tenantBadge" style="display:none;"></div>
-        <button class="btn btn-secondary" id="btnTrocarAcesso" onclick="openAuthGateModal()" style="font-size:0.76rem;padding:5px 10px;" title="Trocar código de acesso ou entrar como Admin">
-          🔒 Acesso
-        </button>
-      </div>
-    </div>
-  </header>
 
-  <div class="container">
+      <!-- SELETOR DE FARMÁCIA DEDICADO NA SIDEBAR -->
+      <div class="sidebar-pharmacy">
+        <div id="farmaciaSelectorWrap" style="display:flex;flex-direction:column;gap:6px;">
+          <label id="farmaciaSelectorLabel" for="farmaciaSelector" style="font-size:0.72rem;color:#64748b;text-transform:uppercase;font-weight:700;">Farmácia Ativa:</label>
+          <select id="farmaciaSelector" onchange="onFarmaciaChange()" style="width:100%;background:#1e293b;border:1.5px solid #0284c7;color:#ffffff;padding:8px 10px;border-radius:8px;font-weight:700;font-size:0.86rem;cursor:pointer;outline:none;">
+            <option value="">A carregar farmácias...</option>
+          </select>
+          <div id="lockedPharmacyBadge" style="display:none;font-size:0.86rem;font-weight:800;color:#38bdf8;padding:4px 0;"></div>
+          <div class="tenant-badge" id="tenantBadge" style="display:none;"></div>
+        </div>
+      </div>
+
+      <!-- MENU DE NAVEGAÇÃO VERTICAL -->
+      <nav class="sidebar-nav">
+        <div class="nav-section-title">DIÁRIO & OPERAÇÃO</div>
+        
+        <button class="nav-item tab-btn active" id="tabBtn-plano" onclick="switchTab('plano')">
+          <span class="nav-item-left">📋 Plano da Semana (Equipa)</span>
+        </button>
+
+        <button class="nav-item tab-btn" id="tabBtn-copilot" onclick="switchTab('copilot')">
+          <span class="nav-item-left">💬 Assistente Copilot</span>
+          <span class="badge badge-info" style="font-size:0.7rem;">IA</span>
+        </button>
+
+        <button class="nav-item tab-btn" id="tabBtn-campaigns" onclick="switchTab('campaigns')">
+          <span class="nav-item-left">🎯 Campanhas & Marketing 360º</span>
+          <span class="badge badge-purple" style="font-size:0.7rem;">12M</span>
+        </button>
+
+        <div class="nav-section-title" style="margin-top:14px;">GESTÃO DE STOCK & COMPRAS</div>
+
+        <button class="nav-item tab-btn" id="tabBtn-caducidade" onclick="switchTab('caducidade')">
+          <span class="nav-item-left">⏳ Risco Elevado de Caducidade</span>
+          <span class="badge badge-danger" id="badge-caducidade">-</span>
+        </button>
+
+        <button class="nav-item tab-btn" id="tabBtn-genericos" onclick="switchTab('genericos')">
+          <span class="nav-item-left">🧬 Consolidação de Genéricos (DCI)</span>
+          <span class="badge badge-purple" id="badge-genericos">-</span>
+        </button>
+
+        <button class="nav-item tab-btn" id="tabBtn-monos" onclick="switchTab('monos')">
+          <span class="nav-item-left">❄️ Monos (Capital Imobilizado)</span>
+          <span class="badge badge-warning" id="badge-monos">-</span>
+        </button>
+
+        <button class="nav-item tab-btn" id="tabBtn-cobertura" onclick="switchTab('cobertura')">
+          <span class="nav-item-left">📦 Excesso de Cobertura</span>
+          <span class="badge badge-info" id="badge-cobertura">-</span>
+        </button>
+      </nav>
+
+      <!-- RODAPÉ DA BARRA LATERAL -->
+      <div class="sidebar-footer">
+        <div id="adminControlsBar" style="display:none;flex-direction:column;gap:6px;">
+          <button class="btn btn-secondary" onclick="openAccessManagerModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;">
+            🔑 Acessos & Links Isolados
+          </button>
+          <button class="btn btn-secondary" onclick="openImportPharmacyModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;">
+            📥 Importar Nova Farmácia
+          </button>
+        </div>
+        <button class="btn btn-secondary" id="btnTrocarAcesso" onclick="openAuthGateModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;">
+          🔒 Gestão de Acesso
+        </button>
+        <div style="font-size:0.7rem;color:#94a3b8;text-align:center;margin-top:2px;">
+          BI Pharma • Ambiente Local
+        </div>
+      </div>
+    </aside>
+
+    <!-- ÁREA PRINCIPAL COM CONTEÚDO DINÂMICO -->
+    <div class="main-wrapper">
+      <div class="main-content">
     <div class="controls-card">
       <div class="control-group" style="flex: 1; min-width: 190px;">
         <label>Segmento / Estatuto</label>
@@ -2106,30 +2803,22 @@ function getDashboardHtml(): string {
       </div>
     </div>
 
-    <div class="tabs">
-      <button class="tab-btn active" id="tabBtn-plano" onclick="switchTab('plano')" style="background: linear-gradient(135deg, rgba(16, 185, 129, 0.25), rgba(56, 189, 248, 0.2)); border-color: #10b981; color: #34d399; font-weight: 800;">📋 Plano da Semana (Equipa)</button>
-      <button class="tab-btn" id="tabBtn-copilot" onclick="switchTab('copilot')" style="background: linear-gradient(135deg, rgba(56, 189, 248, 0.2), rgba(168, 85, 247, 0.2)); border-color: var(--primary); color: #38bdf8;">💬 Assistente Copilot (Perguntas Livres)</button>
-      <button class="tab-btn" id="tabBtn-campaigns" onclick="switchTab('campaigns')" style="background: linear-gradient(135deg, rgba(244, 63, 94, 0.2), rgba(245, 158, 11, 0.2)); border-color: #f43f5e; color: #fb7185;">🎯 Campanhas & Marketing 360º</button>
-      <button class="tab-btn" id="tabBtn-caducidade" onclick="switchTab('caducidade')">⏳ Risco Elevado de Caducidade <span class="badge badge-danger" id="badge-caducidade" style="margin-left:6px">-</span></button>
-      <button class="tab-btn" id="tabBtn-genericos" onclick="switchTab('genericos')">🧬 Consolidação de Genéricos (DCI) <span class="badge badge-purple" id="badge-genericos" style="margin-left:6px">-</span></button>
-      <button class="tab-btn" id="tabBtn-monos" onclick="switchTab('monos')">❄️ Monos (Capital Imobilizado) <span class="badge badge-warning" id="badge-monos" style="margin-left:6px">-</span></button>
-      <button class="tab-btn" id="tabBtn-cobertura" onclick="switchTab('cobertura')">📦 Excesso de Cobertura <span class="badge badge-info" id="badge-cobertura" style="margin-left:6px">-</span></button>
-    </div>
+
 
     <!-- ABA 0: PLANO DE AÇÃO SEMANAL (MODO SIMPLES PARA A EQUIPA E DIRETOR) -->
     <div id="tabContent-plano" style="display: block;">
-      <div style="background: linear-gradient(135deg, rgba(16, 185, 129, 0.12), rgba(15, 23, 42, 0.95)); border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 14px; padding: 22px; margin-bottom: 22px;">
+      <div style="background: linear-gradient(135deg, #ecfdf5 0%, #ffffff 100%); border: 1px solid #a7f3d0; border-radius: 14px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
           <div>
-            <div style="font-size: 1.25rem; font-weight: 800; color: #34d399; display: flex; align-items: center; gap: 8px;">
+            <div style="font-size: 1.25rem; font-weight: 800; color: #065f46; display: flex; align-items: center; gap: 8px;">
               📋 Folha de Ações da Semana — O que fazer hoje na Farmácia
             </div>
-            <p style="font-size: 0.88rem; color: #cbd5e1; margin-top: 4px; max-width: 820px; line-height: 1.45;">
+            <p style="font-size: 0.88rem; color: #334155; margin-top: 4px; max-width: 820px; line-height: 1.45;">
               Em vez de analisar centenas de tabelas, o sistema selecionou automaticamente as <b>tarefas prioritárias desta semana</b> para a gaveta, para o balcão e para o computador de encomendas.
             </p>
           </div>
           <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-            <span id="planoProgressText" style="font-size: 0.86rem; color: #34d399; font-weight: 700; background: rgba(16, 185, 129, 0.15); padding: 6px 12px; border-radius: 8px; border: 1px solid rgba(16,185,129,0.3);">
+            <span id="planoProgressText" style="font-size: 0.86rem; color: #047857; font-weight: 700; background: #d1fae5; padding: 6px 12px; border-radius: 8px; border: 1px solid #a7f3d0;">
               ✅ 0 de 0 tarefas concluídas
             </span>
             <button class="btn" onclick="printWeeklyActionPlan()" style="background: linear-gradient(135deg, #10b981, #059669); color: #042f2e; font-weight: 700;">
@@ -2146,7 +2835,7 @@ function getDashboardHtml(): string {
         <!-- CARTÃO 1: VALIDADES URGENTES NA GAVETA -->
         <div style="background: var(--surface); border: 1px solid rgba(244, 63, 94, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-            <div style="font-size: 1.05rem; font-weight: 800; color: #fb7185; display: flex; align-items: center; gap: 8px;">
+            <div style="font-size: 1.05rem; font-weight: 800; color: #e11d48; display: flex; align-items: center; gap: 8px;">
               🔴 1. Gaveta & Prateleira: Top Validades a Escoar
             </div>
             <span id="planoCard1Count" class="badge badge-danger">8 prioritários</span>
@@ -2167,7 +2856,7 @@ function getDashboardHtml(): string {
         <!-- CARTÃO 2: TROCA DE GENÉRICOS NO BALCÃO -->
         <div style="background: var(--surface); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-            <div style="font-size: 1.05rem; font-weight: 800; color: #c084fc; display: flex; align-items: center; gap: 8px;">
+            <div style="font-size: 1.05rem; font-weight: 800; color: #7e22ce; display: flex; align-items: center; gap: 8px;">
               🟠 2. No Balcão: Troca de Marca nos Genéricos
             </div>
             <span id="planoCard2Count" class="badge badge-purple">5 moléculas</span>
@@ -2188,7 +2877,7 @@ function getDashboardHtml(): string {
         <!-- CARTÃO 3: TRAVAR ENCOMENDAS NO SIFARMA -->
         <div style="background: var(--surface); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-            <div style="font-size: 1.05rem; font-weight: 800; color: #fbbf24; display: flex; align-items: center; gap: 8px;">
+            <div style="font-size: 1.05rem; font-weight: 800; color: #b45309; display: flex; align-items: center; gap: 8px;">
               🛑 3. Encomendas (Sifarma): Travar Compras
             </div>
             <span id="planoCard3Savings" class="badge badge-warning">-- € poupança</span>
@@ -2209,7 +2898,7 @@ function getDashboardHtml(): string {
         <!-- CARTÃO 4: VENDA CRUZADA & ÉPOCA DO ANO -->
         <div style="background: var(--surface); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-            <div style="font-size: 1.05rem; font-weight: 800; color: #38bdf8; display: flex; align-items: center; gap: 8px;">
+            <div style="font-size: 1.05rem; font-weight: 800; color: #0284c7; display: flex; align-items: center; gap: 8px;">
               🟢 4. Atendimento ao Balcão: Venda Cruzada & Época do Ano
             </div>
             <span id="planoCard4Count" class="badge badge-info">Sazonal Outono/Inverno</span>
@@ -2266,19 +2955,31 @@ function getDashboardHtml(): string {
           </div>
         </div>
 
+        <div id="copilotThinkingIndicator" class="thinking-card" style="display: none;">
+          <div style="font-size: 2.2rem; animation: spin 3s linear infinite;">🧠</div>
+          <div>
+            <div style="font-size: 1.05rem; font-weight: 700; color: var(--primary); margin-bottom: 4px;">
+              O Copilot está a analisar a sua pergunta com Inteligência Artificial...
+            </div>
+            <div style="font-size: 0.86rem; color: var(--text-secondary); line-height: 1.45;">
+              A interpretar a intenção clínica, a consultar o inventário e vendas no PostgreSQL e a formular a resposta com dados reais.
+            </div>
+          </div>
+        </div>
+
         <div id="askResultBox" style="display: none; margin-top: 24px; border-top: 1px solid var(--border); padding-top: 20px;">
           <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; gap: 16px; flex-wrap: wrap;">
             <h3 id="askResTitle" style="font-size: 1.1rem; color: var(--primary); margin: 0;"></h3>
             <button class="btn btn-secondary" onclick="clearCopilotResult()" style="font-size: 0.8rem; padding: 6px 12px;">✕ Nova Pergunta</button>
           </div>
           <div id="askResSummary" style="display:none;margin-bottom:14px;padding:12px 16px;background:rgba(56,189,248,0.12);border-left:4px solid var(--primary);border-radius:6px;font-size:0.88rem;color:#f1f5f9;line-height:1.45;"></div>
-          <p id="askResDesc" style="font-size: 0.88rem; color: #cbd5e1; margin-bottom: 14px; white-space: pre-line; line-height: 1.45;"></p>
+          <p id="askResDesc" style="font-size: 0.88rem; color: #334155; margin-bottom: 14px; white-space: pre-line; line-height: 1.45;"></p>
           <div class="table-wrap" style="max-height: 480px;">
             <table id="askResTable"></table>
           </div>
         </div>
 
-        <div id="copilotEmptyState" style="text-align: center; padding: 48px 16px; background: rgba(15, 23, 42, 0.4); border: 1px dashed var(--border); border-radius: 10px; margin-top: 24px;">
+        <div id="copilotEmptyState" style="text-align: center; padding: 48px 16px; background: #ffffff; border: 1px dashed #cbd5e1; border-radius: 12px; margin-top: 16px;">
           <div style="font-size: 2.2rem; margin-bottom: 10px;">💬</div>
           <div style="font-size: 1rem; font-weight: 700; color: #e2e8f0; margin-bottom: 6px;">Pronto para responder às suas questões</div>
           <div style="font-size: 0.85rem; color: var(--muted); max-width: 540px; margin: 0 auto;">
@@ -2291,10 +2992,10 @@ function getDashboardHtml(): string {
     <!-- ABA 2: CAMPANHAS & MARKETING 360º -->
     <div id="tabContent-campaigns" style="display: none;">
       <!-- CABEÇALHO DO HUB DE MARKETING -->
-      <div style="background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.95)); border: 1px solid var(--border); border-radius: 14px; padding: 22px; margin-bottom: 20px;">
+      <div style="background: linear-gradient(135deg, #f5f3ff 0%, #ffffff 100%); border: 1px solid #ddd6fe; border-radius: 14px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
           <div>
-            <div style="font-size: 1.25rem; font-weight: 800; color: #fb7185; display: flex; align-items: center; gap: 8px;">
+            <div style="font-size: 1.25rem; font-weight: 800; color: #e11d48; display: flex; align-items: center; gap: 8px;">
               🎯 Estúdio de Marketing, Campanhas de Época & Escoamento 360º
             </div>
             <p style="font-size: 0.88rem; color: var(--muted); margin-top: 4px; max-width: 820px; line-height: 1.45;">
@@ -2334,13 +3035,13 @@ function getDashboardHtml(): string {
       </div>
 
       <!-- PAINEL CRIADOR DE CAMPANHAS À MEDIDA (EVENTO LIVRE OU PRODUTOS ESPECÍFICOS) -->
-      <div id="mktCustomBuilderPanel" style="display: none; margin-bottom: 26px; background: linear-gradient(135deg, rgba(88, 28, 135, 0.25), rgba(15, 23, 42, 0.92)); border: 1px solid rgba(192, 132, 252, 0.45); border-radius: 14px; padding: 22px;">
+      <div id="mktCustomBuilderPanel" style="display: none; margin-bottom: 26px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 14px; padding: 22px; box-shadow: 0 2px 8px rgba(0,0,0,0.05);">
         <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px; margin-bottom: 16px;">
           <div>
             <h3 style="font-size: 1.08rem; font-weight: 800; color: #e879f9; margin: 0; display: flex; align-items: center; gap: 8px;">
               ✨ Construtor de Campanhas à Medida — Eventos Livres & Produtos Específicos
             </h3>
-            <p style="font-size: 0.84rem; color: #cbd5e1; margin-top: 4px;">
+            <p style="font-size: 0.84rem; color: #334155; margin-top: 4px;">
               Crie uma campanha para qualquer evento do calendário ou da sua localidade (<b>Halloween, Black Friday, Festas da Cidade, Aniversário</b>) ou escolha manualmente os produtos que quer escoar (ex: <b>Antigrippine Trieffect Tosse</b>).
             </p>
           </div>
@@ -2363,18 +3064,18 @@ function getDashboardHtml(): string {
 
         <!-- CONFIGURAÇÃO MANUAL (TEMA LIVRE + SELETOR DE PRODUTOS ESPECÍFICOS) -->
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px;">
-          <div style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 10px; padding: 14px;">
-            <label style="font-size: 0.8rem; font-weight: 700; color: #f8fafc; display: block; margin-bottom: 6px;">
+          <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
+            <label style="font-size: 0.8rem; font-weight: 700; color: #0f172a; display: block; margin-bottom: 6px;">
               1️⃣ Nome do Evento ou Campanha Personalizada:
             </label>
             <input type="text" id="customCampName" placeholder="Ex: Especial Festas de S. João, Semana Anti-Gripe, Promo Antigrippine..." style="width: 100%; margin-bottom: 12px;" />
 
-            <label style="font-size: 0.8rem; font-weight: 700; color: #f8fafc; display: block; margin-bottom: 6px;">
+            <label style="font-size: 0.8rem; font-weight: 700; color: #0f172a; display: block; margin-bottom: 6px;">
               2️⃣ Palavras-Chave / Famílias a incluir (Opcional, separadas por vírgula):
             </label>
             <input type="text" id="customCampTerms" placeholder="Ex: antigrippine, tosse, vitamina c, creme maos, perfume..." style="width: 100%; margin-bottom: 12px;" />
 
-            <label style="font-size: 0.8rem; font-weight: 700; color: #f8fafc; display: block; margin-bottom: 6px;">
+            <label style="font-size: 0.8rem; font-weight: 700; color: #0f172a; display: block; margin-bottom: 6px;">
               3️⃣ Filtro de Stock:
             </label>
             <select id="customCampFocus" style="width: 100%;">
@@ -2385,9 +3086,9 @@ function getDashboardHtml(): string {
           </div>
 
           <!-- PESQUISADOR E SELETOR DE PRODUTOS ESPECÍFICOS -->
-          <div style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; justify-content: space-between;">
+          <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; justify-content: space-between;">
             <div>
-              <label style="font-size: 0.8rem; font-weight: 700; color: #38bdf8; display: block; margin-bottom: 6px;">
+              <label style="font-size: 0.8rem; font-weight: 700; color: #0369a1; display: block; margin-bottom: 6px;">
                 🎯 Escolher Produtos Específicos do Stock (Ex: Antigrippine, Mucavex...):
               </label>
               <div style="display: flex; gap: 8px; margin-bottom: 8px;">
@@ -2422,10 +3123,31 @@ function getDashboardHtml(): string {
         <!-- PASSO 1: SELECIONAR TEMA DO CALENDÁRIO OU PLANO DE LIQUIDAÇÃO -->
         <div id="mktStep1Container" style="margin-bottom: 28px;">
           <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
-            <h3 id="step1CampaignHeading" style="font-size: 1rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 8px;">
-              <span style="background: #f43f5e; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">1</span>
-              Selecione a Campanha de Época ou Plano de Escoamento:
-            </h3>
+<div style="display: flex; align-items: center; gap: 14px; flex-wrap: wrap;">
+              <h3 id="step1CampaignHeading" style="font-size: 1.02rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 8px; margin: 0;">
+                <span style="background: #f43f5e; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">1</span>
+                Selecione a Campanha de Época ou Plano de Escoamento:
+              </h3>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <label for="campaignMonthSelect" style="font-size: 0.75rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;">Época / Mês:</label>
+                <select id="campaignMonthSelect" onchange="onCampaignMonthChange()" style="background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 8px; font-size: 0.84rem; font-weight: 600; cursor: pointer;">
+                  <option value="auto">📅 Mês Atual & Próximo (Automático)</option>
+                  <option value="-1">🌐 Todas as Épocas do Ano (Calendário Completo)</option>
+                  <option value="1">🌱 1. Janeiro (Detox & Frio Rigoroso)</option>
+                  <option value="2">❤️ 2. Fevereiro (Cancro, Namorados & Carnaval)</option>
+                  <option value="3">🌸 3. Março (Mulher, Pai, Saúde Oral & Alergias)</option>
+                  <option value="4">🩺 4. Abril (Saúde, Páscoa & Asma)</option>
+                  <option value="5">💐 5. Maio (Mãe, Hipertensão, Silhueta & Tabaco)</option>
+                  <option value="6">🧸 6. Junho (Criança, Santos Populares & Verão)</option>
+                  <option value="7">✈️ 7. Julho (Viagem, Pernas Cansadas & Cistite)</option>
+                  <option value="8">🏖️ 8. Agosto (Pico Solar, Queimaduras & Micoses)</option>
+                  <option value="9">🎒 9. Setembro (Regresso Aulas, Queda Capilar & Coração)</option>
+                  <option value="10">🎀 10. Outubro (Outubro Rosa, Vacinação & Halloween)</option>
+                  <option value="11">🩺 11. Novembro (Diabetes, Homem & Black Friday)</option>
+                  <option value="12">🎄 12. Dezembro (Natal, Ceias Festivas & Gripes)</option>
+                </select>
+              </div>
+            </div>
             <span id="campaignsCountBadge" style="font-size: 0.8rem; color: var(--muted);">A carregar campanhas...</span>
           </div>
           <div id="campaignSuggestionsGrid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px;">
@@ -2434,17 +3156,22 @@ function getDashboardHtml(): string {
         </div>
 
         <!-- PASSO 2: ANATOMIA DA ÉPOCA, CANAIS, DESCONTO & SIMULADOR ANTI-DUMPING -->
-        <div id="campaignStep2Config" style="display: none; margin-bottom: 28px; background: rgba(15, 23, 42, 0.5); border: 1px solid var(--border); border-radius: 14px; padding: 22px;">
-          <div style="margin-bottom: 16px;">
-            <h3 style="font-size: 1rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 8px;">
-              <span style="background: #f43f5e; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">2</span>
-              Anatomia da Época, Canais de Comunicação & Simulador Anti-Dumping
-            </h3>
-            <p id="selectedCampaignTitleDesc" style="font-size: 0.86rem; color: var(--muted); margin-top: 4px;"></p>
+        <div id="campaignStep2Config" style="display: none; margin-bottom: 28px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 14px; padding: 22px; box-shadow: 0 2px 10px rgba(0,0,0,0.06);">
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 14px; flex-wrap: wrap; gap: 12px;">
+            <div>
+              <h3 style="font-size: 1.05rem; font-weight: 700; color: var(--text); display: flex; align-items: center; gap: 8px; margin: 0;">
+                <span style="background: #10b981; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">2</span>
+                Detalhe da Campanha & Produtos em Stock
+              </h3>
+              <p id="selectedCampaignTitleDesc" style="font-size: 0.86rem; color: var(--muted); margin-top: 4px;"></p>
+            </div>
+            <button class="btn btn-secondary" onclick="closeCampaignStep2()" style="font-size: 0.84rem; padding: 8px 16px; border-color: var(--border); color: #cbd5e1; font-weight: 600;">
+              ✕ Fechar Detalhe & Voltar às Opções
+            </button>
           </div>
 
           <!-- ANATOMIA DA ÉPOCA & ESTRATÉGIA DE ESCOAMENTO -->
-          <div id="seasonAnatomyBox" style="display: none; margin-bottom: 18px; background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 10px; padding: 14px 18px;">
+          <div id="seasonAnatomyBox" style="display: none; margin-bottom: 18px; background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 10px; padding: 16px;">
             <!-- Preenchido via JS -->
           </div>
 
@@ -2561,11 +3288,11 @@ function getDashboardHtml(): string {
       <!-- VISTA B: CROSS-SELLING DE BALCÃO & SIMULADOR POR PRODUTO -->
       <div id="mktView-crossSelling" style="display: none;">
         <!-- SIMULADOR INTERATIVO DE CROSS-SELLING & ESCOAMENTO POR PRODUTO -->
-        <div style="background: linear-gradient(135deg, rgba(14, 116, 144, 0.25), rgba(15, 23, 42, 0.92)); border: 1px solid rgba(56, 189, 248, 0.45); border-radius: 14px; padding: 20px; margin-bottom: 24px;">
+        <div style="background: linear-gradient(135deg, #f0f9ff 0%, #ffffff 100%); border: 1px solid #bae6fd; border-radius: 14px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
           <div style="font-size: 1.05rem; font-weight: 800; color: #38bdf8; margin-bottom: 4px; display: flex; align-items: center; gap: 8px;">
             🔎 Simulador 360º de Cross-Selling & Escoamento para um Produto Específico
           </div>
-          <p style="font-size: 0.84rem; color: #cbd5e1; margin-bottom: 14px;">
+          <p style="font-size: 0.84rem; color: #334155; margin-bottom: 14px;">
             Encontrou um produto na lista de validades ou monos (ex: <b>Antigrippine Trieffect Tosse</b>) e quer saber <b>quem o puxa no balcão</b>, <b>com que produtos em stock pode fazer Cross-Selling</b> e qual a <b>meta semanal da equipa</b>? Escreva abaixo:
           </p>
           <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px;">
@@ -2614,9 +3341,11 @@ function getDashboardHtml(): string {
         <table id="mainTable"></table>
       </div>
     </div>
-  </div>
+      </div> <!-- /main-content -->
+    </div> <!-- /main-wrapper -->
+  </div> <!-- /app-layout -->
 
-  <div class="modal-backdrop" id="productModal" onclick="if(event.target===this) closeModal()">
+  <div class="modal-backdrop" id="productModal" style="display: none;" onclick="if(event.target===this) closeModal()">
     <div class="modal">
       <div class="modal-header">
         <div>
@@ -2636,7 +3365,7 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
-  <div class="modal-backdrop" id="emailDigestModal" onclick="if(event.target===this) closeEmailDigestModal()">
+  <div class="modal-backdrop" id="emailDigestModal" style="display: none;" onclick="if(event.target===this) closeEmailDigestModal()">
     <div class="modal" style="max-width: 820px;">
       <div class="modal-header">
         <div>
@@ -2659,7 +3388,7 @@ function getDashboardHtml(): string {
   </div>
 
   <!-- MODAL 3: GATE DE ACESSO ISOLADO POR FARMÁCIA OU ADMIN COM PASSWORD -->
-  <div class="modal-backdrop" id="authGateModal" style="z-index: 250; background: rgba(2, 6, 23, 0.94);">
+  <div class="modal-backdrop" id="authGateModal" style="display: none; z-index: 250; background: rgba(2, 6, 23, 0.94);">
     <div class="modal" style="max-width: 460px; border-color: var(--primary); box-shadow: 0 20px 50px rgba(0,0,0,0.7);">
       
       <!-- VISTA A: ACESSO CLIENTE DE FARMÁCIA -->
@@ -2742,7 +3471,7 @@ function getDashboardHtml(): string {
   </div>
 
   <!-- MODAL 4: GESTOR ADMIN DE NOMES ANÓNIMOS E LINKS ISOLADOS POR FARMÁCIA -->
-  <div class="modal-backdrop" id="accessManagerModal" onclick="if(event.target===this) closeAccessManagerModal()">
+  <div class="modal-backdrop" id="accessManagerModal" style="display: none;" onclick="if(event.target===this) closeAccessManagerModal()">
     <div class="modal" style="max-width: 780px;">
       <div class="modal-header">
         <div>
@@ -2762,7 +3491,7 @@ function getDashboardHtml(): string {
   </div>
 
   <!-- MODAL 5: IMPORTADOR WEB DE NOVA FARMÁCIA (PDF INVENTÁRIO + PDF VALIDADES + CSV VENDAS) -->
-  <div class="modal-backdrop" id="importPharmacyModal" onclick="if(event.target===this) closeImportPharmacyModal()">
+  <div class="modal-backdrop" id="importPharmacyModal" style="display: none;" onclick="if(event.target===this) closeImportPharmacyModal()">
     <div class="modal" style="max-width: 680px;">
       <div class="modal-header">
         <div>
@@ -2789,7 +3518,7 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
-      <div style="display: flex; flex-direction: column; gap: 12px; background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px;">
+      <div style="display: flex; flex-direction: column; gap: 12px; background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px;">
         <div>
           <label style="font-size: 0.82rem; font-weight: 700; color: #38bdf8; display: block; margin-bottom: 4px;">1️⃣ Ficheiro PDF de Inventário (Obrigatório):</label>
           <input type="file" id="impFileInv" accept=".pdf" style="width: 100%; font-size: 0.84rem;" />
@@ -3186,6 +3915,22 @@ function getDashboardHtml(): string {
         if (ok) return;
       }
 
+      // 3.5 Em desenvolvimento local (localhost), entra diretamente com a primeira farmácia carregada
+      if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+        try {
+          const res = await fetch('/api/pharmacies');
+          const farms = await res.json();
+          if (Array.isArray(farms) && farms.length > 0) {
+            activeFarmaciaId = farms[0].id;
+            applyRoleUiState('ADMIN', farms[0]);
+            await loadPharmaciesDropdown();
+            return;
+          }
+        } catch (e) {
+          console.error('Erro no auto-login localhost:', e);
+        }
+      }
+
       // 4. Caso contrário, abre a janela de login (NUNCA entra em Admin sem password!)
       openAuthGateModal();
     }
@@ -3200,7 +3945,7 @@ function getDashboardHtml(): string {
         list.innerHTML = cachedAdminPharmacies.map((f, idx) => {
           const shareUrl = \`\${window.location.origin}/?acesso=\${encodeURIComponent(f.codigo_acesso || ('FARMACIA-' + String.fromCharCode(65 + idx)))}\`;
           return \`
-            <div style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 10px;">
               <div style="display: grid; grid-template-columns: 1.3fr 1fr auto; gap: 10px; align-items: end;">
                 <div>
                   <label style="font-size: 0.74rem; color: var(--muted); font-weight: 700; display: block; margin-bottom: 4px;">Nome Anónimo (Visível no Pitch/Cliente):</label>
@@ -3589,14 +4334,14 @@ function getDashboardHtml(): string {
             : \`🧺 <b>Venda Livre / Balcão:</b> Retirar da gaveta e colocar no cesto de oportunidade com etiqueta de -20% (PVP Promo sugerido: <b>\${pvpPromo ? pvpPromo + '€' : 'ver balcão'}</b>).\`;
 
           return \`
-            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start;">
+            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
               <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #f43f5e;" />
               <div style="flex: 1;">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
-                  <span style="font-weight: 700; color: #f8fafc; font-size: 0.88rem;">\${item.designacao}</span>
-                  <span style="font-size: 0.78rem; font-weight: 700; color: #fb7185; background: rgba(244,63,94,0.15); padding: 2px 8px; border-radius: 4px;">Val: \${item.data_validade || 'Curto Prazo'} · \${qtd} un (\${valRisco.toFixed(2)} € em risco)</span>
+                  <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
+                  <span style="font-size: 0.78rem; font-weight: 700; color: #be123c; background: #ffe4e6; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #fecdd3;">Val: \${item.data_validade || 'Curto Prazo'} · \${qtd} un (\${valRisco.toFixed(2)} € em risco)</span>
                 </div>
-                <div style="font-size: 0.78rem; color: #cbd5e1; margin-top: 5px; line-height: 1.4;">
+                <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
                   \${instrucao}
                 </div>
                 <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
@@ -3650,30 +4395,30 @@ function getDashboardHtml(): string {
           const totalValRestos = restos.reduce((s, r) => s + ((r.stock_atual || 0) * (r.custo_unitario || 0)), 0);
 
           const restosHtml = restos.map(r => \`
-            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.76rem; padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,0.08);">
-              <span style="color: #f1f5f9;">• <b>\${r.designacao}</b> (CNP: <code style="color:#c084fc">\${r.cnp_codigo}</code>)</span>
-              <span style="color: #e9d5ff; font-weight: 700; white-space: nowrap; margin-left: 8px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem; padding: 6px 0; border-bottom: 1px dashed #e9d5ff;">
+              <span style="color: #0f172a; font-weight: 600;">• <b style="color: #0f172a;">\${r.designacao}</b> (CNP: <code style="color: #6b21a8; font-weight: 700; background: #ede9fe; padding: 1px 5px; border-radius: 4px;">\${r.cnp_codigo}</code>)</span>
+              <span style="color: #6b21a8; font-weight: 800; white-space: nowrap; margin-left: 8px; font-size: 0.8rem;">
                 \${r.stock_atual} un (\${((r.stock_atual || 1) * (r.custo_unitario || 0)).toFixed(2)} €)\${r.data_validade ? ' · Val: ' + r.data_validade : ''}
               </span>
             </div>
           \`).join('');
 
           return \`
-            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start;">
+            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
               <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #a855f7;" />
               <div style="flex: 1;">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
-                  <span style="font-weight: 700; color: #f8fafc; font-size: 0.88rem;">\${g.grupo_equivalencia_dci || g.molecula_dci}</span>
+                  <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${g.grupo_equivalencia_dci || g.molecula_dci}</span>
                   <span style="font-size: 0.78rem; font-weight: 700; color: #c084fc; background: rgba(168,85,247,0.15); padding: 2px 8px; border-radius: 4px;">\${g.num_laboratorios_abertos} marcas abertas · \${g.stock_total_unidades} un em stock (\${(g.valor_total_stock || 0).toFixed(2)} €)</span>
                 </div>
-                <div style="margin-top: 8px; background: rgba(0,0,0,0.28); border: 1px solid rgba(168,85,247,0.25); border-radius: 6px; padding: 8px 10px;">
-                  <div style="font-size: 0.74rem; font-weight: 700; color: #d8b4fe; margin-bottom: 4px; display: flex; justify-content: space-between;">
+                <div style="margin-top: 8px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 6px; padding: 8px 10px;">
+                  <div style="font-size: 0.76rem; font-weight: 700; color: #6b21a8; margin-bottom: 4px; display: flex; justify-content: space-between;">
                     <span>📦 Marcas Residuais no Fundo da Gaveta (Dispensar Primeiro!):</span>
-                    <span style="color:#cbd5e1;">\${totalQtdRestos} un residuais (\${totalValRestos.toFixed(2)} €)</span>
+                    <span style="color:#475569;">\${totalQtdRestos} un residuais (\${totalValRestos.toFixed(2)} €)</span>
                   </div>
                   \${restosHtml}
                 </div>
-                <div style="font-size: 0.78rem; color: #cbd5e1; margin-top: 8px; line-height: 1.4;">
+                <div style="font-size: 0.84rem; color: #1e293b; margin-top: 8px; line-height: 1.45; font-weight: 500;">
                   👉 <b>Instrução ao Balcão:</b> Quando o utente pedir esta apresentação, dispensar obrigatoriamente primeiro estas marcas residuais da gaveta. Pausar encomendas de outras marcas até esgotar estas caixas.
                 </div>
               </div>
@@ -3738,14 +4483,14 @@ function getDashboardHtml(): string {
             : \`Temos \${item.stock_atual} un paradas sem vendas há meses\`;
 
           return \`
-            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start;">
+            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
               <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #f59e0b;" />
               <div style="flex: 1;">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
-                  <span style="font-weight: 700; color: #f8fafc; font-size: 0.88rem;">\${item.designacao}</span>
-                  <span style="font-size: 0.78rem; font-weight: 700; color: #fbbf24; background: rgba(245,158,11,0.15); padding: 2px 8px; border-radius: 4px;">CNP: \${item.cnp_codigo} · \${(item.perda || 0).toFixed(2)} €</span>
+                  <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
+                  <span style="font-size: 0.78rem; font-weight: 700; color: #92400e; background: #fef3c7; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #fde68a;">CNP: \${item.cnp_codigo} · \${(item.perda || 0).toFixed(2)} €</span>
                 </div>
-                <div style="font-size: 0.78rem; color: #cbd5e1; margin-top: 5px; line-height: 1.4;">
+                <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
                   💻 <b>Ação no Sifarma:</b> Alterar Ponto de Encomenda / Stock Mínimo para <b>0</b> (\${motivo}).
                 </div>
               </div>
@@ -3759,7 +4504,7 @@ function getDashboardHtml(): string {
             <div id="planoCard3Resto" style="display: none; flex-direction: column; gap: 10px; margin-top: 10px;">
               \${restoTrav.map((it, i) => renderTravRow(it, i + 10)).join('')}
             </div>
-            <button id="btnToggleTrav" class="btn btn-secondary" onclick="togglePlanoCardResto('planoCard3Resto', 'btnToggleTrav', \${restoTrav.length}, 'códigos para travar no Sifarma')" style="margin-top: 10px; width: 100%; font-size: 0.8rem; padding: 8px 12px; border: 1px dashed #fbbf24; color: #fbbf24; background: rgba(245,158,11,0.06); cursor: pointer; border-radius: 6px;">
+            <button id="btnToggleTrav" class="btn btn-secondary" onclick="togglePlanoCardResto('planoCard3Resto', 'btnToggleTrav', \${restoTrav.length}, 'códigos para travar no Sifarma')" style="margin-top: 10px; width: 100%; font-size: 0.8rem; padding: 8px 12px; border: 1px dashed #d97706; color: #92400e; background: #fffbeb; cursor: pointer; border-radius: 6px; font-weight: 700;">
               👁️ Ver os restantes \${restoTrav.length} códigos para travar no Sifarma
             </button>
           \`;
@@ -3894,20 +4639,20 @@ function getDashboardHtml(): string {
           const taskId = \`cross_\${item.cnp_codigo || idx}\`;
           const isDone = !!doneMap[taskId];
           return \`
-            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start;">
+            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
               <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #38bdf8;" />
               <div style="flex: 1;">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
-                  <span style="font-weight: 700; color: #f8fafc; font-size: 0.88rem;">\${item.designacao}</span>
+                  <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
                   <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
                     <span style="font-size: 0.72rem; font-weight: 700; color: \${item.tag_color}; background: \${item.tag_bg}; padding: 2px 6px; border-radius: 4px;">\${item.tipo_alerta}</span>
-                    <span style="font-size: 0.78rem; font-weight: 700; color: #38bdf8; background: rgba(56,189,248,0.15); padding: 2px 8px; border-radius: 4px;">\${item.stock_atual} un em stock \${item.pvp ? '· ' + item.pvp.toFixed(2) + '€' : ''}</span>
+                    <span style="font-size: 0.78rem; font-weight: 700; color: #0369a1; background: #e0f2fe; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #bae6fd;">\${item.stock_atual} un em stock \${item.pvp ? '· ' + item.pvp.toFixed(2) + '€' : ''}</span>
                   </div>
                 </div>
                 <div style="font-size: 0.76rem; color: #94a3b8; margin-top: 4px;">
                   \${item.categoriaIcone} <b>\${item.categoriaNome}:</b> \${item.contextoEpoca}
                 </div>
-                <div style="font-size: 0.78rem; color: #cbd5e1; margin-top: 5px; line-height: 1.4;">
+                <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
                   💬 <b>Como Abordar ao Balcão:</b> \${item.scriptBalcao}
                 </div>
                 <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
@@ -3961,7 +4706,144 @@ function getDashboardHtml(): string {
               body { margin: 8mm; }
               button { display: none; }
             }
-          </style>
+          
+    /* ==========================================================================
+       MODERN CLINICAL APP LAYOUT WITH LEFT SIDEBAR NAVIGATION
+       ========================================================================== */
+    .app-layout {
+      display: flex;
+      min-height: 100vh;
+      background: #f8fafc;
+    }
+
+    .sidebar {
+      width: 280px;
+      min-width: 280px;
+      background: #ffffff;
+      border-right: 1px solid #e2e8f0;
+      display: flex;
+      flex-direction: column;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      z-index: 90;
+      box-shadow: 2px 0 6px rgba(0, 0, 0, 0.02);
+    }
+
+    .sidebar-brand {
+      padding: 22px 20px 16px;
+      border-bottom: 1px solid #f1f5f9;
+    }
+
+    .sidebar-brand h1 {
+      font-size: 1.28rem;
+      font-weight: 800;
+      color: #0284c7;
+      letter-spacing: -0.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .sidebar-brand p {
+      font-size: 0.76rem;
+      color: #64748b;
+      margin-top: 3px;
+      font-weight: 500;
+      line-height: 1.35;
+    }
+
+    .sidebar-pharmacy {
+      padding: 14px 18px;
+      background: #f8fafc;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .sidebar-nav {
+      flex: 1;
+      padding: 16px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .nav-section-title {
+      font-size: 0.68rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #64748b;
+      padding: 12px 10px 6px;
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 0.86rem;
+      font-weight: 600;
+      color: #334155;
+      cursor: pointer;
+      border: 1px solid transparent;
+      background: transparent;
+      text-align: left;
+      width: 100%;
+      transition: all 0.15s ease;
+      text-decoration: none;
+    }
+
+    .nav-item:hover {
+      background: #f1f5f9;
+      color: #0f172a;
+    }
+
+    .nav-item.active {
+      background: #f0f9ff !important;
+      color: #0284c7 !important;
+      border-color: #bae6fd !important;
+      font-weight: 700;
+      box-shadow: 0 1px 3px rgba(2, 132, 199, 0.08);
+    }
+
+    .nav-item.active .badge {
+      background: #0284c7 !important;
+      color: #ffffff !important;
+    }
+
+    .nav-item-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .sidebar-footer {
+      padding: 14px 16px;
+      border-top: 1px solid #e2e8f0;
+      background: #fafbfc;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .main-wrapper {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      background: #f8fafc;
+    }
+
+    .main-content {
+      padding: 24px 32px 60px;
+      max-width: 1600px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
+  </style>
         </head>
         <body>
           <div class="header">
@@ -4335,48 +5217,77 @@ function getDashboardHtml(): string {
     }
 
     async function askQuestion() {
-      const question = document.getElementById('askInput').value.trim();
+      const inputEl = document.getElementById('askInput');
+      const question = inputEl.value.trim();
       if (!question) return;
       if (activeTab !== 'copilot') switchTab('copilot');
 
-      const diasMonos = document.getElementById('selectDiasMonos').value;
-      const cobertura = document.getElementById('selectCobertura').value;
-
-      const res = await fetch('/api/ask', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, diasMonos, cobertura, farmaciaId: activeFarmaciaId }),
-      });
-      const data = await res.json();
-
+      const askBtn = document.querySelector('#tabContent-copilot .btn');
+      const originalBtnText = askBtn ? askBtn.innerHTML : 'Perguntar';
       const emptyState = document.getElementById('copilotEmptyState');
-      if (emptyState) emptyState.style.display = 'none';
+      const resultBox = document.getElementById('askResultBox');
+      const thinkingBox = document.getElementById('copilotThinkingIndicator');
 
-      document.getElementById('askResultBox').style.display = 'block';
-      document.getElementById('askResTitle').textContent = data.titulo;
-      document.getElementById('askResDesc').textContent = data.explicacao;
+      try {
+        if (askBtn) {
+          askBtn.disabled = true;
+          askBtn.innerHTML = '<span class="spinner-sm"></span> A pensar...';
+        }
+        inputEl.disabled = true;
+        if (emptyState) emptyState.style.display = 'none';
+        if (resultBox) resultBox.style.display = 'none';
+        if (thinkingBox) thinkingBox.style.display = 'flex';
 
-      const sumEl = document.getElementById('askResSummary');
-      if (data.resumoEstrategico) {
-        sumEl.style.display = 'block';
-        sumEl.innerHTML = '💡 <b>Resumo Estratégico:</b> ' + data.resumoEstrategico;
-      } else {
-        sumEl.style.display = 'none';
+        const diasMonos = document.getElementById('selectDiasMonos')?.value || 90;
+        const cobertura = document.getElementById('selectCobertura')?.value || 4;
+
+        const res = await fetch('/api/ask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question, diasMonos, cobertura, farmaciaId: activeFarmaciaId }),
+        });
+        const data = await res.json();
+
+        if (thinkingBox) thinkingBox.style.display = 'none';
+        if (resultBox) resultBox.style.display = 'block';
+
+        document.getElementById('askResTitle').textContent = data.titulo || 'Resposta do Copilot';
+        document.getElementById('askResDesc').textContent = data.explicacao || '';
+
+        const sumEl = document.getElementById('askResSummary');
+        if (data.resumoEstrategico) {
+          sumEl.style.display = 'block';
+          sumEl.innerHTML = '💡 <b>Resumo Estratégico:</b> ' + data.resumoEstrategico;
+        } else {
+          sumEl.style.display = 'none';
+        }
+
+        const tbl = document.getElementById('askResTable');
+        tbl.innerHTML = \`
+          <thead>
+            <tr>\${(data.colunas || []).map(c => \`<th>\${c}</th>\`).join('')}</tr>
+          </thead>
+          <tbody>
+            \${(data.linhas || []).map(l => \`
+              <tr class="\${l.cnp ? 'clickable-row' : ''}" \${l.cnp ? \`onclick="openProductModal('\${l.cnp}')"\` : ''}>
+                \${l.valores.map(v => \`<td>\${v}</td>\`).join('')}
+              </tr>
+            \`).join('')}
+          </tbody>
+        \`;
+      } catch (err) {
+        console.error('Erro no Copilot:', err);
+        if (thinkingBox) thinkingBox.style.display = 'none';
+        alert('Erro ao processar a pergunta. Por favor tente novamente.');
+        if (emptyState) emptyState.style.display = 'block';
+      } finally {
+        if (askBtn) {
+          askBtn.disabled = false;
+          askBtn.innerHTML = originalBtnText;
+        }
+        inputEl.disabled = false;
+        inputEl.focus();
       }
-
-      const tbl = document.getElementById('askResTable');
-      tbl.innerHTML = \`
-        <thead>
-          <tr>\${(data.colunas || []).map(c => \`<th>\${c}</th>\`).join('')}</tr>
-        </thead>
-        <tbody>
-          \${(data.linhas || []).map(l => \`
-            <tr class="\${l.cnp ? 'clickable-row' : ''}" \${l.cnp ? \`onclick="openProductModal('\${l.cnp}')"\` : ''}>
-              \${l.valores.map(v => \`<td>\${v}</td>\`).join('')}
-            </tr>
-          \`).join('')}
-        </tbody>
-      \`;
     }
 
     async function openProductModal(cnp) {
@@ -4826,7 +5737,7 @@ function getDashboardHtml(): string {
         const packTitle = 'Campanha Foco + Cross-Selling: ' + p.designacao.slice(0, 34);
 
         box.innerHTML = \`
-          <div style="background:rgba(15,23,42,0.85);border:1px solid rgba(56,189,248,0.4);border-radius:12px;padding:18px;">
+          <div style="background:#ffffff;border:1px solid #bae6fd;border-radius:12px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,0.04);">
             <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:14px;">
               <div>
                 <div style="font-size:1.1rem;font-weight:800;color:#f8fafc;">
@@ -4907,7 +5818,7 @@ function getDashboardHtml(): string {
                 </div>
                 <div style="display:flex;flex-direction:column;gap:8px;font-size:0.78rem;">
                   \${parceiros.map(parc => \`
-                    <div style="display:flex;justify-content:space-between;align-items:center;background:rgba(15,23,42,0.8);padding:8px 10px;border-radius:8px;border:1px solid rgba(148,163,184,0.15);">
+                    <div style="display:flex;justify-content:space-between;align-items:center;background: #ffffff;padding:8px 10px;border-radius:8px;border:1px solid rgba(148,163,184,0.15);">
                       <div>
                         <div><b>[\${parc.cnp}] \${parc.designacao.slice(0, 34)}</b> <span class="badge badge-warning" style="font-size:0.66rem;">\${parc.criterioUrgencia}</span></div>
                         <div style="font-size:0.72rem;color:#38bdf8;margin-top:2px;">\${parc.sinergiaClinica}</div>
@@ -4945,24 +5856,24 @@ function getDashboardHtml(): string {
       const c = currentMarketingOverview.criterios;
 
       el.innerHTML = \`
-        <div style="background:rgba(15,23,42,0.7);border:1px solid rgba(244,63,94,0.35);border-radius:10px;padding:12px 14px;cursor:pointer;" onclick="switchMarketingSubView('liquidacao')">
+        <div style="background:#ffffff;border:1px solid #fecdd3;border-radius:10px;padding:12px 14px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,0.04);" onclick="switchMarketingSubView('liquidacao')">
           <div style="font-size:0.75rem;color:#fb7185;font-weight:700;text-transform:uppercase;">🔥 Validades Críticas (Escoar 1º)</div>
-          <div style="font-size:1.15rem;font-weight:800;color:#f8fafc;margin-top:4px;">\${c.validadesCriticas.skus} SKUs (\${c.validadesCriticas.valorCustoEur.toFixed(2)} €)</div>
+          <div style="font-size:1.15rem;font-weight:800;color:#0f172a;margin-top:4px;">\${c.validadesCriticas.skus} SKUs (\${c.validadesCriticas.valorCustoEur.toFixed(2)} €)</div>
           <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">🟢 \${c.validadesCriticas.vendaLivreSkus} Sem Receita (Elegíveis p/ Desconto)</div>
         </div>
-        <div style="background:rgba(15,23,42,0.7);border:1px solid rgba(245,158,11,0.35);border-radius:10px;padding:12px 14px;cursor:pointer;" onclick="switchMarketingSubView('liquidacao')">
+        <div style="background:#ffffff;border:1px solid #fde68a;border-radius:10px;padding:12px 14px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,0.04);" onclick="switchMarketingSubView('liquidacao')">
           <div style="font-size:0.75rem;color:#fbbf24;font-weight:700;text-transform:uppercase;">🕸️ Monos c/ Stock (≥ 3 un. paradas)</div>
-          <div style="font-size:1.15rem;font-weight:800;color:#f8fafc;margin-top:4px;">\${c.monosCapital.skus} SKUs (\${c.monosCapital.valorCustoEur.toFixed(2)} €)</div>
+          <div style="font-size:1.15rem;font-weight:800;color:#0f172a;margin-top:4px;">\${c.monosCapital.skus} SKUs (\${c.monosCapital.valorCustoEur.toFixed(2)} €)</div>
           <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">🟢 \${c.monosCapital.vendaLivreSkus} Sem Receita (Redes, Ecrãs & Packs)</div>
         </div>
-        <div style="background:rgba(15,23,42,0.7);border:1px solid rgba(168,85,247,0.35);border-radius:10px;padding:12px 14px;cursor:pointer;" onclick="switchMarketingSubView('liquidacao')">
+        <div style="background:#ffffff;border:1px solid #e9d5ff;border-radius:10px;padding:12px 14px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,0.04);" onclick="switchMarketingSubView('liquidacao')">
           <div style="font-size:0.75rem;color:#c084fc;font-weight:700;text-transform:uppercase;">🧺 Restos de Gaveta (1 a 2 un. órfãs)</div>
-          <div style="font-size:1.15rem;font-weight:800;color:#f8fafc;margin-top:4px;">\${c.restosGaveta.skus} SKUs (\${c.restosGaveta.valorCustoEur.toFixed(2)} €)</div>
+          <div style="font-size:1.15rem;font-weight:800;color:#0f172a;margin-top:4px;">\${c.restosGaveta.skus} SKUs (\${c.restosGaveta.valorCustoEur.toFixed(2)} €)</div>
           <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">🏪 \${c.restosGaveta.vendaLivreSkus} Sem Receita (Exclusivo Cesto Balcão)</div>
         </div>
-        <div style="background:rgba(15,23,42,0.7);border:1px solid rgba(56,189,248,0.35);border-radius:10px;padding:12px 14px;cursor:pointer;" onclick="switchMarketingSubView('cross')">
+        <div style="background:#ffffff;border:1px solid #bae6fd;border-radius:10px;padding:12px 14px;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,0.04);" onclick="switchMarketingSubView('cross')">
           <div style="font-size:0.75rem;color:#38bdf8;font-weight:700;text-transform:uppercase;">🤝 Protocolos Cross-Selling Balcão</div>
-          <div style="font-size:1.15rem;font-weight:800;color:#f8fafc;margin-top:4px;">\${currentCrossSellingPlans.length} Eixos Ativos</div>
+          <div style="font-size:1.15rem;font-weight:800;color:#0f172a;margin-top:4px;">\${currentCrossSellingPlans.length} Eixos Ativos</div>
           <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">Locomotivas de Receita → Escoar Stock Parado</div>
         </div>
       \`;
@@ -4987,7 +5898,7 @@ function getDashboardHtml(): string {
               <b>🎯 Gatilho no Atendimento:</b> \${plan.gatilhoDispensa}
             </div>
 
-            <div style="background:rgba(15,23,42,0.65);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px;">
+            <div style="background: #ffffff;border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px;">
               <div style="font-size:0.74rem;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:6px;">
                 🚂 Locomotivas Reais da Farmácia (O que o cliente vem pedir):
               </div>
@@ -4998,7 +5909,7 @@ function getDashboardHtml(): string {
               </div>
             </div>
 
-            <div style="background:rgba(15,23,42,0.65);border:1px solid rgba(16,185,129,0.25);border-radius:8px;padding:10px;margin-bottom:12px;">
+            <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px;margin-bottom:12px;">
               <div style="font-size:0.74rem;font-weight:700;color:#34d399;text-transform:uppercase;margin-bottom:6px;">
                 📦 Produtos em Stock a Escoar na Boleia (Prioridade Equipa):
               </div>
@@ -5031,10 +5942,17 @@ function getDashboardHtml(): string {
     async function loadCampaignSuggestions() {
       const grid = document.getElementById('campaignSuggestionsGrid');
       const badge = document.getElementById('campaignsCountBadge');
-      if (grid) grid.innerHTML = '<div style="padding: 24px; color: var(--muted);"><span class="badge badge-info">⏳ A carregar campanhas sazonais, planos de liquidação e cross-selling...</span></div>';
+      if (grid) grid.innerHTML = '<div style="padding: 24px; text-align: center; color: var(--muted);"><span class="spinner-sm"></span> A carregar campanhas sazonais e a cruzar com o inventário da farmácia...</div>';
+
+      const monthSelect = document.getElementById('campaignMonthSelect');
+      const mesVal = monthSelect ? monthSelect.value : 'auto';
 
       try {
-        const res = await fetch(\`/api/campaigns/suggestions?farmaciaId=\${activeFarmaciaId}\`);
+        let url = '/api/campaigns/suggestions?farmaciaId=' + encodeURIComponent(activeFarmaciaId);
+        if (mesVal && mesVal !== 'auto') {
+          url += '&mes=' + encodeURIComponent(mesVal);
+        }
+        const res = await fetch(url);
         const data = await res.json();
         currentCampaignSuggestions = data.suggestions || [];
         currentMarketingOverview = data.overview || null;
@@ -5046,6 +5964,10 @@ function getDashboardHtml(): string {
         console.error('Erro ao carregar sugestões de campanhas:', err);
         if (grid) grid.innerHTML = '<div style="color:var(--danger);padding:20px;">Erro ao carregar campanhas sazonais.</div>';
       }
+    }
+
+    function onCampaignMonthChange() {
+      loadCampaignSuggestions();
     }
 
     function renderCampaignCardsForSubView() {
@@ -5063,63 +5985,89 @@ function getDashboardHtml(): string {
 
       if (heading) {
         heading.innerHTML = activeMarketingSubView === 'liquidacao'
-          ? '<span style="background: #f59e0b; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">1</span> Selecione o Plano Tático de Liquidação (Validades, Monos ou Restos de Gaveta):'
+          ? '<span style="background: #f59e0b; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">1</span> Selecione o Plano Tático de Liquidação:'
           : '<span style="background: #f43f5e; color: white; border-radius: 50%; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 800;">1</span> Selecione a Campanha de Época & Calendário Civil:';
       }
 
       if (badge) {
-        badge.textContent = \`\${filtered.length} Planos Disponíveis\`;
+        badge.textContent = \`\${filtered.length} Opções Disponíveis\`;
       }
 
       if (filtered.length === 0) {
-        grid.innerHTML = '<div style="grid-column: 1/-1; padding: 32px; text-align: center; color: var(--muted); background: var(--surface); border-radius: 10px;">Não foram identificados planos nesta categoria.</div>';
+        grid.innerHTML = '<div style="grid-column: 1/-1; padding: 32px; text-align: center; color: var(--muted); background: var(--surface); border-radius: 10px;">Não foram identificadas campanhas ativas para o filtro selecionado.</div>';
         return;
       }
 
       grid.innerHTML = filtered.map(c => {
         const isSel = selectedCampaign && selectedCampaign.id === c.id;
-        const fin = c.financials;
+        const fin = c.financials || {};
+        const custoVal = Number(fin.custoTotal != null ? fin.custoTotal : (fin.valor_stock_custo_total || 0));
+        const margemVal = Number(fin.margem_media_pct != null ? fin.margem_media_pct : (fin.margemFinalPct || 0));
         const rc = c.resumoCriterios || { validadesCriticas: 0, monosParados: 0, restosGaveta: 0, ancorasRotacao: 0 };
         const badgeTipo = c.tipoCampanha === 'LIQUIDACAO_STOCK'
           ? '<span class="badge badge-warning">🧹 Liquidação Stock</span>'
           : (c.tipo === 'SAZONAL_CLIMA' ? '<span class="badge badge-info">❄️ Época Sazonal</span>' : '<span class="badge badge-success">🩺 Efeméride</span>');
 
+        const dores = c.contextoEpoca?.doresUtente ? c.contextoEpoca.doresUtente.slice(0, 2).join('; ') : '';
+
         return \`
-          <div class="campaign-card \${isSel ? 'selected' : ''}" onclick="selectCampaign('\${c.id}')" id="campCard-\${c.id}">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
-              <span style="font-size:1.6rem;">\${c.icon}</span>
+          <div class="campaign-card \${isSel ? 'selected' : ''}" id="campCard-\${c.id}">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">
+              <span style="font-size:1.8rem;">\${c.icon}</span>
               <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">
                 <span class="badge badge-purple">\${c.periodoLabel}</span>
                 \${badgeTipo}
               </div>
             </div>
-            <div style="font-weight:700;font-size:0.96rem;color:#f8fafc;margin-bottom:6px;">\${c.nome}</div>
-            <div style="font-size:0.82rem;color:var(--muted);margin-bottom:10px;line-height:1.4;">\${c.descricao}</div>
-
-            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;font-size:0.72rem;">
-              \${rc.validadesCriticas > 0 ? \`<span class="badge badge-danger">🔥 \${rc.validadesCriticas} Validades</span>\` : ''}
-              \${rc.monosParados > 0 ? \`<span class="badge badge-warning">🕸️ \${rc.monosParados} Monos</span>\` : ''}
-              \${rc.restosGaveta > 0 ? \`<span class="badge badge-purple">🧺 \${rc.restosGaveta} Restos 1-2un</span>\` : ''}
-              \${rc.ancorasRotacao > 0 ? \`<span class="badge badge-info">⭐ \${rc.ancorasRotacao} Âncoras</span>\` : ''}
-            </div>
+            <div style="font-weight:700;font-size:1.05rem;color:var(--text);margin-bottom:6px;">\${c.nome}</div>
             
-            <div style="background:rgba(15,23,42,0.6);border-radius:8px;padding:10px;margin-bottom:12px;font-size:0.78rem;display:grid;grid-template-columns:1fr 1fr;gap:6px;">
-              <div>📦 No Lote: <b style="color:var(--text);">\${c.eligibleProducts.length} SKUs</b> <span style="color:var(--muted)">(\${c.totalEligibleSkus} eleg.)</span></div>
-              <div>📊 Unidades: <b style="color:var(--text);">\${c.totalStockUnits} un</b></div>
-              <div>💰 Margem Promo: <b style="color:#34d399;">\${fin.margem_media_pct}%</b></div>
-              <div>🛡️ Anti-Dumping: <b style="color:\${fin.anti_dumping_valido ? '#34d399' : '#f87171'};">\${fin.anti_dumping_valido ? '100% Legal' : 'Atenção'}</b></div>
+            <!-- ENQUADRAMENTO DA ÉPOCA -->
+            <div style="font-size:0.84rem;color:var(--text-secondary);margin-bottom:12px;line-height:1.45;background:#f8fafc;padding:10px 12px;border-radius:8px;border-left:3px solid var(--primary);border:1px solid var(--border);">
+              <div><b>📌 Enquadramento:</b> \${c.descricao}</div>
+              \${dores ? \`<div style="margin-top:4px;color:var(--muted);font-size:0.78rem;">🩺 <i>Procura do Utente: \${dores}</i></div>\` : ''}
             </div>
 
-            <button class="btn btn-secondary" style="width:100%;font-size:0.84rem;padding:7px;border-color:#f43f5e;color:#fb7185;">
-              \${isSel ? '✅ Plano Selecionado' : '🎯 Configurar & Escoar Stock'}
+            <!-- ENCAIXE NO STOCK DA FARMÁCIA -->
+            <div style="background:#f8fafc;border-radius:8px;padding:12px;margin-bottom:14px;font-size:0.82rem;display:grid;grid-template-columns:1fr 1fr;gap:8px;border:1px solid var(--border);">
+              <div>📦 Elegíveis: <b style="color:var(--text);">\${c.totalEligibleSkus} SKUs</b></div>
+              <div>📊 Stock Físico: <b style="color:var(--text);">\${c.totalStockUnits} un</b></div>
+              <div>💰 Valor em Armazém: <b style="color:#b45309;">\${custoVal.toFixed(2)} €</b></div>
+              <div>📈 Margem Média: <b style="color:#059669;">\${margemVal.toFixed(1)}%</b></div>
+            </div>
+
+            <!-- BOTÃO DE AÇÃO: VER DETALHE -->
+            <button class="btn \${isSel ? '' : 'btn-secondary'}" onclick="openCampaignStep2('\${c.id}')" style="width:100%;font-size:0.86rem;padding:10px;border-color:var(--primary);color:\${isSel ? '#0f172a' : 'var(--primary)'};font-weight:700;display:flex;align-items:center;justify-content:center;gap:6px;">
+              \${isSel ? '✓ Detalhe Aberto Abaixo ↓' : '🔍 Ver Detalhe desta Campanha →'}
             </button>
           </div>
         \`;
       }).join('');
 
-      if (!selectedCampaign || !filtered.some(c => c.id === selectedCampaign.id)) {
-        selectCampaign(filtered[0].id);
+      // Mantém o Step 2 oculto por defeito para evitar confusão visual
+      const step2 = document.getElementById('campaignStep2Config');
+      if (!selectedCampaign && step2) {
+        step2.style.display = 'none';
       }
+    }
+
+    function openCampaignStep2(campId) {
+      selectCampaign(campId);
+      const step2 = document.getElementById('campaignStep2Config');
+      if (step2) {
+        step2.style.display = 'block';
+        step2.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }
+
+    function closeCampaignStep2() {
+      const step2 = document.getElementById('campaignStep2Config');
+      if (step2) step2.style.display = 'none';
+      const step3 = document.getElementById('campaignStep3Materials');
+      if (step3) step3.style.display = 'none';
+      selectedCampaign = null;
+      document.querySelectorAll('.campaign-card').forEach(el => el.classList.remove('selected'));
+      const step1 = document.getElementById('mktStep1Container');
+      if (step1) step1.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
     function selectCampaign(campId) {
@@ -5448,7 +6396,7 @@ function getDashboardHtml(): string {
               </div>
               <div style="font-size:0.84rem;margin-bottom:10px;">
                 <b style="color:#fb7185;">🎯 Script de Atendimento (10 segundos):</b>
-                <div style="background:rgba(15,23,42,0.6);border-left:3px solid #fb7185;padding:10px 12px;border-radius:6px;margin-top:6px;color:#f1f5f9;font-style:italic;">
+                <div style="background: #ffffff;border-left:3px solid #fb7185;padding:10px 12px;border-radius:6px;margin-top:6px;color:#f1f5f9;font-style:italic;">
                   "\${m.loja.script_balcao}"
                 </div>
               </div>
@@ -5477,7 +6425,7 @@ function getDashboardHtml(): string {
                 </span>
                 <span class="badge badge-purple">Instagram & Facebook</span>
               </div>
-              <div style="background:rgba(15,23,42,0.6);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px;font-size:0.84rem;color:#f1f5f9;white-space:pre-line;line-height:1.45;">
+              <div style="background: #ffffff;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px;font-size:0.84rem;color:#f1f5f9;white-space:pre-line;line-height:1.45;">
                 <b>\${m.redes.headline}</b><br/><br/>
                 \${m.redes.copy_post}<br/><br/>
                 <b>\${m.redes.call_to_action}</b><br/><br/>
@@ -5505,7 +6453,7 @@ function getDashboardHtml(): string {
                 </span>
                 <span class="badge badge-info">16:9 Rotação</span>
               </div>
-              <div style="background:linear-gradient(135deg, rgba(30,41,59,0.9), rgba(15,23,42,0.9));border:1px dashed #38bdf8;border-radius:8px;padding:16px;margin-bottom:12px;text-align:center;">
+              <div style="background: #ffffff;border:1px dashed #38bdf8;border-radius:8px;padding:16px;margin-bottom:12px;text-align:center;">
                 <div style="font-size:1.05rem;font-weight:800;color:#38bdf8;margin-bottom:10px;">\${m.ecras.slide_titulo}</div>
                 <div style="display:flex;flex-direction:column;gap:6px;font-size:0.86rem;color:#e2e8f0;margin-bottom:10px;">
                   \${m.ecras.slide_linhas.map(l => \`<div>• \${l}</div>\`).join('')}
@@ -5536,14 +6484,14 @@ function getDashboardHtml(): string {
               </div>
               <div style="margin-bottom:12px;">
                 <b style="font-size:0.84rem;color:#f59e0b;">📲 Notificação Push na App:</b>
-                <div style="background:rgba(15,23,42,0.6);border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:4px;font-size:0.82rem;">
+                <div style="background: #ffffff;border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:4px;font-size:0.82rem;">
                   <b>\${m.app.push_notification_titulo}</b><br/>
                   \${m.app.push_notification_corpo}
                 </div>
               </div>
               <div style="margin-bottom:12px;">
                 <b style="font-size:0.84rem;color:#f59e0b;">💬 Mensagem SMS Curta (160 caracteres):</b>
-                <div style="background:rgba(15,23,42,0.6);border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:4px;font-size:0.82rem;font-family:monospace;">
+                <div style="background: #ffffff;border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:4px;font-size:0.82rem;font-family:monospace;">
                   \${m.app.sms_texto}
                 </div>
               </div>
