@@ -2072,6 +2072,176 @@ function getDashboardHtml(): string {
 
     }
 
+    /* Estilos dos Filtros da Ficha de Trabalhos da Equipa (Desktop) */
+    .plano-toolbar-box {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .plano-toolbar-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .plano-select {
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: #1e293b;
+      outline: none;
+      cursor: pointer;
+      flex: 1;
+      min-width: 130px;
+      transition: all 0.15s ease;
+    }
+
+    .plano-select:focus {
+      border-color: #0284c7;
+      box-shadow: 0 0 0 2px rgba(2, 132, 199, 0.15);
+    }
+
+    .plano-search-box {
+      position: relative;
+      flex: 1;
+      min-width: 170px;
+    }
+
+    .plano-search-box input {
+      width: 100%;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 6px 10px 6px 28px;
+      font-size: 0.80rem;
+      color: #0f172a;
+      outline: none;
+      transition: all 0.15s ease;
+    }
+
+    .plano-search-box input:focus {
+      border-color: #0284c7;
+      box-shadow: 0 0 0 2px rgba(2, 132, 199, 0.15);
+    }
+
+    .plano-search-box .icon {
+      position: absolute;
+      left: 9px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 0.80rem;
+      color: #64748b;
+      pointer-events: none;
+    }
+
+    .plano-status-group {
+      display: inline-flex;
+      background: #e2e8f0;
+      border-radius: 8px;
+      padding: 2px;
+      gap: 2px;
+    }
+
+    .plano-status-pill {
+      border: none;
+      background: transparent;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 0.74rem;
+      font-weight: 700;
+      color: #475569;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .plano-status-pill.active {
+      background: #ffffff;
+      color: #0f172a;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    }
+
+    .plano-subtabs-group {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .plano-subtab-pill {
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: #475569;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease;
+    }
+
+    .plano-subtab-pill.active {
+      background: #f3e8ff;
+      border-color: #a855f7;
+      color: #7e22ce;
+      box-shadow: 0 1px 2px rgba(168, 85, 247, 0.15);
+    }
+
+    .plano-subtab-pill.winter.active {
+      background: #e0f2fe;
+      border-color: #38bdf8;
+      color: #0369a1;
+      box-shadow: 0 1px 2px rgba(56, 189, 248, 0.15);
+    }
+
+    .plano-card-list-scroll {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 520px;
+      overflow-y: auto;
+      padding-right: 6px;
+      flex: 1;
+    }
+
+    .plano-card-list-scroll::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    .plano-card-list-scroll::-webkit-scrollbar-track {
+      background: #f1f5f9;
+      border-radius: 6px;
+    }
+
+    .plano-card-list-scroll::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 6px;
+    }
+
+    .plano-card-list-scroll::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+
+    .plano-counter-badge {
+      font-size: 0.74rem;
+      font-weight: 700;
+      color: #64748b;
+      margin-left: auto;
+      white-space: nowrap;
+    }
+
+
 
 
     /* Override all hardcoded dark cards to clean light cards */
@@ -2550,6 +2720,7 @@ function getDashboardHtml(): string {
 
 
     <!-- ABA 0: PLANO DE AÇÃO SEMANAL (MODO SIMPLES PARA A EQUIPA E DIRETOR) -->
+    <!-- ABA 0: PLANO DE AÇÃO SEMANAL (MODO SIMPLES PARA A EQUIPA E DIRETOR) -->
     <div id="tabContent-plano" style="display: block;">
       <div style="background: linear-gradient(135deg, #ecfdf5 0%, #ffffff 100%); border: 1px solid #a7f3d0; border-radius: 14px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
@@ -2558,7 +2729,7 @@ function getDashboardHtml(): string {
               📋 Folha de Ações da Semana — O que fazer hoje na Farmácia
             </div>
             <p style="font-size: 0.88rem; color: #334155; margin-top: 4px; max-width: 820px; line-height: 1.45;">
-              Em vez de analisar centenas de tabelas, o sistema selecionou automaticamente as <b>tarefas prioritárias desta semana</b> para a gaveta, para o balcão e para o computador de encomendas.
+              Em vez de analisar centenas de tabelas, o sistema organizou as <b>tarefas da semana com filtros inteligentes por área, horizonte e ordem alfabética</b> para agilizar o trabalho físico da equipa na gaveta, no balcão e nas encomendas.
             </p>
           </div>
           <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
@@ -2581,16 +2752,57 @@ function getDashboardHtml(): string {
       <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 20px; margin-bottom: 30px;">
         <!-- CARTÃO 1: VALIDADES URGENTES NA GAVETA -->
         <div style="background: var(--surface); border: 1px solid rgba(244, 63, 94, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #e11d48; display: flex; align-items: center; gap: 8px;">
               🔴 1. Gaveta & Prateleira: Validades Próximas a Tratar
             </div>
-            <span id="planoCard1Count" class="badge badge-danger">8 prioritários</span>
+            <span id="planoCard1Count" class="badge badge-danger">0 produtos</span>
           </div>
-          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
-            Identificação estrita de produtos a aproximar do fim de vida útil para ação prioritária de balcão ou separação física (sem falsas premissas de devolução):
+          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 12px;">
+            Identificação estrita de produtos a aproximar do fim de vida útil para ação prioritária de balcão ou separação física:
           </p>
-          <div id="planoCard1List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
+
+          <!-- Toolbar com Filtros de Categoria, Horizonte, Ordenação e Pesquisa -->
+          <div class="plano-toolbar-box">
+            <div class="plano-toolbar-row">
+              <select id="deskCadMacroFilter" class="plano-select" onchange="onDesktopCadFilterChange()" title="Filtrar por Área / Categoria">
+                <option value="all">🌐 Todas as Áreas / Categorias</option>
+                <option value="MSRM">💊 Medicamentos Sujeitos a Receita (MSRM)</option>
+                <option value="MNSRM_OTC">🟢 Venda Livre (MNSRM / OTC)</option>
+                <option value="DERMOCOSMETICA">🧴 Dermocosmética & Higiene</option>
+                <option value="NUTRICAO_SUPLEMENTOS">🥑 Nutrição & Suplementos</option>
+                <option value="DISPOSITIVOS_SAUDE">🩺 Dispositivos de Saúde</option>
+              </select>
+              <select id="deskCadHorizonFilter" class="plano-select" onchange="onDesktopCadFilterChange()" title="Filtrar por Horizonte Temporal">
+                <option value="all">📅 Todos os Prazos</option>
+                <option value="urgent">🚨 Urgente (≤ 3 Meses)</option>
+                <option value="mid">⏳ 3 a 6 Meses</option>
+                <option value="year">🗓️ 6 a 12 Meses</option>
+              </select>
+            </div>
+            <div class="plano-toolbar-row">
+              <select id="deskCadSortOrder" class="plano-select" onchange="onDesktopCadFilterChange()" title="Critério de Ordenação">
+                <option value="date_asc">⏱️ Validade Mais Próxima (Urgentes 1º)</option>
+                <option value="name_asc">🔤 Alfabética (A ➔ Z)</option>
+                <option value="shelf_asc">📍 Por Prateleira / Gaveta</option>
+                <option value="val_desc">💶 Maior Valor em Risco (€)</option>
+              </select>
+            </div>
+            <div class="plano-toolbar-row">
+              <div class="plano-search-box">
+                <span class="icon">🔍</span>
+                <input type="text" id="deskCadSearch" placeholder="Pesquisar produto, lote, CNP ou prateleira..." oninput="onDesktopCadFilterChange()" />
+              </div>
+              <div class="plano-status-group">
+                <button type="button" class="plano-status-pill active" id="deskCadPill_all" onclick="setDesktopCadStatus('all')">Todos</button>
+                <button type="button" class="plano-status-pill" id="deskCadPill_pending" onclick="setDesktopCadStatus('pending')">Pendentes</button>
+                <button type="button" class="plano-status-pill" id="deskCadPill_done" onclick="setDesktopCadStatus('done')">Concluídos</button>
+              </div>
+              <span id="planoCard1FilteredBadge" class="plano-counter-badge">0 produtos</span>
+            </div>
+          </div>
+
+          <div id="planoCard1List" class="plano-card-list-scroll">
             <!-- Inserido dinamicamente via JS -->
           </div>
           <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); text-align: right;">
@@ -2600,18 +2812,46 @@ function getDashboardHtml(): string {
           </div>
         </div>
 
-        <!-- CARTÃO 2: TROCA DE GENÉRICOS NO BALCÃO -->
+        <!-- CARTÃO 2: BALCÃO & DESTAQUE (A-Z E INVERNO) -->
         <div style="background: var(--surface); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #7e22ce; display: flex; align-items: center; gap: 8px;">
               🟠 2. Balcão & Destaque: Pôr a Rodar Stock Parado & Excessos Sazonais
             </div>
             <span id="planoCard2Count" class="badge badge-purple">Gaveta + Época Alta</span>
           </div>
-          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
-            Fim de gaveta (1-2 un de genéricos) e artigos com excesso de stock na época certa (ex: Ben-u-gripe no pico de inverno):
+          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 12px;">
+            Fim de gaveta (1-2 un de genéricos A-Z) e artigos com excesso de stock na época certa (ex: Ben-u-gripe no pico de inverno):
           </p>
-          <div id="planoCard2List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
+
+          <!-- Toolbar com Sub-tabs A-Z vs Inverno, Pesquisa e Pills -->
+          <div class="plano-toolbar-box">
+            <div class="plano-subtabs-group">
+              <button type="button" class="plano-subtab-pill active" id="deskBalcaoBtnRestos" onclick="setDesktopBalcaoSubtab('restos')">
+                📦 Restos de Gaveta A-Z
+              </button>
+              <button type="button" class="plano-subtab-pill winter" id="deskBalcaoBtnWinter" onclick="setDesktopBalcaoSubtab('winter')">
+                ❄️ Destaques Inverno (Pico)
+              </button>
+              <button type="button" class="plano-subtab-pill" id="deskBalcaoBtnAll" onclick="setDesktopBalcaoSubtab('all')">
+                🌟 Todos
+              </button>
+            </div>
+            <div class="plano-toolbar-row" style="margin-top: 4px;">
+              <div class="plano-search-box">
+                <span class="icon">🔍</span>
+                <input type="text" id="deskBalcaoSearch" placeholder="Pesquisar molécula DCI ou produto..." oninput="onDesktopBalcaoFilterChange()" />
+              </div>
+              <div class="plano-status-group">
+                <button type="button" class="plano-status-pill active" id="deskBalcaoPill_all" onclick="setDesktopBalcaoStatus('all')">Todos</button>
+                <button type="button" class="plano-status-pill" id="deskBalcaoPill_pending" onclick="setDesktopBalcaoStatus('pending')">Pendentes</button>
+                <button type="button" class="plano-status-pill" id="deskBalcaoPill_done" onclick="setDesktopBalcaoStatus('done')">Concluídos</button>
+              </div>
+              <span id="planoCard2FilteredBadge" class="plano-counter-badge">0 itens</span>
+            </div>
+          </div>
+
+          <div id="planoCard2List" class="plano-card-list-scroll">
             <!-- Inserido dinamicamente via JS -->
           </div>
           <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); text-align: right;">
@@ -2623,16 +2863,40 @@ function getDashboardHtml(): string {
 
         <!-- CARTÃO 3: TRAVAR ENCOMENDAS NO SIFARMA -->
         <div style="background: var(--surface); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #b45309; display: flex; align-items: center; gap: 8px;">
               🛑 3. Encomendas (Sifarma): O que NÃO Encomendar Mais
             </div>
             <span id="planoCard3Savings" class="badge badge-warning">-- € poupança</span>
           </div>
-          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
+          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 12px;">
             Colocar o <b>Ponto de Encomenda / Stock Mínimo = 0</b> nestes códigos com cobertura excessiva para travar compras desnecessárias:
           </p>
-          <div id="planoCard3List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
+
+          <!-- Toolbar Cartão 3 -->
+          <div class="plano-toolbar-box">
+            <div class="plano-toolbar-row">
+              <select id="deskTravSortOrder" class="plano-select" onchange="onDesktopTravFilterChange()" title="Critério de Ordenação">
+                <option value="perda_desc">💶 Maior Poupança / Excesso (€)</option>
+                <option value="name_asc">🔤 Alfabética (A ➔ Z)</option>
+                <option value="cob_desc">📦 Maior Cobertura (Meses)</option>
+              </select>
+            </div>
+            <div class="plano-toolbar-row">
+              <div class="plano-search-box">
+                <span class="icon">🔍</span>
+                <input type="text" id="deskTravSearch" placeholder="Pesquisar artigo ou CNP a travar..." oninput="onDesktopTravFilterChange()" />
+              </div>
+              <div class="plano-status-group">
+                <button type="button" class="plano-status-pill active" id="deskTravPill_all" onclick="setDesktopTravStatus('all')">Todos</button>
+                <button type="button" class="plano-status-pill" id="deskTravPill_pending" onclick="setDesktopTravStatus('pending')">Pendentes</button>
+                <button type="button" class="plano-status-pill" id="deskTravPill_done" onclick="setDesktopTravStatus('done')">Concluídos</button>
+              </div>
+              <span id="planoCard3FilteredBadge" class="plano-counter-badge">0 artigos</span>
+            </div>
+          </div>
+
+          <div id="planoCard3List" class="plano-card-list-scroll">
             <!-- Inserido dinamicamente via JS -->
           </div>
           <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); text-align: right;">
@@ -2642,18 +2906,42 @@ function getDashboardHtml(): string {
           </div>
         </div>
 
-        <!-- CARTÃO 4: VENDA CRUZADA & ÉPOCA DO ANO -->
+        <!-- CARTÃO 4: PREVENIR RUTURAS & AJUSTAR NÍVEIS -->
         <div style="background: var(--surface); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #0284c7; display: flex; align-items: center; gap: 8px;">
               🟢 4. Encomendas (Sifarma): Ajustar Níveis & Prevenir Ruturas
             </div>
             <span id="planoCard4Count" class="badge badge-info">Subir Ponto de Encomenda</span>
           </div>
-          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
+          <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 12px;">
             Medicamentos essenciais com stock <= 2 e alto ritmo de saída / pico de inverno. Subir Ponto de Encomenda para evitar ruturas:
           </p>
-          <div id="planoCard4List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
+
+          <!-- Toolbar Cartão 4 -->
+          <div class="plano-toolbar-box">
+            <div class="plano-toolbar-row">
+              <select id="deskRuturaSortOrder" class="plano-select" onchange="onDesktopRuturaFilterChange()" title="Critério de Ordenação">
+                <option value="urgente">🚨 Menor Cobertura / Stock Crítico</option>
+                <option value="vmm_desc">⚡ Maior Ritmo de Vendas (VMM)</option>
+                <option value="name_asc">🔤 Alfabética (A ➔ Z)</option>
+              </select>
+            </div>
+            <div class="plano-toolbar-row">
+              <div class="plano-search-box">
+                <span class="icon">🔍</span>
+                <input type="text" id="deskRuturaSearch" placeholder="Pesquisar medicamento em risco..." oninput="onDesktopRuturaFilterChange()" />
+              </div>
+              <div class="plano-status-group">
+                <button type="button" class="plano-status-pill active" id="deskRuturaPill_all" onclick="setDesktopRuturaStatus('all')">Todos</button>
+                <button type="button" class="plano-status-pill" id="deskRuturaPill_pending" onclick="setDesktopRuturaStatus('pending')">Pendentes</button>
+                <button type="button" class="plano-status-pill" id="deskRuturaPill_done" onclick="setDesktopRuturaStatus('done')">Concluídos</button>
+              </div>
+              <span id="planoCard4FilteredBadge" class="plano-counter-badge">0 artigos</span>
+            </div>
+          </div>
+
+          <div id="planoCard4List" class="plano-card-list-scroll">
             <!-- Inserido dinamicamente via JS -->
           </div>
           <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); text-align: right;">
@@ -4305,6 +4593,80 @@ function getDashboardHtml(): string {
       });
     }
 
+    // ========================================================================
+    // ESTADO E CONTROLO DOS FILTROS DA FICHA DE TRABALHO (DESKTOP)
+    // ========================================================================
+    let desktopFilters = {
+      cadStatus: 'all',
+      balcaoSubtab: 'restos',
+      balcaoStatus: 'all',
+      travStatus: 'all',
+      ruturaStatus: 'all'
+    };
+
+    function setDesktopCadStatus(status) {
+      desktopFilters.cadStatus = status;
+      ['all', 'pending', 'done'].forEach(s => {
+        const btn = document.getElementById('deskCadPill_' + s);
+        if (btn) btn.classList.toggle('active', s === status);
+      });
+      renderDesktopCard1(true);
+    }
+
+    function onDesktopCadFilterChange() {
+      renderDesktopCard1(false);
+    }
+
+    function setDesktopBalcaoSubtab(subtab) {
+      desktopFilters.balcaoSubtab = subtab;
+      const bRestos = document.getElementById('deskBalcaoBtnRestos');
+      const bWinter = document.getElementById('deskBalcaoBtnWinter');
+      const bAll = document.getElementById('deskBalcaoBtnAll');
+      if (bRestos) bRestos.classList.toggle('active', subtab === 'restos');
+      if (bWinter) bWinter.classList.toggle('active', subtab === 'winter');
+      if (bAll) bAll.classList.toggle('active', subtab === 'all');
+      renderDesktopCard2(false);
+    }
+
+    function setDesktopBalcaoStatus(status) {
+      desktopFilters.balcaoStatus = status;
+      ['all', 'pending', 'done'].forEach(s => {
+        const btn = document.getElementById('deskBalcaoPill_' + s);
+        if (btn) btn.classList.toggle('active', s === status);
+      });
+      renderDesktopCard2(true);
+    }
+
+    function onDesktopBalcaoFilterChange() {
+      renderDesktopCard2(false);
+    }
+
+    function setDesktopTravStatus(status) {
+      desktopFilters.travStatus = status;
+      ['all', 'pending', 'done'].forEach(s => {
+        const btn = document.getElementById('deskTravPill_' + s);
+        if (btn) btn.classList.toggle('active', s === status);
+      });
+      renderDesktopCard3(true);
+    }
+
+    function onDesktopTravFilterChange() {
+      renderDesktopCard3(false);
+    }
+
+    function setDesktopRuturaStatus(status) {
+      desktopFilters.ruturaStatus = status;
+      ['all', 'pending', 'done'].forEach(s => {
+        const btn = document.getElementById('deskRuturaPill_' + s);
+        if (btn) btn.classList.toggle('active', s === status);
+      });
+      renderDesktopCard4(true);
+    }
+
+    function onDesktopRuturaFilterChange() {
+      renderDesktopCard4(false);
+    }
+
     function updateWeeklyTasksCounter() {
       const map = getDoneTasksMap();
       const checkboxes = document.querySelectorAll('.weekly-task-checkbox');
@@ -4329,6 +4691,7 @@ function getDashboardHtml(): string {
       card1: [],
       card1All: [],
       card2: [],
+      card2Seasonal: [],
       card3: [],
       card3All: [],
       card4: [],
@@ -4336,134 +4699,199 @@ function getDashboardHtml(): string {
       card3TotalSavings: 0
     };
 
-    function togglePlanoCardResto(containerId, btnId, count, label) {
-      const el = document.getElementById(containerId);
-      const btn = document.getElementById(btnId);
-      if (!el || !btn) return;
-      const isHidden = el.style.display === 'none';
-      el.style.display = isHidden ? 'flex' : 'none';
-      btn.innerHTML = isHidden ? '▲ Ocultar restantes' : \`👁️ Ver os restantes \${count} \${label || 'produtos desta lista'}\`;
-      updateWeeklyTasksCounter();
-    }
+    // ======================================================================
+    // RENDERIZAÇÃO MODULAR DOS 4 CARTÕES COM FILTROS AVANÇADOS (DESKTOP)
+    // ======================================================================
 
-    function renderWeeklyActionPlan() {
-      fetchWeeklyTasksFromDb();
+    function renderDesktopCard1(preserveScroll = false) {
       if (!currentReport) return;
+      const c1El = document.getElementById('planoCard1List');
+      if (!c1El) return;
+      const oldScroll = preserveScroll ? c1El.scrollTop : 0;
       const doneMap = getDoneTasksMap();
 
-      // ======================================================================
-      // CARTÃO 1: 🔴 Pilar 1: Validades Próximas a Tratar (Gaveta & Prateleira)
-      // ======================================================================
-      const allCad = (currentReport.risco_elevado_caducidade || [])
-        .slice()
-        .sort((a, b) => {
-          if (a.data_validade !== b.data_validade) {
-            return (a.data_validade || '').localeCompare(b.data_validade || '');
-          }
-          const valA = a.valor_em_risco != null ? a.valor_em_risco : ((a.stock_atual || a.quantidade || 0) * (a.custo_unitario || 0));
-          const valB = b.valor_em_risco != null ? b.valor_em_risco : ((b.stock_atual || b.quantidade || 0) * (b.custo_unitario || 0));
-          return valB - valA;
-        });
-
-      const top10Cad = allCad.slice(0, 10);
-      const restoCad = allCad.slice(10);
-      currentWeeklyPlanData.card1 = top10Cad;
+      const allCad = (currentReport.risco_elevado_caducidade || []).slice();
       currentWeeklyPlanData.card1All = allCad;
 
       const c1CountEl = document.getElementById('planoCard1Count');
       if (c1CountEl) {
-        c1CountEl.textContent = \`\${allCad.length} produtos (\${top10Cad.length} prioritários)\`;
+        c1CountEl.textContent = \`\${allCad.length} produtos\`;
       }
 
-      const c1El = document.getElementById('planoCard1List');
-      if (c1El) {
-        const renderCadRow = (item, idx) => {
-          const taskId = \`cad_\${item.cnp_codigo}_\${item.lote || idx}\`;
-          const isDone = !!doneMap[taskId];
-          const qtd = item.stock_atual != null ? item.stock_atual : (item.quantidade || 1);
-          const valRisco = item.valor_em_risco != null ? item.valor_em_risco : (qtd * (item.custo_unitario || 0));
+      const q = (document.getElementById('deskCadSearch')?.value || '').toLowerCase().trim();
+      const statusF = desktopFilters.cadStatus || 'all';
+      const macroF = document.getElementById('deskCadMacroFilter')?.value || 'all';
+      const horizonF = document.getElementById('deskCadHorizonFilter')?.value || 'all';
+      const sortOrder = document.getElementById('deskCadSortOrder')?.value || 'date_asc';
 
-          const instrucao = '⚠️ <b>Atenção à Validade:</b> Produto a aproximar-se do fim de vida útil (Data: <b>' + (item.data_validade || 'Curto Prazo') + '</b>). Requer ação prioritária de separação física na gaveta ou destaque no balcão.';
+      const filtered = allCad.filter(it => {
+        const taskId = 'cad_' + it.cnp_codigo + '_' + (it.lote || 0);
+        const isDone = !!doneMap[taskId];
+        if (statusF === 'pending' && isDone) return false;
+        if (statusF === 'done' && !isDone) return false;
 
-          return \`
-            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
-              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #f43f5e;" />
-              <div style="flex: 1;">
-                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
-                  <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
-                  <span style="font-size: 0.78rem; font-weight: 700; color: #be123c; background: #ffe4e6; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #fecdd3;">Val: \${item.data_validade || 'Curto Prazo'} · \${qtd} un (\${valRisco.toFixed(2)} € em risco)</span>
-                </div>
-                <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
-                  \${instrucao}
-                </div>
-                <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
-                  CNP: <code style="color:#38bdf8">\${item.cnp_codigo}</code> | Lote: \${item.lote || 'Geral'} | Tipo: \${item.tipo_venda || 'Geral'}
-                </div>
+        // Filtro de Macro-Área / Categoria
+        if (macroF !== 'all') {
+          const itemMacro = (it.macro_area || '').toUpperCase();
+          const itemTipo = (it.tipo_venda || '').toUpperCase();
+          if (macroF === 'MSRM' && itemTipo !== 'MSRM' && itemMacro !== 'MSRM') return false;
+          if (macroF === 'MNSRM_OTC' && itemTipo !== 'MNSRM' && itemMacro !== 'MNSRM_OTC') return false;
+          if (macroF === 'DERMOCOSMETICA' && itemMacro !== 'DERMOCOSMETICA') return false;
+          if (macroF === 'NUTRICAO_SUPLEMENTOS' && itemMacro !== 'NUTRICAO_SUPLEMENTOS') return false;
+          if (macroF === 'DISPOSITIVOS_SAUDE' && itemMacro !== 'DISPOSITIVOS_SAUDE') return false;
+        }
+
+        // Filtro de Horizonte de Validade
+        if (horizonF !== 'all') {
+          const meses = it.meses_ate_caducidade != null ? Number(it.meses_ate_caducidade) : 999;
+          if (horizonF === 'urgent' && meses > 3) return false;
+          if (horizonF === 'mid' && (meses <= 3 || meses > 6)) return false;
+          if (horizonF === 'year' && (meses <= 6 || meses > 12)) return false;
+        }
+
+        if (q) {
+          const name = (it.designacao || '').toLowerCase();
+          const cnp = (it.cnp_codigo || '').toLowerCase();
+          const lote = (it.lote || '').toLowerCase();
+          const prat = (it.prateleira || '').toLowerCase();
+          return name.includes(q) || cnp.includes(q) || lote.includes(q) || prat.includes(q);
+        }
+        return true;
+      });
+
+      // Ordenação selecionada pelo utilizador
+      filtered.sort((a, b) => {
+        if (sortOrder === 'name_asc') {
+          return (a.designacao || '').localeCompare(b.designacao || '', 'pt');
+        }
+        if (sortOrder === 'shelf_asc') {
+          const sA = a.prateleira || 'ZZZ';
+          const sB = b.prateleira || 'ZZZ';
+          const compShelf = sA.localeCompare(sB, 'pt');
+          if (compShelf !== 0) return compShelf;
+          return (a.designacao || '').localeCompare(b.designacao || '', 'pt');
+        }
+        if (sortOrder === 'val_desc') {
+          const vA = a.valor_em_risco != null ? a.valor_em_risco : ((a.stock_atual || 1) * (a.custo_unitario || 0));
+          const vB = b.valor_em_risco != null ? b.valor_em_risco : ((b.stock_atual || 1) * (b.custo_unitario || 0));
+          return vB - vA;
+        }
+        // Padrão: data de validade mais próxima primeiro
+        const dateA = a.data_validade || '9999-12-31';
+        const dateB = b.data_validade || '9999-12-31';
+        if (dateA !== dateB) return dateA.localeCompare(dateB);
+        const vA = a.valor_em_risco != null ? a.valor_em_risco : ((a.stock_atual || 1) * (a.custo_unitario || 0));
+        const vB = b.valor_em_risco != null ? b.valor_em_risco : ((b.stock_atual || 1) * (b.custo_unitario || 0));
+        return vB - vA;
+      });
+
+      currentWeeklyPlanData.card1 = filtered;
+
+      const badgeEl = document.getElementById('planoCard1FilteredBadge');
+      if (badgeEl) {
+        badgeEl.textContent = \`\${filtered.length} de \${allCad.length} produtos\`;
+      }
+
+      if (filtered.length === 0) {
+        c1El.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;padding:24px;text-align:center;">✅ Nenhuma validade encontrada com os filtros selecionados.</div>';
+        return;
+      }
+
+      c1El.innerHTML = filtered.map((item, idx) => {
+        const taskId = 'cad_' + item.cnp_codigo + '_' + (item.lote || 0);
+        const isDone = !!doneMap[taskId];
+        const qtd = item.stock_atual != null ? item.stock_atual : (item.quantidade || 1);
+        const valRisco = item.valor_em_risco != null ? item.valor_em_risco : (qtd * (item.custo_unitario || 0));
+        const instrucao = '⚠️ <b>Atenção à Validade:</b> Produto a aproximar-se do fim de vida útil (Data: <b>' + (item.data_validade || 'Curto Prazo') + '</b>). Requer ação prioritária de separação física na gaveta ou destaque no balcão.';
+
+        return \`
+          <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
+            <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\${taskId}', 'VALIDADE', '\${item.cnp_codigo}', '\${escapeHtml(item.designacao)}', \${valRisco})" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #f43f5e;" />
+            <div style="flex: 1;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+                <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
+                <span style="font-size: 0.78rem; font-weight: 700; color: #be123c; background: #ffe4e6; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #fecdd3;">Val: \${item.data_validade || 'Curto Prazo'} · \${qtd} un (\${valRisco.toFixed(2)} € em risco)</span>
+              </div>
+              <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
+                \${instrucao}
+              </div>
+              <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+                <span>CNP: <code style="color:#0284c7">\${item.cnp_codigo}</code></span>
+                <span>Lote: <b>\${item.lote || 'Geral'}</b></span>
+                \${item.prateleira ? \`<span style="color: #475569; background: #f1f5f9; padding: 1px 6px; border-radius: 4px;">📍 \${item.prateleira}</span>\` : ''}
+                <span style="color: #64748b;">Tipo: \${item.tipo_venda || 'Geral'}</span>
               </div>
             </div>
-          \`;
-        };
+          </div>
+        \`;
+      }).join('');
 
-        let html1 = top10Cad.map(renderCadRow).join('');
-        if (restoCad.length > 0) {
-          html1 += \`
-            <div id="planoCard1Resto" style="display: none; flex-direction: column; gap: 10px; margin-top: 10px;">
-              \${restoCad.map((it, i) => renderCadRow(it, i + 10)).join('')}
-            </div>
-            <button id="btnToggleCad" class="btn btn-secondary" onclick="togglePlanoCardResto('planoCard1Resto', 'btnToggleCad', \${restoCad.length}, 'produtos em risco de validade')" style="margin-top: 10px; width: 100%; font-size: 0.8rem; padding: 8px 12px; border: 1px dashed #fb7185; color: #fb7185; background: rgba(244,63,94,0.06); cursor: pointer; border-radius: 6px;">
-              👁️ Ver os restantes \${restoCad.length} produtos desta lista
-            </button>
-          \`;
-        }
-        c1El.innerHTML = (html1 || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem validades críticas registadas.</div>').replace(/\\ItemPlaceholderId/g, "'+taskId+'");
-      }
+      if (preserveScroll) c1El.scrollTop = oldScroll;
+    }
 
-      // ======================================================================
-      // CARTÃO 2: 🟠 Pilar 2: Pôr a Rodar Stock Parado & Excessos na Época Alta
-      // ======================================================================
-      // Sub-bloco 2A: Restos de gaveta de Genéricos (DCI)
+    function renderDesktopCard2(preserveScroll = false) {
+      if (!currentReport) return;
+      const c2El = document.getElementById('planoCard2List');
+      if (!c2El) return;
+      const oldScroll = preserveScroll ? c2El.scrollTop : 0;
+      const doneMap = getDoneTasksMap();
+
+      // Moléculas com restos de gaveta, estritamente ordenadas por ORDEM ALFABÉTICA (A ➔ Z)
       const listGen = (currentReport.consolidacao_genericos_dci || [])
         .filter(g => g.restos_gaveta_escobar_primeiro && g.restos_gaveta_escobar_primeiro.length > 0)
         .slice()
         .sort((a, b) => {
-          const diffRestos = (b.restos_gaveta_escobar_primeiro?.length || 0) - (a.restos_gaveta_escobar_primeiro?.length || 0);
-          if (diffRestos !== 0) return diffRestos;
-          return (b.valor_total_stock || 0) - (a.valor_total_stock || 0);
-        })
-        .slice(0, 4);
+          const nameA = a.grupo_equivalencia_dci || a.molecula_dci || '';
+          const nameB = b.grupo_equivalencia_dci || b.molecula_dci || '';
+          return nameA.localeCompare(nameB, 'pt');
+        });
 
-      // Sub-bloco 2B: Excessos Sazonais em Pico de Procura (Inverno)
-      // Destaque prioritário para artigos com excesso de cobertura na época certa (ex: Ben-u-gripe com 49 un!)
-      const seasonalExcessPool = (currentReport.alertas_excesso_cobertura || [])
-        .filter(i => (i.stock_atual || 0) >= 3)
+      // Excessos sazonais em pico de inverno (ordenados alfabeticamente A ➔ Z)
+      const listSeasonal = (currentReport.alertas_excesso_cobertura || [])
+        .filter(i => (i.stock_atual || 0) >= 3 && /ben-u-gripe|cegripe|antigrip|grip|constip|tosse|frio|labi|ureia|vapor|pastilh|gargant|nasal/i.test(i.designacao))
         .slice()
-        .sort((a, b) => {
-          const isFluA = /ben-u-gripe|cegripe|antigrip|grip|constip|tosse|frio|labi|ureia/i.test(a.designacao);
-          const isFluB = /ben-u-gripe|cegripe|antigrip|grip|constip|tosse|frio|labi|ureia/i.test(b.designacao);
-          if (isFluA && !isFluB) return -1;
-          if (!isFluA && isFluB) return 1;
-          return (b.stock_atual || 0) - (a.stock_atual || 0);
-        })
-        .slice(0, 4);
+        .sort((a, b) => (a.designacao || '').localeCompare(b.designacao || '', 'pt'));
 
       currentWeeklyPlanData.card2 = listGen;
-      currentWeeklyPlanData.card2Seasonal = seasonalExcessPool;
+      currentWeeklyPlanData.card2Seasonal = listSeasonal;
 
       const c2CountEl = document.getElementById('planoCard2Count');
       if (c2CountEl) {
-        c2CountEl.textContent = \`\${listGen.length} moléculas + \${seasonalExcessPool.length} excessos sazonais\`;
+        c2CountEl.textContent = \`\${listGen.length} moléculas + \${listSeasonal.length} excessos sazonais\`;
       }
 
-      const c2El = document.getElementById('planoCard2List');
-      if (c2El) {
-        let html2 = '';
+      const q = (document.getElementById('deskBalcaoSearch')?.value || '').toLowerCase().trim();
+      const statusF = desktopFilters.balcaoStatus || 'all';
+      const subtab = desktopFilters.balcaoSubtab || 'restos';
 
-        if (listGen.length > 0) {
-          html2 += '<div style="font-size: 0.78rem; font-weight: 800; color: #7e22ce; text-transform: uppercase; margin-bottom: 8px;">📦 A. Restos de Gaveta de Genéricos (Dispensar Primeiro):</div>';
-          html2 += listGen.map((g, idx) => {
-            const taskId = \`gen_\${normStr(g.molecula_dci || g.grupo_equivalencia_dci || idx)}\`;
+      let html = '';
+      let renderedCount = 0;
+
+      // Bloco A: Restos de gaveta A-Z
+      if (subtab === 'restos' || subtab === 'all') {
+        const filteredGen = listGen.filter(g => {
+          const taskId = 'gen_' + normStr(g.molecula_dci || g.grupo_equivalencia_dci);
+          const isDone = !!doneMap[taskId];
+          if (statusF === 'pending' && isDone) return false;
+          if (statusF === 'done' && !isDone) return false;
+          if (q) {
+            const mol = (g.molecula_dci || '').toLowerCase();
+            const eq = (g.grupo_equivalencia_dci || '').toLowerCase();
+            return mol.includes(q) || eq.includes(q);
+          }
+          return true;
+        });
+
+        renderedCount += filteredGen.length;
+
+        if (filteredGen.length > 0) {
+          html += '<div style="font-size: 0.78rem; font-weight: 800; color: #7e22ce; text-transform: uppercase; margin: 4px 0 8px;">📦 Restos de Gaveta Alfabéticos (A ➔ Z):</div>';
+          html += filteredGen.map(g => {
+            const taskId = 'gen_' + normStr(g.molecula_dci || g.grupo_equivalencia_dci);
             const isDone = !!doneMap[taskId];
             const restos = g.restos_gaveta_escobar_primeiro || [];
+            const name = g.grupo_equivalencia_dci || g.molecula_dci;
+
             const restosHtml = restos.map(r => \`
               <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem; padding: 4px 0; border-bottom: 1px dashed #e9d5ff;">
                 <span style="color: #0f172a; font-weight: 600;">• <b>\${r.designacao}</b> (CNP: <code style="color: #6b21a8; font-weight: 700;">\${r.cnp_codigo}</code>)</span>
@@ -4473,43 +4901,61 @@ function getDashboardHtml(): string {
 
             return \`
               <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; display: flex; gap: 10px; align-items: flex-start; margin-bottom: 8px;">
-                <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 17px; height: 17px; cursor: pointer; accent-color: #a855f7;" />
+                <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\${taskId}', 'RESTO_GAVETA', null, '\${escapeHtml(name)}', 0)" style="margin-top: 3px; width: 17px; height: 17px; cursor: pointer; accent-color: #a855f7;" />
                 <div style="flex: 1;">
                   <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px;">
-                    <span style="font-weight: 700; color: #0f172a; font-size: 0.86rem;">\${g.grupo_equivalencia_dci || g.molecula_dci}</span>
-                    <span style="font-size: 0.74rem; font-weight: 700; color: #c084fc; background: rgba(168,85,247,0.12); padding: 2px 7px; border-radius: 4px;">\${restos.length} marcas a esgotar</span>
+                    <span style="font-weight: 700; color: #0f172a; font-size: 0.86rem;">\${name}</span>
+                    <span style="font-size: 0.74rem; font-weight: 700; color: #7e22ce; background: rgba(168,85,247,0.12); padding: 2px 7px; border-radius: 4px;">\${restos.length} marcas a esgotar</span>
                   </div>
                   <div style="margin-top: 6px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 6px; padding: 6px 8px;">
                     \${restosHtml}
                   </div>
                   <div style="font-size: 0.78rem; color: #334155; margin-top: 6px;">
-                    👉 <b>Balcão:</b> Dispensar primeiro estas caixas paradas na gaveta antes de encomendar outras marcas.
+                    👉 <b>Ação Balcão:</b> Dispensar primeiro estas caixas paradas na gaveta antes de encomendar outras marcas.
                   </div>
                 </div>
               </div>
             \`;
           }).join('');
         }
+      }
 
-        if (seasonalExcessPool.length > 0) {
-          html2 += '<div style="font-size: 0.78rem; font-weight: 800; color: #c2410c; text-transform: uppercase; margin: 12px 0 8px;">🔥 B. Excessos na Época Alta (Pôr a Rodar no Balcão / Cesto):</div>';
-          html2 += seasonalExcessPool.map((item, idx) => {
-            const taskId = \`seas_exc_\${item.cnp_codigo}\`;
+      // Bloco B: Excessos Sazonais em Pico de Inverno
+      if (subtab === 'winter' || subtab === 'all') {
+        const filteredSeasonal = listSeasonal.filter(s => {
+          const taskId = 'saz_' + s.cnp_codigo;
+          const isDone = !!doneMap[taskId];
+          if (statusF === 'pending' && isDone) return false;
+          if (statusF === 'done' && !isDone) return false;
+          if (q) {
+            const name = (s.designacao || '').toLowerCase();
+            const cnp = (s.cnp_codigo || '').toLowerCase();
+            return name.includes(q) || cnp.includes(q);
+          }
+          return true;
+        });
+
+        renderedCount += filteredSeasonal.length;
+
+        if (filteredSeasonal.length > 0) {
+          html += '<div style="font-size: 0.78rem; font-weight: 800; color: #0284c7; text-transform: uppercase; margin: 12px 0 8px;">❄️ Destaques da Época de Inverno (A ➔ Z):</div>';
+          html += filteredSeasonal.map(item => {
+            const taskId = 'saz_' + item.cnp_codigo;
             const isDone = !!doneMap[taskId];
             const cobText = item.cobertura_meses ? \`\${item.cobertura_meses.toFixed(0)} meses de stock\` : 'stock elevado';
 
             return \`
-              <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #fff7ed; border: 1px solid #ffedd5; border-radius: 8px; padding: 10px 12px; display: flex; gap: 10px; align-items: flex-start; margin-bottom: 8px;">
-                <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 17px; height: 17px; cursor: pointer; accent-color: #ea580c;" />
+              <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 10px 12px; display: flex; gap: 10px; align-items: flex-start; margin-bottom: 8px;">
+                <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\${taskId}', 'DESTAQUE_SAZONAL', '\${item.cnp_codigo}', '\${escapeHtml(item.designacao)}', 0)" style="margin-top: 3px; width: 17px; height: 17px; cursor: pointer; accent-color: #0284c7;" />
                 <div style="flex: 1;">
                   <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px;">
-                    <span style="font-weight: 700; color: #9a3412; font-size: 0.86rem;">\${item.designacao}</span>
-                    <span style="font-size: 0.74rem; font-weight: 800; color: #c2410c; background: #ffedd5; padding: 2px 7px; border-radius: 4px; border: 1px solid #fed7aa;">\${item.stock_atual} un em armazém (\${cobText})</span>
+                    <span style="font-weight: 700; color: #0369a1; font-size: 0.86rem;">\${item.designacao}</span>
+                    <span style="font-size: 0.74rem; font-weight: 800; color: #0284c7; background: #e0f2fe; padding: 2px 7px; border-radius: 4px; border: 1px solid #bae6fd;">\${item.stock_atual} un em armazém (\${cobText})</span>
                   </div>
-                  <div style="font-size: 0.80rem; color: #431407; margin-top: 5px; line-height: 1.4;">
-                    🔥 <b>Pico Sazonal de Procura:</b> Aproveitar a época de inverno para colocar em destaque no balcão e no cesto de oportunidade com aconselhamento ativo da equipa.
+                  <div style="font-size: 0.80rem; color: #075985; margin-top: 5px; line-height: 1.4;">
+                    ❄️ <b>Pico Sazonal de Inverno:</b> Colocar em destaque no balcão e no cesto de oportunidade com aconselhamento ativo da equipa.
                   </div>
-                  <div style="font-size: 0.72rem; color: #9a3412; margin-top: 3px;">
+                  <div style="font-size: 0.72rem; color: #0369a1; margin-top: 3px;">
                     CNP: <code>\${item.cnp_codigo}</code> | PVP: <b>\${item.pvp ? item.pvp.toFixed(2) + '€' : '-'}</b>
                   </div>
                 </div>
@@ -4517,13 +4963,24 @@ function getDashboardHtml(): string {
             \`;
           }).join('');
         }
-
-        c2El.innerHTML = (html2 || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem restos de gaveta ou excessos sazonais pendentes.</div>').replace(/\\ItemPlaceholderId/g, "'+taskId+'");
       }
 
-      // ======================================================================
-      // CARTÃO 3: 🛑 Pilar 3: O que NÃO Encomendar Mais (Bloquear no Sifarma, P.E. = 0)
-      // ======================================================================
+      const badgeEl = document.getElementById('planoCard2FilteredBadge');
+      if (badgeEl) {
+        badgeEl.textContent = \`\${renderedCount} itens visíveis\`;
+      }
+
+      c2El.innerHTML = html || '<div style="color:var(--muted);font-size:0.85rem;padding:24px;text-align:center;">✅ Sem restos de gaveta ou destaques pendentes com os filtros atuais.</div>';
+      if (preserveScroll) c2El.scrollTop = oldScroll;
+    }
+
+    function renderDesktopCard3(preserveScroll = false) {
+      if (!currentReport) return;
+      const c3El = document.getElementById('planoCard3List');
+      if (!c3El) return;
+      const oldScroll = preserveScroll ? c3El.scrollTop : 0;
+      const doneMap = getDoneTasksMap();
+
       const poolTrav = [
         ...(currentReport.alertas_excesso_cobertura || []).map(i => {
           const vmm = i.vmm || 1;
@@ -4552,12 +5009,7 @@ function getDashboardHtml(): string {
         }
       }
 
-      const allTrav = Array.from(mapTrav.values())
-        .sort((a, b) => (b.perda || 0) - (a.perda || 0));
-
-      const top10Trav = allTrav.slice(0, 10);
-      const restoTrav = allTrav.slice(10);
-      currentWeeklyPlanData.card3 = top10Trav;
+      const allTrav = Array.from(mapTrav.values());
       currentWeeklyPlanData.card3All = allTrav;
 
       const totalSavings = allTrav.reduce((s, i) => s + (i.perda || 0), 0);
@@ -4568,55 +5020,79 @@ function getDashboardHtml(): string {
         savBadge.textContent = \`Poupança: \${totalSavings.toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €\`;
       }
 
-      const c3El = document.getElementById('planoCard3List');
-      if (c3El) {
-        const renderTravRow = (item, idx) => {
-          const taskId = \`trav_\${item.cnp_codigo}\`;
-          const isDone = !!doneMap[taskId];
-          const motivo = item.cobertura_meses
-            ? \`Temos \${item.stock_atual} un em stock (\${item.cobertura_meses.toFixed(1)} meses de cobertura)\`
-            : \`Temos \${item.stock_atual} un paradas sem vendas há meses\`;
+      const q = (document.getElementById('deskTravSearch')?.value || '').toLowerCase().trim();
+      const statusF = desktopFilters.travStatus || 'all';
+      const sortOrder = document.getElementById('deskTravSortOrder')?.value || 'perda_desc';
 
-          return \`
-            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
-              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #f59e0b;" />
-              <div style="flex: 1;">
-                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
-                  <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
-                  <span style="font-size: 0.78rem; font-weight: 700; color: #92400e; background: #fef3c7; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #fde68a;">CNP: \${item.cnp_codigo} · \${(item.perda || 0).toFixed(2)} €</span>
-                </div>
-                <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
-                  🛑 <b>Ação no Sifarma:</b> Alterar Ponto de Encomenda / Stock Mínimo para <b>0</b> (\${motivo}).
-                </div>
-              </div>
-            </div>
-          \`;
-        };
-
-        let html3 = top10Trav.map(renderTravRow).join('');
-        if (restoTrav.length > 0) {
-          html3 += \`
-            <div id="planoCard3Resto" style="display: none; flex-direction: column; gap: 10px; margin-top: 10px;">
-              \${restoTrav.map((it, i) => renderTravRow(it, i + 10)).join('')}
-            </div>
-            <button id="btnToggleTrav" class="btn btn-secondary" onclick="togglePlanoCardResto('planoCard3Resto', 'btnToggleTrav', \${restoTrav.length}, 'códigos para travar no Sifarma')" style="margin-top: 10px; width: 100%; font-size: 0.8rem; padding: 8px 12px; border: 1px dashed #d97706; color: #92400e; background: #fffbeb; cursor: pointer; border-radius: 6px; font-weight: 700;">
-              👁️ Ver os restantes \${restoTrav.length} códigos para travar no Sifarma
-            </button>
-          \`;
+      const filtered = allTrav.filter(item => {
+        const taskId = 'trav_' + item.cnp_codigo;
+        const isDone = !!doneMap[taskId];
+        if (statusF === 'pending' && isDone) return false;
+        if (statusF === 'done' && !isDone) return false;
+        if (q) {
+          const name = (item.designacao || '').toLowerCase();
+          const cnp = (item.cnp_codigo || '').toLowerCase();
+          return name.includes(q) || cnp.includes(q);
         }
-        c3El.innerHTML = (html3 || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem compras excessivas a travar.</div>').replace(/\\ItemPlaceholderId/g, "'+taskId+'");
+        return true;
+      });
+
+      filtered.sort((a, b) => {
+        if (sortOrder === 'name_asc') {
+          return (a.designacao || '').localeCompare(b.designacao || '', 'pt');
+        }
+        if (sortOrder === 'cob_desc') {
+          return (b.cobertura_meses || 0) - (a.cobertura_meses || 0);
+        }
+        return (b.perda || 0) - (a.perda || 0);
+      });
+
+      currentWeeklyPlanData.card3 = filtered;
+
+      const badgeEl = document.getElementById('planoCard3FilteredBadge');
+      if (badgeEl) {
+        badgeEl.textContent = \`\${filtered.length} de \${allTrav.length} artigos\`;
       }
 
-      // ======================================================================
-      // CARTÃO 4: 🟢 Pilar 4: Ajustar Níveis & Prevenir Ruturas (Subir Ponto de Encomenda)
-      // ======================================================================
-      const rawRuturaPool = (currentReport.artigos_risco_rutura || [])
-        .slice()
-        .sort((a, b) => (b.vmm || 0) - (a.vmm || 0) || (a.stock_atual || 0) - (b.stock_atual || 0));
+      if (filtered.length === 0) {
+        c3El.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;padding:24px;text-align:center;">✅ Sem compras excessivas a travar com os filtros selecionados.</div>';
+        return;
+      }
 
-      const top10Rutura = rawRuturaPool.slice(0, 10);
-      const restoRutura = rawRuturaPool.slice(10);
-      currentWeeklyPlanData.card4 = top10Rutura;
+      c3El.innerHTML = filtered.map(item => {
+        const taskId = 'trav_' + item.cnp_codigo;
+        const isDone = !!doneMap[taskId];
+        const motivo = item.cobertura_meses
+          ? \`Temos \${item.stock_atual} un em stock (\${item.cobertura_meses.toFixed(1)} meses de cobertura)\`
+          : \`Temos \${item.stock_atual} un paradas sem vendas há meses\`;
+
+        return \`
+          <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
+            <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\${taskId}', 'TRAVAR_COMPRA', '\${item.cnp_codigo}', '\${escapeHtml(item.designacao)}', \${item.perda || 0})" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #f59e0b;" />
+            <div style="flex: 1;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+                <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
+                <span style="font-size: 0.78rem; font-weight: 700; color: #92400e; background: #fef3c7; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #fde68a;">CNP: \${item.cnp_codigo} · \${(item.perda || 0).toFixed(2)} €</span>
+              </div>
+              <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
+                🛑 <b>Ação no Sifarma:</b> Alterar Ponto de Encomenda / Stock Mínimo para <b>0</b> (\${motivo}).
+              </div>
+            </div>
+          </div>
+        \`;
+      }).join('');
+
+      if (preserveScroll) c3El.scrollTop = oldScroll;
+    }
+
+    function renderDesktopCard4(preserveScroll = false) {
+      if (!currentReport) return;
+      const c4El = document.getElementById('planoCard4List');
+      if (!c4El) return;
+      const oldScroll = preserveScroll ? c4El.scrollTop : 0;
+      const doneMap = getDoneTasksMap();
+
+      const rawRuturaPool = (currentReport.artigos_risco_rutura || []).slice();
       currentWeeklyPlanData.card4All = rawRuturaPool;
 
       const c4CountEl = document.getElementById('planoCard4Count');
@@ -4624,52 +5100,90 @@ function getDashboardHtml(): string {
         c4CountEl.textContent = \`\${rawRuturaPool.length} artigos em risco de rutura\`;
       }
 
-      const c4El = document.getElementById('planoCard4List');
-      if (c4El) {
-        const renderRuturaRow = (item, idx) => {
-          const taskId = \`rut_\${item.cnp_codigo}\`;
-          const isDone = !!doneMap[taskId];
-          const sugestaoEnc = item.sugestao_encomenda || Math.max(2, Math.ceil((item.vmm || 1) * 0.5));
-          const diasTxt = item.dias_cobertura != null ? \`\${item.dias_cobertura} dias\` : 'crítica';
+      const q = (document.getElementById('deskRuturaSearch')?.value || '').toLowerCase().trim();
+      const statusF = desktopFilters.ruturaStatus || 'all';
+      const sortOrder = document.getElementById('deskRuturaSortOrder')?.value || 'urgente';
 
-          return \`
-            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #bae6fd; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
-              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #0284c7;" />
-              <div style="flex: 1;">
-                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
-                  <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
-                  <span style="font-size: 0.78rem; font-weight: 800; color: #0369a1; background: #e0f2fe; padding: 2px 8px; border-radius: 4px; border: 1px solid #bae6fd;">
-                    Stock: \${item.stock_atual} un · VMM: \${item.vmm}/mês
-                  </span>
-                </div>
-                <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
-                  🟢 <b>Ajustar no Sifarma:</b> Subir Ponto de Encomenda para <b>\${sugestaoEnc} un</b> (risco de rutura iminente face às vendas: cobertura atual de apenas \${diasTxt}).
-                </div>
-                <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
-                  CNP: <code style="color:#0284c7">\${item.cnp_codigo}</code> | Categoria: \${item.categoria || 'Geral'} | Tipo: \${item.tipo_venda || 'MSRM'}
-                </div>
+      const filtered = rawRuturaPool.filter(item => {
+        const taskId = 'rut_' + item.cnp_codigo;
+        const isDone = !!doneMap[taskId];
+        if (statusF === 'pending' && isDone) return false;
+        if (statusF === 'done' && !isDone) return false;
+        if (q) {
+          const name = (item.designacao || '').toLowerCase();
+          const cnp = (item.cnp_codigo || '').toLowerCase();
+          return name.includes(q) || cnp.includes(q);
+        }
+        return true;
+      });
+
+      filtered.sort((a, b) => {
+        if (sortOrder === 'name_asc') {
+          return (a.designacao || '').localeCompare(b.designacao || '', 'pt');
+        }
+        if (sortOrder === 'vmm_desc') {
+          return (b.vmm || 0) - (a.vmm || 0);
+        }
+        // Urgente: menor cobertura / stock atual menor
+        const diasA = a.dias_cobertura != null ? a.dias_cobertura : 999;
+        const diasB = b.dias_cobertura != null ? b.dias_cobertura : 999;
+        if (diasA !== diasB) return diasA - diasB;
+        return (a.stock_atual || 0) - (b.stock_atual || 0);
+      });
+
+      currentWeeklyPlanData.card4 = filtered;
+
+      const badgeEl = document.getElementById('planoCard4FilteredBadge');
+      if (badgeEl) {
+        badgeEl.textContent = \`\${filtered.length} de \${rawRuturaPool.length} artigos\`;
+      }
+
+      if (filtered.length === 0) {
+        c4El.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;padding:24px;text-align:center;">✅ Níveis de stock mínimos equilibrados no Sifarma com os filtros atuais.</div>';
+        return;
+      }
+
+      c4El.innerHTML = filtered.map(item => {
+        const taskId = 'rut_' + item.cnp_codigo;
+        const isDone = !!doneMap[taskId];
+        const sugestaoEnc = item.sugestao_encomenda || Math.max(2, Math.ceil((item.vmm || 1) * 0.5));
+        const diasTxt = item.dias_cobertura != null ? \`\${item.dias_cobertura} dias\` : 'crítica';
+
+        return \`
+          <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #bae6fd; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
+            <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\${taskId}', 'PREVENIR_RUTURA', '\${item.cnp_codigo}', '\${escapeHtml(item.designacao)}', 0)" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #0284c7;" />
+            <div style="flex: 1;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+                <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
+                <span style="font-size: 0.78rem; font-weight: 800; color: #0369a1; background: #e0f2fe; padding: 2px 8px; border-radius: 4px; border: 1px solid #bae6fd;">
+                  Stock: \${item.stock_atual} un · VMM: \${item.vmm}/mês
+                </span>
+              </div>
+              <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
+                🟢 <b>Ajustar no Sifarma:</b> Subir Ponto de Encomenda para <b>\${sugestaoEnc} un</b> (risco de rutura iminente face às vendas: cobertura atual de apenas \${diasTxt}).
+              </div>
+              <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
+                CNP: <code style="color:#0284c7">\${item.cnp_codigo}</code> | Categoria: \${item.categoria || 'Geral'} | Tipo: \${item.tipo_venda || 'MSRM'}
               </div>
             </div>
-          \`;
-        };
+          </div>
+        \`;
+      }).join('');
 
-        let html4 = top10Rutura.map(renderRuturaRow).join('');
-        if (restoRutura.length > 0) {
-          html4 += \`
-            <div id="planoCard4Resto" style="display: none; flex-direction: column; gap: 10px; margin-top: 10px;">
-              \${restoRutura.map((it, i) => renderRuturaRow(it, i + 10)).join('')}
-            </div>
-            <button id="btnToggleRutura" class="btn btn-secondary" onclick="togglePlanoCardResto('planoCard4Resto', 'btnToggleRutura', \${restoRutura.length}, 'medicamentos com risco de rutura')" style="margin-top: 10px; width: 100%; font-size: 0.8rem; padding: 8px 12px; border: 1px dashed #0284c7; color: #0284c7; background: rgba(2,132,199,0.06); cursor: pointer; border-radius: 6px; font-weight: 700;">
-              👁️ Ver os restantes \${restoRutura.length} produtos em risco de rutura
-            </button>
-          \`;
-        }
-        c4El.innerHTML = (html4 || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Níveis de stock mínimos equilibrados no Sifarma.</div>').replace(/\\ItemPlaceholderId/g, "'+taskId+'");
-      }
+      if (preserveScroll) c4El.scrollTop = oldScroll;
+    }
+
+    function renderWeeklyActionPlan() {
+      fetchWeeklyTasksFromDb();
+      if (!currentReport) return;
+
+      renderDesktopCard1(false);
+      renderDesktopCard2(false);
+      renderDesktopCard3(false);
+      renderDesktopCard4(false);
 
       updateWeeklyTasksCounter();
     }
-
     function printWeeklyActionPlan() {
       if (!currentReport) return;
       const farmNome = currentReport.farmacia?.nome || 'Farmácia';
