@@ -111,19 +111,57 @@ export async function ensureDatabaseReady(): Promise<{
     console.log(`[DB] Ligação remota configurada para ${host}:${port} (Modo Cloud / Supabase)...`);
   }
 
-  const basePrisma = new PrismaClient({
-    datasources: {
-      db: { url: dbUrl },
-    },
-  });
+  const isSupabasePooler = host.includes('pooler.supabase.com');
+  const candidateUrls: string[] = [];
 
-  await basePrisma.$connect();
+  if (isSupabasePooler) {
+    // 1. Porta 6543 (Modo Transação PgBouncer/Supavisor): permite múltiplos clientes sem esgotar o limite da sessão
+    const url6543 = dbUrl.replace(':5432/', ':6543/');
+    const sep6543 = url6543.includes('?') ? '&' : '?';
+    const clean6543 = url6543.includes('pgbouncer=')
+      ? url6543
+      : `${url6543}${sep6543}pgbouncer=true&connection_limit=3`;
+    candidateUrls.push(clean6543);
+
+    // 2. Porta 5432 (Modo Sessão com limite estrito de ligações)
+    const sep5432 = dbUrl.includes('?') ? '&' : '?';
+    const clean5432 = dbUrl.includes('connection_limit=')
+      ? dbUrl
+      : `${dbUrl}${sep5432}connection_limit=2`;
+    candidateUrls.push(clean5432);
+  } else {
+    candidateUrls.push(dbUrl);
+  }
+
+  let basePrisma: PrismaClient | null = null;
+  let lastErr: any = null;
+
+  for (const urlCandidate of candidateUrls) {
+    const masked = urlCandidate.replace(/:([^:@]+)@/, ':***@');
+    try {
+      const testPrisma = new PrismaClient({
+        datasources: { db: { url: urlCandidate } },
+      });
+      await testPrisma.$connect();
+      console.log(`[DB] ✅ Ligação estabelecida com sucesso: ${masked}`);
+      basePrisma = testPrisma;
+      break;
+    } catch (err: any) {
+      console.warn(`[DB] ⚠️ Falha ao ligar com ${masked} (${err.message?.split('\\n')[0]}). A tentar alternativa...`);
+      lastErr = err;
+    }
+  }
+
+  if (!basePrisma) {
+    throw lastErr || new Error('Não foi possível estabelecer ligação à base de dados.');
+  }
+
   await ensureNonDestructiveSchema(basePrisma);
 
   const prisma = attachTenantPriceOverlay(basePrisma);
 
   const cleanup = async () => {
-    await basePrisma.$disconnect();
+    await basePrisma!.$disconnect();
     if (embeddedPgInstance) {
       await embeddedPgInstance.stop();
       embeddedPgInstance = null;
