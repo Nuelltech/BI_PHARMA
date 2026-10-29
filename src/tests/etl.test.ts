@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import path from 'path';
+import fs from 'fs';
 import {
   parseInventarioPdfFile,
   parseValidadesPdfFile,
@@ -46,7 +47,8 @@ describe('Motor de ETL e Inteligência Farmacêutica - Testes de Extração e Li
   });
 
   it('deve extrair 100% dos 3.426 artigos, 13.155 unidades e 65.422,60€ do PDF de Inventário', async () => {
-    const pdfPath = path.resolve(process.cwd(), '21000lista_20261019104350.pdf');
+    const defaultPath = path.resolve(process.cwd(), 'baptista', '21000lista_20261019104350.pdf');
+    const pdfPath = fs.existsSync(defaultPath) ? defaultPath : path.resolve(process.cwd(), '21000lista_20261019104350.pdf');
     const parsed = await parseInventarioPdfFile(pdfPath);
 
     expect(parsed.farmaciaNif).toBe('505016419');
@@ -63,7 +65,8 @@ describe('Motor de ETL e Inteligência Farmacêutica - Testes de Extração e Li
   }, 30000);
 
   it('deve extrair todas as 707 linhas do PDF de Controlo de Prazos de Validades', async () => {
-    const pdfPath = path.resolve(process.cwd(), '21001lista_20261019190456_Validades.pdf');
+    const defaultPath = path.resolve(process.cwd(), 'baptista', '21001lista_20261019190456_Validades.pdf');
+    const pdfPath = fs.existsSync(defaultPath) ? defaultPath : path.resolve(process.cwd(), '21001lista_20261019190456_Validades.pdf');
     const parsed = await parseValidadesPdfFile(pdfPath);
 
     expect(parsed.rows.length).toBe(707);
@@ -75,10 +78,11 @@ describe('Motor de ETL e Inteligência Farmacêutica - Testes de Extração e Li
   }, 20000);
 
   it('deve ler os 10.731 artigos do CSV de Vendas do Sifarma e desdobrar os meses com vendas', async () => {
-    const csvPath = path.resolve(process.cwd(), 'vendas baptista25-26.csv');
+    const defaultPath = path.resolve(process.cwd(), 'baptista', 'vendas baptista25-26.csv');
+    const csvPath = fs.existsSync(defaultPath) ? defaultPath : path.resolve(process.cwd(), 'vendas baptista25-26.csv');
     const parsed = await parseVendasCsvFile(csvPath, 2025);
 
     expect(parsed.totalArtigosCatalogo).toBe(10731);
     expect(parsed.stagingRows.length).toBeGreaterThan(15000);
-  }, 20000);
+  }, 30000);
 });

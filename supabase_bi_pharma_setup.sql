@@ -32,6 +32,14 @@ CREATE TABLE IF NOT EXISTS public."ProdutoMestre" (
   CONSTRAINT "ProdutoMestre_pkey" PRIMARY KEY ("cnp_codigo")
 );
 
+ALTER TABLE public."ProdutoMestre" ADD COLUMN IF NOT EXISTS "macro_area" TEXT;
+ALTER TABLE public."ProdutoMestre" ADD COLUMN IF NOT EXISTS "subcategoria" TEXT;
+ALTER TABLE public."ProdutoMestre" ADD COLUMN IF NOT EXISTS "sazonalidade" TEXT;
+ALTER TABLE public."ProdutoMestre" ADD COLUMN IF NOT EXISTS "gh_codigo" TEXT;
+ALTER TABLE public."ProdutoMestre" ADD COLUMN IF NOT EXISTS "gh_switch_cnp" TEXT;
+ALTER TABLE public."ProdutoMestre" ADD COLUMN IF NOT EXISTS "gh_switch_nome" TEXT;
+ALTER TABLE public."ProdutoMestre" ADD COLUMN IF NOT EXISTS "gh_switch_margem_ganho" DECIMAL(10,2);
+
 CREATE TABLE IF NOT EXISTS public."StagingInventario" (
   "id" TEXT NOT NULL,
   "batch_id" TEXT NOT NULL,

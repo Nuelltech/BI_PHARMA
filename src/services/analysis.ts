@@ -114,6 +114,23 @@ export interface GrupoConsolidacaoGenericoItem {
   }>;
 }
 
+export interface ProdutoRiscoRuturaItem {
+  cnp_codigo: string;
+  designacao: string;
+  tipo_venda: string;
+  segmento: string;
+  categoria: string;
+  stock_atual: number;
+  vmm: number;
+  dias_cobertura: number;
+  stock_minimo_sugerido: number;
+  deficit_unidades: number;
+  sugestao_encomenda: number;
+  custo_unitario: number;
+  pvp: number;
+  motivo_urgencia: string;
+}
+
 export interface PharmacyAnalysisReport {
   farmacia: {
     id: string;
@@ -153,6 +170,7 @@ export interface PharmacyAnalysisReport {
   monos: ProdutoMonoItem[];
   risco_elevado_caducidade: ProdutoRiscoCaducidadeItem[];
   consolidacao_genericos_dci: GrupoConsolidacaoGenericoItem[];
+  artigos_risco_rutura: ProdutoRiscoRuturaItem[];
 }
 
 function round2(val: number): number {
@@ -400,6 +418,7 @@ export async function analyzePharmacyInventory(
   const alertasExcessoCobertura: ProdutoCoberturaItem[] = [];
   const monos: ProdutoMonoItem[] = [];
   const riscoElevadoCaducidade: ProdutoRiscoCaducidadeItem[] = [];
+  const artigosRiscoRutura: ProdutoRiscoRuturaItem[] = [];
 
   const dciGroupsMap = new Map<
     string,
@@ -523,6 +542,33 @@ export async function analyzePharmacyInventory(
     const mesesAteCaducidade = item.data_validade
       ? Math.max(0, round2((item.data_validade.getTime() - dataReferencia.getTime()) / MS_POR_MES))
       : null;
+
+    // Risco de Rutura (Stock <= 2 ou abaixo do mínimo de 7 dias com vendas ativas)
+    if (vmm > 0) {
+      const vendaDiaria = vmm / 30.0;
+      const stockMinimoSugerido = Math.max(1, Math.ceil(vendaDiaria * 7 * 1.2));
+      const deficit = stockMinimoSugerido - item.quantidade;
+      const diasCobertura = vendaDiaria > 0 ? Math.round(item.quantidade / vendaDiaria) : 0;
+      if (item.quantidade <= 2 || deficit > 0) {
+        const sugestaoEnc = Math.max(deficit > 0 ? deficit : 1, Math.ceil(vendaDiaria * 14)); // encomenda para 14 dias
+        artigosRiscoRutura.push({
+          cnp_codigo: item.cnp_codigo,
+          designacao: item.produto.designacao,
+          tipo_venda: tipoVenda,
+          segmento,
+          categoria,
+          stock_atual: item.quantidade,
+          vmm,
+          dias_cobertura: diasCobertura,
+          stock_minimo_sugerido: stockMinimoSugerido,
+          deficit_unidades: deficit > 0 ? deficit : 0,
+          sugestao_encomenda: sugestaoEnc,
+          custo_unitario: custoUnit,
+          pvp: pvp ?? 0,
+          motivo_urgencia: item.quantidade === 0 ? 'Rutura Iminente (Stock 0)' : `${diasCobertura} dias de cobertura restante`,
+        });
+      }
+    }
 
     let dciStats: { numLabs: number; vmmTotal: number; labPrincipal: string } | undefined;
     if (ehGenerico && grupoDci) {
@@ -811,5 +857,6 @@ export async function analyzePharmacyInventory(
     monos,
     risco_elevado_caducidade: riscoElevadoCaducidade,
     consolidacao_genericos_dci: consolidacaoGenericosDci,
+    artigos_risco_rutura: artigosRiscoRutura.sort((a, b) => b.vmm - a.vmm || a.dias_cobertura - b.dias_cobertura),
   };
 }

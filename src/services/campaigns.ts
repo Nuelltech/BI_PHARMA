@@ -1066,20 +1066,34 @@ function summarizeCriteria(items: CampaignProductItem[]) {
  * Obtém as campanhas sugeridas para o mês atual/próximo + Planos Táticos de Liquidação de Stock
  * (Salva-Validades, Destrava Monos e Cesto de Oportunidade Restos de Gaveta).
  */
-export async function getSeasonalCampaignSuggestions(
-  prisma: PrismaClient,
-  farmaciaId: string,
-  mesReferencia?: number // 1 a 12 (default mês atual), ou -1 para todas
-): Promise<CampaignSuggestionResult[]> {
-  const mesAtual = new Date().getMonth() + 1;
-  const mes = mesReferencia && mesReferencia > 0 && mesReferencia <= 12 ? mesReferencia : mesAtual;
-  const proximoMes = mes === 12 ? 1 : mes + 1;
-
-  const campanhasRelevantes = mesReferencia === -1
-    ? ANNUAL_CAMPAIGNS
-    : ANNUAL_CAMPAIGNS.filter(
-        (c) => c.mesesAlvo.includes(mes) || (mesReferencia ? false : c.mesesAlvo.includes(proximoMes))
-      );
+export async function getSeasonalCampaignSuggestions(
+
+  prisma: PrismaClient,
+
+  farmaciaId: string,
+
+  mesReferencia?: number // 1 a 12 (default mês atual), ou -1 para todas
+
+): Promise<CampaignSuggestionResult[]> {
+
+  const mesAtual = new Date().getMonth() + 1;
+
+  const mes = mesReferencia && mesReferencia > 0 && mesReferencia <= 12 ? mesReferencia : mesAtual;
+
+  const proximoMes = mes === 12 ? 1 : mes + 1;
+
+
+
+  const campanhasRelevantes = mesReferencia === -1
+
+    ? ANNUAL_CAMPAIGNS
+
+    : ANNUAL_CAMPAIGNS.filter(
+
+        (c) => c.mesesAlvo.includes(mes) || (mesReferencia ? false : c.mesesAlvo.includes(proximoMes))
+
+      );
+
 
   const catalog = await getPharmacyCatalog(prisma, farmaciaId);
   const resultados: CampaignSuggestionResult[] = [];
@@ -2500,4 +2514,263 @@ export async function analyzeProductMarketingAndCrossSell360(
     parceirosCrossSelling,
     scriptBalcaoPronto,
   };
+}
+
+
+// ============================================================================
+// PACKS CLÍNICOS & CESTOS TEMÁTICOS (POR SINTOMA / PROPÓSITO DO UTENTE)
+// ============================================================================
+
+export interface ClinicalThemePackItem {
+  cnp: string;
+  designacao: string;
+  propositoUtente: string; // Linguagem simples: o que o produto faz na prática
+  stockAtual: number;
+  custoUnitario: number;
+  pvpUnitario: number;
+  margemPct: number;
+  tipoVenda: string;
+}
+
+export interface ClinicalThemePack {
+  id: string;
+  titulo: string;
+  sintomaOuQueixa: string;
+  publicoAlvo: string;
+  icone: string;
+  produtos: ClinicalThemePackItem[];
+  pvpTotalOriginal: number;
+  custoTotal: number;
+  descontoPct: number;
+  pvpPackComDesconto: number;
+  poupancaUtente: number;
+  margemPackPct: number;
+  orientacaoBalcao: string;
+  disposicaoFisica: string;
+}
+
+export async function generateClinicalThemePacks(
+  prisma: PrismaClient,
+  farmaciaId: string
+): Promise<ClinicalThemePack[]> {
+  const catalog = await getPharmacyCatalog(prisma, farmaciaId);
+
+  const archetypes = [
+    {
+      id: 'pack_gripe_imunidade',
+      titulo: 'Pack Gripe, Tosse & Imunidade Total',
+      icone: '🧣',
+      sintomaOuQueixa: 'Febre, dores musculares no corpo, tosse e congestão nasal no inverno',
+      publicoAlvo: 'Adultos e famílias com sintomas gripais que procuram alívio rápido e reforço das defesas',
+      orientacaoBalcao: 'Ao aviar receitas de antibióticos ou analgésicos, perguntar pelos outros sintomas e sugerir a proteção conjunta da garganta e imunidade.',
+      disposicaoFisica: 'Cesto temático no balcão principal com o título «SOS Inverno: Alívio Sintomático + Imunidade».',
+      roles: [
+        {
+          nomePapel: 'Antigripal / Antipirético',
+          termos: ['ben-u-gripe', 'cegripe', 'antigrippine', 'aspirina c', 'paracetamol gripe', 'trioval', 'ilvico'],
+          proposito: 'Alívio rápido da febre, cefaleias e sensação de corpo dorido',
+          priorizarExcesso: true,
+        },
+        {
+          nomePapel: 'Garganta & Imunidade Celular',
+          termos: ['strepsils', 'propolis', 'mebocaina', 'cegripe c', 'vitamina c', 'pastilhas garganta', 'zinco'],
+          proposito: 'Desinfeção da orofaringe, proteção da mucosa e reforço das defesas celulares',
+          priorizarExcesso: false,
+        },
+      ],
+    },
+    {
+      id: 'pack_barreira_cutanea_frio',
+      titulo: 'Pack SOS Barreira Cutânea, Lábios & Frio',
+      icone: '❄️',
+      sintomaOuQueixa: 'Lábios gretados, cieiro, fissuras dolorosas nas mãos e pele ressequida pelo frio',
+      publicoAlvo: 'Utentes expostos ao vento/frio, trabalhadores exteriores ou com pele atópica e mãos secas',
+      orientacaoBalcao: 'Apresentar como complemento de conveniência no fecho de qualquer atendimento a utentes com mãos expostas ou cieiro.',
+      disposicaoFisica: 'Cesto de oportunidades junto ao terminal Multibanco para compra imediata por impulso.',
+      roles: [
+        {
+          nomePapel: 'Stick / Reparador Labial',
+          termos: ['letibalm', 'labello', 'cicalfate labios', 'balsamo labial', 'stick labial', 'batom cieiro'],
+          proposito: 'Cicatrização rápida de cieiro e criação de barreira protetora labial contra o vento',
+          priorizarExcesso: false,
+        },
+        {
+          nomePapel: 'Creme Reparador de Mãos & Emoliente',
+          termos: ['creme maos', 'dermaprotect', 'ureia', 'neutrogena maos', 'atoderm maos', 'cicalfate'],
+          proposito: 'Nutrição profunda e regeneração da pele gretada e áspera das mãos',
+          priorizarExcesso: true,
+        },
+      ],
+    },
+    {
+      id: 'pack_digestao_refluxo',
+      titulo: 'Pack Conforto Digestivo & Azia Pós-Refeições',
+      icone: '🍵',
+      sintomaOuQueixa: 'Azia, ardor de estômago, refluxo ácido e sensação de enfartamento abdominal',
+      publicoAlvo: 'Utentes com queixas dispépticas, refeições pesadas ou excessos de fim-de-semana',
+      orientacaoBalcao: 'Perguntar se o desconforto é azia imediata ou enfartamento pesado, oferecendo a solução combinada de alívio.',
+      disposicaoFisica: 'Expor na prateleira de venda livre na secção de bem-estar gástrico com sinalética de dupla ação.',
+      roles: [
+        {
+          nomePapel: 'Antiácido / Protetor da Mucosa',
+          termos: ['gaviscon', 'rennie', 'kompensan', 'pantoprazol', 'omeprazol'],
+          proposito: 'Ação imediata contra o ardor estomacal e neutralização do refluxo ácido',
+          priorizarExcesso: false,
+        },
+        {
+          nomePapel: 'Regulador Hepático & Digestivo',
+          termos: ['digest', 'cha digestivo', 'alcachofra', 'sollievo', 'cardo mariano', 'hepato'],
+          proposito: 'Estimulação da digestão leve e alívio do inchaço e peso abdominal',
+          priorizarExcesso: true,
+        },
+      ],
+    },
+    {
+      id: 'pack_sono_relaxamento',
+      titulo: 'Pack Noite Tranquila & Sono Reparador',
+      icone: '🌙',
+      sintomaOuQueixa: 'Dificuldade em adormecer, despertares noturnos frequentes e cansaço ao acordar',
+      publicoAlvo: 'Utentes com insónia inicial, stress de trabalho ou ritmos de sono alterados',
+      orientacaoBalcao: 'Explicar que a melatonina atua a induzir o sono e o magnésio/valeriana impedem o despertar a meio da noite.',
+      disposicaoFisica: 'Cesto temático na secção de suplementos e fitoterapia com foco em bem-estar noturno.',
+      roles: [
+        {
+          nomePapel: 'Indutor de Sono (Melatonina)',
+          termos: ['aquilea sono', 'melatonina', 'sono', 'dormir'],
+          proposito: 'Redução do tempo necessário para adormecer de forma suave e fisiológica',
+          priorizarExcesso: false,
+        },
+        {
+          nomePapel: 'Relaxante Muscular & Nervoso',
+          termos: ['valeriana', 'passiflora', 'magnesio', 'stress', 'ansiedade'],
+          proposito: 'Relaxamento das tensões musculares e diminuição dos despertares a meio da noite',
+          priorizarExcesso: true,
+        },
+      ],
+    },
+    {
+      id: 'pack_muscular_articular',
+      titulo: 'Pack Alívio Muscular & Articular (Dupla Ação)',
+      icone: '🦵',
+      sintomaOuQueixa: 'Rigidez matinal, dores articulares agravadas pelo frio e humidade e contraturas musculares',
+      publicoAlvo: 'Utentes com queixas osteoarticulares crónicas, idosos ou pessoas com tensão muscular',
+      orientacaoBalcao: 'Recomendar a aplicação local do gel para alívio imediato combinada com o suporte articular contínuo.',
+      disposicaoFisica: 'Dispor na secção de ortopedia e mobilidade com destaque para o pack de alívio duplo.',
+      roles: [
+        {
+          nomePapel: 'Gel / Creme Tópico de Ação Rápida',
+          termos: ['voltaren', 'biofreeze', 'arnica', 'gel dor', 'traumeel', 'flexagil'],
+          proposito: 'Efeito térmico e anti-inflamatório localizado para alívio rápido da dor',
+          priorizarExcesso: false,
+        },
+        {
+          nomePapel: 'Suporte Articular / Magnésio',
+          termos: ['cartilagem', 'colagenio', 'magnesio', 'articulacoes', 'glucosamina'],
+          proposito: 'Nutrição das cartilagens e relaxamento contínuo das fibras musculares',
+          priorizarExcesso: true,
+        },
+      ],
+    },
+  ];
+
+  const packs: ClinicalThemePack[] = [];
+
+  for (const arc of archetypes) {
+    const selectedItems: ClinicalThemePackItem[] = [];
+    const usedCnps = new Set<string>();
+
+    for (const role of arc.roles) {
+      const matches = catalog.filter((item) => {
+        if (usedCnps.has(item.cnp)) return false;
+        const itemNorm = item.norm || normalizeText(item.designacao);
+        return role.termos.some((t) => {
+          const normT = normalizeText(t);
+          return itemNorm.includes(normT) || item.designacao.toLowerCase().includes(t.toLowerCase());
+        });
+      });
+
+      if (matches.length === 0) continue;
+
+      matches.sort((a, b) => {
+        const aHasStock = (a.stock || 0) > 0 ? 1 : 0;
+        const bHasStock = (b.stock || 0) > 0 ? 1 : 0;
+        if (aHasStock !== bHasStock) return bHasStock - aHasStock;
+
+        if (role.priorizarExcesso) {
+          return (b.stock || 0) - (a.stock || 0);
+        }
+        return (b.margem || 0) - (a.margem || 0);
+      });
+
+      const chosen = matches[0];
+      usedCnps.add(chosen.cnp);
+
+      selectedItems.push({
+        cnp: chosen.cnp,
+        designacao: chosen.designacao,
+        propositoUtente: role.proposito,
+        stockAtual: chosen.stock,
+        custoUnitario: chosen.custo,
+        pvpUnitario: chosen.pvp,
+        margemPct: Number(chosen.margem.toFixed(1)),
+        tipoVenda: chosen.tipoVenda,
+      });
+    }
+
+    if (selectedItems.length >= 2) {
+      const pvpTotalOriginal = Number(
+        selectedItems.reduce((acc, it) => acc + (it.pvpUnitario || 0), 0).toFixed(2)
+      );
+      const custoTotal = Number(
+        selectedItems.reduce((acc, it) => acc + (it.custoUnitario || 0), 0).toFixed(2)
+      );
+
+      let descontoPct = 12;
+      let pvpPackComDesconto = Number((pvpTotalOriginal * (1 - descontoPct / 100)).toFixed(2));
+      let margemPackPct =
+        pvpPackComDesconto > 0
+          ? Number((((pvpPackComDesconto - custoTotal) / pvpPackComDesconto) * 100).toFixed(1))
+          : 0;
+
+      if (margemPackPct < 5 && custoTotal > 0) {
+        const pvpMinimoSeguro = Number((custoTotal / 0.95).toFixed(2));
+        if (pvpMinimoSeguro < pvpTotalOriginal) {
+          pvpPackComDesconto = pvpMinimoSeguro;
+          descontoPct = Math.max(
+            0,
+            Math.round(((pvpTotalOriginal - pvpPackComDesconto) / pvpTotalOriginal) * 100)
+          );
+          margemPackPct = 5.0;
+        } else {
+          pvpPackComDesconto = pvpTotalOriginal;
+          descontoPct = 0;
+          margemPackPct =
+            pvpTotalOriginal > 0
+              ? Number((((pvpTotalOriginal - custoTotal) / pvpTotalOriginal) * 100).toFixed(1))
+              : 0;
+        }
+      }
+
+      const poupancaUtente = Number(Math.max(0, pvpTotalOriginal - pvpPackComDesconto).toFixed(2));
+
+      packs.push({
+        id: arc.id,
+        titulo: arc.titulo,
+        sintomaOuQueixa: arc.sintomaOuQueixa,
+        publicoAlvo: arc.publicoAlvo,
+        icone: arc.icone,
+        produtos: selectedItems,
+        pvpTotalOriginal,
+        custoTotal,
+        descontoPct,
+        pvpPackComDesconto,
+        poupancaUtente,
+        margemPackPct,
+        orientacaoBalcao: arc.orientacaoBalcao,
+        disposicaoFisica: arc.disposicaoFisica,
+      });
+    }
+  }
+
+  return packs;
 }

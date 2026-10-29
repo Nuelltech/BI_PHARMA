@@ -132,17 +132,42 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
     const vend = vendMap.get(p.cnp_codigo);
     const pf = precoMap.get(p.cnp_codigo);
     const c = classifyProduct(p.cnp_codigo, p.designacao, p.taxa_iva);
-    const custo = inv?.custo || 0;
+    let custo = inv?.custo || 0;
     const vendasQtd = vend?.qtd || 0;
     const faturacao = vend?.fat || 0;
-    const rawPvp = pf?.pvp !== undefined && pf?.pvp !== null ? pf.pvp : p.pvp ? Number(p.pvp) : null;
-    const rawMargem = pf?.margem !== undefined && pf?.margem !== null ? pf.margem : p.margem_padrao ? Number(p.margem_padrao) : null;
-    const pvp = rawPvp ? rawPvp : vendasQtd > 0 ? faturacao / vendasQtd : custo * 1.4;
-    const margem = rawMargem !== null
-      ? rawMargem
-      : pvp > custo && pvp > 0
-        ? ((pvp - custo) / pvp) * 100
-        : 0;
+
+    // Normalização de Unidades para Sacaria de Apoio (fardos/caixas de 1000 ou 500 sacos)
+    const desLower = p.designacao.toLowerCase();
+    if (desLower.includes('saco') && desLower.includes('1000') && custo >= 5) {
+      custo = Number((custo / 1000).toFixed(4));
+    } else if (desLower.includes('saco') && desLower.includes('500') && custo >= 5) {
+      custo = Number((custo / 500).toFixed(4));
+    }
+
+    // Determinação rigorosa de PVP e Margem:
+    // 1. O PrecoFarmacia (pf) reflete o ficheiro Sifarma da própria farmácia.
+    // 2. Se for MSRM e o pf.pvp for inferior ao custo, trata-se de distorção de copagamento do SNS registado no Sifarma;
+    //    nesse caso, utiliza-se o PVP oficial do Infarmed (p.pvp).
+    // 3. Caso contrário, o ficheiro da farmácia (pf) é a verdade absoluta.
+    const rawPvp = pf?.pvp !== undefined && pf?.pvp !== null ? Number(pf.pvp) : p.pvp ? Number(p.pvp) : null;
+    const rawMargem = pf?.margem !== undefined && pf?.margem !== null ? Number(pf.margem) : p.margem_padrao ? Number(p.margem_padrao) : null;
+
+    let pvp: number;
+    let margem: number;
+
+    if (rawPvp !== null) {
+      if (c.tipo_venda === 'MSRM' && rawPvp < custo && p.pvp && Number(p.pvp) > custo) {
+        // Copagamento do SNS no ficheiro: corrige para o PVP legal Infarmed
+        pvp = Number(p.pvp);
+        margem = ((pvp - custo) / pvp) * 100;
+      } else {
+        pvp = rawPvp;
+        margem = rawMargem !== null ? rawMargem : pvp > 0 ? ((pvp - custo) / pvp) * 100 : 0;
+      }
+    } else {
+      pvp = p.pvp ? Number(p.pvp) : vendasQtd > 0 ? faturacao / vendasQtd : custo * 1.4;
+      margem = pvp > 0 ? ((pvp - custo) / pvp) * 100 : 0;
+    }
 
     const cat = p.categoria || c.categoria || '';
     const subcat = p.subcategoria || c.subcategoria || '';

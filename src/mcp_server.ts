@@ -18,6 +18,12 @@ import {
   toolPlanearComprasSazonais,
   toolSugerirVendasCruzadasReceita,
   toolConsultarProdutosPorNomeOuCategoria,
+  toolCompararSimilaresERentabilidade,
+  toolAvaliarAcordoAnualComprasEscalonadas,
+  toolCalcularNiveisSazonaisDinamicos,
+  toolGerarPropostaEncomendaReposicao,
+  toolAnalisarCurvaAbcFaturacaoEMargem,
+  toolAuditarAnomaliasMargemEPrecos,
 } from './services/mcp_pharma_tools.js';
 
 // ============================================================================
@@ -211,7 +217,7 @@ async function main() {
         {
           name: 'consultar_produtos_por_nome_ou_categoria',
           description:
-            'Pesquisa e detalha produtos da farmácia por nome comercial, marca, substância DCI, código CNP ou categoria (ex: "ben-u-gripe", "cegripe", "antigripais", "brufen", "preservativos", "vitamina c"). Devolve stock atual, vendas nos últimos 12 meses, VMM, dias e meses de cobertura, margem comercial e um diagnóstico direto sobre se se deve ou não encomendar.',
+            'Pesquisa e detalha produtos da farmácia por nome comercial, marca, substância DCI, código CNP ou categoria (ex: "ben-u-gripe", "cegripe", "strepsils", "brufen", "preservativos"). Devolve stock atual, vendas nos últimos 12 meses, VMM, HISTÓRICO REAL DE VENDAS MÊS A MÊS (historicoVendasMensais), vendas reais por estação (vendasPorEstacao), mês de pico, dias e meses de cobertura, margem comercial e parecer financeiro rigoroso sobre se se deve ou não encomendar.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -229,6 +235,83 @@ async function main() {
             required: ['termo_pesquisa'],
           },
         },
+        {
+          name: 'comparar_similares_e_rentabilidade',
+          description:
+            'Compara medicamentos similares, genéricos ou de mesma indicação terapêutica (ex: Atorvastatina, Pantoprazol, Ibuprofeno). Revela quem vende mais vs quem liberta mais lucro em Euros (€/unidade) e margem %, identificando oportunidades de troca favorável de marca na gaveta.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              termo_pesquisa: { type: 'string', description: 'Molécula DCI ou nome (ex: "atorvastatina", "pantoprazol")' },
+              apenas_com_stock: { type: 'boolean', description: 'Filtrar apenas com stock' },
+              limite: { type: 'number', description: 'Máximo de registos' },
+            },
+            required: ['termo_pesquisa'],
+          },
+        },
+        {
+          name: 'avaliar_acordo_anual_compras_escalonadas',
+          description:
+            'Avalia o histórico real de vendas de uma marca nos últimos 12 meses para negociar acordos diretos de laboratório, sugerindo volume anual máximo seguro e tranches escalonadas.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              marca_ou_laboratorio: { type: 'string', description: 'Marca ou gama a avaliar (ex: "Strepsils", "Cêgripe")' },
+              margem_seguranca_pct: { type: 'number', description: 'Margem de segurança percentual (default 15)' },
+              numero_tranches: { type: 'number', description: 'Número de tranches (default 3)' },
+            },
+            required: ['marca_ou_laboratorio'],
+          },
+        },
+        {
+          name: 'calcular_niveis_sazonais_dinamicos',
+          description:
+            'Calcula stocks mínimos, pontos de encomenda e máximos viáveis adaptados à FASE ATUAL da estação (Entrada, Pico ou Esgotamento).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              termo_pesquisa: { type: 'string', description: 'Categoria ou produto (ex: "antigripais", "solar")' },
+            },
+            required: ['termo_pesquisa'],
+          },
+        },
+        {
+          name: 'gerar_proposta_encomenda_reposicao',
+          description:
+            'Gera a proposta de carrinho semanal ou quinzenal de compras para os produtos em risco de rutura com custo financeiro total em €.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              dias_cobertura_desejados: { type: 'number', description: 'Dias a cobrir (7 para semanal, 14 para quinzenal)' },
+              apenas_venda_regular: { type: 'boolean', description: 'Apenas venda regular (default true)' },
+              limite: { type: 'number', description: 'Máximo de artigos' },
+            },
+          },
+        },
+        {
+          name: 'analisar_curva_abc_faturacao_e_margem',
+          description:
+            'Aplica o Princípio de Pareto para identificar os produtos Classe A (80% da receita/lucro) e audita o seu risco de rutura.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              tipo_curva: { type: 'string', enum: ['FATURACAO', 'MARGEM'], description: 'Classificar por Faturação ou Lucro' },
+              top_n: { type: 'number', description: 'Número de produtos no ranking' },
+            },
+          },
+        },
+        {
+          name: 'auditar_anomalias_margem_e_precos',
+          description:
+            'Audita o catálogo à procura de margens negativas (PVP < Custo - venda com prejuízo!) ou margem excessivamente baixa (< 5%).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              margem_minima_alerta_pct: { type: 'number', description: 'Margem mínima de alerta (default 5.0)' },
+              limite: { type: 'number', description: 'Máximo de anomalias a listar' },
+            },
+          },
+        },
       ],
     };
   });
@@ -242,6 +325,30 @@ async function main() {
       switch (name) {
         case 'consultar_produtos_por_nome_ou_categoria':
           result = await toolConsultarProdutosPorNomeOuCategoria(prisma, secContext, (args as any) || {});
+          break;
+
+        case 'comparar_similares_e_rentabilidade':
+          result = await toolCompararSimilaresERentabilidade(prisma, secContext, (args as any) || {});
+          break;
+
+        case 'avaliar_acordo_anual_compras_escalonadas':
+          result = await toolAvaliarAcordoAnualComprasEscalonadas(prisma, secContext, (args as any) || {});
+          break;
+
+        case 'calcular_niveis_sazonais_dinamicos':
+          result = await toolCalcularNiveisSazonaisDinamicos(prisma, secContext, (args as any) || {});
+          break;
+
+        case 'gerar_proposta_encomenda_reposicao':
+          result = await toolGerarPropostaEncomendaReposicao(prisma, secContext, (args as any) || {});
+          break;
+
+        case 'analisar_curva_abc_faturacao_e_margem':
+          result = await toolAnalisarCurvaAbcFaturacaoEMargem(prisma, secContext, (args as any) || {});
+          break;
+
+        case 'auditar_anomalias_margem_e_precos':
+          result = await toolAuditarAnomaliasMargemEPrecos(prisma, secContext, (args as any) || {});
           break;
         case 'calcular_stock_minimo_e_cobertura':
           result = await toolCalcularStockMinimoECobertura(prisma, secContext, (args as any) || {});

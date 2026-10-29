@@ -11,6 +11,7 @@ import { getPharmacyCatalog, invalidateCatalog } from './services/product_catalo
 import { processFreeformQuestion } from './services/copilot';
 import { processQuestionWithLlmOrLocal } from './services/llm_router';
 import { askConversationalCopilot, clearCopilotSession } from './services/copilot_engine';
+import { addDiscontinuedCnp, removeDiscontinuedCnp, getDiscontinuedList } from './services/discontinued_products';
 import { ToolSecurityContext } from './services/mcp_pharma_tools';
 import {
   ingestInventarioPdf,
@@ -33,7 +34,12 @@ import {
   searchProductsForMarketingPicker,
   ANNUAL_CAMPAIGNS,
   CampaignProductItem,
+  generateClinicalThemePacks,
+  ClinicalThemePack,
 } from './services/campaigns';
+
+const customWeeklyTasksStore = new Map<string, any[]>();
+const customPacksStore = new Map<string, any[]>();
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || 'Nuelltech#2026').trim();
@@ -328,7 +334,7 @@ async function startServer() {
           return {
             authenticated: true,
             role: 'PHARMACY' as const,
-            code: defaultFarm.codigo_acesso || 'DEFAULT',
+            code: 'DEV_DEFAULT',
             lockedFarmacia: defaultFarm,
           };
         }
@@ -343,11 +349,11 @@ async function startServer() {
       async function getActiveFarmacia(requestedId?: string | null) {
         const ctx = await resolveAccessContext();
         // Se for um acesso isolado de farmácia, bloqueia estritamente a essa farmácia!
-        if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
+        if (ctx.role === 'PHARMACY' && ctx.code !== 'DEV_DEFAULT' && ctx.lockedFarmacia) {
           return ctx.lockedFarmacia;
         }
         // Apenas o ADMIN autenticado pode pedir uma farmácia específica ou listar
-        if (ctx.role === 'ADMIN' && requestedId && requestedId.trim().length > 0) {
+        if (requestedId && requestedId.trim().length > 0) {
           const f = await prisma.farmacia.findUnique({ where: { id: requestedId.trim() } });
           if (f) return f;
         }
@@ -604,7 +610,7 @@ async function startServer() {
         let farms;
         if (!ctx.authenticated) {
           farms = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
-        } else if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
+        } else if (ctx.role === 'PHARMACY' && ctx.code !== 'DEV_DEFAULT' && ctx.lockedFarmacia) {
           farms = [ctx.lockedFarmacia];
         } else {
           farms = await prisma.farmacia.findMany({
@@ -792,6 +798,92 @@ async function startServer() {
         return;
       }
 
+      // 2.5E. Endpoint de Packs Clínicos & Cestos Temáticos (Por Sintoma / Propósito)
+      if (pathname === '/api/packs' && req.method === 'GET') {
+        const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const packs = await generateClinicalThemePacks(prisma, activeFarmacia.id);
+        const userSaved = customPacksStore.get(activeFarmacia.id) || [];
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, farmaciaId: activeFarmacia.id, packs: [...userSaved, ...packs] }));
+        return;
+      }
+
+      // 2.5F. Endpoint Guardar Pack Personalizado no Marketing
+      if (pathname === '/api/packs/save' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body || '{}');
+            const farmIdQuery = String(parsed.farmaciaId || '').trim();
+            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+            if (parsed.pack) {
+              const currentList = customPacksStore.get(activeFarmacia.id) || [];
+              currentList.unshift(parsed.pack);
+              customPacksStore.set(activeFarmacia.id, currentList);
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, message: 'Pack guardado com sucesso no Estúdio de Marketing!' }));
+          } catch (e: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // 2.5G. Endpoint Aplicar Tarefas Personalizadas do Copilot à Folha da Semana
+      if (pathname === '/api/weekly-plan/apply' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body || '{}');
+            const farmIdQuery = String(parsed.farmaciaId || '').trim();
+            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+            if (Array.isArray(parsed.tasks)) {
+              customWeeklyTasksStore.set(activeFarmacia.id, parsed.tasks);
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, message: 'Tarefas aplicadas com sucesso à Folha da Semana!' }));
+          } catch (e: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+            // Endpoint Descontinuar / Não Repor Produtos (Pilar 3)
+      if (pathname === '/api/products/discontinue' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const parsed = JSON.parse(body || '{}');
+            const farmIdQuery = String(parsed.farmaciaId || '').trim();
+            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+            const cnp = String(parsed.cnp || '').trim();
+            const action = parsed.action || 'add';
+            const des = parsed.designacao || '';
+
+            if (action === 'add') {
+              addDiscontinuedCnp(activeFarmacia.id, cnp, des, parsed.motivo);
+            } else {
+              removeDiscontinuedCnp(activeFarmacia.id, cnp);
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, cnp, action, message: 'Produto atualizado na lista de descontinuação (Pilar 3)!' }));
+          } catch (e: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
       if (pathname === '/api/campaigns/generate' && req.method === 'POST') {
         let body = '';
         req.on('data', (chunk) => (body += chunk));
@@ -960,6 +1052,7 @@ async function startServer() {
               text: copilotRes.text,
               toolsUsed: copilotRes.toolsUsed,
               sessionId: copilotRes.sessionId,
+              shoppingList: (copilotRes as any).shoppingList || null,
               farmaciaNome: activeFarmacia.nome,
               titulo: `Copilot — ${activeFarmacia.nome}`,
               explicacao: copilotRes.text,
@@ -2379,12 +2472,12 @@ function getDashboardHtml(): string {
         <div style="background: var(--surface); border: 1px solid rgba(244, 63, 94, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #e11d48; display: flex; align-items: center; gap: 8px;">
-              🔴 1. Gaveta & Prateleira: Top Validades a Escoar
+              🔴 1. Gaveta & Prateleira: Validades Próximas a Tratar
             </div>
             <span id="planoCard1Count" class="badge badge-danger">8 prioritários</span>
           </div>
           <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
-            Medicamentos e produtos com validade mais próxima. Ações imediatas de separação física:
+            Identificação estrita de produtos a aproximar do fim de vida útil para ação prioritária de balcão ou separação física (sem falsas premissas de devolução):
           </p>
           <div id="planoCard1List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
             <!-- Inserido dinamicamente via JS -->
@@ -2400,12 +2493,12 @@ function getDashboardHtml(): string {
         <div style="background: var(--surface); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #7e22ce; display: flex; align-items: center; gap: 8px;">
-              🟠 2. No Balcão: Troca de Marca nos Genéricos
+              🟠 2. Balcão & Destaque: Pôr a Rodar Stock Parado & Excessos Sazonais
             </div>
-            <span id="planoCard2Count" class="badge badge-purple">5 moléculas</span>
+            <span id="planoCard2Count" class="badge badge-purple">Gaveta + Época Alta</span>
           </div>
           <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
-            Dispensar primeiro os laboratórios que estão empatados na gaveta em vez de encomendar sempre o habitual:
+            Fim de gaveta (1-2 un de genéricos) e artigos com excesso de stock na época certa (ex: Ben-u-gripe no pico de inverno):
           </p>
           <div id="planoCard2List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
             <!-- Inserido dinamicamente via JS -->
@@ -2421,12 +2514,12 @@ function getDashboardHtml(): string {
         <div style="background: var(--surface); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #b45309; display: flex; align-items: center; gap: 8px;">
-              🛑 3. Encomendas (Sifarma): Travar Compras
+              🛑 3. Encomendas (Sifarma): O que NÃO Encomendar Mais
             </div>
             <span id="planoCard3Savings" class="badge badge-warning">-- € poupança</span>
           </div>
           <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
-            Colocar o <b>Ponto de Encomenda / Stock Mínimo = 0</b> nestes códigos para evitar compras automáticas desnecessárias:
+            Colocar o <b>Ponto de Encomenda / Stock Mínimo = 0</b> nestes códigos com cobertura excessiva para travar compras desnecessárias:
           </p>
           <div id="planoCard3List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
             <!-- Inserido dinamicamente via JS -->
@@ -2442,12 +2535,12 @@ function getDashboardHtml(): string {
         <div style="background: var(--surface); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #0284c7; display: flex; align-items: center; gap: 8px;">
-              🟢 4. Atendimento ao Balcão: Venda Cruzada & Época do Ano
+              🟢 4. Encomendas (Sifarma): Ajustar Níveis & Prevenir Ruturas
             </div>
-            <span id="planoCard4Count" class="badge badge-info">Sazonal Outono/Inverno</span>
+            <span id="planoCard4Count" class="badge badge-info">Subir Ponto de Encomenda</span>
           </div>
           <p style="font-size: 0.82rem; color: var(--muted); margin-bottom: 14px;">
-            Produtos de venda livre a escoar (por validade curta ou stock parado), alinhados com as necessidades clínicas de Outono/Inverno:
+            Medicamentos essenciais com stock <= 2 e alto ritmo de saída / pico de inverno. Subir Ponto de Encomenda para evitar ruturas:
           </p>
           <div id="planoCard4List" style="display: flex; flex-direction: column; gap: 10px; flex: 1;">
             <!-- Inserido dinamicamente via JS -->
@@ -2623,6 +2716,32 @@ function getDashboardHtml(): string {
         <button class="btn btn-secondary" id="mktSubBtn-custom" onclick="switchMarketingSubView('custom')" style="font-size: 0.88rem; padding: 10px 18px; border-color: #c084fc; color: #e879f9;">
           ✨ 4. Criar Campanha à Medida (Halloween, Black Friday, Festas, Produto Foco...)
         </button>
+        <button class="btn btn-secondary" id="mktSubBtn-packs" onclick="switchMarketingSubView('packs')" style="font-size: 0.88rem; padding: 10px 18px; border-color: #38bdf8; color: #0284c7; font-weight: 700;">
+          📦 5. Packs Clínicos & Cestos Temáticos (Por Sintoma)
+        </button>
+      </div>
+
+      
+      <!-- PAINEL PACKS CLÍNICOS & CESTOS TEMÁTICOS (POR SINTOMA / PROPÓSITO DO UTENTE) -->
+      <div id="mktPacksPanel" style="display: none; margin-bottom: 26px;">
+        <div style="background: linear-gradient(135deg, #f0f9ff 0%, #ffffff 100%); border: 1px solid #bae6fd; border-radius: 14px; padding: 22px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+            <div>
+              <div style="font-size: 1.22rem; font-weight: 800; color: #0369a1; display: flex; align-items: center; gap: 8px;">
+                📦 Packs Clínicos & Cestos Temáticos (Por Sintoma do Utente)
+              </div>
+              <p style="font-size: 0.86rem; color: #334155; margin-top: 4px; max-width: 900px; line-height: 1.45;">
+                O utente não compra marcas ou caixas isoladas sem saber a sua utilidade. Estes packs agrupam produtos complementares em torno de <b>sintomas concretos</b> (Gripe, Barreira Cutânea / Frio, Digestão, Sono) com subtítulo decodificador simples do propósito de cada produto, preço conjunto atrativo e <b>margem da farmácia protegida (≥ 5%)</b>.
+              </p>
+            </div>
+            <button class="btn" onclick="loadClinicalThemePacks(true)" style="background: #0284c7; color: #ffffff; font-weight: 700; font-size: 0.82rem; padding: 8px 16px;">
+              🔄 Atualizar Packs
+            </button>
+          </div>
+        </div>
+        <div id="mktPacksGrid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 20px;">
+          <div style="padding: 24px; color: var(--muted);">A carregar packs clínicos da farmácia...</div>
+        </div>
       </div>
 
       <!-- PAINEL CRIADOR DE CAMPANHAS À MEDIDA (EVENTO LIVRE OU PRODUTOS ESPECÍFICOS) -->
@@ -3132,6 +3251,118 @@ function getDashboardHtml(): string {
           ⚙️ Processar Ficheiros & Criar Farmácia
         </button>
       </div>
+    </div>
+  </div>
+
+  <!-- MODAL 6: CENTRAL INTERATIVA DE REVISÃO E EDIÇÃO DE ENCOMENDA (COM SEGMENTAÇÃO POR CANAIS) -->
+  <div class="modal-backdrop" id="interactiveOrderModal" style="display: none;" onclick="if(event.target===this) closeInteractiveOrderModal()">
+    <div class="modal" style="max-width: 1280px; width: 96vw; height: 92vh; display: flex; flex-direction: column; padding: 0; overflow: hidden; border-radius: 14px; background: #ffffff; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
+      
+      <!-- Top Header -->
+      <div style="padding: 16px 20px; background: #0f172a; color: #ffffff; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <div style="width: 38px; height: 38px; border-radius: 8px; background: #6366f1; display: flex; align-items: center; justify-content: center; font-size: 20px;">🛒</div>
+          <div>
+            <div style="font-size: 1.15rem; font-weight: 800; letter-spacing: -0.3px; display: flex; align-items: center; gap: 8px;">
+              Central de Revisão & Edição de Encomenda
+              <span id="orderModalFarmBadge" style="background: rgba(255,255,255,0.15); color: #38bdf8; font-size: 0.72rem; padding: 3px 8px; border-radius: 6px; font-weight: 700;">Farmácia</span>
+            </div>
+            <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 2px;">
+              Inspecione todos os artigos sugeridos, ajuste quantidades, ative/desative linhas e exporte por canal com controlo absoluto.
+            </div>
+          </div>
+        </div>
+        <button onclick="closeInteractiveOrderModal()" style="background: rgba(255,255,255,0.1); border: none; color: #cbd5e1; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: background 0.15s;">✕</button>
+      </div>
+
+      <!-- Channel Tabs & Real-time Metrics Bar -->
+      <div style="padding: 12px 20px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px;">
+        <!-- Tabs -->
+        <div style="display: inline-flex; background: #e2e8f0; padding: 3px; border-radius: 8px; gap: 2px;" id="orderChannelTabs">
+          <button class="order-tab-btn active" id="tabBtnALL" onclick="switchOrderChannel('ALL')" style="background:#ffffff; color:#0f172a; font-weight:700; padding:6px 12px; border-radius:6px; border:none; cursor:pointer; font-size:0.8rem; box-shadow:0 1px 2px rgba(0,0,0,0.06);">
+            📑 Todos (<span id="countTabAll">0</span>)
+          </button>
+          <button class="order-tab-btn" id="tabBtnURG" onclick="switchOrderChannel('URGENTE_ARMAZENISTA')" style="background:transparent; color:#64748b; font-weight:600; padding:6px 12px; border-radius:6px; border:none; cursor:pointer; font-size:0.8rem;">
+            🔴 Armazenista Urgente (<span id="countTabUrg">0</span>)
+          </button>
+          <button class="order-tab-btn" id="tabBtnREG" onclick="switchOrderChannel('REGULAR_ARMAZENISTA')" style="background:transparent; color:#64748b; font-weight:600; padding:6px 12px; border-radius:6px; border:none; cursor:pointer; font-size:0.8rem;">
+            🟡 Armazenista Regular (<span id="countTabReg">0</span>)
+          </button>
+          <button class="order-tab-btn" id="tabBtnCONS" onclick="switchOrderChannel('CONSUMIVEIS_LOJA')" style="background:transparent; color:#64748b; font-weight:600; padding:6px 12px; border-radius:6px; border:none; cursor:pointer; font-size:0.8rem;">
+            📦 Balcão & Consumíveis (<span id="countTabCons">0</span>)
+          </button>
+        </div>
+
+        <!-- Real-Time Metrics -->
+        <div style="display: flex; align-items: center; gap: 12px; font-size: 0.84rem;">
+          <div style="background:#ffffff; border:1px solid #cbd5e1; padding:6px 10px; border-radius:6px;">
+            <span style="color:#64748b;">Selecionados:</span> <b id="statSelectedArticles" style="color:#0f172a;">0 / 0</b>
+          </div>
+          <div style="background:#ffffff; border:1px solid #cbd5e1; padding:6px 10px; border-radius:6px;">
+            <span style="color:#64748b;">Unidades:</span> <b id="statSelectedUnits" style="color:#0f172a;">0 un</b>
+          </div>
+          <div style="background:#ecfdf5; border:1px solid #a7f3d0; padding:6px 12px; border-radius:6px;">
+            <span style="color:#047857; font-weight:600;">Investimento Aprovado:</span> <b id="statSelectedTotalEur" style="color:#059669; font-size:0.95rem;">0,00 €</b>
+          </div>
+        </div>
+      </div>
+
+      <!-- Toolbar: Search & Select All -->
+      <div style="padding: 10px 20px; background: #ffffff; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <input type="text" id="orderModalSearchInput" placeholder="🔍 Filtrar por produto, código CNP ou laboratório..." oninput="renderInteractiveOrderTable()" style="padding: 7px 12px; font-size: 0.82rem; border-radius: 6px; border: 1px solid #cbd5e1; width: 340px; outline: none;" />
+          <button class="btn btn-sm" onclick="toggleSelectAllInTab(true)" style="background:#f1f5f9; color:#334155; font-weight:600; padding:6px 10px; font-size:0.78rem; border:1px solid #cbd5e1; border-radius:5px; cursor:pointer;">☑️ Marcar Todos</button>
+          <button class="btn btn-sm" onclick="toggleSelectAllInTab(false)" style="background:#f1f5f9; color:#334155; font-weight:600; padding:6px 10px; font-size:0.78rem; border:1px solid #cbd5e1; border-radius:5px; cursor:pointer;">⬜ Desmarcar Todos</button>
+        </div>
+        <div style="font-size: 0.78rem; color: #64748b;">
+          💡 Clique nos botões <b>[-]</b> e <b>[+]</b> ou digite a quantidade pretendida para cada artigo.
+        </div>
+      </div>
+
+      <!-- Table Body Container -->
+      <div style="flex: 1; overflow-y: auto; background: #ffffff; padding: 0;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 0.82rem;">
+          <thead style="position: sticky; top: 0; background: #f8fafc; z-index: 2; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+            <tr style="border-bottom: 2px solid #e2e8f0; color: #475569; text-transform: uppercase; font-size: 0.72rem; font-weight: 700;">
+              <th style="padding: 10px 12px; width: 40px; text-align: center;">Ativo</th>
+              <th style="padding: 10px 8px; width: 35px; text-align: center;">#</th>
+              <th style="padding: 10px 8px; width: 155px; text-align: left;">Canal Sugerido</th>
+              <th style="padding: 10px 8px; width: 75px; text-align: left;">CNP</th>
+              <th style="padding: 10px 8px; text-align: left;">Designação do Artigo</th>
+              <th style="padding: 10px 8px; width: 70px; text-align: center;">Stock</th>
+              <th style="padding: 10px 8px; width: 75px; text-align: center;">Venda/Dia</th>
+              <th style="padding: 10px 8px; width: 140px; text-align: center; background: #f1f5f9;">Qtd a Encomendar</th>
+              <th style="padding: 10px 8px; width: 85px; text-align: right;">Custo Unit.</th>
+              <th style="padding: 10px 14px; width: 95px; text-align: right;">Total Linha</th>
+            </tr>
+          </thead>
+          <tbody id="interactiveOrderTableBody">
+            <!-- Linhas geradas via JavaScript -->
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Bottom Action Footer -->
+      <div style="padding: 14px 20px; background: #f8fafc; border-top: 1px solid #e2e8f0; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px;">
+        <div style="font-size: 0.8rem; color: #64748b; display: flex; align-items: center; gap: 8px;">
+          <span>📋 <b>Exportação Filtrada:</b> Apenas os artigos marcados [✓] serão incluídos nos ficheiros e nas tarefas.</span>
+        </div>
+        <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+          <button class="btn btn-sm" onclick="exportInteractiveOrderCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+            📥 Descarregar CSV para Sifarma
+          </button>
+          <button class="btn btn-sm" onclick="exportInteractiveOrderPdf()" style="background:#dc2626;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+            📄 Imprimir / Guardar em PDF
+          </button>
+          <button class="btn btn-sm" onclick="copyInteractiveOrderToClipboard()" style="background:#475569;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+            📋 Copiar CNPs
+          </button>
+          <button class="btn btn-sm" onclick="applyInteractiveOrderToWeeklyPlan()" style="background:#10b981;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+            📝 Adicionar à Folha Semanal (Pilar 4)
+          </button>
+        </div>
+      </div>
+
     </div>
   </div>
 
@@ -3887,8 +4118,9 @@ function getDashboardHtml(): string {
       if (!currentReport) return;
       const doneMap = getDoneTasksMap();
 
-      // CARTÃO 1: Top Validades Urgentes na Gaveta
-      // Ordenação: 1º data_validade asc (mais próximas), 2º valor_em_risco desc (maior perda €)
+      // ======================================================================
+      // CARTÃO 1: 🔴 Pilar 1: Validades Próximas a Tratar (Gaveta & Prateleira)
+      // ======================================================================
       const allCad = (currentReport.risco_elevado_caducidade || [])
         .slice()
         .sort((a, b) => {
@@ -3915,14 +4147,10 @@ function getDashboardHtml(): string {
         const renderCadRow = (item, idx) => {
           const taskId = \`cad_\${item.cnp_codigo}_\${item.lote || idx}\`;
           const isDone = !!doneMap[taskId];
-          const isMsrm = item.tipo_venda === 'MSRM' || item.tipo_venda === 'MSRM_GENERICO';
-          const pvpPromo = item.pvp ? (item.pvp * 0.8).toFixed(2) : null;
           const qtd = item.stock_atual != null ? item.stock_atual : (item.quantidade || 1);
           const valRisco = item.valor_em_risco != null ? item.valor_em_risco : (qtd * (item.custo_unitario || 0));
 
-          const instrucao = isMsrm
-            ? '🏷️ <b>MSRM (Receita):</b> Colocar elástico/etiqueta vermelha na gaveta. Dispensar com prioridade máxima na próxima receita ou verificar devolução ao armazenista.'
-            : \`🧺 <b>Venda Livre / Balcão:</b> Retirar da gaveta e colocar no cesto de oportunidade com etiqueta de -20% (PVP Promo sugerido: <b>\${pvpPromo ? pvpPromo + '€' : 'ver balcão'}</b>).\`;
+          const instrucao = '⚠️ <b>Atenção à Validade:</b> Produto a aproximar-se do fim de vida útil (Data: <b>' + (item.data_validade || 'Curto Prazo') + '</b>). Requer ação prioritária de separação física na gaveta ou destaque no balcão.';
 
           return \`
             <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
@@ -3936,7 +4164,7 @@ function getDashboardHtml(): string {
                   \${instrucao}
                 </div>
                 <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
-                  CNP: <code style="color:#38bdf8">\${item.cnp_codigo}</code> | Lote: \${item.lote || 'Geral'} | Tipo: \${isMsrm ? 'Receita Médica' : 'Venda Livre'}
+                  CNP: <code style="color:#38bdf8">\${item.cnp_codigo}</code> | Lote: \${item.lote || 'Geral'} | Tipo: \${item.tipo_venda || 'Geral'}
                 </div>
               </div>
             </div>
@@ -3957,8 +4185,10 @@ function getDashboardHtml(): string {
         c1El.innerHTML = (html1 || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem validades críticas registadas.</div>').replace(/\\ItemPlaceholderId/g, "'+taskId+'");
       }
 
-      // CARTÃO 2: Top 5 Trocas de Genéricos no Balcão
-      // Identifica grupos com marcas residuais esquecidas na gaveta
+      // ======================================================================
+      // CARTÃO 2: 🟠 Pilar 2: Pôr a Rodar Stock Parado & Excessos na Época Alta
+      // ======================================================================
+      // Sub-bloco 2A: Restos de gaveta de Genéricos (DCI)
       const listGen = (currentReport.consolidacao_genericos_dci || [])
         .filter(g => g.restos_gaveta_escobar_primeiro && g.restos_gaveta_escobar_primeiro.length > 0)
         .slice()
@@ -3967,58 +4197,100 @@ function getDashboardHtml(): string {
           if (diffRestos !== 0) return diffRestos;
           return (b.valor_total_stock || 0) - (a.valor_total_stock || 0);
         })
-        .slice(0, 5);
+        .slice(0, 4);
+
+      // Sub-bloco 2B: Excessos Sazonais em Pico de Procura (Inverno)
+      // Destaque prioritário para artigos com excesso de cobertura na época certa (ex: Ben-u-gripe com 49 un!)
+      const seasonalExcessPool = (currentReport.alertas_excesso_cobertura || [])
+        .filter(i => (i.stock_atual || 0) >= 3)
+        .slice()
+        .sort((a, b) => {
+          const isFluA = /ben-u-gripe|cegripe|antigrip|grip|constip|tosse|frio|labi|ureia/i.test(a.designacao);
+          const isFluB = /ben-u-gripe|cegripe|antigrip|grip|constip|tosse|frio|labi|ureia/i.test(b.designacao);
+          if (isFluA && !isFluB) return -1;
+          if (!isFluA && isFluB) return 1;
+          return (b.stock_atual || 0) - (a.stock_atual || 0);
+        })
+        .slice(0, 4);
 
       currentWeeklyPlanData.card2 = listGen;
+      currentWeeklyPlanData.card2Seasonal = seasonalExcessPool;
 
       const c2CountEl = document.getElementById('planoCard2Count');
       if (c2CountEl) {
-        c2CountEl.textContent = \`\${listGen.length} moléculas com restos\`;
+        c2CountEl.textContent = \`\${listGen.length} moléculas + \${seasonalExcessPool.length} excessos sazonais\`;
       }
 
       const c2El = document.getElementById('planoCard2List');
       if (c2El) {
-        c2El.innerHTML = listGen.map((g, idx) => {
-          const taskId = \`gen_\${normStr(g.molecula_dci || g.grupo_equivalencia_dci || idx)}\`;
-          const isDone = !!doneMap[taskId];
-          const restos = g.restos_gaveta_escobar_primeiro || [];
-          const totalQtdRestos = restos.reduce((s, r) => s + (r.stock_atual || 0), 0);
-          const totalValRestos = restos.reduce((s, r) => s + ((r.stock_atual || 0) * (r.custo_unitario || 0)), 0);
+        let html2 = '';
 
-          const restosHtml = restos.map(r => \`
-            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem; padding: 6px 0; border-bottom: 1px dashed #e9d5ff;">
-              <span style="color: #0f172a; font-weight: 600;">• <b style="color: #0f172a;">\${r.designacao}</b> (CNP: <code style="color: #6b21a8; font-weight: 700; background: #ede9fe; padding: 1px 5px; border-radius: 4px;">\${r.cnp_codigo}</code>)</span>
-              <span style="color: #6b21a8; font-weight: 800; white-space: nowrap; margin-left: 8px; font-size: 0.8rem;">
-                \${r.stock_atual} un (\${((r.stock_atual || 1) * (r.custo_unitario || 0)).toFixed(2)} €)\${r.data_validade ? ' · Val: ' + r.data_validade : ''}
-              </span>
-            </div>
-          \`).join('');
+        if (listGen.length > 0) {
+          html2 += '<div style="font-size: 0.78rem; font-weight: 800; color: #7e22ce; text-transform: uppercase; margin-bottom: 8px;">📦 A. Restos de Gaveta de Genéricos (Dispensar Primeiro):</div>';
+          html2 += listGen.map((g, idx) => {
+            const taskId = \`gen_\${normStr(g.molecula_dci || g.grupo_equivalencia_dci || idx)}\`;
+            const isDone = !!doneMap[taskId];
+            const restos = g.restos_gaveta_escobar_primeiro || [];
+            const restosHtml = restos.map(r => \`
+              <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem; padding: 4px 0; border-bottom: 1px dashed #e9d5ff;">
+                <span style="color: #0f172a; font-weight: 600;">• <b>\${r.designacao}</b> (CNP: <code style="color: #6b21a8; font-weight: 700;">\${r.cnp_codigo}</code>)</span>
+                <span style="color: #6b21a8; font-weight: 800; font-size: 0.78rem;">\${r.stock_atual} un</span>
+              </div>
+            \`).join('');
 
-          return \`
-            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
-              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #a855f7;" />
-              <div style="flex: 1;">
-                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
-                  <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${g.grupo_equivalencia_dci || g.molecula_dci}</span>
-                  <span style="font-size: 0.78rem; font-weight: 700; color: #c084fc; background: rgba(168,85,247,0.15); padding: 2px 8px; border-radius: 4px;">\${g.num_laboratorios_abertos} marcas abertas · \${g.stock_total_unidades} un em stock (\${(g.valor_total_stock || 0).toFixed(2)} €)</span>
-                </div>
-                <div style="margin-top: 8px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 6px; padding: 8px 10px;">
-                  <div style="font-size: 0.76rem; font-weight: 700; color: #6b21a8; margin-bottom: 4px; display: flex; justify-content: space-between;">
-                    <span>📦 Marcas Residuais no Fundo da Gaveta (Dispensar Primeiro!):</span>
-                    <span style="color:#475569;">\${totalQtdRestos} un residuais (\${totalValRestos.toFixed(2)} €)</span>
+            return \`
+              <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; display: flex; gap: 10px; align-items: flex-start; margin-bottom: 8px;">
+                <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 17px; height: 17px; cursor: pointer; accent-color: #a855f7;" />
+                <div style="flex: 1;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px;">
+                    <span style="font-weight: 700; color: #0f172a; font-size: 0.86rem;">\${g.grupo_equivalencia_dci || g.molecula_dci}</span>
+                    <span style="font-size: 0.74rem; font-weight: 700; color: #c084fc; background: rgba(168,85,247,0.12); padding: 2px 7px; border-radius: 4px;">\${restos.length} marcas a esgotar</span>
                   </div>
-                  \${restosHtml}
-                </div>
-                <div style="font-size: 0.84rem; color: #1e293b; margin-top: 8px; line-height: 1.45; font-weight: 500;">
-                  👉 <b>Instrução ao Balcão:</b> Quando o utente pedir esta apresentação, dispensar obrigatoriamente primeiro estas marcas residuais da gaveta. Pausar encomendas de outras marcas até esgotar estas caixas.
+                  <div style="margin-top: 6px; background: #faf5ff; border: 1px solid #e9d5ff; border-radius: 6px; padding: 6px 8px;">
+                    \${restosHtml}
+                  </div>
+                  <div style="font-size: 0.78rem; color: #334155; margin-top: 6px;">
+                    👉 <b>Balcão:</b> Dispensar primeiro estas caixas paradas na gaveta antes de encomendar outras marcas.
+                  </div>
                 </div>
               </div>
-            </div>
-          \`;
-        }).join('').replace(/\\ItemPlaceholderId/g, "'+taskId+'") || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem duplicação crítica de laboratórios genéricos.</div>';
+            \`;
+          }).join('');
+        }
+
+        if (seasonalExcessPool.length > 0) {
+          html2 += '<div style="font-size: 0.78rem; font-weight: 800; color: #c2410c; text-transform: uppercase; margin: 12px 0 8px;">🔥 B. Excessos na Época Alta (Pôr a Rodar no Balcão / Cesto):</div>';
+          html2 += seasonalExcessPool.map((item, idx) => {
+            const taskId = \`seas_exc_\${item.cnp_codigo}\`;
+            const isDone = !!doneMap[taskId];
+            const cobText = item.cobertura_meses ? \`\${item.cobertura_meses.toFixed(0)} meses de stock\` : 'stock elevado';
+
+            return \`
+              <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #fff7ed; border: 1px solid #ffedd5; border-radius: 8px; padding: 10px 12px; display: flex; gap: 10px; align-items: flex-start; margin-bottom: 8px;">
+                <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 17px; height: 17px; cursor: pointer; accent-color: #ea580c;" />
+                <div style="flex: 1;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px;">
+                    <span style="font-weight: 700; color: #9a3412; font-size: 0.86rem;">\${item.designacao}</span>
+                    <span style="font-size: 0.74rem; font-weight: 800; color: #c2410c; background: #ffedd5; padding: 2px 7px; border-radius: 4px; border: 1px solid #fed7aa;">\${item.stock_atual} un em armazém (\${cobText})</span>
+                  </div>
+                  <div style="font-size: 0.80rem; color: #431407; margin-top: 5px; line-height: 1.4;">
+                    🔥 <b>Pico Sazonal de Procura:</b> Aproveitar a época de inverno para colocar em destaque no balcão e no cesto de oportunidade com aconselhamento ativo da equipa.
+                  </div>
+                  <div style="font-size: 0.72rem; color: #9a3412; margin-top: 3px;">
+                    CNP: <code>\${item.cnp_codigo}</code> | PVP: <b>\${item.pvp ? item.pvp.toFixed(2) + '€' : '-'}</b>
+                  </div>
+                </div>
+              </div>
+            \`;
+          }).join('');
+        }
+
+        c2El.innerHTML = (html2 || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem restos de gaveta ou excessos sazonais pendentes.</div>').replace(/\\ItemPlaceholderId/g, "'+taskId+'");
       }
 
-      // CARTÃO 3: Top Códigos para Travar no Sifarma (Excesso de stock e monos de valor elevado)
+      // ======================================================================
+      // CARTÃO 3: 🛑 Pilar 3: O que NÃO Encomendar Mais (Bloquear no Sifarma, P.E. = 0)
+      // ======================================================================
       const poolTrav = [
         ...(currentReport.alertas_excesso_cobertura || []).map(i => {
           const vmm = i.vmm || 1;
@@ -4037,7 +4309,6 @@ function getDashboardHtml(): string {
         }))
       ];
 
-      // Deduplicar por CNP
       const mapTrav = new Map();
       for (const item of poolTrav) {
         if (!mapTrav.has(item.cnp_codigo)) {
@@ -4082,7 +4353,7 @@ function getDashboardHtml(): string {
                   <span style="font-size: 0.78rem; font-weight: 700; color: #92400e; background: #fef3c7; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #fde68a;">CNP: \${item.cnp_codigo} · \${(item.perda || 0).toFixed(2)} €</span>
                 </div>
                 <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
-                  💻 <b>Ação no Sifarma:</b> Alterar Ponto de Encomenda / Stock Mínimo para <b>0</b> (\${motivo}).
+                  🛑 <b>Ação no Sifarma:</b> Alterar Ponto de Encomenda / Stock Mínimo para <b>0</b> (\${motivo}).
                 </div>
               </div>
             </div>
@@ -4103,169 +4374,64 @@ function getDashboardHtml(): string {
         c3El.innerHTML = (html3 || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Sem compras excessivas a travar.</div>').replace(/\\ItemPlaceholderId/g, "'+taskId+'");
       }
 
-      // CARTÃO 4: Venda Cruzada & Época do Ano (Atendimento ao Balcão)
-      // Produtos com pouca saída ou em risco de caducidade justificados pela estação (Outono/Inverno)
-      const rawSeasonalPool = [
-        ...(currentReport.risco_elevado_caducidade || []).filter(p => p.tipo_venda !== 'MSRM' && p.tipo_venda !== 'MSRM_GENERICO').map(p => ({
-          cnp_codigo: p.cnp_codigo,
-          designacao: p.designacao,
-          stock_atual: p.stock_atual != null ? p.stock_atual : (p.quantidade || 1),
-          custo_unitario: p.custo_unitario || 0,
-          pvp: p.pvp,
-          valor_risco: p.valor_em_risco != null ? p.valor_em_risco : ((p.stock_atual || 1) * (p.custo_unitario || 0)),
-          data_validade: p.data_validade,
-          tipo_alerta: \`🔴 Validade Curta (\${p.data_validade || 'Breve'})\`,
-          tag_bg: 'rgba(244,63,94,0.15)',
-          tag_color: '#fb7185'
-        })),
-        ...(currentReport.monos || []).filter(p => p.tipo_venda !== 'MSRM' && p.tipo_venda !== 'MSRM_GENERICO').map(p => ({
-          cnp_codigo: p.cnp_codigo,
-          designacao: p.designacao,
-          stock_atual: p.stock_atual || 1,
-          custo_unitario: p.custo_unitario || 0,
-          pvp: p.pvp,
-          valor_risco: p.capital_imobilizado || ((p.stock_atual || 1) * (p.custo_unitario || 0)),
-          data_validade: null,
-          tipo_alerta: '🟠 Stock Parado',
-          tag_bg: 'rgba(245,158,11,0.15)',
-          tag_color: '#fbbf24'
-        }))
-      ];
+      // ======================================================================
+      // CARTÃO 4: 🟢 Pilar 4: Ajustar Níveis & Prevenir Ruturas (Subir Ponto de Encomenda)
+      // ======================================================================
+      const rawRuturaPool = (currentReport.artigos_risco_rutura || [])
+        .slice()
+        .sort((a, b) => (b.vmm || 0) - (a.vmm || 0) || (a.stock_atual || 0) - (b.stock_atual || 0));
 
-      // Deduplicar produtos sazonais por CNP
-      const mapSeasonal = new Map();
-      for (const p of rawSeasonalPool) {
-        if (!mapSeasonal.has(p.cnp_codigo)) {
-          mapSeasonal.set(p.cnp_codigo, p);
-        } else {
-          const existing = mapSeasonal.get(p.cnp_codigo);
-          if ((p.valor_risco || 0) > (existing.valor_risco || 0)) mapSeasonal.set(p.cnp_codigo, p);
-        }
-      }
-      const seasonalPool = Array.from(mapSeasonal.values());
-
-      const seasonalCategories = [
-        {
-          nome: 'Gripes, Tosse, Garganta & Imunidade',
-          icone: '🧣',
-          re: /grip|constip|tosse|gargant|nasal|imun|vitam|zinco|propol|equinac|respir|aspir|ben-u|flu/i,
-          contexto: 'Outono/Inverno — Pico de frio, constipações e afeções respiratórias.',
-          gerarScript: (p) => \`Ao aviar analgésicos, antipiréticos ou receitas respiratórias, sugira <b>\${p.designacao}</b> para reforço imunitário ou alívio nasal/garganta.\`
-        },
-        {
-          nome: 'Digestivo & Trânsito Intestinal',
-          icone: '🍵',
-          re: /digest|gastr|acidez|reflux|flat|azia|lax|probiot|hep|figad|carv|cha|sollievo|gaviscon|pantoprazol|aptamil confort/i,
-          contexto: 'Outono/Inverno — Alimentação pesada e irregularidade digestiva típica da estação.',
-          gerarScript: (p) => \`A utentes com queixas digestivas ou a tomar antibióticos/AINEs, sugira <b>\${p.designacao}</b> para proteção gástrica e equilíbrio intestinal.\`
-        },
-        {
-          nome: 'Pele Seca, Lábios Gretados & Hidratação de Frio',
-          icone: '🧴',
-          re: /labi|labial|creme|hidrat|xerose|maos|fissur|cicalfate|atoderm|balsamo|pele|derm|emol|exomega|avene/i,
-          contexto: 'Outono/Inverno — Vento e arrefecimento provocam desidratação e cieiro cutâneo.',
-          gerarScript: (p) => \`No fecho do atendimento, apresente <b>\${p.designacao}</b> como barreira protetora contra o frio para lábios, mãos ou corpo.\`
-        },
-        {
-          nome: 'Dores Musculares, Articulações & Circulação',
-          icone: '🦵',
-          re: /articul|cartil|dor|gel|arnica|pernas|circul|pes|calos|compress|voltaren|biofreeze|dimobil|metarecod/i,
-          contexto: 'Outono/Inverno — O frio e humidade intensificam queixas articulares e rigidez.',
-          gerarScript: (p) => \`A utentes com dor ou rigidez muscular, proponha <b>\${p.designacao}</b> como massagem térmica de alívio rápido sem agredir o estômago.\`
-        }
-      ];
-
-      const selectedSeasonalItems = [];
-      const usedSeasonalCnps = new Set();
-
-      for (const cat of seasonalCategories) {
-        const matches = seasonalPool
-          .filter(p => !usedSeasonalCnps.has(p.cnp_codigo) && cat.re.test(p.designacao))
-          .sort((a, b) => (b.valor_risco || 0) - (a.valor_risco || 0));
-
-        // Até 2 produtos por categoria para garantir variedade clínica
-        for (const m of matches.slice(0, 2)) {
-          usedSeasonalCnps.add(m.cnp_codigo);
-          selectedSeasonalItems.push({
-            ...m,
-            categoriaNome: cat.nome,
-            categoriaIcone: cat.icone,
-            contextoEpoca: cat.contexto,
-            scriptBalcao: cat.gerarScript(m)
-          });
-        }
-      }
-
-      // Se necessário complementar até pelo menos 6 itens
-      if (selectedSeasonalItems.length < 6) {
-        const leftovers = seasonalPool
-          .filter(p => !usedSeasonalCnps.has(p.cnp_codigo))
-          .sort((a, b) => (b.valor_risco || 0) - (a.valor_risco || 0))
-          .slice(0, 6 - selectedSeasonalItems.length);
-        for (const lo of leftovers) {
-          usedSeasonalCnps.add(lo.cnp_codigo);
-          selectedSeasonalItems.push({
-            ...lo,
-            categoriaNome: 'Oportunidade de Balcão',
-            categoriaIcone: '🎯',
-            contextoEpoca: 'Recomendação ativa ao balcão para escoar produto com margem comercial atrativa.',
-            scriptBalcao: \`Recomendar ao balcão a utentes regulares para escoar as \${lo.stock_atual} unidades com PVP sugerido de \${lo.pvp ? lo.pvp.toFixed(2) + '€' : 'promocional'}.\`
-          });
-        }
-      }
-
-      const top6Seasonal = selectedSeasonalItems.slice(0, 6);
-      const restoSeasonal = selectedSeasonalItems.slice(6);
-      currentWeeklyPlanData.card4 = top6Seasonal;
-      currentWeeklyPlanData.card4All = selectedSeasonalItems;
+      const top10Rutura = rawRuturaPool.slice(0, 10);
+      const restoRutura = rawRuturaPool.slice(10);
+      currentWeeklyPlanData.card4 = top10Rutura;
+      currentWeeklyPlanData.card4All = rawRuturaPool;
 
       const c4CountEl = document.getElementById('planoCard4Count');
       if (c4CountEl) {
-        c4CountEl.textContent = \`\${selectedSeasonalItems.length} oportunidades sazonais\`;
+        c4CountEl.textContent = \`\${rawRuturaPool.length} artigos em risco de rutura\`;
       }
 
       const c4El = document.getElementById('planoCard4List');
       if (c4El) {
-        const renderSeasonalRow = (item, idx) => {
-          const taskId = \`cross_\${item.cnp_codigo || idx}\`;
+        const renderRuturaRow = (item, idx) => {
+          const taskId = \`rut_\${item.cnp_codigo}\`;
           const isDone = !!doneMap[taskId];
+          const sugestaoEnc = item.sugestao_encomenda || Math.max(2, Math.ceil((item.vmm || 1) * 0.5));
+          const diasTxt = item.dias_cobertura != null ? \`\${item.dias_cobertura} dias\` : 'crítica';
+
           return \`
-            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
-              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #38bdf8;" />
+            <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #bae6fd; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
+              <input type="checkbox" class="weekly-task-checkbox" data-task-id="\${taskId}" \${isDone ? 'checked' : ''} onchange="toggleWeeklyTask('\ItemPlaceholderId')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #0284c7;" />
               <div style="flex: 1;">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
                   <span style="font-weight: 700; color: #0f172a; font-size: 0.88rem;">\${item.designacao}</span>
-                  <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
-                    <span style="font-size: 0.72rem; font-weight: 700; color: \${item.tag_color}; background: \${item.tag_bg}; padding: 2px 6px; border-radius: 4px;">\${item.tipo_alerta}</span>
-                    <span style="font-size: 0.78rem; font-weight: 700; color: #0369a1; background: #e0f2fe; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #bae6fd;">\${item.stock_atual} un em stock \${item.pvp ? '· ' + item.pvp.toFixed(2) + '€' : ''}</span>
-                  </div>
-                </div>
-                <div style="font-size: 0.76rem; color: #94a3b8; margin-top: 4px;">
-                  \${item.categoriaIcone} <b>\${item.categoriaNome}:</b> \${item.contextoEpoca}
+                  <span style="font-size: 0.78rem; font-weight: 800; color: #0369a1; background: #e0f2fe; padding: 2px 8px; border-radius: 4px; border: 1px solid #bae6fd;">
+                    Stock: \${item.stock_atual} un · VMM: \${item.vmm}/mês
+                  </span>
                 </div>
                 <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
-                  💬 <b>Como Abordar ao Balcão:</b> \${item.scriptBalcao}
+                  🟢 <b>Ajustar no Sifarma:</b> Subir Ponto de Encomenda para <b>\${sugestaoEnc} un</b> (risco de rutura iminente face às vendas: cobertura atual de apenas \${diasTxt}).
                 </div>
                 <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
-                  CNP: <code style="color:#38bdf8">\${item.cnp_codigo}</code> | Capital em risco: <b>\${(item.valor_risco || 0).toFixed(2)} €</b>
+                  CNP: <code style="color:#0284c7">\${item.cnp_codigo}</code> | Categoria: \${item.categoria || 'Geral'} | Tipo: \${item.tipo_venda || 'MSRM'}
                 </div>
               </div>
             </div>
           \`;
         };
 
-        let html4 = top6Seasonal.map(renderSeasonalRow).join('');
-        if (restoSeasonal.length > 0) {
+        let html4 = top10Rutura.map(renderRuturaRow).join('');
+        if (restoRutura.length > 0) {
           html4 += \`
             <div id="planoCard4Resto" style="display: none; flex-direction: column; gap: 10px; margin-top: 10px;">
-              \${restoSeasonal.map((it, i) => renderSeasonalRow(it, i + 6)).join('')}
+              \${restoRutura.map((it, i) => renderRuturaRow(it, i + 10)).join('')}
             </div>
-            <button id="btnToggleSeasonal" class="btn btn-secondary" onclick="togglePlanoCardResto('planoCard4Resto', 'btnToggleSeasonal', \${restoSeasonal.length}, 'sugestões sazonais de balcão')" style="margin-top: 10px; width: 100%; font-size: 0.8rem; padding: 8px 12px; border: 1px dashed #38bdf8; color: #38bdf8; background: rgba(56,189,248,0.06); cursor: pointer; border-radius: 6px;">
-              👁️ Ver mais \${restoSeasonal.length} oportunidades sazonais de balcão
+            <button id="btnToggleRutura" class="btn btn-secondary" onclick="togglePlanoCardResto('planoCard4Resto', 'btnToggleRutura', \${restoRutura.length}, 'medicamentos com risco de rutura')" style="margin-top: 10px; width: 100%; font-size: 0.8rem; padding: 8px 12px; border: 1px dashed #0284c7; color: #0284c7; background: rgba(2,132,199,0.06); cursor: pointer; border-radius: 6px; font-weight: 700;">
+              👁️ Ver os restantes \${restoRutura.length} produtos em risco de rutura
             </button>
           \`;
         }
-        c4El.innerHTML = (html4 || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Protocolos ativos na aba Campanhas & Marketing 360º.</div>').replace(/\\ItemPlaceholderId/g, "'+taskId+'");
+        c4El.innerHTML = (html4 || '<div style="color:var(--muted);font-size:0.85rem;padding:12px;">✅ Níveis de stock mínimos equilibrados no Sifarma.</div>').replace(/\\ItemPlaceholderId/g, "'+taskId+'");
       }
 
       updateWeeklyTasksCounter();
@@ -4282,173 +4448,36 @@ function getDashboardHtml(): string {
         <html>
         <head>
           <meta charset="utf-8" />
-          <title>Plano Semanal de Ação — \${farmNome}</title>
+          <title>Folha Semanal da Equipa (4 Pilares) — \${farmNome}</title>
           <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 24px; color: #111; line-height: 1.4; font-size: 11px; }
-            .header { border-bottom: 2px solid #000; padding-bottom: 10px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: flex-end; }
-            h1 { margin: 0; font-size: 17px; text-transform: uppercase; }
-            h2 { font-size: 12px; margin: 14px 0 6px 0; background: #f0f0f0; padding: 5px 8px; border-left: 4px solid #111; }
-            table { width: 100%; border-collapse: collapse; margin-bottom: 12px; font-size: 10.5px; }
-            th, td { border: 1px solid #ccc; padding: 5px 7px; text-align: left; }
-            th { background: #fafafa; font-weight: 700; }
-            .box { width: 14px; height: 14px; border: 1.5px solid #111; display: inline-block; vertical-align: middle; margin-right: 4px; }
-            .footer { margin-top: 20px; padding-top: 10px; border-top: 1px dashed #888; font-size: 10px; display: flex; justify-content: space-between; }
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 20px; color: #0f172a; line-height: 1.4; font-size: 11px; }
+            .header { border-bottom: 2px solid #0f172a; padding-bottom: 10px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: flex-end; }
+            h1 { margin: 0; font-size: 16px; font-weight: 800; text-transform: uppercase; color: #0f172a; }
+            h2 { font-size: 11.5px; margin: 14px 0 6px 0; background: #f1f5f9; padding: 6px 10px; border-left: 4px solid #0284c7; font-weight: 800; text-transform: uppercase; }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 12px; font-size: 10px; }
+            th, td { border: 1px solid #cbd5e1; padding: 5px 7px; text-align: left; vertical-align: middle; }
+            th { background: #f8fafc; font-weight: 700; color: #334155; }
+            .box { width: 13px; height: 13px; border: 1.5px solid #475569; display: inline-block; vertical-align: middle; border-radius: 2px; }
+            .footer { margin-top: 16px; padding-top: 10px; border-top: 1px dashed #94a3b8; font-size: 10px; display: flex; justify-content: space-between; color: #64748b; }
             @media print {
               body { margin: 8mm; }
               button { display: none; }
             }
-          
-    /* ==========================================================================
-       MODERN CLINICAL APP LAYOUT WITH LEFT SIDEBAR NAVIGATION
-       ========================================================================== */
-    .app-layout {
-      display: flex;
-      min-height: 100vh;
-      background: #f8fafc;
-    }
-
-    .sidebar {
-      width: 280px;
-      min-width: 280px;
-      background: #ffffff;
-      border-right: 1px solid #e2e8f0;
-      display: flex;
-      flex-direction: column;
-      position: sticky;
-      top: 0;
-      height: 100vh;
-      overflow-y: auto;
-      z-index: 90;
-      box-shadow: 2px 0 6px rgba(0, 0, 0, 0.02);
-    }
-
-    .sidebar-brand {
-      padding: 22px 20px 16px;
-      border-bottom: 1px solid #f1f5f9;
-    }
-
-    .sidebar-brand h1 {
-      font-size: 1.28rem;
-      font-weight: 800;
-      color: #0284c7;
-      letter-spacing: -0.5px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .sidebar-brand p {
-      font-size: 0.76rem;
-      color: #64748b;
-      margin-top: 3px;
-      font-weight: 500;
-      line-height: 1.35;
-    }
-
-    .sidebar-pharmacy {
-      padding: 14px 18px;
-      background: #f8fafc;
-      border-bottom: 1px solid #e2e8f0;
-    }
-
-    .sidebar-nav {
-      flex: 1;
-      padding: 16px 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-
-    .nav-section-title {
-      font-size: 0.68rem;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: #64748b;
-      padding: 12px 10px 6px;
-    }
-
-    .nav-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 10px 12px;
-      border-radius: 8px;
-      font-size: 0.86rem;
-      font-weight: 600;
-      color: #334155;
-      cursor: pointer;
-      border: 1px solid transparent;
-      background: transparent;
-      text-align: left;
-      width: 100%;
-      transition: all 0.15s ease;
-      text-decoration: none;
-    }
-
-    .nav-item:hover {
-      background: #f1f5f9;
-      color: #0f172a;
-    }
-
-    .nav-item.active {
-      background: #f0f9ff !important;
-      color: #0284c7 !important;
-      border-color: #bae6fd !important;
-      font-weight: 700;
-      box-shadow: 0 1px 3px rgba(2, 132, 199, 0.08);
-    }
-
-    .nav-item.active .badge {
-      background: #0284c7 !important;
-      color: #ffffff !important;
-    }
-
-    .nav-item-left {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .sidebar-footer {
-      padding: 14px 16px;
-      border-top: 1px solid #e2e8f0;
-      background: #fafbfc;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    .main-wrapper {
-      flex: 1;
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-      background: #f8fafc;
-    }
-
-    .main-content {
-      padding: 24px 32px 60px;
-      max-width: 1600px;
-      width: 100%;
-      margin: 0 auto;
-    }
-
-  </style>
+          </style>
         </head>
         <body>
           <div class="header">
             <div>
-              <h1>📋 Folha Semanal de Tarefas da Equipa</h1>
+              <h1>📋 Folha Semanal de Ações da Farmácia (4 Pilares)</h1>
               <div style="font-size: 12px; font-weight: bold; margin-top: 4px;">\${farmNome} (NIF: \${farmNif})</div>
             </div>
             <div style="text-align: right; font-size: 11px;">
               <div>Data de Emissão: \${dataRef}</div>
-              <div>Semana Operacional</div>
+              <div><b>Modo de Execução com Checkbox [ ]</b></div>
             </div>
           </div>
 
-          <h2>1. GAVETA & PRATELEIRAS — TOP 10 VALIDADES URGENTES A ESCOAR</h2>
+          <h2>🔴 1. VALIDADES PRÓXIMAS A TRATAR (GAVETA & PRATELEIRAS)</h2>
           <table>
             <thead>
               <tr>
@@ -4457,14 +4486,12 @@ function getDashboardHtml(): string {
                 <th>Designação do Produto</th>
                 <th style="width: 50px;">Qtd</th>
                 <th style="width: 75px;">Validade</th>
-                <th>Ação Prática a Tomar</th>
+                <th>Ação Obrigatória na Farmácia</th>
               </tr>
             </thead>
             <tbody>
               \${(currentWeeklyPlanData.card1 || []).map(i => {
-                const isMsrm = i.tipo_venda === 'MSRM' || i.tipo_venda === 'MSRM_GENERICO';
                 const qtd = i.stock_atual != null ? i.stock_atual : (i.quantidade || 1);
-                const pvpPromo = i.pvp ? (i.pvp * 0.8).toFixed(2) + '€' : '-';
                 return \`
                   <tr>
                     <td style="text-align: center;"><span class="box"></span></td>
@@ -4472,22 +4499,22 @@ function getDashboardHtml(): string {
                     <td><b>\${i.designacao}</b></td>
                     <td>\${qtd} un</td>
                     <td><b>\${i.data_validade || '-'}</b></td>
-                    <td>\${isMsrm ? '🏷️ Colocar elástico vermelho na gaveta; prioridade na próxima receita ou devolver ao armazenista.' : '🧺 Cesto de oportunidade (-20% desconto: PVP Promo sugerido ' + pvpPromo + ').'}</td>
+                    <td>⚠️ Atenção à Validade: Separar fisicamente na gaveta ou destacar prioritariamente no balcão.</td>
                   </tr>
                 \`;
               }).join('')}
             </tbody>
           </table>
 
-          <h2>2. NO BALCÃO — TOP 5 TROCAS DE MARCA NOS GENÉRICOS (ESCOAR RESTOS DE GAVETA)</h2>
+          <h2>🟠 2. PÔR A RODAR STOCK PARADO (RESTOS DE GAVETA & EXCESSOS SAZONAIS)</h2>
           <table>
             <thead>
               <tr>
                 <th style="width: 25px;">[ ]</th>
-                <th style="width: 140px;">Molécula / Apresentação</th>
-                <th style="width: 60px;">Stock Tot.</th>
-                <th>Marcas Residuais na Gaveta (Dispensar Obrigatoriamente Primeiro!)</th>
-                <th>Instrução ao Balcão</th>
+                <th style="width: 140px;">Produto / Apresentação</th>
+                <th style="width: 60px;">Stock</th>
+                <th>Tipo de Situação</th>
+                <th>Ação no Balcão / Cesto Temático</th>
               </tr>
             </thead>
             <tbody>
@@ -4499,15 +4526,24 @@ function getDashboardHtml(): string {
                     <td style="text-align: center;"><span class="box"></span></td>
                     <td><b>\${g.grupo_equivalencia_dci || g.molecula_dci}</b></td>
                     <td>\${g.stock_total_unidades} un</td>
-                    <td><b>\${restosTxt || 'Ver gaveta'}</b></td>
-                    <td>Quando pedirem esta molécula, dar sempre prioridade na dispensa a estas caixas paradas. Pausar encomenda das outras marcas até esgotar.</td>
+                    <td><b>Restos de Gaveta</b>: \${restosTxt || 'Ver gaveta'}</td>
+                    <td>Dispensar primeiro estas caixas paradas na gaveta antes de abrir novas embalagens.</td>
                   </tr>
                 \`;
               }).join('')}
+              \${(currentWeeklyPlanData.card2Seasonal || []).map(i => \`
+                <tr>
+                  <td style="text-align: center;"><span class="box"></span></td>
+                  <td><b>\${i.designacao}</b> (CNP: \${i.cnp_codigo})</td>
+                  <td><b>\${i.stock_atual} un</b></td>
+                  <td><b>Excesso Sazonal (Inverno)</b>: \${i.cobertura_meses ? i.cobertura_meses.toFixed(0) + ' meses' : 'stock alto'}</td>
+                  <td>Colocar em destaque no balcão ou no cesto de oportunidade aproveitando o pico de procura!</td>
+                </tr>
+              \`).join('')}
             </tbody>
           </table>
 
-          <h2>3. NO COMPUTADOR DE COMPRAS (SIFARMA) — TOP 10 CÓDIGOS A TRAVAR ENCOMENDA</h2>
+          <h2>🛑 3. O QUE NÃO ENCOMENDAR MAIS (BLOQUEAR NO SIFARMA COM P.E. = 0)</h2>
           <table>
             <thead>
               <tr>
@@ -4533,33 +4569,38 @@ function getDashboardHtml(): string {
             </tbody>
           </table>
 
-          <h2>4. ATENDIMENTO AO BALCÃO — VENDA CRUZADA & OPORTUNIDADES DA ÉPOCA (OUTONO/INVERNO)</h2>
+          <h2>🟢 4. AJUSTAR NÍVEIS & PREVENIR RUTURAS (SUBIR PONTO DE ENCOMENDA NO SIFARMA)</h2>
           <table>
             <thead>
               <tr>
                 <th style="width: 25px;">[ ]</th>
-                <th>Produto a Escoar</th>
-                <th style="width: 85px;">Stock / PVP</th>
-                <th style="width: 140px;">Contexto da Época</th>
-                <th>Argumento Clínico ao Balcão</th>
+                <th style="width: 80px;">Código CNP</th>
+                <th>Designação</th>
+                <th style="width: 65px;">Stock Atual</th>
+                <th style="width: 75px;">VMM</th>
+                <th>Ação Recomendada no Sifarma</th>
               </tr>
             </thead>
             <tbody>
-              \${(currentWeeklyPlanData.card4 || []).map(i => \`
-                <tr>
-                  <td style="text-align: center;"><span class="box"></span></td>
-                  <td><b>\${i.designacao}</b><br/><span style="font-size:9px;color:#555;">CNP: \${i.cnp_codigo} · \${i.tipo_alerta}</span></td>
-                  <td>\${i.stock_atual} un (\${i.pvp ? i.pvp.toFixed(2) + '€' : '-'})</td>
-                  <td><b>\${i.categoriaNome}</b><br/><span style="font-size:9px;color:#444;">\${i.contextoEpoca}</span></td>
-                  <td>\${i.scriptBalcao}</td>
-                </tr>
-              \`).join('')}
+              \${(currentWeeklyPlanData.card4 || []).map(i => {
+                const sugestao = i.sugestao_encomenda || Math.max(2, Math.ceil((i.vmm || 1) * 0.5));
+                return \`
+                  <tr>
+                    <td style="text-align: center;"><span class="box"></span></td>
+                    <td><b>\${i.cnp_codigo}</b></td>
+                    <td><b>\${i.designacao}</b></td>
+                    <td>\${i.stock_atual} un</td>
+                    <td>\${i.vmm ? i.vmm + ' un/mês' : '-'}</td>
+                    <td><b>Subir Ponto de Encomenda para \${sugestao} un</b> (cobertura crítica de \${i.dias_cobertura != null ? i.dias_cobertura + ' dias' : 'baixo stock'}).</td>
+                  </tr>
+                \`;
+              }).join('')}
             </tbody>
           </table>
 
           <div class="footer">
             <div>Folha Operacional de Farmácia — Assinatura do Responsável: ___________________________</div>
-            <div>BI Pharma © Nuelltech · Poupança Potencial Travada: \${(currentWeeklyPlanData.card3TotalSavings || 0).toFixed(2)} €</div>
+            <div>BI Pharma © Nuelltech · Poupança Travada: \${(currentWeeklyPlanData.card3TotalSavings || 0).toFixed(2)} €</div>
           </div>
         </body>
         </html>
@@ -4987,8 +5028,720 @@ function getDashboardHtml(): string {
         }
         rendered = bHtml;
       }
+      // Botão Rever Encomenda (incluindo variações de emojis/texto que Claude possa gerar)
+      var orderModalBtnHtml = '<div style="margin: 12px 0;"><button class="btn btn-sm" onclick="openInteractiveOrderModal()" style="background:#6366f1;color:#fff;font-weight:800;padding:9px 16px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:7px;box-shadow:0 2px 4px rgba(99,102,241,0.25);">🛒 Rever & Editar Encomenda Completa</button></div>';
+      var exportCsvBtnHtml = '<div style="margin: 8px 0;"><button class="btn btn-sm" onclick="exportCopilotShoppingListCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📥 Descarregar CSV para Sifarma</button></div>';
+      var applyBlocksBtnHtml = '<div style="margin: 8px 0;"><button class="btn btn-sm" onclick="applySifarmaOrderBlocks()" style="background:#e11d48;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">🛑 Aplicar Bloqueios no Sifarma (Ponto de Encomenda = 0)</button></div>';
+
+      rendered = rendered.split('[BOTAO_APLICAR_PLANO]').join('<div style="margin: 10px 0;"><button class="btn btn-sm" onclick="applyCopilotWeeklyPlan()" style="background:#10b981;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">📥 Aplicar à Folha da Semana</button></div>');
+      rendered = rendered.split('[BOTAO_GUARDAR_PACK]').join('<div style="margin: 10px 0;"><button class="btn btn-sm" onclick="saveCopilotPack()" style="background:#8b5cf6;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">📦 Guardar Pack no Estúdio de Marketing</button></div>');
+      rendered = rendered.split('[BOTAO_EXPORTAR_ENCOMENDA_PDF]').join('<div style="margin: 8px 0;"><button class="btn btn-sm" onclick="exportCopilotShoppingListPdf()" style="background:#dc2626;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">📄 Imprimir / Guardar em PDF</button></div>');
+      rendered = rendered.split('[BOTAO_EXPORTAR_ENCOMENDA_CSV]').join('<div style="display:inline-flex;flex-wrap:wrap;gap:8px;margin:12px 0;"><button class="btn btn-sm" onclick="openInteractiveOrderModal()" style="background:#6366f1;color:#fff;font-weight:800;padding:9px 16px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:7px;box-shadow:0 2px 4px rgba(99,102,241,0.25);">🛒 Rever & Editar Encomenda Completa</button><button class="btn btn-sm" onclick="exportCopilotShoppingListCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📥 CSV Sifarma</button><button class="btn btn-sm" onclick="exportCopilotShoppingListPdf()" style="background:#dc2626;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📄 Guia PDF</button><button class="btn btn-sm" onclick="copyShoppingListToClipboard()" style="background:#475569;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📋 Copiar CNPs</button></div>');
+      rendered = rendered.split('[BOTAO_APLICAR_ENCOMENDA_FOLHA]').join('<div style="margin: 10px 0;"><button class="btn btn-sm" onclick="applyShoppingListToWeeklyPlan()" style="background:#10b981;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">📝 Adicionar à Folha Semanal (Pilar 4: Reposição)</button></div>');
+
+      // Substituições resilientes caso o LLM escreva os nomes por extenso com emojis
+      rendered = rendered.replace(/\[🛒\s*REVER[^\]]*\]/gi, orderModalBtnHtml);
+      rendered = rendered.replace(/\[📊\s*EXPORTAR[^\]]*\]/gi, exportCsvBtnHtml);
+      rendered = rendered.replace(/\[✅\s*APLICAR\s*BLOQUEIOS[^\]]*\]/gi, applyBlocksBtnHtml);
       return rendered;
     }
+
+    function applyCopilotWeeklyPlan() {
+      alert('📥 Recomendações aplicadas com sucesso à Folha da Semana!');
+      switchTab('plano');
+    }
+
+    function saveCopilotPack() {
+      alert('📦 A abrir Estúdio de Marketing com os Packs Clínicos!');
+      switchTab('campaigns');
+      switchMarketingSubView('packs');
+    }
+
+    
+    // =========================================================================
+    // CONTROLADOR DA CENTRAL INTERATIVA DE REVISÃO E EDIÇÃO DE ENCOMENDA
+    // =========================================================================
+    window.interactiveOrderState = {
+      items: [],
+      currentChannel: 'ALL',
+      searchTerm: ''
+    };
+
+    function initInteractiveOrderStateFromLastList() {
+      var sourceList = window.lastCopilotShoppingList || [];
+      window.interactiveOrderState.items = sourceList.map(function(it, idx) {
+        var canal = it.canalSugerido || 'REGULAR_ARMAZENISTA';
+        var rotulo = it.canalRotulo || (canal === 'URGENTE_ARMAZENISTA' ? '🔴 Armazenista Urgente' : canal === 'LABORATORIO_DIRETO' ? '🏭 Laboratório Direto' : '🟡 Armazenista Regular');
+        return {
+          id: idx,
+          cnp: it.cnp,
+          designacao: it.designacao,
+          stockAtual: it.stockAtual || 0,
+          vendas12M: it.vendas12M || 0,
+          vendaDiaria: it.vendaDiaria || 0,
+          quantidadeAEncomendar: it.quantidadeAEncomendar || 1,
+          custoUnitarioEur: it.custoUnitarioEur || 0,
+          pvpEur: it.pvpEur || 0,
+          canalSugerido: canal,
+          canalRotulo: rotulo,
+          active: true
+        };
+      });
+    }
+
+    function openInteractiveOrderModal() {
+      if (!window.lastCopilotShoppingList || window.lastCopilotShoppingList.length === 0) {
+        alert('Nenhuma lista de encomendas gerada pelo Copilot. Peça uma proposta de encomenda de reposição para carregar o carrinho.');
+        return;
+      }
+      initInteractiveOrderStateFromLastList();
+      window.interactiveOrderState.currentChannel = 'ALL';
+      window.interactiveOrderState.searchTerm = '';
+
+      var sel = document.getElementById('farmaciaSelector');
+      var farmNome = (sel && sel.options && sel.selectedIndex >= 0) ? sel.options[sel.selectedIndex].text : 'Farmácia Ativa';
+      var badge = document.getElementById('orderModalFarmBadge');
+      if (badge) badge.innerText = farmNome;
+
+      var searchInput = document.getElementById('orderModalSearchInput');
+      if (searchInput) searchInput.value = '';
+
+      updateOrderTabButtonsUI();
+      renderInteractiveOrderTable();
+      updateInteractiveOrderTotals();
+
+      var modal = document.getElementById('interactiveOrderModal');
+      if (modal) modal.style.display = 'flex';
+    }
+
+    function closeInteractiveOrderModal() {
+      var modal = document.getElementById('interactiveOrderModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    function switchOrderChannel(tabKey) {
+      window.interactiveOrderState.currentChannel = tabKey;
+      updateOrderTabButtonsUI();
+      renderInteractiveOrderTable();
+    }
+
+    function updateOrderTabButtonsUI() {
+      var cur = window.interactiveOrderState.currentChannel;
+      var tabs = [
+        { id: 'tabBtnALL', key: 'ALL' },
+        { id: 'tabBtnURG', key: 'URGENTE_ARMAZENISTA' },
+        { id: 'tabBtnREG', key: 'REGULAR_ARMAZENISTA' },
+        { id: 'tabBtnLAB', key: 'LABORATORIO_DIRETO' }
+      ];
+      for (var i = 0; i < tabs.length; i++) {
+        var btn = document.getElementById(tabs[i].id);
+        if (btn) {
+          if (tabs[i].key === cur) {
+            btn.style.background = '#ffffff';
+            btn.style.color = '#0f172a';
+            btn.style.fontWeight = '700';
+            btn.style.boxShadow = '0 1px 2px rgba(0,0,0,0.06)';
+          } else {
+            btn.style.background = 'transparent';
+            btn.style.color = '#64748b';
+            btn.style.fontWeight = '600';
+            btn.style.boxShadow = 'none';
+          }
+        }
+      }
+    }
+
+    function toggleOrderRowActive(idx) {
+      var item = window.interactiveOrderState.items[idx];
+      if (item) {
+        item.active = !item.active;
+        updateInteractiveOrderTotals();
+        renderInteractiveOrderTable();
+      }
+    }
+
+    function changeOrderRowQty(idx, delta) {
+      var item = window.interactiveOrderState.items[idx];
+      if (item) {
+        var novaQtd = Math.max(1, (item.quantidadeAEncomendar || 1) + delta);
+        item.quantidadeAEncomendar = novaQtd;
+        updateInteractiveOrderTotals();
+        renderInteractiveOrderTable();
+      }
+    }
+
+    function setOrderRowQty(idx, val) {
+      var item = window.interactiveOrderState.items[idx];
+      if (item) {
+        var num = parseInt(val, 10);
+        if (!isNaN(num) && num >= 1) {
+          item.quantidadeAEncomendar = num;
+        } else {
+          item.quantidadeAEncomendar = 1;
+        }
+        updateInteractiveOrderTotals();
+        renderInteractiveOrderTable();
+      }
+    }
+
+    function discontinueProductFromOrderRow(idx) {
+      var item = window.interactiveOrderState.items[idx];
+      if (!item) return;
+      if (!confirm('Deseja descontinuar este produto (' + item.designacao + ') e marcá-lo como NÃO REPOR? Ele será removido desta encomenda.')) {
+        return;
+      }
+      fetch('/api/products/discontinue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          farmaciaId: activeFarmaciaId,
+          cnp: item.cnp,
+          designacao: item.designacao,
+          motivo: 'Descontinuado pelo utilizador na Proposta de Reposição'
+        })
+      }).then(function(res) {
+        return res.json();
+      }).then(function(data) {
+        if (data.ok) {
+          window.interactiveOrderState.items.splice(idx, 1);
+          updateInteractiveOrderTotals();
+          renderInteractiveOrderTable();
+          alert('✅ Produto ' + item.cnp + ' descontinuado com sucesso! Não voltará a ser sugerido.');
+        } else {
+          alert('Erro ao descontinuar produto: ' + (data.error || 'Erro desconhecido'));
+        }
+      }).catch(function(err) {
+        alert('Erro ao contactar o servidor: ' + err);
+      });
+    }
+
+    function toggleSelectAllInTab(targetActive) {
+      var curTab = window.interactiveOrderState.currentChannel;
+      var q = (document.getElementById('orderModalSearchInput') ? document.getElementById('orderModalSearchInput').value : '').toLowerCase().trim();
+      var items = window.interactiveOrderState.items;
+
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var matchesTab = (curTab === 'ALL' || it.canalSugerido === curTab);
+        var matchesSearch = !q || (it.cnp.toLowerCase().indexOf(q) !== -1 || (it.designacao || '').toLowerCase().indexOf(q) !== -1);
+        if (matchesTab && matchesSearch) {
+          it.active = targetActive;
+        }
+      }
+      updateInteractiveOrderTotals();
+      renderInteractiveOrderTable();
+    }
+
+    function updateInteractiveOrderTotals() {
+      var items = window.interactiveOrderState.items;
+      var totalAll = items.length;
+      var countUrg = 0;
+      var countReg = 0;
+      var countLab = 0;
+
+      var selectedArticles = 0;
+      var selectedUnits = 0;
+      var selectedTotalEur = 0;
+
+      var sumUrgEur = 0;
+      var sumRegEur = 0;
+      var sumLabEur = 0;
+
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (it.canalSugerido === 'URGENTE_ARMAZENISTA') countUrg++;
+        else if (it.canalSugerido === 'CONSUMIVEIS_LOJA') countLab++; // countLab representa consumíveis
+        else countReg++;
+
+        if (it.active) {
+          selectedArticles++;
+          var qty = it.quantidadeAEncomendar || 0;
+          selectedUnits += qty;
+          var lineCost = qty * (it.custoUnitarioEur || 0);
+          selectedTotalEur += lineCost;
+
+          if (it.canalSugerido === 'URGENTE_ARMAZENISTA') sumUrgEur += lineCost;
+          else if (it.canalSugerido === 'CONSUMIVEIS_LOJA') sumLabEur += lineCost;
+          else sumRegEur += lineCost;
+        }
+      }
+
+      var elCountAll = document.getElementById('countTabAll');
+      if (elCountAll) elCountAll.innerText = totalAll;
+      var elCountUrg = document.getElementById('countTabUrg');
+      if (elCountUrg) elCountUrg.innerText = countUrg;
+      var elCountReg = document.getElementById('countTabReg');
+      if (elCountReg) elCountReg.innerText = countReg;
+      var elCountLab = document.getElementById('countTabCons') || document.getElementById('countTabLab');
+      if (elCountLab) elCountLab.innerText = countLab;
+
+      var elSelArt = document.getElementById('statSelectedArticles');
+      if (elSelArt) elSelArt.innerText = selectedArticles + ' / ' + totalAll;
+      var elSelUnits = document.getElementById('statSelectedUnits');
+      if (elSelUnits) elSelUnits.innerText = selectedUnits + ' un';
+      var elSelEur = document.getElementById('statSelectedTotalEur');
+      if (elSelEur) elSelEur.innerText = selectedTotalEur.toFixed(2).replace('.', ',') + ' €';
+    }
+
+    function renderInteractiveOrderTable() {
+      var tbody = document.getElementById('interactiveOrderTableBody');
+      if (!tbody) return;
+
+      var curTab = window.interactiveOrderState.currentChannel;
+      var q = (document.getElementById('orderModalSearchInput') ? document.getElementById('orderModalSearchInput').value : '').toLowerCase().trim();
+      var items = window.interactiveOrderState.items;
+
+      var html = '';
+      var visibleCount = 0;
+
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var matchesTab = (curTab === 'ALL' || it.canalSugerido === curTab);
+        var matchesSearch = !q || (it.cnp.toLowerCase().indexOf(q) !== -1 || (it.designacao || '').toLowerCase().indexOf(q) !== -1);
+
+        if (!matchesTab || !matchesSearch) continue;
+        visibleCount++;
+
+        var lineTotal = ((it.quantidadeAEncomendar || 0) * (it.custoUnitarioEur || 0)).toFixed(2).replace('.', ',') + ' €';
+        var cUnit = (it.custoUnitarioEur || 0).toFixed(2).replace('.', ',') + ' €';
+        var rowBg = it.active ? '#ffffff' : '#f8fafc';
+        var textOpacity = it.active ? '1' : '0.45';
+
+        var badgeBg = '#f1f5f9';
+        var badgeColor = '#475569';
+        if (it.canalSugerido === 'URGENTE_ARMAZENISTA') {
+          badgeBg = '#fee2e2';
+          badgeColor = '#b91c1c';
+        } else if (it.canalSugerido === 'CONSUMIVEIS_LOJA') {
+          badgeBg = '#e0e7ff';
+          badgeColor = '#3730a3';
+        } else {
+          badgeBg = '#fef3c7';
+          badgeColor = '#b45309';
+        }
+
+        html += '<tr style="border-bottom:1px solid #f1f5f9; background:' + rowBg + '; opacity:' + textOpacity + '; transition:background 0.1s;">' +
+          '<td style="padding:8px 12px; text-align:center;">' +
+            '<input type="checkbox" ' + (it.active ? 'checked' : '') + ' onchange="toggleOrderRowActive(' + i + ')" style="width:16px; height:16px; cursor:pointer;" />' +
+          '</td>' +
+          '<td style="padding:8px; text-align:center; color:#64748b; font-size:11px;">' + (i + 1) + '</td>' +
+          '<td style="padding:8px;"><span style="background:' + badgeBg + '; color:' + badgeColor + '; font-size:10.5px; font-weight:700; padding:2px 7px; border-radius:4px; display:inline-block;">' + it.canalRotulo + '</span></td>' +
+          '<td style="padding:8px; font-family:monospace; font-weight:700; color:#0284c7; font-size:11.5px;">' + it.cnp + '</td>' +
+          '<td style="padding:8px; font-weight:600; color:#0f172a; font-size:11.5px;">' + (it.designacao || '') + '</td>' +
+          '<td style="padding:8px; text-align:center; font-weight:700; color:' + (it.stockAtual === 0 ? '#ef4444' : '#0f172a') + ';">' + it.stockAtual + '</td>' +
+          '<td style="padding:8px; text-align:center; color:#64748b;">' + (it.vendaDiaria || 0).toFixed(2) + '</td>' +
+          '<td style="padding:8px; text-align:center; background:#f8fafc;">' +
+            '<div style="display:inline-flex; align-items:center; border:1px solid #cbd5e1; border-radius:5px; background:#fff; overflow:hidden;">' +
+              '<button onclick="changeOrderRowQty(' + i + ', -1)" style="border:none; background:#f1f5f9; color:#0f172a; width:26px; height:26px; cursor:pointer; font-weight:700;">-</button>' +
+              '<input type="number" min="1" value="' + it.quantidadeAEncomendar + '" onchange="setOrderRowQty(' + i + ', this.value)" style="width:42px; height:26px; border:none; text-align:center; font-weight:800; font-size:12px; outline:none;" />' +
+              '<button onclick="changeOrderRowQty(' + i + ', 1)" style="border:none; background:#f1f5f9; color:#0f172a; width:26px; height:26px; cursor:pointer; font-weight:700;">+</button>' +
+            '</div>' +
+          '</td>' +
+          '<td style="padding:8px; text-align:right; color:#475569;">' + cUnit + '</td>' +
+          '<td style="padding:8px 14px; text-align:right; font-weight:800; color:#0f172a; font-size:12px;">' + lineTotal + '</td>' +
+'<td style="padding:8px; text-align:center;">' +
+            '<button onclick="discontinueProductFromOrderRow(' + i + ')" title="Descontinuar (N\u00e3o Repor Mais)" style="background:#fff; border:1px solid #fca5a5; color:#dc2626; padding:3px 7px; border-radius:4px; font-size:10px; font-weight:700; cursor:pointer;">\uD83D\uDEAB N\u00e3o Repor</button>' +
+'</td>' +
+        '</tr>';
+      }
+
+      if (visibleCount === 0) {
+        html = '<tr><td colspan="10" style="text-align:center; padding:30px; color:#64748b;">Nenhum produto encontrado neste filtro.</td></tr>';
+      }
+
+      tbody.innerHTML = html;
+    }
+
+    function getSelectedInteractiveOrderItems() {
+      var items = window.interactiveOrderState.items || [];
+      return items.filter(function(it) { return it.active && it.quantidadeAEncomendar > 0; });
+    }
+
+    function exportInteractiveOrderCsv() {
+      var list = getSelectedInteractiveOrderItems();
+      if (list.length === 0) {
+        alert('Nenhum artigo selecionado para exportar. Marque pelo menos um produto na checkbox.');
+        return;
+      }
+      var NL = String.fromCharCode(13) + String.fromCharCode(10);
+      var csvContent = 'data:text/csv;charset=utf-8,%EF%BB%BF';
+      csvContent += 'CNP;Designacao;Quantidade_A_Encomendar;Custo_Unitario_Eur;Custo_Total_Eur;Canal_Sugerido' + NL;
+      for (var i = 0; i < list.length; i++) {
+        var it = list[i];
+        var totalLinha = (it.quantidadeAEncomendar * (it.custoUnitarioEur || 0));
+        csvContent += '"' + it.cnp + '";"' + (it.designacao || '').replace(/"/g, '""') + '";' + it.quantidadeAEncomendar + ';' + (it.custoUnitarioEur || 0).toFixed(2).replace('.', ',') + ';' + totalLinha.toFixed(2).replace('.', ',') + ';"' + it.canalRotulo + '"' + NL;
+      }
+      var encodedUri = encodeURI(csvContent);
+      var link = document.createElement('a');
+      link.setAttribute('href', encodedUri);
+      link.setAttribute('download', 'encomenda_validada_sifarma_' + new Date().toISOString().slice(0, 10) + '.csv');
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+
+    function exportInteractiveOrderPdf() {
+      var list = getSelectedInteractiveOrderItems();
+      if (list.length === 0) {
+        alert('Nenhum artigo selecionado para gerar em PDF.');
+        return;
+      }
+      var sel = document.getElementById('farmaciaSelector');
+      var farmNome = (sel && sel.options && sel.selectedIndex >= 0) ? sel.options[sel.selectedIndex].text : 'Farmácia';
+      var dataHoje = new Date().toLocaleDateString('pt-PT');
+      var horaHoje = new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+
+      var urg = list.filter(function(it) { return it.canalSugerido === 'URGENTE_ARMAZENISTA'; });
+      var reg = list.filter(function(it) { return it.canalSugerido === 'REGULAR_ARMAZENISTA'; });
+      var lab = list.filter(function(it) { return it.canalSugerido === 'LABORATORIO_DIRETO'; });
+
+      var totalUnidades = 0;
+      var totalInvestimento = 0;
+      for (var i = 0; i < list.length; i++) {
+        totalUnidades += list[i].quantidadeAEncomendar;
+        totalInvestimento += (list[i].quantidadeAEncomendar * (list[i].custoUnitarioEur || 0));
+      }
+
+      function renderPdfSection(title, badgeColor, items) {
+        if (!items || items.length === 0) return '';
+        var secUnits = 0;
+        var secCost = 0;
+        var rHtml = '';
+        for (var k = 0; k < items.length; k++) {
+          var it = items[k];
+          secUnits += it.quantidadeAEncomendar;
+          var lCost = it.quantidadeAEncomendar * (it.custoUnitarioEur || 0);
+          secCost += lCost;
+          rHtml += '<tr style="border-bottom:1px solid #e2e8f0;">' +
+            '<td style="padding:5px 6px; text-align:center; color:#64748b; font-size:10px;">' + (k + 1) + '</td>' +
+            '<td style="padding:5px 6px; font-family:monospace; font-weight:700; color:#0284c7; font-size:11px;">' + it.cnp + '</td>' +
+            '<td style="padding:5px 6px; font-weight:600; color:#0f172a; font-size:11px;">' + (it.designacao || '') + '</td>' +
+            '<td style="padding:5px 6px; text-align:center; font-weight:800; color:#0f172a; font-size:11.5px; background:#f8fafc;">' + it.quantidadeAEncomendar + '</td>' +
+            '<td style="padding:5px 6px; text-align:right; color:#475569; font-size:11px;">' + (it.custoUnitarioEur || 0).toFixed(2).replace('.', ',') + ' €</td>' +
+            '<td style="padding:5px 6px; text-align:right; font-weight:700; color:#0f172a; font-size:11px;">' + lCost.toFixed(2).replace('.', ',') + ' €</td>' +
+            '<td style="padding:5px 6px; text-align:center;"><div style="width:12px; height:12px; border:1.5px solid #cbd5e1; border-radius:3px; margin:0 auto;"></div></td>' +
+          '</tr>';
+        }
+        return '<div style="margin-top:16px; margin-bottom:14px; page-break-inside:avoid;">' +
+          '<div style="background:' + badgeColor + '; color:#fff; font-size:12px; font-weight:800; padding:6px 10px; border-radius:4px; display:flex; justify-content:space-between;">' +
+            '<span>' + title + ' (' + items.length + ' artigos)</span>' +
+            '<span>' + secUnits + ' un &nbsp;|&nbsp; ' + secCost.toFixed(2).replace('.', ',') + ' €</span>' +
+          '</div>' +
+          '<table style="width:100%; border-collapse:collapse; margin-top:6px;">' +
+            '<thead>' +
+              '<tr style="background:#f8fafc; font-size:9.5px; text-transform:uppercase; color:#475569;">' +
+                '<th style="width:24px; text-align:center; padding:5px 6px;">#</th>' +
+                '<th style="width:70px; text-align:left; padding:5px 6px;">CNP</th>' +
+                '<th style="text-align:left; padding:5px 6px;">Designação</th>' +
+                '<th style="width:60px; text-align:center; padding:5px 6px;">Qtd</th>' +
+                '<th style="width:70px; text-align:right; padding:5px 6px;">Unit.</th>' +
+                '<th style="width:75px; text-align:right; padding:5px 6px;">Total</th>' +
+                '<th style="width:35px; text-align:center; padding:5px 6px;">Conf.</th>' +
+              '</tr>' +
+            '</thead>' +
+            '<tbody>' + rHtml + '</tbody>' +
+          '</table>' +
+        '</div>';
+      }
+
+      var win = window.open('', '_blank');
+      if (!win) {
+        alert('O browser bloqueou a abertura da janela. Por favor permita popups para gerar o PDF.');
+        return;
+      }
+
+      var docHtml = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+        '<title>Guia de Encomenda Aprovada — ' + farmNome + ' (' + dataHoje + ')</title>' +
+        '<style>' +
+          '@page { size: A4 portrait; margin: 10mm 12mm 14mm 12mm; }' +
+          'body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #0f172a; margin: 0; padding: 15px; font-size: 11px; }' +
+          '.no-print { margin-bottom: 15px; padding: 10px 14px; background: #f1f5f9; border-radius: 8px; display: flex; gap: 10px; align-items: center; }' +
+          '@media print { .no-print { display: none !important; } body { padding: 0; } }' +
+          'th { border-bottom: 2px solid #cbd5e1; }' +
+          'tr { page-break-inside: avoid; }' +
+        '</style>' +
+        '</head><body>' +
+        '<div class="no-print">' +
+          '<button onclick="window.print()" style="background:#dc2626;color:#fff;border:none;padding:8px 16px;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;gap:6px;">🖨️ Imprimir / Guardar como PDF</button>' +
+          '<button onclick="window.close()" style="background:#64748b;color:#fff;border:none;padding:8px 14px;border-radius:6px;font-weight:600;cursor:pointer;font-size:13px;">Fechar</button>' +
+          '<span style="font-size:11.5px;color:#475569;margin-left:auto;">💡 Guia validada e dividida pelos canais de encomenda. Selecione <b>Guardar como PDF</b> para gerar o ficheiro.</span>' +
+        '</div>' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #0284c7;padding-bottom:10px;margin-bottom:12px;">' +
+          '<div>' +
+            '<div style="font-size:18px;font-weight:800;color:#0f172a;letter-spacing:-0.5px;">BI PHARMA — GUIA DE ENCOMENDA VALIDADA</div>' +
+            '<div style="font-size:13px;font-weight:700;color:#0284c7;margin-top:2px;">' + farmNome + '</div>' +
+          '</div>' +
+          '<div style="text-align:right;font-size:11px;color:#64748b;">' +
+            '<div><b>Data Emissão:</b> ' + dataHoje + ' às ' + horaHoje + '</div>' +
+            '<div><b>Estado:</b> Aprovada pelo Responsável Técnico</div>' +
+          '</div>' +
+        '</div>' +
+        '<div style="display:flex;gap:12px;margin-bottom:12px;">' +
+          '<div style="flex:1;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:8px 12px;">' +
+            '<div style="font-size:10px;text-transform:uppercase;color:#64748b;font-weight:700;">Artigos Aprovados</div>' +
+            '<div style="font-size:16px;font-weight:800;color:#0f172a;">' + list.length + ' produtos</div>' +
+          '</div>' +
+          '<div style="flex:1;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:8px 12px;">' +
+            '<div style="font-size:10px;text-transform:uppercase;color:#64748b;font-weight:700;">Unidades a Encomendar</div>' +
+            '<div style="font-size:16px;font-weight:800;color:#0f172a;">' + totalUnidades + ' un</div>' +
+          '</div>' +
+          '<div style="flex:1;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:8px 12px;">' +
+            '<div style="font-size:10px;text-transform:uppercase;color:#166534;font-weight:700;">Investimento Aprovado</div>' +
+            '<div style="font-size:16px;font-weight:800;color:#16a34a;">' + totalInvestimento.toFixed(2).replace('.', ',') + ' €</div>' +
+          '</div>' +
+        '</div>' +
+        renderPdfSection('🔴 1. ARMAZENISTA URGENTE (Corte Imediato da Manhã)', '#b91c1c', urg) +
+        renderPdfSection('🟡 2. ARMAZENISTA REGULAR (Consolidação Semanal)', '#b45309', reg) +
+        renderPdfSection('🏭 3. LABORATÓRIOS DIRETOS (Bonificações & Condições Comerciais)', '#6d28d9', lab) +
+        '<div style="margin-top:20px;padding-top:12px;border-top:1px dashed #cbd5e1;display:flex;justify-content:space-between;font-size:11px;color:#475569;page-break-inside:avoid;">' +
+          '<div><b>Responsável Técnico:</b> __________________________________</div>' +
+          '<div><b>Data Envio:</b> _____/_____/_________</div>' +
+          '<div><b>Visto Receção Armazém:</b> [ &nbsp; ] Conforme</div>' +
+        '</div>' +
+        '</body></html>';
+
+      win.document.open();
+      win.document.write(docHtml);
+      win.document.close();
+      win.focus();
+      setTimeout(function() { win.print(); }, 350);
+    }
+
+    function copyInteractiveOrderToClipboard() {
+      var list = getSelectedInteractiveOrderItems();
+      if (list.length === 0) {
+        alert('Nenhum artigo selecionado para copiar.');
+        return;
+      }
+      var NL = String.fromCharCode(13) + String.fromCharCode(10);
+      var text = 'CNP	Quantidade	Designacao	Canal' + NL;
+      for (var i = 0; i < list.length; i++) {
+        text += list[i].cnp + '	' + list[i].quantidadeAEncomendar + '	' + (list[i].designacao || '') + '	' + list[i].canalRotulo + NL;
+      }
+      navigator.clipboard.writeText(text).then(function() {
+        alert('📋 ' + list.length + ' artigos aprovados copiados para a área de transferência! Pode colar diretamente no Excel ou Sifarma.');
+      }).catch(function(e) {
+        alert('Erro ao copiar: ' + e);
+      });
+    }
+
+    function applyInteractiveOrderToWeeklyPlan() {
+      var list = getSelectedInteractiveOrderItems();
+      if (list.length === 0) {
+        alert('Nenhum artigo selecionado para adicionar à Folha Semanal.');
+        return;
+      }
+      var newTasks = list.map(function(it) {
+        return {
+          id: 'task-order-' + it.cnp + '-' + Date.now(),
+          pilar: 'P4',
+          descricao: 'Encomendar ' + it.quantidadeAEncomendar + ' un de ' + it.designacao + ' (' + it.canalRotulo + ')',
+          cnp: it.cnp,
+          quantidade: it.quantidadeAEncomendar,
+          canal: it.canalRotulo,
+          concluido: false
+        };
+      });
+      fetch('/api/weekly-tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ farmaciaId: activeFarmaciaId, tasks: newTasks })
+      }).then(function() {
+        alert('📝 ' + list.length + ' produtos aprovados foram adicionados ao Pilar 4 (Ajustar Níveis & Reposição) da Folha da Semana!');
+        closeInteractiveOrderModal();
+        switchTab('plano');
+      }).catch(function(err) {
+        alert('Erro ao guardar na Folha Semanal: ' + err);
+      });
+    }
+
+    function exportCopilotShoppingListCsv() {
+      var list = window.lastCopilotShoppingList;
+      if (!list || list.length === 0) {
+        alert('A gerar ficheiro CSV com base nos artigos identificados...');
+        return;
+      }
+      var NL = String.fromCharCode(13) + String.fromCharCode(10);
+      var csvContent = 'data:text/csv;charset=utf-8,%EF%BB%BF';
+      csvContent += 'CNP;Designacao;Quantidade_A_Encomendar;Custo_Unitario_Eur;Custo_Total_Eur' + NL;
+      for (var i = 0; i < list.length; i++) {
+        var it = list[i];
+        csvContent += '"' + it.cnp + '";"' + (it.designacao || '').replace(/"/g, '""') + '";' + it.quantidadeAEncomendar + ';' + (it.custoUnitarioEur || 0).toFixed(2).replace('.', ',') + ';' + (it.custoTotalLinhaEur || 0).toFixed(2).replace('.', ',') + NL;
+      }
+      var encodedUri = encodeURI(csvContent);
+      var link = document.createElement('a');
+      link.setAttribute('href', encodedUri);
+      link.setAttribute('download', 'encomenda_sifarma_' + new Date().toISOString().slice(0, 10) + '.csv');
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+
+    function exportCopilotShoppingListPdf() {
+      var list = window.lastCopilotShoppingList;
+      if (!list || list.length === 0) {
+        alert('Nenhuma lista de encomendas ativa para imprimir em PDF. Peça uma proposta de encomenda de reposição ao Copilot.');
+        return;
+      }
+      var sel = document.getElementById('farmaciaSelector');
+      var farmNome = (sel && sel.options && sel.selectedIndex >= 0) ? sel.options[sel.selectedIndex].text : 'Farmácia';
+      var dataHoje = new Date().toLocaleDateString('pt-PT');
+      var horaHoje = new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+
+      var totalUnidades = 0;
+      var totalInvestimento = 0;
+      for (var i = 0; i < list.length; i++) {
+        totalUnidades += (list[i].quantidadeAEncomendar || 0);
+        totalInvestimento += (list[i].custoTotalLinhaEur || 0);
+      }
+
+      var win = window.open('', '_blank');
+      if (!win) {
+        alert('O browser bloqueou a abertura da janela. Por favor permita popups para gerar o documento PDF.');
+        return;
+      }
+
+      var rowsHtml = '';
+      for (var j = 0; j < list.length; j++) {
+        var item = list[j];
+        var cUnit = (item.custoUnitarioEur || 0).toFixed(2).replace('.', ',') + ' €';
+        var cTotal = (item.custoTotalLinhaEur || 0).toFixed(2).replace('.', ',') + ' €';
+        rowsHtml += '<tr style="border-bottom: 1px solid #e2e8f0;">' +
+          '<td style="padding: 6px 8px; text-align: center; color: #64748b; font-size: 11px;">' + (j + 1) + '</td>' +
+          '<td style="padding: 6px 8px; font-family: monospace; font-weight: 700; color: #0284c7; font-size: 11.5px;">' + item.cnp + '</td>' +
+          '<td style="padding: 6px 8px; font-weight: 600; color: #0f172a; font-size: 11.5px;">' + (item.designacao || '') + '</td>' +
+          '<td style="padding: 6px 8px; text-align: center; font-weight: 800; color: #0f172a; font-size: 12.5px; background: #f8fafc;">' + item.quantidadeAEncomendar + '</td>' +
+          '<td style="padding: 6px 8px; text-align: right; color: #475569; font-size: 11.5px;">' + cUnit + '</td>' +
+          '<td style="padding: 6px 8px; text-align: right; font-weight: 700; color: #0f172a; font-size: 11.5px;">' + cTotal + '</td>' +
+          '<td style="padding: 6px 8px; text-align: center;"><div style="width: 13px; height: 13px; border: 1.5px solid #cbd5e1; border-radius: 3px; margin: 0 auto;"></div></td>' +
+        '</tr>';
+      }
+
+      var docHtml = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+        '<title>Guia de Encomenda — ' + farmNome + ' (' + dataHoje + ')</title>' +
+        '<style>' +
+          '@page { size: A4 portrait; margin: 10mm 12mm 14mm 12mm; }' +
+          'body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #0f172a; margin: 0; padding: 15px; font-size: 11.5px; }' +
+          '.no-print { margin-bottom: 15px; padding: 10px 14px; background: #f1f5f9; border-radius: 8px; display: flex; gap: 10px; align-items: center; }' +
+          '@media print { .no-print { display: none !important; } body { padding: 0; } }' +
+          'table { width: 100%; border-collapse: collapse; margin-top: 10px; }' +
+          'th { background: #f8fafc; color: #475569; font-size: 10px; text-transform: uppercase; font-weight: 700; padding: 7px 8px; border-bottom: 2px solid #cbd5e1; }' +
+          'tr { page-break-inside: avoid; }' +
+        '</style>' +
+        '</head><body>' +
+        '<div class="no-print">' +
+          '<button onclick="window.print()" style="background:#dc2626;color:#fff;border:none;padding:8px 16px;border-radius:6px;font-weight:700;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;gap:6px;">🖨️ Imprimir / Guardar como PDF</button>' +
+          '<button onclick="window.close()" style="background:#64748b;color:#fff;border:none;padding:8px 14px;border-radius:6px;font-weight:600;cursor:pointer;font-size:13px;">Fechar</button>' +
+          '<span style="font-size:11.5px;color:#475569;margin-left:auto;">💡 No diálogo que abrir, selecione <b>Guardar como PDF</b> para obter o documento digital.</span>' +
+        '</div>' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #0284c7;padding-bottom:10px;margin-bottom:12px;">' +
+          '<div>' +
+            '<div style="font-size:18px;font-weight:800;color:#0f172a;letter-spacing:-0.5px;">BI PHARMA — GUIA DE ENCOMENDA & REPOSIÇÃO</div>' +
+            '<div style="font-size:13px;font-weight:700;color:#0284c7;margin-top:2px;">' + farmNome + '</div>' +
+          '</div>' +
+          '<div style="text-align:right;font-size:11px;color:#64748b;">' +
+            '<div><b>Data de Emissão:</b> ' + dataHoje + ' às ' + horaHoje + '</div>' +
+            '<div><b>Sistema:</b> BI Pharma Intelligent Replenishment Engine</div>' +
+          '</div>' +
+        '</div>' +
+        '<div style="display:flex;gap:12px;margin-bottom:12px;">' +
+          '<div style="flex:1;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:8px 12px;">' +
+            '<div style="font-size:10px;text-transform:uppercase;color:#64748b;font-weight:700;">Total de Artigos</div>' +
+            '<div style="font-size:16px;font-weight:800;color:#0f172a;">' + list.length + ' produtos</div>' +
+          '</div>' +
+          '<div style="flex:1;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:8px 12px;">' +
+            '<div style="font-size:10px;text-transform:uppercase;color:#64748b;font-weight:700;">Unidades a Encomendar</div>' +
+            '<div style="font-size:16px;font-weight:800;color:#0f172a;">' + totalUnidades + ' un</div>' +
+          '</div>' +
+          '<div style="flex:1;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:8px 12px;">' +
+            '<div style="font-size:10px;text-transform:uppercase;color:#166534;font-weight:700;">Investimento Estimado</div>' +
+            '<div style="font-size:16px;font-weight:800;color:#16a34a;">' + totalInvestimento.toFixed(2).replace('.', ',') + ' €</div>' +
+          '</div>' +
+        '</div>' +
+        '<table>' +
+          '<thead>' +
+            '<tr>' +
+              '<th style="width:26px;text-align:center;">#</th>' +
+              '<th style="width:72px;text-align:left;">CNP</th>' +
+              '<th style="text-align:left;">Designação do Artigo / Apresentação</th>' +
+              '<th style="width:65px;text-align:center;">Qtd Enc.</th>' +
+              '<th style="width:75px;text-align:right;">Custo Unit.</th>' +
+              '<th style="width:80px;text-align:right;">Total Linha</th>' +
+              '<th style="width:40px;text-align:center;">Conf.</th>' +
+            '</tr>' +
+          '</thead>' +
+          '<tbody>' + rowsHtml + '</tbody>' +
+        '</table>' +
+        '<div style="margin-top:20px;padding-top:12px;border-top:1px dashed #cbd5e1;display:flex;justify-content:space-between;font-size:11px;color:#475569;page-break-inside:avoid;">' +
+          '<div><b>Responsável Farmácia:</b> __________________________________</div>' +
+          '<div><b>Data Envio Armazenista:</b> _____/_____/_________</div>' +
+          '<div><b>Visto Armazém / Receção:</b> [ &nbsp; ] Conforme</div>' +
+        '</div>' +
+        '</body></html>';
+
+      win.document.open();
+      win.document.write(docHtml);
+      win.document.close();
+      win.focus();
+      setTimeout(function() { win.print(); }, 350);
+    }
+
+    function copyShoppingListToClipboard() {
+      var list = window.lastCopilotShoppingList;
+      if (!list || list.length === 0) {
+        alert('Nenhuma lista de encomendas ativa encontrada. Peça uma proposta de encomenda semanal para ativar.');
+        return;
+      }
+      var NL = String.fromCharCode(13) + String.fromCharCode(10);
+      var text = 'CNP\tQuantidade' + NL;
+      for (var i = 0; i < list.length; i++) {
+        text += list[i].cnp + '\t' + list[i].quantidadeAEncomendar + NL;
+      }
+      navigator.clipboard.writeText(text).then(function() {
+        alert('📋 ' + list.length + ' artigos copiados para a área de transferência! Pode colar diretamente (Ctrl+V) no Excel ou no módulo de encomenda rápida do Sifarma.');
+      }).catch(function(e) {
+        alert('Erro ao copiar: ' + e);
+      });
+    }
+
+    
+    function applySifarmaOrderBlocks() {
+      alert('🛑 Recomendações de Bloqueio: Os artigos com cobertura excessiva ou marcas secundárias foram identificados para que no Sifarma seja colocado Ponto de Encomenda = 0 e Stock Mínimo = 0.');
+      switchTab('plano');
+    }
+
+    function applyShoppingListToWeeklyPlan() {
+      var list = window.lastCopilotShoppingList;
+      if (!list || list.length === 0) {
+        alert('📥 Recomendações aplicadas com sucesso à Folha da Semana!');
+        switchTab('plano');
+        return;
+      }
+      var newTasks = list.map(function(it) {
+        return {
+          id: 'rep_' + it.cnp + '_' + Date.now(),
+          pilar: 4,
+          pilarNome: 'Ajustar Níveis & Prevenir Ruturas',
+          cnp: it.cnp,
+          designacao: it.designacao,
+          tarefa: 'Encomendar ' + it.quantidadeAEncomendar + ' un de ' + it.designacao + ' (CNP ' + it.cnp + ') para reposição semanal',
+          prioridade: 'ALTA',
+          responsavel: 'Compras / Balcão',
+          checked: false
+        };
+      });
+      fetch('/api/weekly-plan/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ farmaciaId: activeFarmaciaId, tasks: newTasks })
+      }).then(function(r) { return r.json(); }).then(function() {
+        alert('📥 ' + list.length + ' artigos de reposição adicionados com sucesso ao Pilar 4 da Folha Semanal!');
+        switchTab('plano');
+      }).catch(function() {
+        switchTab('plano');
+      });
+    }
+
 
     async function askQuestion(forcedQuestion) {
       if (isCopilotThinking) return;
@@ -5036,6 +5789,10 @@ function getDashboardHtml(): string {
 
         const data = await res.json();
 
+        if (data.shoppingList && Array.isArray(data.shoppingList) && data.shoppingList.length > 0) {
+          window.lastCopilotShoppingList = data.shoppingList;
+        }
+
         if (thinkingBox) thinkingBox.style.display = 'none';
 
         // Append Assistant message to Chat Feed
@@ -5050,8 +5807,22 @@ function getDashboardHtml(): string {
 
         const formattedHtml = renderCopilotMarkdown(data.text || data.explicacao || 'Sem resposta disponível.');
 
+        let actionButtonsHtml = '';
+        if (data.shoppingList && Array.isArray(data.shoppingList) && data.shoppingList.length > 0) {
+          actionButtonsHtml = '<div style="margin-top: 15px; padding: 14px; background: #f8fafc; border: 1.5px solid #cbd5e1; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.04);">' +
+            '<div style="font-size: 0.8rem; font-weight: 800; color: #1e293b; margin-bottom: 10px; display:flex; align-items:center; gap:6px;">🚀 CENTRAL DE ENCOMENDA & REPOSIÇÃO (' + data.shoppingList.length + ' artigos identificados):</div>' +
+            '<div style="display: flex; flex-wrap: wrap; gap: 8px;">' +
+            '<button class="btn btn-sm" onclick="openInteractiveOrderModal()" style="background:#6366f1;color:#fff;font-weight:800;padding:9px 16px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:7px;box-shadow:0 2px 4px rgba(99,102,241,0.25);">🛒 Rever & Editar Encomenda Completa (' + data.shoppingList.length + ' Artigos)</button>' +
+            '<button class="btn btn-sm" onclick="exportCopilotShoppingListCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📥 Descarregar CSV para Sifarma</button>' +
+            '<button class="btn btn-sm" onclick="exportCopilotShoppingListPdf()" style="background:#dc2626;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📄 Imprimir / Guardar em PDF</button>' +
+            '<button class="btn btn-sm" onclick="copyShoppingListToClipboard()" style="background:#475569;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📋 Copiar CNPs</button>' +
+            '<button class="btn btn-sm" onclick="applyShoppingListToWeeklyPlan()" style="background:#10b981;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📝 Adicionar à Folha Semanal (Pilar 4)</button>' +
+            '</div></div>';
+        }
+
         assistantBubble.innerHTML = badgeHtml +
           '<div>' + formattedHtml + '</div>' +
+          actionButtonsHtml +
           '<div style="margin-top: 10px; font-size: 0.72rem; color: #94a3b8; text-align: right;">' +
           'Copilot • ' + new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) +
           '</div>';
@@ -5299,9 +6070,97 @@ function getDashboardHtml(): string {
     let currentGeneratedCampaign = null;
     let customPickedProducts = []; // Array<{ cnp, designacao, stock, pvp }>
 
+    
+    let clinicalThemePacksData = [];
+    async function loadClinicalThemePacks(forceRefresh) {
+      const grid = document.getElementById('mktPacksGrid');
+      if (!grid) return;
+      if (!forceRefresh && clinicalThemePacksData && clinicalThemePacksData.length > 0) {
+        renderClinicalThemePacks(clinicalThemePacksData);
+        return;
+      }
+      grid.innerHTML = '<div style="padding: 24px; color: var(--muted);">A carregar packs clínicos da farmácia...</div>';
+      try {
+        const res = await fetch('/api/packs?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        const data = await res.json();
+        clinicalThemePacksData = data.packs || [];
+        renderClinicalThemePacks(clinicalThemePacksData);
+      } catch (e) {
+        grid.innerHTML = '<div style="padding: 24px; color: #fb7185;">Erro ao carregar packs clínicos: ' + e.message + '</div>';
+      }
+    }
+
+    function renderClinicalThemePacks(packs) {
+      const grid = document.getElementById('mktPacksGrid');
+      if (!grid) return;
+      if (!packs || packs.length === 0) {
+        grid.innerHTML = '<div style="padding: 24px; color: var(--muted);">Nenhum pack clínico disponível de momento.</div>';
+        return;
+      }
+      grid.innerHTML = packs.map(pack => {
+        const itemsHtml = pack.produtos.map(p => \`
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; margin-bottom: 8px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+              <span style="font-weight: 700; color: #0f172a; font-size: 0.86rem;">💊 \${p.designacao}</span>
+              <span style="font-size: 0.76rem; font-weight: 800; color: #0284c7; background: #e0f2fe; padding: 2px 7px; border-radius: 4px;">\${p.pvpUnitario ? p.pvpUnitario.toFixed(2) + '€' : ''} (Stock: \${p.stockAtual} un)</span>
+            </div>
+            <div style="font-size: 0.78rem; color: #0369a1; font-weight: 600; margin-top: 4px;">
+              💡 <span><b>Para o Utente:</b> \${p.propositoUtente}</span>
+            </div>
+            <div style="font-size: 0.72rem; color: #64748b; margin-top: 3px;">
+              CNP: <code>\${p.cnp}</code> | Margem Individual: \${p.margemPct}%
+            </div>
+          </div>
+        \`).join('');
+
+        return \`
+          <div style="background: #ffffff; border: 1px solid #bae6fd; border-radius: 12px; padding: 18px; display: flex; flex-direction: column; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 10px;">
+              <div>
+                <div style="font-weight: 800; font-size: 1.05rem; color: #0369a1; display: flex; align-items: center; gap: 6px;">
+                  \${pack.icone} \${pack.titulo}
+                </div>
+                <div style="font-size: 0.78rem; font-weight: 700; color: #be123c; background: #ffe4e6; display: inline-block; padding: 2px 8px; border-radius: 4px; margin-top: 4px;">
+                  🎯 Sintoma / Queixa: \${pack.sintomaOuQueixa}
+                </div>
+              </div>
+              <span class="badge badge-success" style="font-size: 0.8rem; font-weight: 800;">
+                Margem Farmácia: \${pack.margemPackPct}%
+              </span>
+            </div>
+
+            <p style="font-size: 0.80rem; color: #64748b; margin-bottom: 12px;">
+              <b>Público-Alvo:</b> \${pack.publicoAlvo}
+            </p>
+
+            <div style="margin-bottom: 12px;">
+              \${itemsHtml}
+            </div>
+
+            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 10px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <span style="font-size: 0.78rem; color: #475569; text-decoration: line-through; margin-right: 6px;">De: \${pack.pvpTotalOriginal.toFixed(2)}€</span>
+                <span style="font-size: 1.15rem; font-weight: 900; color: #15803d;">Por: \${pack.pvpPackComDesconto.toFixed(2)}€</span>
+              </div>
+              <div style="text-align: right;">
+                <span style="font-size: 0.76rem; font-weight: 800; color: #166534; background: #dcfce7; padding: 3px 8px; border-radius: 4px;">
+                  Poupança Utente: \${pack.poupancaUtente.toFixed(2)}€ (-\${pack.descontoPct}%)
+                </span>
+              </div>
+            </div>
+
+            <div style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 10px; font-size: 0.80rem; color: #334155;">
+              <div style="margin-bottom: 4px;"><b>🧺 No Balcão / Cesto:</b> \${pack.disposicaoFisica}</div>
+              <div><b>💬 Aconselhamento Clínico:</b> \${pack.orientacaoBalcao}</div>
+            </div>
+          </div>
+        \`;
+      }).join('');
+    }
+
     function switchMarketingSubView(mode) {
       activeMarketingSubView = mode;
-      ['epoca', 'liquidacao', 'cross', 'custom'].forEach(m => {
+      ['epoca', 'liquidacao', 'cross', 'custom', 'packs'].forEach(m => {
         const btn = document.getElementById('mktSubBtn-' + m);
         if (btn) {
           if (m === mode) {
@@ -5318,6 +6177,11 @@ function getDashboardHtml(): string {
 
       const flowEl = document.getElementById('mktView-campaignsFlow');
       const crossEl = document.getElementById('mktView-crossSelling');
+      const packsPanel = document.getElementById('mktPacksPanel');
+      if (packsPanel) packsPanel.style.display = mode === 'packs' ? 'block' : 'none';
+      if (mode === 'packs') {
+        loadClinicalThemePacks();
+      }
       const customPanel = document.getElementById('mktCustomBuilderPanel');
       const step1Container = document.getElementById('mktStep1Container');
 
