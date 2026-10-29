@@ -263,6 +263,27 @@ export function getMobileStaffHtml(): string {
       cursor: pointer;
     }
 
+    .logout-btn {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(244, 63, 94, 0.4);
+      color: #fda4af;
+      padding: 4px 10px;
+      border-radius: 16px;
+      font-size: 0.74rem;
+      font-weight: 800;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      outline: none;
+    }
+
+    .logout-btn:active {
+      background: rgba(239, 68, 68, 0.35);
+      transform: scale(0.95);
+    }
+
     /* Barra de Progresso Semanal */
     .progress-bar-container {
       margin-top: 4px;
@@ -809,9 +830,12 @@ export function getMobileStaffHtml(): string {
         </div>
         <div class="header-user-badge">
           <span class="live-dot" title="Sincronização em direto ativa"></span>
-          <div class="user-pill" onclick="changeOperator()" id="hdrOperatorPill">
+          <div class="user-pill" onclick="changeOperator()" id="hdrOperatorPill" title="Mudar operador">
             👤 <span id="hdrOperatorName">Operador</span>
           </div>
+          <button type="button" class="logout-btn" onclick="logoutMobile()" title="Terminar sessão / Mudar de farmácia">
+            🚪 Sair
+          </button>
         </div>
       </div>
 
@@ -1020,8 +1044,7 @@ export function getMobileStaffHtml(): string {
     window.addEventListener('DOMContentLoaded', async () => {
       setupTouchSwipe();
       document.getElementById('pinOperatorInput').value = currentOperator;
-      await loadFarmaciasList();
-      checkSavedSession();
+      await initMobileApp();
     });
 
     function showToast(msg, bg) {
@@ -1095,28 +1118,94 @@ export function getMobileStaffHtml(): string {
     // ========================================================================
     // AUTENTICAÇÃO POR PIN MÍNIMO
     // ========================================================================
-    async function loadFarmaciasList() {
+    async function initMobileApp() {
       try {
         const res = await fetch('/api/pharmacies');
         const data = await res.json();
-        allFarmacias = data.pharmacies || [];
+        allFarmacias = Array.isArray(data) ? data : (data.pharmacies || []);
+        
         const sel = document.getElementById('pinFarmSelect');
         sel.innerHTML = allFarmacias
           .map(f => \`<option value="\${f.id}">\${f.nome} (\${f.codigo_acesso || f.nif})</option>\`)
           .join('');
 
         const urlParams = new URLSearchParams(window.location.search);
-        const accessParam = urlParams.get('acesso') || urlParams.get('code') || urlParams.get('farmacia');
-        if (accessParam) {
-          const match = allFarmacias.find(
-            f => (f.codigo_acesso && f.codigo_acesso.toLowerCase() === accessParam.toLowerCase()) || f.id === accessParam
-          );
-          if (match) {
-            sel.value = match.id;
+        const targetId = (urlParams.get('farmaciaId') || urlParams.get('farmacia') || '').trim();
+        const accessCode = (urlParams.get('acesso') || urlParams.get('code') || '').trim();
+
+        let targetFarmFromUrl = null;
+        if (targetId || accessCode) {
+          targetFarmFromUrl = allFarmacias.find(f => {
+            if (targetId && (f.id === targetId || f.nif === targetId)) return true;
+            if (accessCode && f.codigo_acesso && f.codigo_acesso.toLowerCase() === accessCode.toLowerCase()) return true;
+            if (accessCode && f.id === accessCode) return true;
+            return false;
+          });
+          if (targetFarmFromUrl) {
+            sel.value = targetFarmFromUrl.id;
           }
         }
+
+        const saved = JSON.parse(localStorage.getItem('bi_pharma_mobile_session') || '{}');
+
+        // Se o utilizador abriu um link específico da Farmácia:
+        if (targetFarmFromUrl) {
+          // Se a sessão guardada for de OUTRA farmácia diferente do URL, limpar sessão anterior!
+          if (saved && saved.farmacia && saved.farmacia.id !== targetFarmFromUrl.id) {
+            console.log('Link para ' + targetFarmFromUrl.nome + ' difere da sessão anterior. A invalidar sessão antiga.');
+            localStorage.removeItem('bi_pharma_mobile_session');
+            document.getElementById('pinOverlay').style.display = 'flex';
+            showToast('🏥 Link ativo: ' + targetFarmFromUrl.nome + '. Confirme o PIN.', '#0284c7');
+            return;
+          }
+          // Se a sessão guardada já for exatamente a desta farmácia do link:
+          if (saved && saved.farmacia && saved.farmacia.id === targetFarmFromUrl.id) {
+            restoreMobileSession(saved);
+            return;
+          }
+          // Primeira autenticação nesta farmácia
+          document.getElementById('pinOverlay').style.display = 'flex';
+          return;
+        }
+
+        // Sem link de farmácia no URL: restaura a sessão guardada se existir
+        if (saved && saved.farmacia && saved.farmacia.id) {
+          restoreMobileSession(saved);
+        } else {
+          document.getElementById('pinOverlay').style.display = 'flex';
+        }
       } catch (err) {
-        console.error('Erro ao listar farmácias:', err);
+        console.error('Erro na inicialização mobile:', err);
+      }
+    }
+
+    function restoreMobileSession(saved) {
+      currentFarmacia = saved.farmacia;
+      if (saved.operator) currentOperator = saved.operator;
+      document.getElementById('pinOverlay').style.display = 'none';
+      document.getElementById('hdrFarmName').textContent = currentFarmacia.nome;
+      document.getElementById('hdrOperatorName').textContent = currentOperator;
+      loadMobileData();
+      startLiveSync();
+    }
+
+    function logoutMobile() {
+      const nomeFarm = currentFarmacia?.nome || 'esta farmácia';
+      if (confirm('Deseja terminar a sessão na ' + nomeFarm + ' e mudar de farmácia?')) {
+        if (syncInterval) clearInterval(syncInterval);
+        syncInterval = null;
+        localStorage.removeItem('bi_pharma_mobile_session');
+        currentFarmacia = null;
+        rawReport = null;
+        tasksMap = {};
+        clearPin();
+
+        // Limpar parâmetros de query da URL para não forçar a mesma farmácia após logout
+        const cleanUrl = window.location.origin + window.location.pathname;
+        window.history.replaceState({}, '', cleanUrl);
+
+        document.getElementById('pinOverlay').style.display = 'flex';
+        showToast('👋 Sessão terminada. Pode escolher outra farmácia.', '#64748b');
       }
     }
 
@@ -1185,21 +1274,6 @@ export function getMobileStaffHtml(): string {
       } catch (e) {
         showToast('Erro de ligação ao servidor.', '#e11d48');
       }
-    }
-
-    function checkSavedSession() {
-      try {
-        const saved = JSON.parse(localStorage.getItem('bi_pharma_mobile_session') || '{}');
-        if (saved && saved.farmacia && saved.farmacia.id) {
-          currentFarmacia = saved.farmacia;
-          if (saved.operator) currentOperator = saved.operator;
-          document.getElementById('pinOverlay').style.display = 'none';
-          document.getElementById('hdrFarmName').textContent = currentFarmacia.nome;
-          document.getElementById('hdrOperatorName').textContent = currentOperator;
-          loadMobileData();
-          startLiveSync();
-        }
-      } catch (err) {}
     }
 
     function changeOperator() {

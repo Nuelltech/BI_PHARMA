@@ -448,7 +448,7 @@ async function startServer() {
                   id: f.id,
                   nome: f.nome,
                   nif: maskNif(f.nif),
-                  codigo_acesso: ctx.role === 'ADMIN' ? f.codigo_acesso : undefined,
+                  codigo_acesso: f.codigo_acesso || f.id,
                 })),
               })
             );
@@ -631,7 +631,7 @@ async function startServer() {
               id: f.id,
               nome: f.nome,
               nif: maskNif(f.nif),
-              codigo_acesso: ctx.role === 'ADMIN' ? f.codigo_acesso : undefined,
+              codigo_acesso: f.codigo_acesso || f.id,
             }))
           )
         );
@@ -4572,7 +4572,8 @@ function getDashboardHtml(): string {
         : ((typeof currentReport !== 'undefined' && currentReport?.farmacia) ? [currentReport.farmacia] : []);
       const f = activeFarmaciaId && farmsList ? farmsList.find(x => x.id === activeFarmaciaId) : ((typeof currentReport !== 'undefined' && currentReport?.farmacia) ? currentReport.farmacia : null);
       const code = f?.codigo_acesso || (activeFarmaciaId ? activeFarmaciaId : '');
-      const fullUrl = window.location.origin + '/mobile?acesso=' + encodeURIComponent(code);
+      const farmIdParam = f?.id || activeFarmaciaId || '';
+      const fullUrl = window.location.origin + '/mobile?acesso=' + encodeURIComponent(code) + (farmIdParam ? '&farmaciaId=' + encodeURIComponent(farmIdParam) : '');
       const inp = document.getElementById('mobileDirectUrl');
       if (inp) inp.value = fullUrl;
       const img = document.getElementById('mobileQrImg');
