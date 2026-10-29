@@ -3255,7 +3255,7 @@ function getDashboardHtml(): string {
         </div>
 
         <div style="display: flex; flex-direction: column; gap: 12px;">
-          <div>
+          <form onsubmit="event.preventDefault(); submitAdminPassword();">
             <label style="font-size: 0.78rem; font-weight: 700; color: #c084fc; text-transform: uppercase; display: block; margin-bottom: 6px;">
               Password de Administrador:
             </label>
@@ -3263,10 +3263,11 @@ function getDashboardHtml(): string {
               type="password"
               id="authAdminPasswordInput"
               placeholder="••••••••••••"
+              autocomplete="current-password"
               style="width: 100%; font-size: 1rem; font-weight: 700; text-align: center; letter-spacing: 2px; padding: 12px;"
               onkeydown="if(event.key==='Enter') submitAdminPassword()"
             />
-          </div>
+          </form>
 
           <div id="authGateAdminError" style="display: none; font-size: 0.82rem; color: #fb7185; background: rgba(244, 63, 94, 0.12); border: 1px solid rgba(244, 63, 94, 0.3); padding: 8px 12px; border-radius: 8px; text-align: center;"></div>
 
@@ -4236,13 +4237,18 @@ function getDashboardHtml(): string {
     }
 
     function openMobileStaffModal() {
-      const f = activeFarmaciaId && allFarmacias ? allFarmacias.find(x => x.id === activeFarmaciaId) : null;
+      const farmsList = (typeof cachedAdminPharmacies !== 'undefined' && Array.isArray(cachedAdminPharmacies))
+        ? cachedAdminPharmacies
+        : ((typeof currentReport !== 'undefined' && currentReport?.farmacia) ? [currentReport.farmacia] : []);
+      const f = activeFarmaciaId && farmsList ? farmsList.find(x => x.id === activeFarmaciaId) : ((typeof currentReport !== 'undefined' && currentReport?.farmacia) ? currentReport.farmacia : null);
       const code = f?.codigo_acesso || (activeFarmaciaId ? activeFarmaciaId : '');
       const fullUrl = window.location.origin + '/mobile?acesso=' + encodeURIComponent(code);
-      document.getElementById('mobileDirectUrl').value = fullUrl;
-      document.getElementById('mobileQrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(fullUrl);
+      const inp = document.getElementById('mobileDirectUrl');
+      if (inp) inp.value = fullUrl;
+      const img = document.getElementById('mobileQrImg');
+      if (img) img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(fullUrl);
       const modal = document.getElementById('mobileStaffModal');
-      modal.style.display = 'flex';
+      if (modal) modal.style.display = 'flex';
     }
 
     function closeMobileStaffModal() {
