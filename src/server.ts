@@ -1,3 +1,10 @@
+import { getMobileStaffHtml } from './views/mobile_staff_view';
+import {
+  getPharmacyWeeklyTasks,
+  toggleWeeklyTaskInDb,
+  resetWeeklyTasksInDb,
+  verifyMobileStaffPin,
+} from './services/weekly_tasks';
 import http from 'http';
 import url from 'url';
 import fs from 'fs';
@@ -1084,6 +1091,101 @@ async function startServer() {
             res.end(JSON.stringify({ success: false, error: e.message }));
           }
         });
+        return;
+      }
+
+            // 2.5H. Endpoint Mobile Staff Auth PIN
+      if (pathname === '/api/mobile/auth-pin' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const { farmaciaId, pin } = JSON.parse(body || '{}');
+            const resAuth = await verifyMobileStaffPin(prisma, farmaciaId, pin);
+            res.writeHead(resAuth.valid ? 200 : 401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: resAuth.valid, ...resAuth }));
+          } catch (e: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // 2.5I. Endpoint Obter Tarefas Semanais da Farmácia
+      if (pathname === '/api/weekly-tasks' && req.method === 'GET') {
+        try {
+          const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+          const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+          const tasksData = await getPharmacyWeeklyTasks(prisma, activeFarmacia.id);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, farmaciaId: activeFarmacia.id, ...tasksData }));
+        } catch (e: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 2.5J. Endpoint Toggle Tarefa Semanal (Supabase Sync)
+      if (pathname === '/api/weekly-tasks/toggle' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const { farmaciaId, taskId, concluido, concluido_por, categoria, cnp_codigo, designacao, valor_impacto } = JSON.parse(body || '{}');
+            const farmIdQuery = String(farmaciaId || '').trim();
+            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+            const saved = await toggleWeeklyTaskInDb(prisma, {
+              farmaciaId: activeFarmacia.id,
+              taskId,
+              concluido: !!concluido,
+              concluido_por: concluido_por || 'Equipa',
+              categoria,
+              cnp_codigo,
+              designacao,
+              valor_impacto: valor_impacto !== undefined ? Number(valor_impacto) : undefined,
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, task: saved }));
+          } catch (e: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // 2.5K. Endpoint Reset Tarefas da Semana
+      if (pathname === '/api/weekly-tasks/reset' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', async () => {
+          try {
+            const { farmaciaId } = JSON.parse(body || '{}');
+            const farmIdQuery = String(farmaciaId || '').trim();
+            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+            const resetRes = await resetWeeklyTasksInDb(prisma, activeFarmacia.id);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(resetRes));
+          } catch (e: any) {
+            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+        return;
+      }
+
+      // 2.5L. Rota da Interface Mobile da Equipa
+      if (
+        pathname === '/mobile' ||
+        pathname === '/equipa' ||
+        pathname === '/tarefas-mobile' ||
+        parsedUrl.query.mobile === '1' ||
+        parsedUrl.query.modo === 'equipa'
+      ) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(getMobileStaffHtml());
         return;
       }
 
@@ -2462,6 +2564,9 @@ function getDashboardHtml(): string {
             </button>
             <button class="btn btn-secondary" onclick="resetWeeklyTasksProgress()" style="font-size: 0.8rem; padding: 7px 12px;" title="Limpar vistos marcados">
               🔄 Limpar Vistos
+            </button>
+            <button class="btn" onclick="openMobileStaffModal()" style="background: linear-gradient(135deg, #0284c7, #0369a1); color: #ffffff; font-weight: 700; box-shadow: 0 2px 4px rgba(2, 132, 199, 0.3);">
+              📱 Abrir no Telemóvel da Equipa
             </button>
           </div>
         </div>
@@ -4051,7 +4156,27 @@ function getDashboardHtml(): string {
     // ========================================================================
     // GESTOR DE TAREFAS SEMANAIS DA EQUIPA (PERSISTÊNCIA LOCAL + IMPRESSÃO A4)
     // ========================================================================
+    let remoteDoneTasksMap = {};
+
+    async function fetchWeeklyTasksFromDb() {
+      if (!activeFarmaciaId) return;
+      try {
+        const res = await fetch('/api/weekly-tasks?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        const data = await res.json();
+        if (data.ok && data.tasksMap) {
+          remoteDoneTasksMap = data.tasksMap;
+          localStorage.setItem('bi_pharma_weekly_done_' + activeFarmaciaId, JSON.stringify(remoteDoneTasksMap));
+          updateWeeklyTasksCounter();
+        }
+      } catch (err) {
+        console.warn('Aviso: falha ao carregar tarefas do servidor, a usar cache local:', err);
+      }
+    }
+
     function getDoneTasksMap() {
+      if (remoteDoneTasksMap && Object.keys(remoteDoneTasksMap).length > 0) {
+        return remoteDoneTasksMap;
+      }
       try {
         return JSON.parse(localStorage.getItem('bi_pharma_weekly_done_' + activeFarmaciaId) || '{}');
       } catch {
@@ -4059,18 +4184,77 @@ function getDashboardHtml(): string {
       }
     }
 
-    function toggleWeeklyTask(taskId) {
+    async function toggleWeeklyTask(taskId, categoria, cnp, designacao, valor) {
       const map = getDoneTasksMap();
-      map[taskId] = !map[taskId];
+      const current = map[taskId];
+      const isDone = typeof current === 'object' ? !!current.concluido : !!current;
+      const nextDone = !isDone;
+
+      if (nextDone) {
+        map[taskId] = { concluido: true, concluido_por: 'Desktop (Balcão)', concluido_em: new Date().toISOString() };
+      } else {
+        delete map[taskId];
+      }
+
+      remoteDoneTasksMap = map;
       localStorage.setItem('bi_pharma_weekly_done_' + activeFarmaciaId, JSON.stringify(map));
       updateWeeklyTasksCounter();
+
+      try {
+        await fetch('/api/weekly-tasks/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            taskId: taskId,
+            concluido: nextDone,
+            concluido_por: 'Desktop (Balcão)',
+            categoria: categoria || 'GERAL',
+            cnp_codigo: cnp,
+            designacao: designacao,
+            valor_impacto: valor
+          })
+        });
+      } catch (e) {
+        console.error('Erro ao sincronizar tarefa com a BD:', e);
+      }
     }
 
-    function resetWeeklyTasksProgress() {
-      if (confirm('Tem a certeza que deseja limpar todos os vistos das tarefas desta semana?')) {
+    async function resetWeeklyTasksProgress() {
+      if (confirm('Tem a certeza que deseja limpar todos os vistos das tarefas desta semana na Base de Dados e no Telemóvel?')) {
         localStorage.removeItem('bi_pharma_weekly_done_' + activeFarmaciaId);
+        remoteDoneTasksMap = {};
+        try {
+          await fetch('/api/weekly-tasks/reset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ farmaciaId: activeFarmaciaId })
+          });
+        } catch {}
         renderWeeklyActionPlan();
       }
+    }
+
+    function openMobileStaffModal() {
+      const f = activeFarmaciaId && allFarmacias ? allFarmacias.find(x => x.id === activeFarmaciaId) : null;
+      const code = f?.codigo_acesso || (activeFarmaciaId ? activeFarmaciaId : '');
+      const fullUrl = window.location.origin + '/mobile?acesso=' + encodeURIComponent(code);
+      document.getElementById('mobileDirectUrl').value = fullUrl;
+      document.getElementById('mobileQrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(fullUrl);
+      const modal = document.getElementById('mobileStaffModal');
+      modal.style.display = 'flex';
+    }
+
+    function closeMobileStaffModal() {
+      document.getElementById('mobileStaffModal').style.display = 'none';
+    }
+
+    function copyMobileUrl() {
+      const inp = document.getElementById('mobileDirectUrl');
+      inp.select();
+      navigator.clipboard.writeText(inp.value).then(() => {
+        alert('✅ Link copiado para a área de transferência!');
+      });
     }
 
     function updateWeeklyTasksCounter() {
@@ -4115,6 +4299,7 @@ function getDashboardHtml(): string {
     }
 
     function renderWeeklyActionPlan() {
+      fetchWeeklyTasksFromDb();
       if (!currentReport) return;
       const doneMap = getDoneTasksMap();
 
@@ -4602,7 +4787,43 @@ function getDashboardHtml(): string {
             <div>Folha Operacional de Farmácia — Assinatura do Responsável: ___________________________</div>
             <div>BI Pharma © Nuelltech · Poupança Travada: \${(currentWeeklyPlanData.card3TotalSavings || 0).toFixed(2)} €</div>
           </div>
-        </body>
+        
+  <!-- MODAL ABRIR NO TELEMÓVEL DA EQUIPA -->
+  <div id="mobileStaffModal" style="display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 99999; align-items: center; justify-content: center;">
+    <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 24px; max-width: 440px; width: 90%; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35); text-align: center;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h3 style="font-size: 1.15rem; font-weight: 800; color: #0284c7; margin: 0; display: flex; align-items: center; gap: 8px;">
+          📱 Modo Equipa (Mobile Staff)
+        </h3>
+        <button onclick="closeMobileStaffModal()" style="background: none; border: none; font-size: 1.2rem; cursor: pointer; color: var(--muted);">&times;</button>
+      </div>
+      <p style="font-size: 0.84rem; color: var(--text-secondary); margin-bottom: 16px; line-height: 1.4;">
+        Aponte a câmara do telemóvel para o QR Code para abrir a lista de tarefas da equipa. As caixas picadas no telemóvel refletem-se aqui em tempo real!
+      </p>
+      
+      <div style="background: #ffffff; padding: 14px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 16px;">
+        <img id="mobileQrImg" src="" alt="QR Code Mobile" style="width: 180px; height: 180px; display: block;" />
+      </div>
+
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 16px; text-align: left;">
+        <div style="font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: uppercase; margin-bottom: 4px;">Link Direto:</div>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" id="mobileDirectUrl" readonly style="flex: 1; font-size: 0.78rem; font-family: monospace; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface);" />
+          <button class="btn btn-secondary" onclick="copyMobileUrl()" style="font-size: 0.78rem; padding: 6px 10px;">📋 Copiar</button>
+        </div>
+      </div>
+
+      <div style="font-size: 0.78rem; color: #059669; font-weight: 700; background: #d1fae5; padding: 8px 12px; border-radius: 8px; margin-bottom: 16px;">
+        🔒 PIN de Acesso da Equipa: <b>1234</b> (ou os 4 dígitos do código da farmácia)
+      </div>
+
+      <button class="btn btn-secondary" onclick="closeMobileStaffModal()" style="width: 100%; font-size: 0.85rem; padding: 9px;">
+        Fechar
+      </button>
+    </div>
+  </div>
+
+</body>
         </html>
       \`;
 

@@ -156,3 +156,27 @@ CREATE TABLE IF NOT EXISTS public."PrecoFarmacia" (
 );
 
 CREATE INDEX IF NOT EXISTS "PrecoFarmacia_farmaciaId_idx" ON public."PrecoFarmacia"("farmaciaId");
+
+-- ============================================================================
+-- TAREFAS SEMANAIS DA EQUIPA (PERSISTÊNCIA, SEGUIMENTO & MOBILE STAFF)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS public."TarefaEquipa" (
+  "id" TEXT NOT NULL,
+  "farmaciaId" TEXT NOT NULL,
+  "week_key" TEXT NOT NULL,
+  "task_id" TEXT NOT NULL,
+  "categoria" TEXT NOT NULL,
+  "cnp_codigo" TEXT,
+  "designacao" TEXT,
+  "concluido" BOOLEAN NOT NULL DEFAULT true,
+  "concluido_por" TEXT,
+  "concluido_em" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "valor_impacto" DECIMAL(10,2),
+  CONSTRAINT "TarefaEquipa_pkey" PRIMARY KEY ("id"),
+  CONSTRAINT "TarefaEquipa_farmaciaId_fkey" FOREIGN KEY ("farmaciaId") REFERENCES public."Farmacia"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS "TarefaEquipa_farmaciaId_week_key_task_id_key" ON public."TarefaEquipa"("farmaciaId", "week_key", "task_id");
+CREATE INDEX IF NOT EXISTS "TarefaEquipa_farmaciaId_week_key_idx" ON public."TarefaEquipa"("farmaciaId", "week_key");
+CREATE INDEX IF NOT EXISTS "TarefaEquipa_concluido_idx" ON public."TarefaEquipa"("concluido");
+

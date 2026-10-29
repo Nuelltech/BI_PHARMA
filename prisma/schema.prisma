@@ -21,6 +21,7 @@ model Farmacia {
   stagingVendas      StagingVendas[]
   stagingValidades   StagingValidades[]
   precos             PrecoFarmacia[]
+  tarefasEquipa      TarefaEquipa[]
   criadoEm           DateTime            @default(now())
 }
 
@@ -167,6 +168,27 @@ model PrecoFarmacia {
 
   @@id([farmaciaId, cnp_codigo])
   @@index([farmaciaId])
+}
+
+// Tarefas Semanais da Equipa (Validades na Gaveta, Restos ao Balcão, Travar Compras)
+model TarefaEquipa {
+  id             String    @id @default(uuid())
+  farmaciaId     String
+  week_key       String
+  task_id        String
+  categoria      String
+  cnp_codigo     String?
+  designacao     String?
+  concluido      Boolean   @default(true)
+  concluido_por  String?
+  concluido_em   DateTime  @default(now())
+  valor_impacto  Decimal?  @db.Decimal(10, 2)
+
+  farmacia       Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+
+  @@unique([farmaciaId, week_key, task_id])
+  @@index([farmaciaId, week_key])
+  @@index([concluido])
 }
 
 // ============================================================================
