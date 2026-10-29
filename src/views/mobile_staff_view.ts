@@ -292,7 +292,7 @@ export function getMobileStaffHtml(): string {
       transition: width 0.3s ease;
     }
 
-    /* Barra de Tabs com Transição Deslizante */
+    /* Barra de Tabs (4 Secções) */
     .tabs-bar {
       display: flex;
       background: #0f172a;
@@ -303,11 +303,11 @@ export function getMobileStaffHtml(): string {
 
     .tab-btn {
       flex: 1;
-      padding: 12px 6px;
+      padding: 10px 4px;
       background: none;
       border: none;
       color: #94a3b8;
-      font-size: 0.78rem;
+      font-size: 0.74rem;
       font-weight: 800;
       text-align: center;
       cursor: pointer;
@@ -324,8 +324,8 @@ export function getMobileStaffHtml(): string {
     }
 
     .tab-btn .badge-pill {
-      font-size: 0.68rem;
-      padding: 1px 6px;
+      font-size: 0.66rem;
+      padding: 1px 5px;
       border-radius: 10px;
       background: #1e293b;
       color: #cbd5e1;
@@ -344,22 +344,26 @@ export function getMobileStaffHtml(): string {
       background: rgba(245, 158, 11, 0.2);
       color: #fbbf24;
     }
+    .tab-btn.tab-4.active .badge-pill {
+      background: rgba(16, 185, 129, 0.2);
+      color: #34d399;
+    }
 
     .tab-indicator {
       position: absolute;
       bottom: -2px;
       left: 0;
       height: 2px;
-      width: 33.333%;
-      background: #38bdf8;
+      width: 25%;
+      background: #fb7185;
       transition: transform 0.25s cubic-bezier(0.25, 1, 0.5, 1), background-color 0.2s;
     }
 
-    /* Swipeable Viewport (Deslizar para o lado) */
+    /* Swipeable Viewport (4 Secções = 400vw) */
     .viewport {
       flex: 1;
       display: flex;
-      width: 300vw;
+      width: 400vw;
       transform: translateX(0%);
       transition: transform 0.3s cubic-bezier(0.25, 1, 0.5, 1);
       overflow-y: hidden;
@@ -373,17 +377,17 @@ export function getMobileStaffHtml(): string {
       display: flex;
       flex-direction: column;
       overflow-y: auto;
-      padding: 12px 14px 40px 14px;
+      padding: 10px 14px 40px 14px;
       -webkit-overflow-scrolling: touch;
       user-select: text;
     }
 
     /* Barra de Pesquisa e Filtros */
     .search-filter-bar {
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 7px;
     }
 
     .search-input-wrapper {
@@ -392,12 +396,12 @@ export function getMobileStaffHtml(): string {
 
     .search-input {
       width: 100%;
-      padding: 10px 14px 10px 36px;
+      padding: 9px 14px 9px 34px;
       background: #1e293b;
       border: 1px solid #334155;
       border-radius: 10px;
       color: #f8fafc;
-      font-size: 0.85rem;
+      font-size: 0.84rem;
       outline: none;
     }
 
@@ -407,25 +411,29 @@ export function getMobileStaffHtml(): string {
 
     .search-icon {
       position: absolute;
-      left: 12px;
+      left: 11px;
       top: 50%;
       transform: translateY(-50%);
       color: #64748b;
-      font-size: 0.85rem;
+      font-size: 0.82rem;
     }
 
     .filter-chips {
       display: flex;
-      gap: 6px;
+      gap: 5px;
       overflow-x: auto;
       padding-bottom: 2px;
+      scrollbar-width: none;
+    }
+    .filter-chips::-webkit-scrollbar {
+      display: none;
     }
 
     .filter-chip {
       background: #0f172a;
       border: 1px solid #334155;
       color: #94a3b8;
-      padding: 4px 10px;
+      padding: 4px 9px;
       border-radius: 12px;
       font-size: 0.72rem;
       font-weight: 700;
@@ -439,18 +447,86 @@ export function getMobileStaffHtml(): string {
       border-color: #38bdf8;
     }
 
+    /* Controles Avançados da Secção 1 (Validades) */
+    .validades-toolbar {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 8px 10px;
+      margin-bottom: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .toolbar-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .toolbar-select {
+      flex: 1;
+      padding: 6px 8px;
+      background: #1e293b;
+      border: 1px solid #475569;
+      border-radius: 6px;
+      color: #f8fafc;
+      font-size: 0.74rem;
+      font-weight: 600;
+      outline: none;
+    }
+
+    .filter-counter-badge {
+      font-size: 0.72rem;
+      color: #94a3b8;
+      font-weight: 700;
+      padding: 2px 0;
+    }
+
+    /* Sub-tabs do Balcão */
+    .balcao-subtabs {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+
+    .subtab-btn {
+      flex: 1;
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #94a3b8;
+      padding: 7px 8px;
+      border-radius: 8px;
+      font-size: 0.74rem;
+      font-weight: 700;
+      text-align: center;
+      cursor: pointer;
+    }
+
+    .subtab-btn.active {
+      background: rgba(168, 85, 247, 0.2);
+      border-color: #a855f7;
+      color: #f3e8ff;
+    }
+    .subtab-btn.active.winter {
+      background: rgba(56, 189, 248, 0.2);
+      border-color: #38bdf8;
+      color: #e0f2fe;
+    }
+
     /* Cartões de Tarefa em Formato Lista */
     .task-list {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 9px;
     }
 
     .task-card {
       background: #1e293b;
       border: 1px solid #334155;
       border-radius: 14px;
-      padding: 14px;
+      padding: 13px;
       display: flex;
       gap: 12px;
       align-items: flex-start;
@@ -499,7 +575,7 @@ export function getMobileStaffHtml(): string {
     }
 
     .task-title {
-      font-size: 0.92rem;
+      font-size: 0.90rem;
       font-weight: 700;
       color: #f8fafc;
       line-height: 1.3;
@@ -510,14 +586,14 @@ export function getMobileStaffHtml(): string {
     .task-tags {
       display: flex;
       flex-wrap: wrap;
-      gap: 5px;
-      margin-bottom: 6px;
+      gap: 4px;
+      margin-bottom: 5px;
     }
 
     .tag {
-      font-size: 0.7rem;
+      font-size: 0.69rem;
       font-weight: 700;
-      padding: 2px 7px;
+      padding: 2px 6px;
       border-radius: 6px;
       display: inline-flex;
       align-items: center;
@@ -542,16 +618,29 @@ export function getMobileStaffHtml(): string {
       border: 1px solid rgba(245, 158, 11, 0.3);
     }
 
+    .tag-success {
+      background: rgba(16, 185, 129, 0.18);
+      color: #6ee7b7;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
     .tag-cnp {
       background: #0f172a;
       color: #38bdf8;
       border: 1px solid #334155;
       font-family: monospace;
-      font-size: 0.72rem;
+      font-size: 0.70rem;
+    }
+
+    .tag-shelf {
+      background: #042f2e;
+      color: #2dd4bf;
+      border: 1px solid #0d9488;
+      font-size: 0.68rem;
     }
 
     .task-instruction {
-      font-size: 0.78rem;
+      font-size: 0.77rem;
       color: #cbd5e1;
       line-height: 1.35;
       margin-top: 5px;
@@ -573,7 +662,7 @@ export function getMobileStaffHtml(): string {
 
     /* Sub-lista de genéricos (marcas a esgotar) */
     .restos-box {
-      margin-top: 8px;
+      margin-top: 7px;
       background: #0f172a;
       border: 1px solid #334155;
       border-radius: 8px;
@@ -584,8 +673,8 @@ export function getMobileStaffHtml(): string {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      font-size: 0.75rem;
-      padding: 4px 0;
+      font-size: 0.74rem;
+      padding: 3px 0;
       border-bottom: 1px dashed #1e293b;
     }
 
@@ -608,7 +697,7 @@ export function getMobileStaffHtml(): string {
       text-align: center;
       font-size: 0.72rem;
       color: #64748b;
-      margin-top: 20px;
+      margin-top: 18px;
       padding-bottom: 20px;
     }
 
@@ -709,7 +798,7 @@ export function getMobileStaffHtml(): string {
   </div>
 
   <!-- ========================================================================
-       Ecrã Principal Mobile com Slide Horizontal
+       Ecrã Principal Mobile com Slide Horizontal (4 Secções)
        ======================================================================== -->
   <div id="appContainer">
     <!-- Header Fixo -->
@@ -738,34 +827,67 @@ export function getMobileStaffHtml(): string {
       </div>
     </header>
 
-    <!-- Barra de Separadores / Tabs -->
+    <!-- Barra de Separadores / Tabs (4 Secções) -->
     <div class="tabs-bar">
       <button class="tab-btn tab-1 active" onclick="goToSection(0)">
-        <span>🔴 1. Validades</span>
+        <span>🔴 Validades</span>
         <span class="badge-pill" id="tabCount1">0</span>
       </button>
       <button class="tab-btn tab-2" onclick="goToSection(1)">
-        <span>🟣 2. Balcão</span>
+        <span>🟣 Balcão</span>
         <span class="badge-pill" id="tabCount2">0</span>
       </button>
       <button class="tab-btn tab-3" onclick="goToSection(2)">
-        <span>🟡 3. Sifarma</span>
+        <span>🟡 Sifarma</span>
         <span class="badge-pill" id="tabCount3">0</span>
+      </button>
+      <button class="tab-btn tab-4" onclick="goToSection(3)">
+        <span>🟢 Ruturas</span>
+        <span class="badge-pill" id="tabCount4">0</span>
       </button>
       <div class="tab-indicator" id="tabIndicator"></div>
     </div>
 
-    <!-- Viewport Deslizante (Slide / Swipe) -->
+    <!-- Viewport Deslizante (Slide / Swipe em 4 Secções) -->
     <div class="viewport" id="viewport">
       
       <!-- ====================================================================
-           SECÇÃO 1: VALIDADES PRÓXIMAS (GAVETA & PRATELEIRA)
+           SECÇÃO 1: VALIDADES PRÓXIMAS (GAVETA & PRATELEIRA COM FILTROS)
            ==================================================================== -->
       <div class="section-page" id="page0">
+        <!-- Toolbar com Filtros de Categoria, Horizonte de Validade e Ordenação -->
+        <div class="validades-toolbar">
+          <div class="toolbar-row">
+            <select id="cadMacroFilter" class="toolbar-select" onchange="renderSection1()">
+              <option value="all">📂 Todas as Áreas / Categorias</option>
+              <option value="MSRM">💊 Medicamentos Sujeitos a Receita (MSRM)</option>
+              <option value="MNSRM_OTC">🌿 Venda Livre (MNSRM / OTC)</option>
+              <option value="DERMOCOSMETICA">🧴 Dermocosmética & Higiene</option>
+              <option value="NUTRICAO_SUPLEMENTOS">🍎 Nutrição & Suplementos</option>
+              <option value="DISPOSITIVOS_SAUDE">🩺 Dispositivos de Saúde</option>
+            </select>
+            <select id="cadHorizonFilter" class="toolbar-select" onchange="renderSection1()">
+              <option value="all">📅 Todos os Prazos</option>
+              <option value="urgent">🚨 Urgente (≤ 3 Meses)</option>
+              <option value="mid">⚠️ 3 a 6 Meses</option>
+              <option value="year">🗓️ 6 a 12 Meses</option>
+            </select>
+          </div>
+          <div class="toolbar-row">
+            <select id="cadSortOrder" class="toolbar-select" onchange="renderSection1()">
+              <option value="date_asc">⏱️ Validade Mais Próxima (Urgentes 1º)</option>
+              <option value="name_asc">🔤 Alfabética (A ➔ Z)</option>
+              <option value="shelf_asc">📍 Por Prateleira / Gaveta</option>
+              <option value="val_desc">💶 Maior Valor em Risco (€)</option>
+            </select>
+            <div class="filter-counter-badge" id="cadCounterBadge">0 produtos</div>
+          </div>
+        </div>
+
         <div class="search-filter-bar">
           <div class="search-input-wrapper">
             <span class="search-icon">🔍</span>
-            <input type="text" class="search-input" id="search0" placeholder="Pesquisar por produto ou CNP..." oninput="filterSection(0)" />
+            <input type="text" class="search-input" id="search0" placeholder="Pesquisar produto, lote ou CNP..." oninput="filterSection(0)" />
           </div>
           <div class="filter-chips">
             <span class="filter-chip active" id="f0_all" onclick="setStatusFilter(0, 'all')">Todos</span>
@@ -779,17 +901,30 @@ export function getMobileStaffHtml(): string {
             <p>A carregar validades da farmácia...</p>
           </div>
         </div>
-        <div class="swipe-hint">👉 Deslize para a esquerda para ver a secção "2. Balcão"</div>
+        <div class="swipe-hint">👉 Deslize para a esquerda para "2. Balcão"</div>
       </div>
 
       <!-- ====================================================================
-           SECÇÃO 2: BALCÃO & RESTOS DE GAVETA & SAZONAIS
+           SECÇÃO 2: BALCÃO (A-Z ALFABÉTICO + DESTAQUES DE INVERNO)
            ==================================================================== -->
       <div class="section-page" id="page1">
+        <!-- Sub-tabs do Balcão: Restos de Gaveta A-Z vs Destaques de Inverno -->
+        <div class="balcao-subtabs">
+          <button class="subtab-btn active" id="btnSubtabRestos" onclick="setBalcaoSubtab('restos')">
+            📦 Restos de Gaveta A-Z
+          </button>
+          <button class="subtab-btn winter" id="btnSubtabWinter" onclick="setBalcaoSubtab('winter')">
+            ❄️ Destaques Inverno (Pico)
+          </button>
+          <button class="subtab-btn" id="btnSubtabAll" onclick="setBalcaoSubtab('all')">
+            🌟 Todos
+          </button>
+        </div>
+
         <div class="search-filter-bar">
           <div class="search-input-wrapper">
             <span class="search-icon">🔍</span>
-            <input type="text" class="search-input" id="search1" placeholder="Pesquisar molécula ou artigo..." oninput="filterSection(1)" />
+            <input type="text" class="search-input" id="search1" placeholder="Pesquisar molécula DCI ou produto..." oninput="filterSection(1)" />
           </div>
           <div class="filter-chips">
             <span class="filter-chip active" id="f1_all" onclick="setStatusFilter(1, 'all')">Todos</span>
@@ -827,6 +962,30 @@ export function getMobileStaffHtml(): string {
             <p>A carregar artigos para travar no Sifarma...</p>
           </div>
         </div>
+        <div class="swipe-hint">👈 Deslize para a direita ou esquerda 👉</div>
+      </div>
+
+      <!-- ====================================================================
+           SECÇÃO 4: PREVENIR RUTURAS & ENCOMENDAS (PONTO 4)
+           ==================================================================== -->
+      <div class="section-page" id="page3">
+        <div class="search-filter-bar">
+          <div class="search-input-wrapper">
+            <span class="search-icon">🔍</span>
+            <input type="text" class="search-input" id="search3" placeholder="Pesquisar produto em rutura ou CNP..." oninput="filterSection(3)" />
+          </div>
+          <div class="filter-chips">
+            <span class="filter-chip active" id="f3_all" onclick="setStatusFilter(3, 'all')">Todos</span>
+            <span class="filter-chip" id="f3_pending" onclick="setStatusFilter(3, 'pending')">Pendentes</span>
+            <span class="filter-chip" id="f3_done" onclick="setStatusFilter(3, 'done')">Concluídos</span>
+          </div>
+        </div>
+        <div class="task-list" id="list3">
+          <div class="empty-state">
+            <div class="empty-icon">⏳</div>
+            <p>A carregar artigos com risco de rutura...</p>
+          </div>
+        </div>
         <div class="swipe-hint">👈 Deslize para a direita para ver as secções anteriores</div>
       </div>
 
@@ -847,7 +1006,8 @@ export function getMobileStaffHtml(): string {
     let rawReport = null;
     let tasksMap = {};
     let allFarmacias = [];
-    let statusFilters = ['all', 'all', 'all'];
+    let statusFilters = ['all', 'all', 'all', 'all'];
+    let balcaoSubtab = 'restos'; // 'restos' | 'winter' | 'all'
     let syncInterval = null;
 
     // Gestos de Touch / Swipe
@@ -876,7 +1036,7 @@ export function getMobileStaffHtml(): string {
     }
 
     // ========================================================================
-    // GESTÃO DE TOUCH SWIPE (DESLIZAR PARA O LADO)
+    // GESTÃO DE TOUCH SWIPE (DESLIZAR PARA O LADO EM 4 SECÇÕES)
     // ========================================================================
     function setupTouchSwipe() {
       const viewport = document.getElementById('viewport');
@@ -901,7 +1061,7 @@ export function getMobileStaffHtml(): string {
       if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 45) {
         if (deltaX < 0) {
           // Deslizar para a esquerda -> Próxima secção
-          if (currentSectionIndex < 2) {
+          if (currentSectionIndex < 3) {
             goToSection(currentSectionIndex + 1);
           }
         } else {
@@ -928,7 +1088,8 @@ export function getMobileStaffHtml(): string {
 
       if (index === 0) indicator.style.backgroundColor = '#fb7185';
       else if (index === 1) indicator.style.backgroundColor = '#c084fc';
-      else indicator.style.backgroundColor = '#fbbf24';
+      else if (index === 2) indicator.style.backgroundColor = '#fbbf24';
+      else indicator.style.backgroundColor = '#34d399';
     }
 
     // ========================================================================
@@ -944,7 +1105,6 @@ export function getMobileStaffHtml(): string {
           .map(f => \`<option value="\${f.id}">\${f.nome} (\${f.codigo_acesso || f.nif})</option>\`)
           .join('');
 
-        // Se houver query param ?acesso= ou ?farmacia= selecionar automaticamente
         const urlParams = new URLSearchParams(window.location.search);
         const accessParam = urlParams.get('acesso') || urlParams.get('code') || urlParams.get('farmacia');
         if (accessParam) {
@@ -1058,7 +1218,6 @@ export function getMobileStaffHtml(): string {
     async function loadMobileData() {
       if (!currentFarmacia) return;
       try {
-        // Obter simultaneamente a análise da farmácia e o mapa de tarefas concluídas no Supabase
         const [repRes, tasksRes] = await Promise.all([
           fetch('/api/analysis?farmaciaId=' + currentFarmacia.id),
           fetch('/api/weekly-tasks?farmaciaId=' + currentFarmacia.id),
@@ -1071,6 +1230,7 @@ export function getMobileStaffHtml(): string {
         renderSection1();
         renderSection2();
         renderSection3();
+        renderSection4();
         updateOverallProgress();
       } catch (err) {
         console.error('Erro ao carregar dados:', err);
@@ -1079,7 +1239,6 @@ export function getMobileStaffHtml(): string {
 
     function startLiveSync() {
       if (syncInterval) clearInterval(syncInterval);
-      // Polling a cada 4 segundos para refletir em direto o que outros colegas picam
       syncInterval = setInterval(async () => {
         if (!currentFarmacia) return;
         try {
@@ -1089,24 +1248,28 @@ export function getMobileStaffHtml(): string {
           renderSection1(true);
           renderSection2(true);
           renderSection3(true);
+          renderSection4(true);
           updateOverallProgress();
         } catch {}
       }, 4000);
     }
 
     // ========================================================================
-    // RENDERIZAÇÃO DAS 3 SECÇÕES EM FORMATO LISTA
+    // RENDERIZAÇÃO DAS 4 SECÇÕES EM FORMATO LISTA
     // ========================================================================
 
-    // SECÇÃO 1: VALIDADES PRÓXIMAS (GAVETA & PRATELEIRA)
+    // SECÇÃO 1: VALIDADES PRÓXIMAS (GAVETA & PRATELEIRA COM FILTROS AVANÇADOS)
     function renderSection1(preserveScroll = false) {
       if (!rawReport) return;
       const container = document.getElementById('list0');
-      const allCad = rawReport.risco_elevado_caducidade || [];
+      const allCad = (rawReport.risco_elevado_caducidade || []).slice();
       document.getElementById('tabCount1').textContent = allCad.length;
 
       const q = (document.getElementById('search0').value || '').toLowerCase().trim();
       const statusF = statusFilters[0];
+      const macroF = document.getElementById('cadMacroFilter')?.value || 'all';
+      const horizonF = document.getElementById('cadHorizonFilter')?.value || 'all';
+      const sortOrder = document.getElementById('cadSortOrder')?.value || 'date_asc';
 
       const filtered = allCad.filter(it => {
         const taskId = 'cad_' + it.cnp_codigo + '_' + (it.lote || 0);
@@ -1114,19 +1277,68 @@ export function getMobileStaffHtml(): string {
         if (statusF === 'pending' && isDone) return false;
         if (statusF === 'done' && !isDone) return false;
 
+        // Filtro de Macro-Área / Categoria
+        if (macroF !== 'all') {
+          const itemMacro = (it.macro_area || '').toUpperCase();
+          const itemTipo = (it.tipo_venda || '').toUpperCase();
+          if (macroF === 'MSRM' && itemTipo !== 'MSRM' && itemMacro !== 'MSRM') return false;
+          if (macroF === 'MNSRM_OTC' && itemTipo !== 'MNSRM' && itemMacro !== 'MNSRM_OTC') return false;
+          if (macroF === 'DERMOCOSMETICA' && itemMacro !== 'DERMOCOSMETICA') return false;
+          if (macroF === 'NUTRICAO_SUPLEMENTOS' && itemMacro !== 'NUTRICAO_SUPLEMENTOS') return false;
+          if (macroF === 'DISPOSITIVOS_SAUDE' && itemMacro !== 'DISPOSITIVOS_SAUDE') return false;
+        }
+
+        // Filtro de Horizonte de Validade
+        if (horizonF !== 'all') {
+          const meses = it.meses_ate_caducidade != null ? Number(it.meses_ate_caducidade) : 999;
+          if (horizonF === 'urgent' && meses > 3) return false;
+          if (horizonF === 'mid' && (meses <= 3 || meses > 6)) return false;
+          if (horizonF === 'year' && (meses <= 6 || meses > 12)) return false;
+        }
+
         if (q) {
           const name = (it.designacao || '').toLowerCase();
           const cnp = (it.cnp_codigo || '').toLowerCase();
-          return name.includes(q) || cnp.includes(q);
+          const lote = (it.lote || '').toLowerCase();
+          const prat = (it.prateleira || '').toLowerCase();
+          return name.includes(q) || cnp.includes(q) || lote.includes(q) || prat.includes(q);
         }
         return true;
       });
+
+      // Ordenação selecionada pelo utilizador
+      filtered.sort((a, b) => {
+        if (sortOrder === 'name_asc') {
+          return (a.designacao || '').localeCompare(b.designacao || '', 'pt');
+        }
+        if (sortOrder === 'shelf_asc') {
+          const sA = a.prateleira || 'ZZZ';
+          const sB = b.prateleira || 'ZZZ';
+          const compShelf = sA.localeCompare(sB, 'pt');
+          if (compShelf !== 0) return compShelf;
+          return (a.designacao || '').localeCompare(b.designacao || '', 'pt');
+        }
+        if (sortOrder === 'val_desc') {
+          const vA = a.valor_em_risco != null ? a.valor_em_risco : ((a.stock_atual || 1) * (a.custo_unitario || 0));
+          const vB = b.valor_em_risco != null ? b.valor_em_risco : ((b.stock_atual || 1) * (b.custo_unitario || 0));
+          return vB - vA;
+        }
+        // Padrão: data de validade mais próxima primeiro
+        const dateA = a.data_validade || '9999-12-31';
+        const dateB = b.data_validade || '9999-12-31';
+        return dateA.localeCompare(dateB);
+      });
+
+      const badgeEl = document.getElementById('cadCounterBadge');
+      if (badgeEl) {
+        badgeEl.textContent = \`\${filtered.length} de \${allCad.length} produtos\`;
+      }
 
       if (filtered.length === 0) {
         container.innerHTML = \`
           <div class="empty-state">
             <div class="empty-icon">✅</div>
-            <p>Nenhuma validade pendente nesta lista.</p>
+            <p>Nenhuma validade pendente com os filtros selecionados.</p>
           </div>
         \`;
         return;
@@ -1149,10 +1361,11 @@ export function getMobileStaffHtml(): string {
               <div class="task-tags">
                 <span class="tag tag-danger">📅 Val: \${it.data_validade || 'Curto Prazo'}</span>
                 <span class="tag tag-danger">📦 \${qtd} un (\${Number(valRisco).toFixed(2)} €)</span>
+                \${it.prateleira ? \`<span class="tag tag-shelf">📍 \${it.prateleira}</span>\` : ''}
                 <span class="tag tag-cnp">CNP: \${it.cnp_codigo}</span>
               </div>
               <div class="task-instruction">
-                ⚠️ <b>Ação Gaveta:</b> Separar fisicamente da prateleira ou colocar em destaque imediato de balcão.
+                ⚠️ <b>Ação Gaveta / Balcão:</b> Separar fisicamente da prateleira ou colocar em destaque imediato de balcão.
               </div>
               \${isDone ? \`
                 <div class="task-completion-stamp">
@@ -1165,19 +1378,34 @@ export function getMobileStaffHtml(): string {
       }).join('');
     }
 
-    // SECÇÃO 2: BALCÃO & RESTOS DE GAVETA & SAZONAIS
+    // SECÇÃO 2: BALCÃO (A-Z ALFABÉTICO + DESTAQUES DE INVERNO)
+    function setBalcaoSubtab(tab) {
+      balcaoSubtab = tab;
+      document.getElementById('btnSubtabRestos').classList.toggle('active', tab === 'restos');
+      document.getElementById('btnSubtabWinter').classList.toggle('active', tab === 'winter');
+      document.getElementById('btnSubtabAll').classList.toggle('active', tab === 'all');
+      renderSection2();
+    }
+
     function renderSection2(preserveScroll = false) {
       if (!rawReport) return;
       const container = document.getElementById('list1');
 
-      // Moléculas com restos de gaveta
+      // Moléculas com restos de gaveta, estritamente ordenadas por ORDEM ALFABÉTICA (A ➔ Z)
       const listGen = (rawReport.consolidacao_genericos_dci || [])
-        .filter(g => g.restos_gaveta_escobar_primeiro && g.restos_gaveta_escobar_primeiro.length > 0);
+        .filter(g => g.restos_gaveta_escobar_primeiro && g.restos_gaveta_escobar_primeiro.length > 0)
+        .slice()
+        .sort((a, b) => {
+          const nameA = a.grupo_equivalencia_dci || a.molecula_dci || '';
+          const nameB = b.grupo_equivalencia_dci || b.molecula_dci || '';
+          return nameA.localeCompare(nameB, 'pt');
+        });
 
-      // Excessos sazonais em pico de inverno
+      // Excessos sazonais em pico de inverno (ordenados alfabeticamente)
       const listSeasonal = (rawReport.alertas_excesso_cobertura || [])
-        .filter(i => (i.stock_atual || 0) >= 3 && /ben-u-gripe|cegripe|antigrip|grip|constip|tosse|frio|labi|ureia/i.test(i.designacao))
-        .slice(0, 10);
+        .filter(i => (i.stock_atual || 0) >= 3 && /ben-u-gripe|cegripe|antigrip|grip|constip|tosse|frio|labi|ureia|vapor|pastilh|gargant|nasal/i.test(i.designacao))
+        .slice()
+        .sort((a, b) => (a.designacao || '').localeCompare(b.designacao || '', 'pt'));
 
       const totalItems = listGen.length + listSeasonal.length;
       document.getElementById('tabCount2').textContent = totalItems;
@@ -1187,107 +1415,111 @@ export function getMobileStaffHtml(): string {
 
       let html = '';
 
-      // Bloco A: Restos de gaveta
-      const filteredGen = listGen.filter(g => {
-        const taskId = 'gen_' + normStr(g.molecula_dci || g.grupo_equivalencia_dci);
-        const isDone = !!tasksMap[taskId]?.concluido;
-        if (statusF === 'pending' && isDone) return false;
-        if (statusF === 'done' && !isDone) return false;
-        if (q) {
-          const mol = (g.molecula_dci || '').toLowerCase();
-          const eq = (g.grupo_equivalencia_dci || '').toLowerCase();
-          return mol.includes(q) || eq.includes(q);
-        }
-        return true;
-      });
-
-      if (filteredGen.length > 0) {
-        html += '<div style="font-size: 0.78rem; font-weight: 800; color: #c084fc; text-transform: uppercase; margin: 4px 0 8px 0;">📦 Restos de Gaveta (Dispensar Primeiro):</div>';
-        html += filteredGen.map(g => {
+      // Bloco A: Restos de gaveta A-Z
+      if (balcaoSubtab === 'restos' || balcaoSubtab === 'all') {
+        const filteredGen = listGen.filter(g => {
           const taskId = 'gen_' + normStr(g.molecula_dci || g.grupo_equivalencia_dci);
-          const tInfo = tasksMap[taskId];
-          const isDone = !!tInfo?.concluido;
-          const restos = g.restos_gaveta_escobar_primeiro || [];
-          const name = g.grupo_equivalencia_dci || g.molecula_dci;
+          const isDone = !!tasksMap[taskId]?.concluido;
+          if (statusF === 'pending' && isDone) return false;
+          if (statusF === 'done' && !isDone) return false;
+          if (q) {
+            const mol = (g.molecula_dci || '').toLowerCase();
+            const eq = (g.grupo_equivalencia_dci || '').toLowerCase();
+            return mol.includes(q) || eq.includes(q);
+          }
+          return true;
+        });
 
-          const restosRows = restos.map(r => \`
-            <div class="resto-row">
-              <span class="resto-name">• \${r.designacao} (<code>\${r.cnp_codigo}</code>)</span>
-              <span class="resto-qtd">\${r.stock_atual} un</span>
-            </div>
-          \`).join('');
+        if (filteredGen.length > 0) {
+          html += '<div style="font-size: 0.78rem; font-weight: 800; color: #c084fc; text-transform: uppercase; margin: 4px 0 8px 0;">📦 Restos de Gaveta Alfabéticos (A ➔ Z):</div>';
+          html += filteredGen.map(g => {
+            const taskId = 'gen_' + normStr(g.molecula_dci || g.grupo_equivalencia_dci);
+            const tInfo = tasksMap[taskId];
+            const isDone = !!tInfo?.concluido;
+            const restos = g.restos_gaveta_escobar_primeiro || [];
+            const name = g.grupo_equivalencia_dci || g.molecula_dci;
 
-          return \`
-            <div class="task-card \${isDone ? 'completed' : ''}" id="card_\${taskId}">
-              <div class="task-check-btn" onclick="toggleTask('\${taskId}', 'RESTO_GAVETA', null, '\${escapeHtml(name)}', 0)">
-                \${isDone ? '✓' : ''}
+            const restosRows = restos.map(r => \`
+              <div class="resto-row">
+                <span class="resto-name">• \${r.designacao} (<code>\${r.cnp_codigo}</code>)</span>
+                <span class="resto-qtd">\${r.stock_atual} un</span>
               </div>
-              <div class="task-body">
-                <div class="task-title">\${name}</div>
-                <div class="task-tags">
-                  <span class="tag tag-purple">💊 \${restos.length} marcas a esgotar</span>
+            \`).join('');
+
+            return \`
+              <div class="task-card \${isDone ? 'completed' : ''}" id="card_\${taskId}">
+                <div class="task-check-btn" onclick="toggleTask('\${taskId}', 'RESTO_GAVETA', null, '\${escapeHtml(name)}', 0)">
+                  \${isDone ? '✓' : ''}
                 </div>
-                <div class="restos-box">
-                  \${restosRows}
-                </div>
-                <div class="task-instruction" style="margin-top: 6px;">
-                  👉 <b>Ação Balcão:</b> Dispensar primeiro estas caixas paradas antes de abrir novas marcas.
-                </div>
-                \${isDone ? \`
-                  <div class="task-completion-stamp">
-                    ✓ Concluído por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                <div class="task-body">
+                  <div class="task-title">\${name}</div>
+                  <div class="task-tags">
+                    <span class="tag tag-purple">💊 \${restos.length} marcas a esgotar</span>
                   </div>
-                \` : ''}
+                  <div class="restos-box">
+                    \${restosRows}
+                  </div>
+                  <div class="task-instruction" style="margin-top: 6px;">
+                    👉 <b>Ação Balcão:</b> Dispensar primeiro estas caixas paradas antes de abrir novas marcas.
+                  </div>
+                  \${isDone ? \`
+                    <div class="task-completion-stamp">
+                      ✓ Concluído por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                    </div>
+                  \` : ''}
+                </div>
               </div>
-            </div>
-          \`;
-        }).join('');
+            \`;
+          }).join('');
+        }
       }
 
-      // Bloco B: Excessos Sazonais
-      const filteredSeasonal = listSeasonal.filter(s => {
-        const taskId = 'saz_' + s.cnp_codigo;
-        const isDone = !!tasksMap[taskId]?.concluido;
-        if (statusF === 'pending' && isDone) return false;
-        if (statusF === 'done' && !isDone) return false;
-        if (q) {
-          const name = (s.designacao || '').toLowerCase();
-          const cnp = (s.cnp_codigo || '').toLowerCase();
-          return name.includes(q) || cnp.includes(q);
-        }
-        return true;
-      });
-
-      if (filteredSeasonal.length > 0) {
-        html += '<div style="font-size: 0.78rem; font-weight: 800; color: #fb923c; text-transform: uppercase; margin: 16px 0 8px 0;">🔥 Destaque Sazonal de Inverno:</div>';
-        html += filteredSeasonal.map(s => {
+      // Bloco B: Excessos Sazonais em Pico de Inverno
+      if (balcaoSubtab === 'winter' || balcaoSubtab === 'all') {
+        const filteredSeasonal = listSeasonal.filter(s => {
           const taskId = 'saz_' + s.cnp_codigo;
-          const tInfo = tasksMap[taskId];
-          const isDone = !!tInfo?.concluido;
+          const isDone = !!tasksMap[taskId]?.concluido;
+          if (statusF === 'pending' && isDone) return false;
+          if (statusF === 'done' && !isDone) return false;
+          if (q) {
+            const name = (s.designacao || '').toLowerCase();
+            const cnp = (s.cnp_codigo || '').toLowerCase();
+            return name.includes(q) || cnp.includes(q);
+          }
+          return true;
+        });
 
-          return \`
-            <div class="task-card \${isDone ? 'completed' : ''}" id="card_\${taskId}">
-              <div class="task-check-btn" onclick="toggleTask('\${taskId}', 'DESTAQUE_SAZONAL', '\${s.cnp_codigo}', '\${escapeHtml(s.designacao)}', 0)">
-                \${isDone ? '✓' : ''}
-              </div>
-              <div class="task-body">
-                <div class="task-title">\${s.designacao}</div>
-                <div class="task-tags">
-                  <span class="tag" style="background: rgba(249, 115, 22, 0.2); color: #fdba74;">📦 \${s.stock_atual} un em stock</span>
-                  <span class="tag tag-cnp">CNP: \${s.cnp_codigo}</span>
+        if (filteredSeasonal.length > 0) {
+          html += '<div style="font-size: 0.78rem; font-weight: 800; color: #38bdf8; text-transform: uppercase; margin: 12px 0 8px 0;">❄️ Destaques da Época de Inverno (A ➔ Z):</div>';
+          html += filteredSeasonal.map(s => {
+            const taskId = 'saz_' + s.cnp_codigo;
+            const tInfo = tasksMap[taskId];
+            const isDone = !!tInfo?.concluido;
+
+            return \`
+              <div class="task-card \${isDone ? 'completed' : ''}" id="card_\${taskId}">
+                <div class="task-check-btn" onclick="toggleTask('\${taskId}', 'DESTAQUE_SAZONAL', '\${s.cnp_codigo}', '\${escapeHtml(s.designacao)}', 0)">
+                  \${isDone ? '✓' : ''}
                 </div>
-                <div class="task-instruction">
-                  🌟 <b>Ação Balcão:</b> Colocar no linear de topo ou balcão de atendimento ativo.
-                </div>
-                \${isDone ? \`
-                  <div class="task-completion-stamp">
-                    ✓ Concluído por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                <div class="task-body">
+                  <div class="task-title">\${s.designacao}</div>
+                  <div class="task-tags">
+                    <span class="tag" style="background: rgba(56, 189, 248, 0.2); color: #bae6fd;">❄️ Inverno: \${s.stock_atual} un em stock</span>
+                    <span class="tag tag-cnp">CNP: \${s.cnp_codigo}</span>
                   </div>
-                \` : ''}
+                  <div class="task-instruction">
+                    🌟 <b>Ação Balcão:</b> Colocar no linear de topo ou sugerir ativamente em queixas respiratórias/gripais.
+                  </div>
+                  \${isDone ? \`
+                    <div class="task-completion-stamp">
+                      ✓ Concluído por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                    </div>
+                  \` : ''}
+                </div>
               </div>
-            </div>
-          \`;
-        }).join('');
+            \`;
+          }).join('');
+        }
       }
 
       container.innerHTML = html || \`
@@ -1363,6 +1595,73 @@ export function getMobileStaffHtml(): string {
       }).join('');
     }
 
+    // SECÇÃO 4: PREVENIR RUTURAS & ENCOMENDAS (PONTO 4)
+    function renderSection4(preserveScroll = false) {
+      if (!rawReport) return;
+      const container = document.getElementById('list3');
+      const allRutura = (rawReport.artigos_risco_rutura || []).slice();
+      document.getElementById('tabCount4').textContent = allRutura.length;
+
+      const q = (document.getElementById('search3').value || '').toLowerCase().trim();
+      const statusF = statusFilters[3];
+
+      const filtered = allRutura.filter(it => {
+        const taskId = 'rut_' + it.cnp_codigo;
+        const isDone = !!tasksMap[taskId]?.concluido;
+        if (statusF === 'pending' && isDone) return false;
+        if (statusF === 'done' && !isDone) return false;
+        if (q) {
+          const name = (it.designacao || '').toLowerCase();
+          const cnp = (it.cnp_codigo || '').toLowerCase();
+          return name.includes(q) || cnp.includes(q);
+        }
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        container.innerHTML = \`
+          <div class="empty-state">
+            <div class="empty-icon">✅</div>
+            <p>Nenhum artigo com risco de rutura pendente.</p>
+          </div>
+        \`;
+        return;
+      }
+
+      container.innerHTML = filtered.map(it => {
+        const taskId = 'rut_' + it.cnp_codigo;
+        const tInfo = tasksMap[taskId];
+        const isDone = !!tInfo?.concluido;
+        const sugestaoEnc = it.sugestao_encomenda || Math.max(2, Math.ceil((it.vmm || 1) * 0.5));
+        const diasTxt = it.dias_cobertura != null ? \`\${it.dias_cobertura} dias\` : 'crítica';
+
+        return \`
+          <div class="task-card \${isDone ? 'completed' : ''}" id="card_\${taskId}">
+            <div class="task-check-btn" onclick="toggleTask('\${taskId}', 'PREVENIR_RUTURA', '\${it.cnp_codigo}', '\${escapeHtml(it.designacao)}', 0)">
+              \${isDone ? '✓' : ''}
+            </div>
+            <div class="task-body">
+              <div class="task-title">\${it.designacao}</div>
+              <div class="task-tags">
+                <span class="tag tag-danger">🚨 Cobertura: apenas \${diasTxt}</span>
+                <span class="tag tag-success">📦 Encomendar: \${sugestaoEnc} un</span>
+                <span class="tag" style="background:#0f172a; color:#94a3b8; border:1px solid #334155;">Stock: \${it.stock_atual} · VMM: \${it.vmm}/mês</span>
+                <span class="tag tag-cnp">CNP: \${it.cnp_codigo}</span>
+              </div>
+              <div class="task-instruction">
+                🟢 <b>Ajustar no Sifarma:</b> Subir Ponto de Encomenda para <b>\${sugestaoEnc} un</b> ou gerar encomenda imediata ao fornecedor habitual.
+              </div>
+              \${isDone ? \`
+                <div class="task-completion-stamp">
+                  ✓ Encomendado/Ajustado por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                </div>
+              \` : ''}
+            </div>
+          </div>
+        \`;
+      }).join('');
+    }
+
     // ========================================================================
     // TOGGLE / PICAR TAREFA (COM ATRIBUIÇÃO AO COLABORADOR)
     // ========================================================================
@@ -1371,7 +1670,6 @@ export function getMobileStaffHtml(): string {
       const isCurrentlyDone = !!tasksMap[taskId]?.concluido;
       const nextDoneState = !isCurrentlyDone;
 
-      // Atualização otimista imediata na interface
       if (nextDoneState) {
         tasksMap[taskId] = {
           concluido: true,
@@ -1386,13 +1684,12 @@ export function getMobileStaffHtml(): string {
         showToast('↩️ Tarefa reaberta', '#64748b');
       }
 
-      // Re-renderizar secção atual
       if (currentSectionIndex === 0) renderSection1();
       else if (currentSectionIndex === 1) renderSection2();
-      else renderSection3();
+      else if (currentSectionIndex === 2) renderSection3();
+      else renderSection4();
       updateOverallProgress();
 
-      // Gravar na base de dados Supabase via API
       try {
         await fetch('/api/weekly-tasks/toggle', {
           method: 'POST',
@@ -1419,7 +1716,8 @@ export function getMobileStaffHtml(): string {
       const c2 = (rawReport.consolidacao_genericos_dci || []).filter(g => g.restos_gaveta_escobar_primeiro?.length > 0).length +
                  (rawReport.alertas_excesso_cobertura || []).filter(i => (i.stock_atual || 0) >= 3 && /ben-u-gripe|cegripe|antigrip|grip|constip|tosse|frio|labi|ureia/i.test(i.designacao)).slice(0, 10).length;
       const c3 = (rawReport.alertas_excesso_cobertura || []).length;
-      const totalPossible = c1 + c2 + c3;
+      const c4 = (rawReport.artigos_risco_rutura || []).length;
+      const totalPossible = c1 + c2 + c3 + c4;
 
       let doneCount = 0;
       let savings = 0;
@@ -1444,7 +1742,8 @@ export function getMobileStaffHtml(): string {
     function filterSection(idx) {
       if (idx === 0) renderSection1();
       else if (idx === 1) renderSection2();
-      else renderSection3();
+      else if (idx === 2) renderSection3();
+      else renderSection4();
     }
 
     function setStatusFilter(secIdx, filter) {
