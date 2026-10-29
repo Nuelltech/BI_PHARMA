@@ -1184,12 +1184,18 @@ async function startServer() {
         parsedUrl.query.mobile === '1' ||
         parsedUrl.query.modo === 'equipa'
       ) {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(getMobileStaffHtml());
         return;
       }
 
       if (pathname === '/' || pathname === '/index.html') {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(getDashboardHtml());
         return;
