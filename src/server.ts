@@ -3472,6 +3472,42 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
+  <!-- MODAL ABRIR NO TELEMÓVEL DA EQUIPA -->
+  <div id="mobileStaffModal" style="display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 99999; align-items: center; justify-content: center;">
+    <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 24px; max-width: 440px; width: 90%; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35); text-align: center;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h3 style="font-size: 1.15rem; font-weight: 800; color: #0284c7; margin: 0; display: flex; align-items: center; gap: 8px;">
+          📱 Modo Equipa (Mobile Staff)
+        </h3>
+        <button onclick="closeMobileStaffModal()" style="background: none; border: none; font-size: 1.2rem; cursor: pointer; color: var(--muted);">&times;</button>
+      </div>
+      <p style="font-size: 0.84rem; color: var(--text-secondary); margin-bottom: 16px; line-height: 1.4;">
+        Aponte a câmara do telemóvel para o QR Code para abrir a lista de tarefas da equipa. As caixas picadas no telemóvel refletem-se aqui em tempo real!
+      </p>
+      
+      <div style="background: #ffffff; padding: 14px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 16px;">
+        <img id="mobileQrImg" src="" alt="QR Code Mobile" style="width: 180px; height: 180px; display: block;" />
+      </div>
+
+      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 16px; text-align: left;">
+        <div style="font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: uppercase; margin-bottom: 4px;">Link Direto:</div>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" id="mobileDirectUrl" readonly style="flex: 1; font-size: 0.78rem; font-family: monospace; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface);" />
+          <button class="btn btn-secondary" onclick="copyMobileUrl()" style="font-size: 0.78rem; padding: 6px 10px;">📋 Copiar</button>
+        </div>
+      </div>
+
+      <div style="font-size: 0.78rem; color: #059669; font-weight: 700; background: #d1fae5; padding: 8px 12px; border-radius: 8px; margin-bottom: 16px;">
+        🔒 PIN de Acesso da Equipa: <b>1234</b> (ou os 4 dígitos do código da farmácia)
+      </div>
+
+      <button class="btn btn-secondary" onclick="closeMobileStaffModal()" style="width: 100%; font-size: 0.85rem; padding: 9px;">
+        Fechar
+      </button>
+    </div>
+  </div>
+
+
   <script>
     let currentReport = null;
     let activeTab = 'plano';
@@ -4794,40 +4830,7 @@ function getDashboardHtml(): string {
             <div>BI Pharma © Nuelltech · Poupança Travada: \${(currentWeeklyPlanData.card3TotalSavings || 0).toFixed(2)} €</div>
           </div>
         
-  <!-- MODAL ABRIR NO TELEMÓVEL DA EQUIPA -->
-  <div id="mobileStaffModal" style="display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 99999; align-items: center; justify-content: center;">
-    <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 24px; max-width: 440px; width: 90%; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35); text-align: center;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-        <h3 style="font-size: 1.15rem; font-weight: 800; color: #0284c7; margin: 0; display: flex; align-items: center; gap: 8px;">
-          📱 Modo Equipa (Mobile Staff)
-        </h3>
-        <button onclick="closeMobileStaffModal()" style="background: none; border: none; font-size: 1.2rem; cursor: pointer; color: var(--muted);">&times;</button>
-      </div>
-      <p style="font-size: 0.84rem; color: var(--text-secondary); margin-bottom: 16px; line-height: 1.4;">
-        Aponte a câmara do telemóvel para o QR Code para abrir a lista de tarefas da equipa. As caixas picadas no telemóvel refletem-se aqui em tempo real!
-      </p>
-      
-      <div style="background: #ffffff; padding: 14px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 16px;">
-        <img id="mobileQrImg" src="" alt="QR Code Mobile" style="width: 180px; height: 180px; display: block;" />
-      </div>
 
-      <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 16px; text-align: left;">
-        <div style="font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: uppercase; margin-bottom: 4px;">Link Direto:</div>
-        <div style="display: flex; gap: 8px;">
-          <input type="text" id="mobileDirectUrl" readonly style="flex: 1; font-size: 0.78rem; font-family: monospace; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface);" />
-          <button class="btn btn-secondary" onclick="copyMobileUrl()" style="font-size: 0.78rem; padding: 6px 10px;">📋 Copiar</button>
-        </div>
-      </div>
-
-      <div style="font-size: 0.78rem; color: #059669; font-weight: 700; background: #d1fae5; padding: 8px 12px; border-radius: 8px; margin-bottom: 16px;">
-        🔒 PIN de Acesso da Equipa: <b>1234</b> (ou os 4 dígitos do código da farmácia)
-      </div>
-
-      <button class="btn btn-secondary" onclick="closeMobileStaffModal()" style="width: 100%; font-size: 0.85rem; padding: 9px;">
-        Fechar
-      </button>
-    </div>
-  </div>
 
 </body>
         </html>
