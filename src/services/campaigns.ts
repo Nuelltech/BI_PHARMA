@@ -1710,12 +1710,29 @@ export function generateOmnichannelMaterials(
 /**
  * Gera o template executivo do Boletim Comercial Mensal por Email
  */
+function escapeEmailHtml(str: any): string {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export function generateMonthlyEmailDigest(
   farmaciaNome: string,
   campanha: CampaignDefinition,
   produtos: CampaignProductItem[],
   simulacao: FinancialSimulation
 ): { subject: string; html: string; text: string } {
+  const safeFarmNome = escapeEmailHtml(farmaciaNome);
+  const safeIcone = escapeEmailHtml(campanha.icone);
+  const safeTitulo = escapeEmailHtml(campanha.titulo);
+  const safeEpoca = escapeEmailHtml(campanha.epoca);
+  const safeMecanica = escapeEmailHtml(campanha.mecanicaSugerida);
+  const safeDescricao = escapeEmailHtml(campanha.descricao);
+
   const subject = `[BI Pharma] ${campanha.icone} Proposta de Campanha para ${campanha.epoca} — ${farmaciaNome}`;
 
   const listaHtml = produtos
@@ -1724,12 +1741,12 @@ export function generateMonthlyEmailDigest(
       (p) =>
         `<tr>
           <td style="padding: 8px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px;">
-            <b>[${p.cnp_codigo}]</b> ${p.designacao}<br/>
-            <span style="font-size: 11px; color: #0284c7;">${p.criterio_marketing || p.eixo_campanha || ''} · ${p.canais_recomendados || ''}</span>
+            <b>[${escapeEmailHtml(p.cnp_codigo)}]</b> ${escapeEmailHtml(p.designacao)}<br/>
+            <span style="font-size: 11px; color: #0284c7;">${escapeEmailHtml(p.criterio_marketing || p.eixo_campanha || '')} · ${escapeEmailHtml(p.canais_recomendados || '')}</span>
           </td>
-          <td style="padding: 8px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; text-align: center;">${p.stock_atual} un</td>
-          <td style="padding: 8px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; text-align: right;">${p.pvp.toFixed(2)} €</td>
-          <td style="padding: 8px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; text-align: right; color: #10b981; font-weight: 700;">${p.margem_percentagem.toFixed(0)}%</td>
+          <td style="padding: 8px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; text-align: center;">${Number(p.stock_atual) || 0} un</td>
+          <td style="padding: 8px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; text-align: right;">${Number(p.pvp || 0).toFixed(2)} €</td>
+          <td style="padding: 8px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; text-align: right; color: #10b981; font-weight: 700;">${Number(p.margem_percentagem || 0).toFixed(0)}%</td>
         </tr>`
     )
     .join('');
@@ -1742,17 +1759,17 @@ export function generateMonthlyEmailDigest(
       <div style="max-width: 620px; margin: 0 auto; background: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);">
         <div style="background: linear-gradient(135deg, #0284c7, #6366f1); padding: 24px; color: #ffffff;">
           <div style="font-size: 13px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; opacity: 0.9;">Boletim Comercial & Escoamento 360º</div>
-          <h1 style="font-size: 22px; margin: 8px 0 4px; font-weight: 800;">${campanha.icone} ${campanha.titulo}</h1>
-          <div style="font-size: 14px; opacity: 0.9;">Farmácia: ${farmaciaNome} | Época: ${campanha.epoca}</div>
+          <h1 style="font-size: 22px; margin: 8px 0 4px; font-weight: 800;">${safeIcone} ${safeTitulo}</h1>
+          <div style="font-size: 14px; opacity: 0.9;">Farmácia: ${safeFarmNome} | Época: ${safeEpoca}</div>
         </div>
         <div style="padding: 24px;">
           <p style="font-size: 15px; line-height: 1.5; color: #334155;">
-            Olá equipa da <b>${farmaciaNome}</b>,<br/><br/>
+            Olá equipa da <b>${safeFarmNome}</b>,<br/><br/>
             Com base no calendário de saúde e nos critérios de escoamento de stock (Validades, Monos e Restos de Gaveta), preparámos o plano operacional para as próximas semanas:
           </p>
           <div style="background: #f1f5f9; border-left: 4px solid #0284c7; padding: 14px 18px; border-radius: 6px; margin: 18px 0;">
-            <div style="font-weight: 700; color: #0f172a; font-size: 15px;">Mecânica Proposta: ${campanha.mecanicaSugerida}</div>
-            <div style="font-size: 13px; color: #475569; margin-top: 4px;">${campanha.descricao}</div>
+            <div style="font-weight: 700; color: #0f172a; font-size: 15px;">Mecânica Proposta: ${safeMecanica}</div>
+            <div style="font-size: 13px; color: #475569; margin-top: 4px;">${safeDescricao}</div>
           </div>
           <div style="display: flex; gap: 12px; margin: 20px 0;">
             <div style="flex: 1; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center;">
@@ -2265,6 +2282,95 @@ export async function searchProductsForMarketingPicker(
     vmm: Number((i.vendasQtd / 12).toFixed(1)),
     riscoValidade: isItemExpiryRisk(i),
   }));
+}
+
+export interface SmartCampaignBaskets {
+  validades: Array<{
+    cnp: string;
+    designacao: string;
+    categoria: string;
+    stock: number;
+    pvp: number;
+    custo: number;
+    margemPct: number;
+    validade: string | null;
+  }>;
+  monos: Array<{
+    cnp: string;
+    designacao: string;
+    categoria: string;
+    stock: number;
+    pvp: number;
+    custo: number;
+    margemPct: number;
+    capitalEmpatadoEur: number;
+  }>;
+  topMargem: Array<{
+    cnp: string;
+    designacao: string;
+    categoria: string;
+    stock: number;
+    pvp: number;
+    custo: number;
+    margemPct: number;
+  }>;
+}
+
+export async function getSmartCampaignBaskets(
+  prisma: PrismaClient,
+  farmaciaId: string
+): Promise<SmartCampaignBaskets> {
+  const catalog = await getPharmacyCatalog(prisma, farmaciaId);
+  const comStock = catalog.filter((i) => i.stock > 0 && i.tipoVenda !== 'MSRM');
+
+  // 1. Validades a Caducar (< 6 meses)
+  const validades = comStock
+    .filter((i) => isItemExpiryRisk(i) && i.validade)
+    .sort((a, b) => (a.validade! > b.validade! ? 1 : -1))
+    .slice(0, 15)
+    .map((i) => ({
+      cnp: i.cnp,
+      designacao: i.designacao,
+      categoria: i.categoria,
+      stock: i.stock,
+      pvp: i.pvp,
+      custo: i.custo,
+      margemPct: Number(i.margem.toFixed(1)),
+      validade: i.validade,
+    }));
+
+  // 2. Monos & Stock Parado (> 180 dias / sem vendas)
+  const monos = comStock
+    .filter((i) => (i.vendasQtd <= 2 && i.stock >= 2) || (i.vendasQtd === 0 && i.stock >= 1))
+    .sort((a, b) => b.stock * b.custo - a.stock * a.custo)
+    .slice(0, 15)
+    .map((i) => ({
+      cnp: i.cnp,
+      designacao: i.designacao,
+      categoria: i.categoria,
+      stock: i.stock,
+      pvp: i.pvp,
+      custo: i.custo,
+      margemPct: Number(i.margem.toFixed(1)),
+      capitalEmpatadoEur: Number((i.stock * i.custo).toFixed(2)),
+    }));
+
+  // 3. Top Margem Comercial (>= 40%)
+  const topMargem = comStock
+    .filter((i) => i.margem >= 40 && i.stock >= 2)
+    .sort((a, b) => b.margem - a.margem || b.stock - a.stock)
+    .slice(0, 15)
+    .map((i) => ({
+      cnp: i.cnp,
+      designacao: i.designacao,
+      categoria: i.categoria,
+      stock: i.stock,
+      pvp: i.pvp,
+      custo: i.custo,
+      margemPct: Number(i.margem.toFixed(1)),
+    }));
+
+  return { validades, monos, topMargem };
 }
 
 export async function analyzeProductMarketingAndCrossSell360(

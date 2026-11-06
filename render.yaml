@@ -8,9 +8,13 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20
+      - key: NODE_ENV
+        value: production
+      - key: ALLOW_DEV_FALLBACK
+        value: "false"
       - key: DATABASE_URL
         sync: false
-      - key: MASTER_ACCESS_CODE
-        value: MASTER-BI
+      - key: ADMIN_PASSWORD
+        sync: false
       - key: ANTHROPIC_API_KEY
         sync: false

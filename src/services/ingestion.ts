@@ -595,6 +595,10 @@ export interface ParsedWinpharVendasPdf {
   farmaciaNif: string | null;
   periodo: string | null;
   anoVendas: number;
+  isDaily: boolean;
+  dataInicio: string | null; // ISO YYYY-MM-DD
+  dataFim: string | null;    // ISO YYYY-MM-DD
+  granularidade: 'MENSAL' | 'DIARIO';
   rows: ParsedWinpharVendasItem[];
 }
 
@@ -611,12 +615,79 @@ export interface ParsedWinpharValidadesPdf {
   rows: ParsedWinpharValidadesItem[];
 }
 
-export async function parseWinpharVendasPdfFile(filePath: string): Promise<ParsedWinpharVendasPdf> {
-  const dataBuffer = fs.readFileSync(filePath);
-  let farmaciaNome: string | null = null;
-  let farmaciaNif: string | null = null;
+const PT_MONTHS_MAP_GLOBAL: Record<string, number> = {
+  janeiro: 1, jan: 1,
+  fevereiro: 2, fev: 2,
+  'março': 3, marco: 3, mar: 3,
+  abril: 4, abr: 4,
+  maio: 5, mai: 5,
+  junho: 6, jun: 6,
+  julho: 7, jul: 7,
+  agosto: 8, ago: 8,
+  setembro: 9, set: 9,
+  outubro: 10, out: 10,
+  novembro: 11, nov: 11,
+  dezembro: 12, dez: 12,
+};
+
+export function parseWinpharPeriodString(periodoStr: string | null | undefined): {
+  isDaily: boolean;
+  granularidade: 'MENSAL' | 'DIARIO';
+  dataInicio: string | null;
+  dataFim: string | null;
+  anoVendas: number;
+} {
+  if (!periodoStr) {
+    return {
+      isDaily: false,
+      granularidade: 'MENSAL',
+      dataInicio: null,
+      dataFim: null,
+      anoVendas: 2026,
+    };
+  }
+
+  const periodRegex = /de\s+(\d{1,2})\s+de\s+([a-zA-Zçã]+)\s+de\s+(\d{4})\s+a\s+(\d{1,2})\s+de\s+([a-zA-Zçã]+)\s+de\s+(\d{4})/i;
+  const m = periodoStr.match(periodRegex);
+  if (!m) {
+    const matchYear = periodoStr.match(/(\d{4})/);
+    const yr = matchYear ? parseInt(matchYear[1], 10) : 2026;
+    return {
+      isDaily: false,
+      granularidade: 'MENSAL',
+      dataInicio: `${yr}-01-01T00:00:00.000Z`,
+      dataFim: `${yr}-12-31T23:59:59.000Z`,
+      anoVendas: yr,
+    };
+  }
+
+  const [, d1, m1, y1, d2, m2, y2] = m;
+  const month1 = PT_MONTHS_MAP_GLOBAL[m1.toLowerCase().trim()] || 1;
+  const month2 = PT_MONTHS_MAP_GLOBAL[m2.toLowerCase().trim()] || 12;
+  const year1 = parseInt(y1, 10);
+  const year2 = parseInt(y2, 10);
+  const day1 = parseInt(d1, 10);
+  const day2 = parseInt(d2, 10);
+
+  const isDaily = day1 === day2 && month1 === month2 && year1 === year2;
+  const startIso = `${year1}-${String(month1).padStart(2, '0')}-${String(day1).padStart(2, '0')}T00:00:00.000Z`;
+  const endIso = `${year2}-${String(month2).padStart(2, '0')}-${String(day2).padStart(2, '0')}T23:59:59.000Z`;
+
+  return {
+    isDaily,
+    granularidade: isDaily ? 'DIARIO' : 'MENSAL',
+    dataInicio: startIso,
+    dataFim: endIso,
+    anoVendas: year2,
+  };
+}
+
+export async function parseWinpharVendasPdfFile(filePathOrBuffer: string | Buffer): Promise<ParsedWinpharVendasPdf> {
+  const dataBuffer = Buffer.isBuffer(filePathOrBuffer) ? filePathOrBuffer : fs.readFileSync(filePathOrBuffer);
+  let farmaciaNome: any = null;
+  let farmaciaNif: any = null;
   let periodo: string | null = null;
-  let anoVendas = 2025;
+  let anoVendas = 2026;
   const rows: ParsedWinpharVendasItem[] = [];
 
   const PT_MONTHS: Record<string, number> = {
@@ -687,19 +758,43 @@ export async function parseWinpharVendasPdfFile(filePath: string): Promise<Parse
         let prevM: number | null = null;
         const detectedMonths: Array<{ isoKey: string; x: number; label: string }> = [];
 
-        for (const it of headerItems) {
-          const mNum = PT_MONTHS[it.str.toLowerCase()];
-          if (mNum) {
-            if (prevM !== null && mNum < prevM) {
-              curYear++;
+        const periodInfo = parseWinpharPeriodString(periodo);
+
+        if (periodInfo.isDaily && periodInfo.dataInicio) {
+          // Relatório de Venda Diária (apenas 1 dia): a coluna é o mês mas a data exata é o dia
+          for (const it of headerItems) {
+            const mNum = PT_MONTHS[it.str.toLowerCase()];
+            if (mNum) {
+              detectedMonths.push({
+                isoKey: periodInfo.dataInicio,
+                x: it.x,
+                label: `Dia ${periodInfo.dataInicio.slice(0, 10)}`,
+              });
+              break;
             }
-            prevM = mNum;
-            const mmStr = String(mNum).padStart(2, '0');
+          }
+          if (detectedMonths.length === 0) {
             detectedMonths.push({
-              isoKey: `${curYear}-${mmStr}-01T00:00:00.000Z`,
-              x: it.x,
-              label: `${it.str}/${curYear}`,
+              isoKey: periodInfo.dataInicio,
+              x: 326,
+              label: `Dia ${periodInfo.dataInicio.slice(0, 10)}`,
             });
+          }
+        } else {
+          for (const it of headerItems) {
+            const mNum = PT_MONTHS[it.str.toLowerCase()];
+            if (mNum) {
+              if (prevM !== null && mNum < prevM) {
+                curYear++;
+              }
+              prevM = mNum;
+              const mmStr = String(mNum).padStart(2, '0');
+              detectedMonths.push({
+                isoKey: `${curYear}-${mmStr}-01T00:00:00.000Z`,
+                x: it.x,
+                label: `${it.str}/${curYear}`,
+              });
+            }
           }
         }
 
@@ -799,6 +894,11 @@ export async function parseWinpharVendasPdfFile(filePath: string): Promise<Parse
         }
 
         const totalVendido = totalItem ? parseInt(totalItem.str, 10) || 0 : 0;
+        const periodInfo = parseWinpharPeriodString(periodo);
+
+        if (periodInfo.isDaily && periodInfo.dataInicio && Object.keys(vendasMensais).length === 0 && totalVendido > 0) {
+          vendasMensais[periodInfo.dataInicio] = totalVendido;
+        }
 
         rows.push({
           codigo: codeItem.str.padStart(7, '0'),
@@ -816,19 +916,26 @@ export async function parseWinpharVendasPdfFile(filePath: string): Promise<Parse
     },
   });
 
+  const periodParsed = parseWinpharPeriodString(periodo);
+
+  const cleanNome = typeof farmaciaNome === 'string' ? `Farmácia ${farmaciaNome.replace(/^Farmácia\s*/i, '')}` : 'Farmácia Demonstrativa';
   return {
-    farmaciaNome: farmaciaNome ? `Farmácia ${farmaciaNome.replace(/^Farmácia\s*/i, '')}` : 'Farmácia Avenida',
-    farmaciaNif: farmaciaNif || '518149412',
+    farmaciaNome: cleanNome,
+    farmaciaNif: (farmaciaNif as string) || '999999990',
     periodo,
-    anoVendas,
+    anoVendas: periodParsed.anoVendas || anoVendas,
+    isDaily: periodParsed.isDaily,
+    dataInicio: periodParsed.dataInicio,
+    dataFim: periodParsed.dataFim,
+    granularidade: periodParsed.granularidade,
     rows,
   };
 }
 
-export async function parseWinpharValidadesPdfFile(filePath: string): Promise<ParsedWinpharValidadesPdf> {
-  const dataBuffer = fs.readFileSync(filePath);
-  let farmaciaNome: string | null = null;
-  let farmaciaNif: string | null = null;
+export async function parseWinpharValidadesPdfFile(filePathOrBuffer: string | Buffer): Promise<ParsedWinpharValidadesPdf> {
+  const dataBuffer = Buffer.isBuffer(filePathOrBuffer) ? filePathOrBuffer : fs.readFileSync(filePathOrBuffer);
+  let farmaciaNome: any = null;
+  let farmaciaNif: any = null;
   const rows: ParsedWinpharValidadesItem[] = [];
 
   await pdf(dataBuffer, {
@@ -895,9 +1002,10 @@ export async function parseWinpharValidadesPdfFile(filePath: string): Promise<Pa
     },
   });
 
+  const cleanNomeVal = typeof farmaciaNome === 'string' ? `Farmácia ${farmaciaNome.replace(/^Farmácia\s*/i, '')}` : 'Farmácia Demonstrativa';
   return {
-    farmaciaNome: farmaciaNome ? `Farmácia ${farmaciaNome.replace(/^Farmácia\s*/i, '')}` : 'Farmácia Avenida',
-    farmaciaNif: farmaciaNif || '518149412',
+    farmaciaNome: cleanNomeVal,
+    farmaciaNif: (farmaciaNif as string) || '999999990',
     rows,
   };
 }

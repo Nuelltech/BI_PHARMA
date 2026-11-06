@@ -1,4 +1,12 @@
 import { PrismaClient, Prisma } from '@prisma/client';
+import crypto from 'crypto';
+
+function safeCompareStrings(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const hashA = crypto.createHash('sha256').update(a).digest();
+  const hashB = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
 
 export interface WeeklyTaskItem {
   id?: string;
@@ -186,18 +194,17 @@ function checkPinMatch(farm: any, cleanPin: string) {
   const farmCode = (farm.codigo_acesso || '').toUpperCase();
   // Extrair números do código da farmácia (ex: FARM-A-7842 -> 7842)
   const codeNumbers = farmCode.replace(/[^0-9]/g, '');
-  const last4 = codeNumbers.slice(-4);
+  const last4 = codeNumbers.length >= 4 ? codeNumbers.slice(-4) : '';
+  const configuredStaffPin = (process.env.STAFF_MOBILE_PIN || '').trim();
 
-  // Regras de validação do PIN mínimo de segurança:
-  // 1. PIN padrão rápido: 1234
-  // 2. Os últimos 4 dígitos do código da farmácia (ex: 7842 ou 9315)
-  // 3. O próprio código de acesso completo (ex: FARM-A-7842)
-  // 4. PIN mestre de segurança
+  // Regras de validação do PIN de segurança da equipa:
+  // 1. PIN configurado em STAFF_MOBILE_PIN (se existir)
+  // 2. Os últimos 4 dígitos do código da farmácia (se existirem e tiverem pelo menos 4 dígitos)
+  // 3. O próprio código de acesso completo da farmácia (ex: FARM-A-7842)
   const isMatch =
-    cleanPin === '1234' ||
-    cleanPin === last4 ||
-    cleanPin.toUpperCase() === farmCode ||
-    cleanPin === (process.env.STAFF_MOBILE_PIN || '1234');
+    (configuredStaffPin.length > 0 && safeCompareStrings(cleanPin, configuredStaffPin)) ||
+    (last4.length >= 4 && safeCompareStrings(cleanPin, last4)) ||
+    (farmCode.length > 0 && safeCompareStrings(cleanPin.toUpperCase(), farmCode));
 
   if (isMatch) {
     return {
@@ -212,6 +219,6 @@ function checkPinMatch(farm: any, cleanPin: string) {
 
   return {
     valid: false,
-    error: 'PIN incorreto. (PIN padrão: 1234 ou os 4 dígitos do código da farmácia).',
+    error: 'PIN incorreto. Utilize o PIN atribuído à farmácia ou os 4 dígitos do seu código de acesso.',
   };
 }

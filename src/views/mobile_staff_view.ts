@@ -6,6 +6,7 @@ export function getMobileStaffHtml(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#0f172a" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>BI Pharma — Modo Equipa (Mobile)</title>
   <style>
@@ -1126,7 +1127,7 @@ export function getMobileStaffHtml(): string {
         
         const sel = document.getElementById('pinFarmSelect');
         sel.innerHTML = allFarmacias
-          .map(f => \`<option value="\${f.id}">\${f.nome} (\${f.codigo_acesso || f.nif})</option>\`)
+          .map(f => \`<option value="\${escapeHtml(f.id)}">\${escapeHtml(f.nome)} (\${escapeHtml(f.codigo_acesso || f.nif)})</option>\`)
           .join('');
 
         const urlParams = new URLSearchParams(window.location.search);
@@ -1287,14 +1288,41 @@ export function getMobileStaffHtml(): string {
     }
 
     // ========================================================================
+    // AUTENTICAÇÃO E COMUNICAÇÃO PROTEGIDA COM A API
+    // ========================================================================
+    function getMobileAccessCode() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const fromUrl = (urlParams.get('acesso') || urlParams.get('code') || urlParams.get('accessCode') || '').trim();
+      if (fromUrl) return fromUrl;
+      if (currentFarmacia && currentFarmacia.codigo_acesso) return currentFarmacia.codigo_acesso;
+      try {
+        const saved = JSON.parse(localStorage.getItem('bi_pharma_mobile_session') || '{}');
+        if (saved && saved.farmacia && saved.farmacia.codigo_acesso) return saved.farmacia.codigo_acesso;
+      } catch {}
+      return '';
+    }
+
+    function fetchMobileAuth(url, options) {
+      options = options || {};
+      const code = getMobileAccessCode();
+      const headers = Object.assign({}, options.headers || {});
+      if (code) {
+        headers['x-access-code'] = code;
+      }
+      const separator = url.includes('?') ? '&' : '?';
+      const finalUrl = code ? (url + separator + 'acesso=' + encodeURIComponent(code)) : url;
+      return fetch(finalUrl, Object.assign({}, options, { headers }));
+    }
+
+    // ========================================================================
     // CARREGAMENTO E SINCRONIZAÇÃO EM DIRETO (SUPABASE)
     // ========================================================================
     async function loadMobileData() {
       if (!currentFarmacia) return;
       try {
         const [repRes, tasksRes] = await Promise.all([
-          fetch('/api/analysis?farmaciaId=' + currentFarmacia.id),
-          fetch('/api/weekly-tasks?farmaciaId=' + currentFarmacia.id),
+          fetchMobileAuth('/api/analysis?farmaciaId=' + currentFarmacia.id),
+          fetchMobileAuth('/api/weekly-tasks?farmaciaId=' + currentFarmacia.id),
         ]);
 
         rawReport = await repRes.json();
@@ -1316,7 +1344,7 @@ export function getMobileStaffHtml(): string {
       syncInterval = setInterval(async () => {
         if (!currentFarmacia) return;
         try {
-          const res = await fetch('/api/weekly-tasks?farmaciaId=' + currentFarmacia.id);
+          const res = await fetchMobileAuth('/api/weekly-tasks?farmaciaId=' + currentFarmacia.id);
           const tData = await res.json();
           tasksMap = tData.tasksMap || {};
           renderSection1(true);
@@ -1431,19 +1459,19 @@ export function getMobileStaffHtml(): string {
               \${isDone ? '✓' : ''}
             </div>
             <div class="task-body">
-              <div class="task-title">\${it.designacao}</div>
+              <div class="task-title">\${escapeHtml(it.designacao)}</div>
               <div class="task-tags">
-                <span class="tag tag-danger">📅 Val: \${it.data_validade || 'Curto Prazo'}</span>
+                <span class="tag tag-danger">📅 Val: \${escapeHtml(it.data_validade || 'Curto Prazo')}</span>
                 <span class="tag tag-danger">📦 \${qtd} un (\${Number(valRisco).toFixed(2)} €)</span>
-                \${it.prateleira ? \`<span class="tag tag-shelf">📍 \${it.prateleira}</span>\` : ''}
-                <span class="tag tag-cnp">CNP: \${it.cnp_codigo}</span>
+                \${it.prateleira ? \`<span class="tag tag-shelf">📍 \${escapeHtml(it.prateleira)}</span>\` : ''}
+                <span class="tag tag-cnp">CNP: \${escapeHtml(it.cnp_codigo)}</span>
               </div>
               <div class="task-instruction">
                 ⚠️ <b>Ação Gaveta / Balcão:</b> Separar fisicamente da prateleira ou colocar em destaque imediato de balcão.
               </div>
               \${isDone ? \`
                 <div class="task-completion-stamp">
-                  ✓ Concluído por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                  ✓ Concluído por \${escapeHtml(tInfo?.concluido_por || 'Equipa')} · \${formatTime(tInfo?.concluido_em)}
                 </div>
               \` : ''}
             </div>
@@ -1515,7 +1543,7 @@ export function getMobileStaffHtml(): string {
 
             const restosRows = restos.map(r => \`
               <div class="resto-row">
-                <span class="resto-name">• \${r.designacao} (<code>\${r.cnp_codigo}</code>)</span>
+                <span class="resto-name">• \${escapeHtml(r.designacao)} (<code>\${escapeHtml(r.cnp_codigo)}</code>)</span>
                 <span class="resto-qtd">\${r.stock_atual} un</span>
               </div>
             \`).join('');
@@ -1526,7 +1554,7 @@ export function getMobileStaffHtml(): string {
                   \${isDone ? '✓' : ''}
                 </div>
                 <div class="task-body">
-                  <div class="task-title">\${name}</div>
+                  <div class="task-title">\${escapeHtml(name)}</div>
                   <div class="task-tags">
                     <span class="tag tag-purple">💊 \${restos.length} marcas a esgotar</span>
                   </div>
@@ -1538,7 +1566,7 @@ export function getMobileStaffHtml(): string {
                   </div>
                   \${isDone ? \`
                     <div class="task-completion-stamp">
-                      ✓ Concluído por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                      ✓ Concluído por \${escapeHtml(tInfo?.concluido_por || 'Equipa')} · \${formatTime(tInfo?.concluido_em)}
                     </div>
                   \` : ''}
                 </div>
@@ -1576,17 +1604,17 @@ export function getMobileStaffHtml(): string {
                   \${isDone ? '✓' : ''}
                 </div>
                 <div class="task-body">
-                  <div class="task-title">\${s.designacao}</div>
+                  <div class="task-title">\${escapeHtml(s.designacao)}</div>
                   <div class="task-tags">
                     <span class="tag" style="background: rgba(56, 189, 248, 0.2); color: #bae6fd;">❄️ Inverno: \${s.stock_atual} un em stock</span>
-                    <span class="tag tag-cnp">CNP: \${s.cnp_codigo}</span>
+                    <span class="tag tag-cnp">CNP: \${escapeHtml(s.cnp_codigo)}</span>
                   </div>
                   <div class="task-instruction">
                     🌟 <b>Ação Balcão:</b> Colocar no linear de topo ou sugerir ativamente em queixas respiratórias/gripais.
                   </div>
                   \${isDone ? \`
                     <div class="task-completion-stamp">
-                      ✓ Concluído por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                      ✓ Concluído por \${escapeHtml(tInfo?.concluido_por || 'Equipa')} · \${formatTime(tInfo?.concluido_em)}
                     </div>
                   \` : ''}
                 </div>
@@ -1649,18 +1677,18 @@ export function getMobileStaffHtml(): string {
               \${isDone ? '✓' : ''}
             </div>
             <div class="task-body">
-              <div class="task-title">\${it.designacao}</div>
+              <div class="task-title">\${escapeHtml(it.designacao)}</div>
               <div class="task-tags">
                 <span class="tag tag-warning">💰 \${stockVal.toFixed(2)} € em stock</span>
                 <span class="tag tag-warning">📦 \${it.stock_atual} un (\${Number(it.meses_cobertura || 0).toFixed(1)} meses)</span>
-                <span class="tag tag-cnp">CNP: \${it.cnp_codigo}</span>
+                <span class="tag tag-cnp">CNP: \${escapeHtml(it.cnp_codigo)}</span>
               </div>
               <div class="task-instruction">
                 🛑 <b>Ação no Sifarma:</b> Alterar <b>Ponto de Encomenda / Stock Mínimo = 0</b> para travar novas compras.
               </div>
               \${isDone ? \`
                 <div class="task-completion-stamp">
-                  ✓ Travado por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                  ✓ Travado por \${escapeHtml(tInfo?.concluido_por || 'Equipa')} · \${formatTime(tInfo?.concluido_em)}
                 </div>
               \` : ''}
             </div>
@@ -1715,19 +1743,19 @@ export function getMobileStaffHtml(): string {
               \${isDone ? '✓' : ''}
             </div>
             <div class="task-body">
-              <div class="task-title">\${it.designacao}</div>
+              <div class="task-title">\${escapeHtml(it.designacao)}</div>
               <div class="task-tags">
-                <span class="tag tag-danger">🚨 Cobertura: apenas \${diasTxt}</span>
+                <span class="tag tag-danger">🚨 Cobertura: apenas \${escapeHtml(diasTxt)}</span>
                 <span class="tag tag-success">📦 Encomendar: \${sugestaoEnc} un</span>
                 <span class="tag" style="background:#0f172a; color:#94a3b8; border:1px solid #334155;">Stock: \${it.stock_atual} · VMM: \${it.vmm}/mês</span>
-                <span class="tag tag-cnp">CNP: \${it.cnp_codigo}</span>
+                <span class="tag tag-cnp">CNP: \${escapeHtml(it.cnp_codigo)}</span>
               </div>
               <div class="task-instruction">
                 🟢 <b>Ajustar no Sifarma:</b> Subir Ponto de Encomenda para <b>\${sugestaoEnc} un</b> ou gerar encomenda imediata ao fornecedor habitual.
               </div>
               \${isDone ? \`
                 <div class="task-completion-stamp">
-                  ✓ Encomendado/Ajustado por \${tInfo?.concluido_por || 'Equipa'} · \${formatTime(tInfo?.concluido_em)}
+                  ✓ Encomendado/Ajustado por \${escapeHtml(tInfo?.concluido_por || 'Equipa')} · \${formatTime(tInfo?.concluido_em)}
                 </div>
               \` : ''}
             </div>
@@ -1765,7 +1793,7 @@ export function getMobileStaffHtml(): string {
       updateOverallProgress();
 
       try {
-        await fetch('/api/weekly-tasks/toggle', {
+        await fetchMobileAuth('/api/weekly-tasks/toggle', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1834,7 +1862,13 @@ export function getMobileStaffHtml(): string {
     }
 
     function escapeHtml(str) {
-      return (str || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      if (str == null) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
 
     function formatTime(isoStr) {

@@ -20,8 +20,10 @@ model Farmacia {
   stagingInventario  StagingInventario[]
   stagingVendas      StagingVendas[]
   stagingValidades   StagingValidades[]
+  inventariosSnapshot InventarioSnapshot[]
   precos             PrecoFarmacia[]
   tarefasEquipa      TarefaEquipa[]
+  campanhasAtivas    CampanhaAtiva[]
   criadoEm           DateTime            @default(now())
 }
 
@@ -42,6 +44,7 @@ model ProdutoMestre {
   margem_padrao           Decimal?            @db.Decimal(10, 2)
   taxa_iva                Int?
   inventarios             Inventario[]
+  inventariosSnapshot     InventarioSnapshot[]
   vendas                  Venda[]
 }
 
@@ -144,14 +147,35 @@ model Venda {
   quantidade       Int
   valor_total      Decimal       @db.Decimal(10, 2)
   data_venda       DateTime
+  granularidade    String        @default("MENSAL") // "MENSAL" | "DIARIO"
   
   farmacia         Farmacia      @relation(fields: [farmaciaId], references: [id])
   produto          ProdutoMestre @relation(fields: [cnp_codigo], references: [cnp_codigo])
 
-  @@unique([farmaciaId, cnp_codigo, data_venda])
+  @@unique([farmaciaId, cnp_codigo, data_venda, granularidade])
   @@index([farmaciaId])
   @@index([cnp_codigo])
   @@index([data_venda])
+  @@index([farmaciaId, granularidade, data_venda])
+}
+
+// Histórico de existências de stock por ponto no tempo (Snapshots de fecho ou extração)
+model InventarioSnapshot {
+  id               String        @id @default(uuid())
+  farmaciaId       String
+  cnp_codigo       String
+  data_snapshot    DateTime
+  quantidade       Int
+  custo_unitario   Decimal       @db.Decimal(10, 2)
+  valor_total      Decimal       @db.Decimal(10, 2)
+  data_extracao    DateTime      @default(now())
+  
+  farmacia         Farmacia      @relation(fields: [farmaciaId], references: [id])
+  produto          ProdutoMestre @relation(fields: [cnp_codigo], references: [cnp_codigo])
+
+  @@unique([farmaciaId, cnp_codigo, data_snapshot])
+  @@index([farmaciaId, data_snapshot])
+  @@index([cnp_codigo])
 }
 
 // Preço de venda (PVP) e margem (MG%) praticados por CADA farmácia.
@@ -170,7 +194,7 @@ model PrecoFarmacia {
   @@index([farmaciaId])
 }
 
-// Tarefas Semanais da Equipa (Validades na Gaveta, Restos ao Balcão, Travar Compras)
+// Tarefas Semanais da Equipa (Validades na Gaveta, Restos ao Balcão, Travar Compras, Missões de Campanhas)
 model TarefaEquipa {
   id             String    @id @default(uuid())
   farmaciaId     String
@@ -183,12 +207,35 @@ model TarefaEquipa {
   concluido_por  String?
   concluido_em   DateTime  @default(now())
   valor_impacto  Decimal?  @db.Decimal(10, 2)
+  campanha_id    String?   // Ligação opcional à CampanhaAtiva (ex: "inverno_barreira_cutanea")
 
   farmacia       Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
 
   @@unique([farmaciaId, week_key, task_id])
   @@index([farmaciaId, week_key])
   @@index([concluido])
+  @@index([campanha_id])
+}
+
+// Campanhas Ativas na Farmácia (Escolha do Diretor / Copilot para Execução pela Equipa)
+model CampanhaAtiva {
+  id                    String    @id @default(uuid())
+  farmaciaId            String
+  campanhaId            String    // ex: "inverno_barreira_cutanea", "liquidacao_destrava_monos"
+  titulo                String
+  icone                 String    @default("🎯")
+  dataInicio            DateTime  @default(now())
+  dataFim               DateTime?
+  estado                String    @default("ATIVA") // "ATIVA" | "CONCLUIDA" | "CANCELADA"
+  descontoAplicadoPct   Int       @default(15)
+  produtosJson          Json      // Lista de CNPs, designações, PVPs normais, PVPs promo e stocks aprovados
+  criadoPor             String    @default("Diretor")
+  criadoEm              DateTime  @default(now())
+  atualizadoEm          DateTime  @updatedAt
+
+  farmacia              Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+
+  @@index([farmaciaId, estado])
 }
 
 // ============================================================================

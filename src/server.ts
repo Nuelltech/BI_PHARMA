@@ -26,6 +26,10 @@ import {
   ingestVendasCsv,
 } from './services/ingestion';
 import {
+  inspectFilesForInteractiveImport,
+  executeInteractiveImport,
+} from './services/interactive_import';
+import {
   transformStagingInventario,
   transformStagingValidades,
   transformStagingVendas,
@@ -39,25 +43,164 @@ import {
   buildCustomCampaign,
   analyzeProductMarketingAndCrossSell360,
   searchProductsForMarketingPicker,
+  getSmartCampaignBaskets,
   ANNUAL_CAMPAIGNS,
   CampaignProductItem,
   generateClinicalThemePacks,
   ClinicalThemePack,
 } from './services/campaigns';
+import {
+  getActiveCampaigns,
+  activateCampaign,
+  deactivateCampaign,
+} from './services/active_campaigns';
 
 const customWeeklyTasksStore = new Map<string, any[]>();
 const customPacksStore = new Map<string, any[]>();
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || 'Nuelltech#2026').trim();
-const ADMIN_SESSION_TOKEN =
-  'ADM_' +
-  crypto
-    .createHmac('sha256', ADMIN_PASSWORD)
-    .update('BI_PHARMA_ADMIN_SESSION_V1')
-    .digest('hex')
-    .slice(0, 32)
-    .toUpperCase();
+const IS_PROD = process.env.NODE_ENV === 'production';
+const ALLOW_DEV_FALLBACK = (process.env.ALLOW_DEV_FALLBACK || '').trim().toLowerCase() === 'true';
+const ADMIN_PASSWORD = (process.env.ADMIN_PASSWORD || (IS_PROD ? '' : 'Nuelltech#DevLocal2026')).trim();
+
+if (!ADMIN_PASSWORD && IS_PROD) {
+  console.warn('⚠️ [AVISO DE SEGURANÇA CRÍTICO]: ADMIN_PASSWORD não configurada em ambiente de produção!');
+}
+
+// ============================================================================
+// COMPARAÇÃO EM TEMPO CONSTANTE & GESTÃO DE SESSÕES EFÉMERAS DE ADMIN
+// ============================================================================
+function safeCompareStrings(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const hashA = crypto.createHash('sha256').update(a).digest();
+  const hashB = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+interface AdminSession {
+  token: string;
+  createdAt: number;
+  expiresAt: number;
+}
+const activeAdminSessions = new Map<string, AdminSession>();
+const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 horas de validade
+const MAX_ACTIVE_SESSIONS = 1000;
+
+function createAdminSession(): string {
+  const now = Date.now();
+  if (activeAdminSessions.size >= MAX_ACTIVE_SESSIONS) {
+    for (const [k, s] of activeAdminSessions.entries()) {
+      if (now > s.expiresAt) activeAdminSessions.delete(k);
+    }
+    if (activeAdminSessions.size >= MAX_ACTIVE_SESSIONS) {
+      const oldestKey = activeAdminSessions.keys().next().value;
+      if (oldestKey) activeAdminSessions.delete(oldestKey);
+    }
+  }
+  const token = 'ADM_' + crypto.randomBytes(24).toString('hex').toUpperCase();
+  activeAdminSessions.set(token, {
+    token,
+    createdAt: now,
+    expiresAt: now + ADMIN_SESSION_TTL_MS,
+  });
+  return token;
+}
+
+function isValidAdminSession(token: string): boolean {
+  if (!token || typeof token !== 'string') return false;
+  const cleanToken = token.trim().toUpperCase();
+  const session = activeAdminSessions.get(cleanToken);
+  if (!session) return false;
+  if (Date.now() > session.expiresAt) {
+    activeAdminSessions.delete(cleanToken);
+    return false;
+  }
+  return true;
+}
+
+function invalidateAdminSession(token: string): void {
+  if (token) activeAdminSessions.delete(token.trim().toUpperCase());
+}
+
+// ============================================================================
+// RATE LIMITING EM MEMÓRIA CONTRA ATAQUES DE FORÇA BRUTA (ANTI-SPOOFING & CAP)
+// ============================================================================
+const failedAttemptsMap = new Map<string, { count: number; resetAt: number }>();
+const MAX_RATE_LIMIT_ENTRIES = 5000;
+
+function getClientIp(req: http.IncomingMessage): string {
+  const socketIp = req.socket.remoteAddress || '127.0.0.1';
+  // Apenas confia em X-Forwarded-For em produção (atrás de reverse proxy Render/Cloudflare), usando o último IP adicionado pelo proxy
+  if (IS_PROD) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string' && forwarded.trim().length > 0) {
+      const parts = forwarded.split(',').map((p) => p.trim()).filter(Boolean);
+      if (parts.length > 0) {
+        return parts[parts.length - 1];
+      }
+    }
+  }
+  return socketIp;
+}
+
+function isRateLimited(ip: string, maxAttempts = 10, windowMs = 5 * 60 * 1000): boolean {
+  const now = Date.now();
+  const record = failedAttemptsMap.get(ip);
+  if (!record) return false;
+  if (now > record.resetAt) {
+    failedAttemptsMap.delete(ip);
+    return false;
+  }
+  return record.count >= maxAttempts;
+}
+
+function recordFailedAttempt(ip: string, windowMs = 5 * 60 * 1000): void {
+  const now = Date.now();
+  if (failedAttemptsMap.size >= MAX_RATE_LIMIT_ENTRIES) {
+    for (const [k, v] of failedAttemptsMap.entries()) {
+      if (now > v.resetAt) failedAttemptsMap.delete(k);
+    }
+    if (failedAttemptsMap.size >= MAX_RATE_LIMIT_ENTRIES) {
+      const oldest = failedAttemptsMap.keys().next().value;
+      if (oldest) failedAttemptsMap.delete(oldest);
+    }
+  }
+  const record = failedAttemptsMap.get(ip);
+  if (!record || now > record.resetAt) {
+    failedAttemptsMap.set(ip, { count: 1, resetAt: now + windowMs });
+  } else {
+    record.count++;
+  }
+}
+
+function resetFailedAttempts(ip: string): void {
+  failedAttemptsMap.delete(ip);
+}
+
+// ============================================================================
+// LEITURA SEGURA DE REQUISIÇÕES (ANTI-DOS / PAYLOAD LIMIT)
+// ============================================================================
+function readRequestBody(req: http.IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        req.destroy();
+        const err: any = new Error(`PayloadTooLarge: Limite de ${(maxBytes / (1024 * 1024)).toFixed(1)} MB excedido.`);
+        err.statusCode = 413;
+        reject(err);
+      } else {
+        chunks.push(chunk);
+      }
+    });
+    req.on('end', () => {
+      resolve(Buffer.concat(chunks).toString('utf-8'));
+    });
+    req.on('error', (err) => reject(err));
+  });
+}
 
 // ============================================================================
 // CACHE EM MEMÓRIA DO SERVIDOR + DEDUPLICAÇÃO DE PEDIDOS + PRÉ-AQUECIMENTO
@@ -212,19 +355,22 @@ function maskNif(rawNif: string): string {
   return clean;
 }
 
-const DEFAULT_SECURE_CODES: Record<string, string> = {
-  A: 'FARM-A-7842',
-  B: 'FARM-B-9315',
-  C: 'FARM-C-4629',
-  D: 'FARM-D-8154',
-};
+const importProgressStore = new Map<string, { status: string; percent: number; step: string; detail: string; error?: string }>();
+
+const LEGACY_PREDICTABLE_CODES = new Set([
+  'FARM-A-7842',
+  'FARM-B-9315',
+  'FARM-C-4629',
+  'FARM-D-8154',
+]);
 
 async function ensureAnonymizedTenantsAndAccessCodes(prisma: any) {
   const farms = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
   for (let idx = 0; idx < farms.length; idx++) {
     const f = farms[idx];
     const letter = String.fromCharCode(65 + idx); // A, B, C...
-    const secureDefault = DEFAULT_SECURE_CODES[letter] || `FARM-${letter}-${1000 + idx * 1337}`;
+    const randomPin = crypto.randomInt(100000, 999999);
+    const secureRandomCode = `FARM-${letter}-${randomPin}`;
     const lowerNome = (f.nome || '').toLowerCase();
 
     let newNome = f.nome;
@@ -234,9 +380,12 @@ async function ensureAnonymizedTenantsAndAccessCodes(prisma: any) {
     }
 
     const currentCode = (f.codigo_acesso || '').trim().toUpperCase();
-    // Atualiza códigos previsíveis antigos (FARMACIA-A, FARMACIA-B) para códigos com PIN impossível de adivinhar
-    const isPredictableOldCode = !currentCode || /^FARMACIA-[A-Z]$/.test(currentCode);
-    const newCode = isPredictableOldCode ? secureDefault : currentCode;
+    // Atualiza códigos previsíveis antigos ou códigos públicos do repositório para códigos criptograficamente aleatórios
+    const isPredictableOldCode =
+      !currentCode ||
+      /^FARMACIA-[A-Z]$/.test(currentCode) ||
+      LEGACY_PREDICTABLE_CODES.has(currentCode);
+    const newCode = isPredictableOldCode ? secureRandomCode : currentCode;
 
     if (newNome !== f.nome || newCode !== f.codigo_acesso) {
       await prisma.farmacia.update({
@@ -250,8 +399,10 @@ async function ensureAnonymizedTenantsAndAccessCodes(prisma: any) {
   console.log('\n🔐 [ACESSOS MULTI-TENANT ISOLADOS & ADMIN PROTEGIDO POR PASSWORD]:');
   console.log(`   👑 Acesso Admin (Requer Password): http://localhost:${PORT}/?admin=1 (Password configurada em ADMIN_PASSWORD)`);
   for (const uf of updated) {
+    const rawCode = uf.codigo_acesso || '';
+    const displayCode = IS_PROD && rawCode.length > 4 ? `${rawCode.slice(0, 6)}****` : rawCode;
     console.log(
-      `   🏥 ${uf.nome.padEnd(22)} | NIF: ${maskNif(uf.nif).padEnd(11)} | Código Exclusivo: ${(uf.codigo_acesso || '').padEnd(12)} | Link Cliente: http://localhost:${PORT}/?acesso=${uf.codigo_acesso}`
+      `   🏥 ${uf.nome.padEnd(22)} | NIF: ${maskNif(uf.nif).padEnd(11)} | Código Exclusivo: ${displayCode.padEnd(14)}`
     );
   }
   console.log('');
@@ -275,9 +426,16 @@ async function startServer() {
       const parsedUrl = url.parse(req.url || '/', true);
       const pathname = parsedUrl.pathname || '/';
 
-      res.setHeader('Access-Control-Allow-Origin', '*');
+      const allowedOrigin = process.env.ALLOWED_ORIGIN || (IS_PROD ? '' : '*');
+      if (allowedOrigin) {
+        res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+      }
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-access-code');
+      // Cabeçalhos Defensivos de Segurança Web
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+      res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
 
       if (req.method === 'OPTIONS') {
         res.writeHead(204);
@@ -287,17 +445,33 @@ async function startServer() {
 
       async function resolveAccessContext(explicitCode?: string | null) {
         const headerToken = String(req.headers['x-access-code'] || '').trim();
-        // O Modo Admin SÓ é aceite através do Token Assinado (gerado após validar a Password de Admin), NUNCA por query string no URL!
-        if (
-          headerToken.toUpperCase() === ADMIN_SESSION_TOKEN ||
-          (explicitCode && explicitCode.trim().toUpperCase() === ADMIN_SESSION_TOKEN)
-        ) {
+        const candidateToken = headerToken || (explicitCode ? explicitCode.trim() : '');
+
+        // O Modo Admin SÓ é aceite através do Token Efémero Assinado e Ativo
+        if (candidateToken && isValidAdminSession(candidateToken)) {
           return {
             authenticated: true,
             role: 'ADMIN' as const,
-            code: ADMIN_SESSION_TOKEN,
+            code: candidateToken.toUpperCase(),
             lockedFarmacia: null,
           };
+        }
+
+        // 1. Extrair token de Cookie, Referer ou Query Params
+        let cookieCode = '';
+        if (req.headers.cookie) {
+          const m = req.headers.cookie.match(/(?:^|;\s*)(?:farmacia_access_code|bi_access_code|acesso)=([^;]+)/i);
+          if (m) {
+            try { cookieCode = decodeURIComponent(m[1].trim()); } catch { cookieCode = m[1].trim(); }
+          }
+        }
+
+        let refererCode = '';
+        if (req.headers.referer) {
+          try {
+            const refUrl = new URL(req.headers.referer, 'http://localhost:3000');
+            refererCode = String(refUrl.searchParams.get('acesso') || refUrl.searchParams.get('code') || refUrl.searchParams.get('accessCode') || '').trim();
+          } catch {}
         }
 
         const rawCode = String(
@@ -305,6 +479,8 @@ async function startServer() {
             headerToken ||
             parsedUrl.query.accessCode ||
             parsedUrl.query.acesso ||
+            cookieCode ||
+            refererCode ||
             ''
         )
           .trim()
@@ -335,16 +511,20 @@ async function startServer() {
           };
         }
 
-        // Em localhost / desenvolvimento, autentica automaticamente a primeira farmacia se nao houver codigo
-        const defaultFarm = await prisma.farmacia.findFirst({ orderBy: { criadoEm: 'asc' } });
-        if (defaultFarm) {
-          return {
-            authenticated: true,
-            role: 'PHARMACY' as const,
-            code: 'DEV_DEFAULT',
-            lockedFarmacia: defaultFarm,
-          };
+        // Em desenvolvimento local (localhost), APENAS ativa o fallback se expressamente configurado em ALLOW_DEV_FALLBACK
+        // Em Produção ou sem flag explícita, NUNCA autentica anonimamente!
+        if (!IS_PROD && ALLOW_DEV_FALLBACK) {
+          const defaultFarm = await prisma.farmacia.findFirst({ orderBy: { criadoEm: 'asc' } });
+          if (defaultFarm) {
+            return {
+              authenticated: true,
+              role: 'PHARMACY' as const,
+              code: defaultFarm.codigo_acesso || 'DEV_DEFAULT',
+              lockedFarmacia: defaultFarm,
+            };
+          }
         }
+
         return {
           authenticated: false,
           role: 'NONE' as const,
@@ -355,271 +535,506 @@ async function startServer() {
 
       async function getActiveFarmacia(requestedId?: string | null) {
         const ctx = await resolveAccessContext();
-        // Se for um acesso isolado de farmácia, bloqueia estritamente a essa farmácia!
-        if (ctx.role === 'PHARMACY' && ctx.code !== 'DEV_DEFAULT' && ctx.lockedFarmacia) {
+        // Se for um acesso isolado de farmácia, tranca ESTRITAMENTE a essa farmácia (Defesa contra IDOR/BOLA)
+        if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
           return ctx.lockedFarmacia;
         }
-        // Apenas o ADMIN autenticado pode pedir uma farmácia específica ou listar
-        if (requestedId && requestedId.trim().length > 0) {
-          const f = await prisma.farmacia.findUnique({ where: { id: requestedId.trim() } });
-          if (f) return f;
-        }
-        return (
-          (await prisma.farmacia.findFirst({ orderBy: { criadoEm: 'asc' } })) || {
-            id: '',
-            nome: 'Farmácia A',
-            nif: '000000000',
-            codigo_acesso: 'FARM-A-7842',
+        // Apenas o ADMIN autenticado pode pedir uma farmácia específica ou alternar
+        if (ctx.role === 'ADMIN') {
+          if (requestedId && requestedId.trim().length > 0) {
+            const f = await prisma.farmacia.findUnique({ where: { id: requestedId.trim() } });
+            if (f) return f;
           }
-        );
+          return await prisma.farmacia.findFirst({ orderBy: { criadoEm: 'asc' } });
+        }
+        return null;
+      }
+
+      async function requireActiveFarmacia(requestedId?: string | null) {
+        const f = await getActiveFarmacia(requestedId);
+        if (!f) {
+          const err: any = new Error('Acesso não autorizado. Indique o código de acesso exclusivo ou inicie sessão como administrador.');
+          err.statusCode = 401;
+          throw err;
+        }
+        return f;
       }
 
       // 0A. Endpoint de Autenticação / Validação (Código Exclusivo de Farmácia vs Password de Administrador)
       if (pathname === '/api/auth/verify' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const parsed = JSON.parse(body || '{}');
-            const adminPasswordInput = String(parsed.adminPassword || '').trim();
-            const rawCodeInput = String(parsed.code || '').trim();
+        try {
+          const clientIp = getClientIp(req);
+          if (isRateLimited(clientIp)) {
+            res.writeHead(429, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(
+              JSON.stringify({
+                ok: false,
+                error: 'Demasiadas tentativas falhadas. Por favor, aguarde 5 minutos antes de tentar novamente.',
+              })
+            );
+            return;
+          }
 
-            let ctx;
-            if (adminPasswordInput.length > 0) {
-              if (adminPasswordInput === ADMIN_PASSWORD) {
-                ctx = {
-                  authenticated: true,
-                  role: 'ADMIN' as const,
-                  code: ADMIN_SESSION_TOKEN,
-                  lockedFarmacia: null,
-                };
-              } else {
-                res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(
-                  JSON.stringify({
-                    ok: false,
-                    error: 'Password de Administrador incorreta.',
-                  })
-                );
-                return;
-              }
-            } else if (rawCodeInput === ADMIN_PASSWORD) {
+          const rawBody = await readRequestBody(req, 256 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const adminPasswordInput = String(parsed.adminPassword || '').trim();
+          const rawCodeInput = String(parsed.code || '').trim();
+
+          let ctx: { authenticated: boolean; role: 'ADMIN' | 'PHARMACY' | 'NONE'; code: string; lockedFarmacia: any | null };
+
+          if (adminPasswordInput.length > 0) {
+            if (ADMIN_PASSWORD.length >= 6 && safeCompareStrings(adminPasswordInput, ADMIN_PASSWORD)) {
+              resetFailedAttempts(clientIp);
+              const sessionToken = createAdminSession();
               ctx = {
                 authenticated: true,
-                role: 'ADMIN' as const,
-                code: ADMIN_SESSION_TOKEN,
+                role: 'ADMIN',
+                code: sessionToken,
                 lockedFarmacia: null,
               };
             } else {
-              ctx = await resolveAccessContext(rawCodeInput);
-            }
-
-            if (!ctx.authenticated) {
+              recordFailedAttempt(clientIp);
               res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
               res.end(
                 JSON.stringify({
                   ok: false,
-                  error: 'Código de acesso inválido. Utilize o link ou código exclusivo atribuído à sua Farmácia.',
+                  error: 'Password de Administrador incorreta.',
                 })
               );
               return;
             }
-            const allFarms =
-              ctx.role === 'ADMIN'
-                ? await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } })
-                : ctx.lockedFarmacia
-                  ? [ctx.lockedFarmacia]
-                  : [];
+          } else if (ADMIN_PASSWORD.length >= 6 && safeCompareStrings(rawCodeInput, ADMIN_PASSWORD)) {
+            resetFailedAttempts(clientIp);
+            const sessionToken = createAdminSession();
+            ctx = {
+              authenticated: true,
+              role: 'ADMIN',
+              code: sessionToken,
+              lockedFarmacia: null,
+            };
+          } else {
+            ctx = await resolveAccessContext(rawCodeInput);
+          }
 
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          if (!ctx.authenticated) {
+            recordFailedAttempt(clientIp);
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(
               JSON.stringify({
-                ok: true,
-                role: ctx.role,
-                code: ctx.code,
-                lockedFarmacia: ctx.lockedFarmacia
-                  ? {
-                      id: ctx.lockedFarmacia.id,
-                      nome: ctx.lockedFarmacia.nome,
-                      nif: maskNif(ctx.lockedFarmacia.nif),
-                    }
-                  : null,
-                pharmacies: allFarms.map((f) => ({
-                  id: f.id,
-                  nome: f.nome,
-                  nif: maskNif(f.nif),
-                  codigo_acesso: f.codigo_acesso || f.id,
-                })),
+                ok: false,
+                error: 'Código de acesso inválido. Utilize o link ou código exclusivo atribuído à sua Farmácia.',
               })
             );
-          } catch (e: any) {
-            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
+            return;
           }
-        });
+
+          resetFailedAttempts(clientIp);
+
+          const allFarms =
+            ctx.role === 'ADMIN'
+              ? await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } })
+              : ctx.lockedFarmacia
+                ? [ctx.lockedFarmacia]
+                : [];
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              role: ctx.role,
+              code: ctx.code,
+              lockedFarmacia: ctx.lockedFarmacia
+                ? {
+                    id: ctx.lockedFarmacia.id,
+                    nome: ctx.lockedFarmacia.nome,
+                    nif: maskNif(ctx.lockedFarmacia.nif),
+                  }
+                : null,
+              pharmacies: allFarms.map((f) => ({
+                id: f.id,
+                nome: f.nome,
+                nif: maskNif(f.nif),
+                codigo_acesso: ctx.role === 'ADMIN' ? (f.codigo_acesso || f.id) : undefined,
+              })),
+            })
+          );
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 0A.2. Endpoint de Logout Seguro (Revogação Ativa de Sessão Admin no Servidor)
+      if (pathname === '/api/auth/logout' && req.method === 'POST') {
+        try {
+          const headerToken = String(req.headers['x-access-code'] || '').trim();
+          if (headerToken) {
+            invalidateAdminSession(headerToken);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
       // 0B. Endpoint Admin: Atualizar Nome Anónimo e Código de Acesso de uma Farmácia
       if (pathname === '/api/admin/update-pharmacy' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const ctx = await resolveAccessContext();
-            if (ctx.role !== 'ADMIN') {
-              res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-              res.end(JSON.stringify({ ok: false, error: 'Apenas o Administrador pode gerir farmácias.' }));
-              return;
-            }
-            const { farmaciaId, nome, codigo_acesso } = JSON.parse(body || '{}');
-            if (!farmaciaId || !nome || !codigo_acesso) {
-              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-              res.end(JSON.stringify({ ok: false, error: 'Preencha o Nome e o Código de Acesso.' }));
-              return;
-            }
-            const cleanCode = String(codigo_acesso).trim().toUpperCase().replace(/\s+/g, '-');
-            const updated = await prisma.farmacia.update({
-              where: { id: String(farmaciaId) },
-              data: {
-                nome: String(nome).trim(),
-                codigo_acesso: cleanCode,
-              },
-            });
-            invalidateAllPharmacyCaches(updated.id);
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(
-              JSON.stringify({
-                ok: true,
-                farmacia: {
-                  id: updated.id,
-                  nome: updated.nome,
-                  nif: maskNif(updated.nif),
-                  codigo_acesso: updated.codigo_acesso,
-                },
-              })
-            );
-          } catch (e: any) {
-            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
+        try {
+          const ctx = await resolveAccessContext();
+          if (ctx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Apenas o Administrador pode gerir farmácias.' }));
+            return;
           }
-        });
+          const rawBody = await readRequestBody(req, 256 * 1024);
+          const { farmaciaId, nome, codigo_acesso } = JSON.parse(rawBody || '{}');
+          if (!farmaciaId || !nome || !codigo_acesso) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Preencha o Nome e o Código de Acesso.' }));
+            return;
+          }
+          const cleanCode = String(codigo_acesso).trim().toUpperCase().replace(/\s+/g, '-');
+          const updated = await prisma.farmacia.update({
+            where: { id: String(farmaciaId) },
+            data: {
+              nome: String(nome).trim(),
+              codigo_acesso: cleanCode,
+            },
+          });
+          invalidateAllPharmacyCaches(updated.id);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              farmacia: {
+                id: updated.id,
+                nome: updated.nome,
+                nif: maskNif(updated.nif),
+                codigo_acesso: updated.codigo_acesso,
+              },
+            })
+          );
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
       // 0C. Endpoint Admin: Importar Nova Farmácia via Browser (PDF Inventário + PDF Validades + CSV Vendas)
       if (pathname === '/api/admin/import-pharmacy' && req.method === 'POST') {
-        const chunks: Buffer[] = [];
-        req.on('data', (chunk: Buffer) => chunks.push(chunk));
-        req.on('end', async () => {
-          const tmpFiles: string[] = [];
-          try {
-            const ctx = await resolveAccessContext();
-            if (ctx.role !== 'ADMIN') {
-              res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-              res.end(JSON.stringify({ ok: false, error: 'Apenas o acesso Master/Admin pode importar novas farmácias.' }));
-              return;
-            }
-            const rawBody = Buffer.concat(chunks).toString('utf-8');
-            const parsed = JSON.parse(rawBody || '{}');
-            const nomeAnonimo = String(parsed.nome || 'Farmácia Demo').trim();
-            const nifAlias = String(parsed.nif || `DEMO-${Date.now().toString().slice(-4)}`).trim();
-            const codigoAcesso = String(
-              parsed.codigo_acesso || nomeAnonimo.toUpperCase().replace(/[^A-Z0-9]+/g, '-')
-            )
-              .trim()
-              .toUpperCase();
+        const tmpFiles: string[] = [];
+        try {
+          const ctx = await resolveAccessContext();
+          if (ctx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Apenas o acesso Master/Admin pode importar novas farmácias.' }));
+            return;
+          }
+          const rawBody = await readRequestBody(req, 25 * 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const nomeAnonimo = String(parsed.nome || 'Farmácia Demo').trim();
+          const nifAlias = String(parsed.nif || `DEMO-${Date.now().toString().slice(-4)}`).trim();
+          const codigoAcesso = String(
+            parsed.codigo_acesso || nomeAnonimo.toUpperCase().replace(/[^A-Z0-9]+/g, '-')
+          )
+            .trim()
+            .toUpperCase();
 
-            if (!parsed.pdfInventarioBase64 || !parsed.csvVendasBase64) {
-              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-              res.end(
-                JSON.stringify({
-                  ok: false,
-                  error: 'É obrigatório fornecer pelo menos o PDF de Inventário e o CSV de Vendas.',
-                })
-              );
-              return;
-            }
-
-            const tmpDir = os.tmpdir();
-            const ts = Date.now();
-            const invPath = path.join(tmpDir, `bi_inv_${ts}.pdf`);
-            const csvPath = path.join(tmpDir, `bi_ven_${ts}.csv`);
-            fs.writeFileSync(invPath, Buffer.from(parsed.pdfInventarioBase64, 'base64'));
-            fs.writeFileSync(csvPath, Buffer.from(parsed.csvVendasBase64, 'base64'));
-            tmpFiles.push(invPath, csvPath);
-
-            let valPath: string | null = null;
-            if (parsed.pdfValidadesBase64) {
-              valPath = path.join(tmpDir, `bi_val_${ts}.pdf`);
-              fs.writeFileSync(valPath, Buffer.from(parsed.pdfValidadesBase64, 'base64'));
-              tmpFiles.push(valPath);
-            }
-
-            const newFarm = await prisma.farmacia.upsert({
-              where: { nif: nifAlias },
-              update: { nome: nomeAnonimo, codigo_acesso: codigoAcesso },
-              create: { nome: nomeAnonimo, nif: nifAlias, codigo_acesso: codigoAcesso },
-            });
-
-            const invIngest = await ingestInventarioPdf(prisma, newFarm.id, invPath);
-            await transformStagingInventario(prisma, newFarm.id, invIngest.batchId);
-
-            let valUpdated = 0;
-            if (valPath) {
-              const valIngest = await ingestValidadesPdf(prisma, newFarm.id, valPath);
-              const valTrans = await transformStagingValidades(prisma, newFarm.id, valIngest.batchId);
-              valUpdated = valTrans.inventariosAtualizados;
-            }
-
-            const venIngest = await ingestVendasCsv(prisma, newFarm.id, csvPath);
-            const venTrans = await transformStagingVendas(prisma, newFarm.id, venIngest.batchId);
-
-            await classifyAllExistingProducts(prisma);
-            invalidateAllPharmacyCaches(newFarm.id);
-            getCachedOrComputeAnalysis(prisma, newFarm.id, 90, 4, 12).catch(() => {});
-            getCachedOrComputeCampaignsPayload(prisma, newFarm).catch(() => {});
-
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          if (!parsed.pdfInventarioBase64 || !parsed.csvVendasBase64) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(
               JSON.stringify({
-                ok: true,
-                farmacia: {
-                  id: newFarm.id,
-                  nome: newFarm.nome,
-                  nif: maskNif(newFarm.nif),
-                  codigo_acesso: newFarm.codigo_acesso,
-                },
-                stats: {
-                  artigosInventario: invIngest.totalExtraidos,
-                  validadesCruzadas: valUpdated,
-                  registosVendas: venTrans.processadosComSucesso,
-                },
+                ok: false,
+                error: 'É obrigatório fornecer pelo menos o PDF de Inventário e o CSV de Vendas.',
               })
             );
-          } catch (e: any) {
-            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
-          } finally {
-            for (const f of tmpFiles) {
-              try {
-                if (fs.existsSync(f)) fs.unlinkSync(f);
-              } catch {}
-            }
+            return;
           }
-        });
+
+          const tmpDir = os.tmpdir();
+          const ts = Date.now();
+          const invPath = path.join(tmpDir, `bi_inv_${ts}.pdf`);
+          const csvPath = path.join(tmpDir, `bi_ven_${ts}.csv`);
+          fs.writeFileSync(invPath, Buffer.from(parsed.pdfInventarioBase64, 'base64'));
+          fs.writeFileSync(csvPath, Buffer.from(parsed.csvVendasBase64, 'base64'));
+          tmpFiles.push(invPath, csvPath);
+
+          let valPath: string | null = null;
+          if (parsed.pdfValidadesBase64) {
+            valPath = path.join(tmpDir, `bi_val_${ts}.pdf`);
+            fs.writeFileSync(valPath, Buffer.from(parsed.pdfValidadesBase64, 'base64'));
+            tmpFiles.push(valPath);
+          }
+
+          const newFarm = await prisma.farmacia.upsert({
+            where: { nif: nifAlias },
+            update: { nome: nomeAnonimo, codigo_acesso: codigoAcesso },
+            create: { nome: nomeAnonimo, nif: nifAlias, codigo_acesso: codigoAcesso },
+          });
+
+          const invIngest = await ingestInventarioPdf(prisma, newFarm.id, invPath);
+          await transformStagingInventario(prisma, newFarm.id, invIngest.batchId);
+
+          let valUpdated = 0;
+          if (valPath) {
+            const valIngest = await ingestValidadesPdf(prisma, newFarm.id, valPath);
+            const valTrans = await transformStagingValidades(prisma, newFarm.id, valIngest.batchId);
+            valUpdated = valTrans.inventariosAtualizados;
+          }
+
+          const venIngest = await ingestVendasCsv(prisma, newFarm.id, csvPath);
+          const venTrans = await transformStagingVendas(prisma, newFarm.id, venIngest.batchId);
+
+          await classifyAllExistingProducts(prisma);
+          invalidateAllPharmacyCaches(newFarm.id);
+          getCachedOrComputeAnalysis(prisma, newFarm.id, 90, 4, 12).catch(() => {});
+          getCachedOrComputeCampaignsPayload(prisma, newFarm).catch(() => {});
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              farmacia: {
+                id: newFarm.id,
+                nome: newFarm.nome,
+                nif: maskNif(newFarm.nif),
+                codigo_acesso: newFarm.codigo_acesso,
+              },
+              stats: {
+                artigosInventario: invIngest.totalExtraidos,
+                validadesCruzadas: valUpdated,
+                registosVendas: venTrans.processadosComSucesso,
+              },
+            })
+          );
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        } finally {
+          for (const f of tmpFiles) {
+            try {
+              if (fs.existsSync(f)) fs.unlinkSync(f);
+            } catch {}
+          }
+        }
         return;
       }
 
       // 0. Endpoint de Lista de Farmácias (Multi-Tenant com Isolamento por Código de Acesso)
+      
+      // 0D. Listar ficheiros disponíveis na pasta Avenida (apenas administradores)
+      if (pathname === '/api/admin/avenida-files' && req.method === 'GET') {
+        const ctx = await resolveAccessContext();
+        if (ctx.role !== 'ADMIN') {
+          res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: 'Apenas administradores podem listar ficheiros internos.' }));
+          return;
+        }
+        const avenidaDir = path.resolve(process.cwd(), 'Avenida');
+        if (!fs.existsSync(avenidaDir)) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, files: [] }));
+          return;
+        }
+        const files = fs.readdirSync(avenidaDir)
+          .filter((f) => f.toLowerCase().endsWith('.pdf') || f.toLowerCase().endsWith('.csv') || f.toLowerCase().endsWith('.xlsx'))
+          .map((f) => {
+            const st = fs.statSync(path.join(avenidaDir, f));
+            return {
+              name: f,
+              sizeBytes: st.size,
+              sizeFormatted: (st.size / 1024).toFixed(1) + ' KB',
+              modifiedAt: st.mtime,
+            };
+          });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, files }));
+        return;
+      }
+
+      // 0E. Inspecionar Ficheiros para Importação Interativa (Dry-Run + Detecção de Perguntas)
+      if (pathname === '/api/admin/inspect-import' && req.method === 'POST') {
+        try {
+          const ctx = await resolveAccessContext();
+          if (ctx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Apenas administradores podem inspecionar importações.' }));
+            return;
+          }
+          const rawBody = await readRequestBody(req, 10 * 1024 * 1024);
+          const body = JSON.parse(rawBody || '{}');
+          const farm = await requireActiveFarmacia(body.farmaciaId);
+
+          let fileBuffers: Array<{ name: string; buffer: Buffer }> = [];
+
+          if (body.fromAvenida && Array.isArray(body.fileNames)) {
+            const avenidaDir = path.resolve(process.cwd(), 'Avenida');
+            for (const rawFn of body.fileNames) {
+              const cleanFn = path.basename(String(rawFn || ''));
+              if (!cleanFn || cleanFn.startsWith('.')) continue;
+              const fullP = path.resolve(avenidaDir, cleanFn);
+              // Confinamento estrito de diretório (Anti-Path Traversal)
+              if (!fullP.startsWith(avenidaDir + path.sep)) continue;
+              if (fs.existsSync(fullP)) {
+                fileBuffers.push({ name: cleanFn, buffer: fs.readFileSync(fullP) });
+              }
+            }
+          } else if (Array.isArray(body.files)) {
+            for (const f of body.files) {
+              const cleanName = path.basename(String(f.name || 'ficheiro'));
+              fileBuffers.push({
+                name: cleanName,
+                buffer: Buffer.from(f.base64, 'base64'),
+              });
+            }
+          }
+
+          if (fileBuffers.length === 0) {
+            throw new Error('Nenhum ficheiro válido fornecido para inspeção.');
+          }
+
+          const inspection = await inspectFilesForInteractiveImport(fileBuffers, farm, prisma);
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, farmacia: farm, inspection }));
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 0G. Progresso em Tempo Real da Importação (Apenas Admin)
+      if (pathname === '/api/admin/import-progress' && req.method === 'GET') {
+        const ctx = await resolveAccessContext();
+        if (ctx.role !== 'ADMIN') {
+          res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: 'Apenas administradores podem consultar o progresso de importação.' }));
+          return;
+        }
+        const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+        const cur = importProgressStore.get(farmIdQuery) || {
+          status: 'IDLE',
+          percent: 0,
+          step: 'A aguardar início...',
+          detail: '',
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, progress: cur }));
+        return;
+      }
+
+      // 0F. Executar Importação Interativa
+      if (pathname === '/api/admin/execute-import' && req.method === 'POST') {
+        try {
+          const ctx = await resolveAccessContext();
+          if (ctx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Apenas administradores podem executar importações.' }));
+            return;
+          }
+          const rawBody = await readRequestBody(req, 10 * 1024 * 1024);
+          const body = JSON.parse(rawBody || '{}');
+          const farm = await requireActiveFarmacia(body.farmaciaId);
+
+          let fileBuffers: Array<{ name: string; buffer: Buffer }> = [];
+
+          if (body.fromAvenida && Array.isArray(body.fileNames)) {
+            const avenidaDir = path.resolve(process.cwd(), 'Avenida');
+            for (const rawFn of body.fileNames) {
+              const cleanFn = path.basename(String(rawFn || ''));
+              if (!cleanFn || cleanFn.startsWith('.')) continue;
+              const fullP = path.resolve(avenidaDir, cleanFn);
+              // Confinamento estrito de diretório (Anti-Path Traversal)
+              if (!fullP.startsWith(avenidaDir + path.sep)) continue;
+              if (fs.existsSync(fullP)) {
+                fileBuffers.push({ name: cleanFn, buffer: fs.readFileSync(fullP) });
+              }
+            }
+          } else if (Array.isArray(body.files)) {
+            for (const f of body.files) {
+              const cleanName = path.basename(String(f.name || 'ficheiro'));
+              fileBuffers.push({
+                name: cleanName,
+                buffer: Buffer.from(f.base64, 'base64'),
+              });
+            }
+          }
+
+          importProgressStore.set(farm.id, {
+            status: 'PROCESSING',
+            percent: 5,
+            step: 'A preparar ficheiros para importação...',
+            detail: fileBuffers.length + ' ficheiro(s) em processamento',
+          });
+
+          const decisions = body.decisions || {};
+          const stats = await executeInteractiveImport(
+            fileBuffers,
+            decisions,
+            farm.id,
+            prisma,
+            (percent, step, detail) => {
+              importProgressStore.set(farm.id, {
+                status: percent >= 100 ? 'COMPLETED' : 'PROCESSING',
+                percent,
+                step,
+                detail,
+              });
+            }
+          );
+
+          importProgressStore.set(farm.id, {
+            status: 'COMPLETED',
+            percent: 100,
+            step: '🎉 Importação Concluída com Sucesso!',
+            detail: 'Todos os registos foram integrados.',
+          });
+
+          // Invalida caches
+          invalidateAllPharmacyCaches(farm.id);
+          getCachedOrComputeAnalysis(prisma, farm.id, 90, 4, 12).catch(() => {});
+          getCachedOrComputeCampaignsPayload(prisma, farm).catch(() => {});
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, stats }));
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
       if (pathname === '/api/pharmacies' && req.method === 'GET') {
         const ctx = await resolveAccessContext();
-        let farms;
+        let farms: any[] = [];
         if (!ctx.authenticated) {
-          farms = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
-        } else if (ctx.role === 'PHARMACY' && ctx.code !== 'DEV_DEFAULT' && ctx.lockedFarmacia) {
+          // Utilizadores anónimos apenas podem ver farmácias anónimas sem NUNCA ter acesso aos códigos de acesso
+          const publicFarms = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(
+            JSON.stringify(
+              publicFarms.map((f) => ({
+                id: f.id,
+                nome: f.nome,
+                nif: maskNif(f.nif),
+              }))
+            )
+          );
+          return;
+        } else if (ctx.role === 'PHARMACY' && ctx.lockedFarmacia) {
           farms = [ctx.lockedFarmacia];
-        } else {
+        } else if (ctx.role === 'ADMIN') {
           farms = await prisma.farmacia.findMany({
             orderBy: { criadoEm: 'asc' },
           });
@@ -631,7 +1046,7 @@ async function startServer() {
               id: f.id,
               nome: f.nome,
               nif: maskNif(f.nif),
-              codigo_acesso: f.codigo_acesso || f.id,
+              codigo_acesso: ctx.role === 'ADMIN' ? (f.codigo_acesso || f.id) : undefined,
             }))
           )
         );
@@ -641,7 +1056,7 @@ async function startServer() {
       // 1. Endpoint de Análise Parametrizável (Multi-Tenant + Cache Instantânea)
       if (pathname === '/api/analysis' && req.method === 'GET') {
         const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
-        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
 
         const diasMonos = parseInt(String(parsedUrl.query.diasMonos || '90'), 10);
         const cobertura = parseFloat(String(parsedUrl.query.cobertura || '4'));
@@ -666,7 +1081,7 @@ async function startServer() {
       if (pathname.startsWith('/api/product/') && req.method === 'GET') {
         const cnp = pathname.replace('/api/product/', '').trim();
         const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
-        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
 
         const produto = await prisma.produtoMestre.findUnique({
           where: { cnp_codigo: cnp },
@@ -720,7 +1135,7 @@ async function startServer() {
       // 2.5. Endpoints de Campanhas Comerciais e Sazonais 360º (Multi-Tenant + Cache Instantânea)
       if (pathname === '/api/campaigns/suggestions' && req.method === 'GET') {
         const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
-        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
         const mesQuery = parseInt(String(parsedUrl.query.mes || ''), 10);
         const forceRefresh = String(parsedUrl.query.refresh || '') === '1';
 
@@ -735,46 +1150,102 @@ async function startServer() {
         return;
       }
 
+      // 2.5A. Endpoint para Listar Campanhas Ativas na Farmácia
+      if (pathname === '/api/campaigns/active' && req.method === 'GET') {
+        const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+        const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+        const ativas = await getActiveCampaigns(prisma, activeFarmacia.id);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, campanhas: ativas }));
+        return;
+      }
+
+      // 2.5A2. Endpoint para Ativar uma Campanha e Gerar Tarefas para a Equipa
+      if (pathname === '/api/campaigns/activate' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(parsed.farmaciaId);
+          const resActivate = await activateCampaign(prisma, {
+            farmaciaId: activeFarmacia.id,
+            campanhaId: String(parsed.campanhaId || ''),
+            titulo: String(parsed.titulo || 'Campanha Comercial'),
+            icone: parsed.icone || '🎯',
+            descontoPct: Number(parsed.descontoPct || 15),
+            produtos: Array.isArray(parsed.produtos) ? parsed.produtos : [],
+            diasDuracao: Number(parsed.diasDuracao || 15),
+            criadoPor: parsed.criadoPor || 'Diretor',
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(resActivate));
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 2.5A3. Endpoint para Desativar ou Concluir uma Campanha
+      if (pathname === '/api/campaigns/deactivate' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(parsed.farmaciaId);
+          const resDeact = await deactivateCampaign(
+            prisma,
+            activeFarmacia.id,
+            String(parsed.campanhaId || ''),
+            parsed.estado === 'CANCELADA' ? 'CANCELADA' : 'CONCLUIDA'
+          );
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(resDeact));
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+        return;
+      }
+
       // 2.5B. Endpoint para Criar Campanha à Medida (Eventos Livres: Halloween, Black Friday, Festas da Cidade ou Produtos Específicos)
       if (pathname === '/api/campaigns/custom' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const parsed = JSON.parse(body || '{}');
-            const activeFarmacia = await getActiveFarmacia(parsed.farmaciaId);
-            const s = await buildCustomCampaign(prisma, activeFarmacia.id, parsed);
-            const fin = calculateCampaignFinancials(s.produtosSugeridos, s.campanha.descontoSugeridoPct);
-            const enriched = {
-              ...s,
-              id: s.campanha.id,
-              nome: s.campanha.titulo,
-              icon: s.campanha.icone,
-              periodoLabel: s.campanha.epoca,
-              descricao: s.campanha.descricao,
-              tipoCampanha: s.campanha.tipoCampanha || 'EPOCA_CALENDARIO',
-              contextoEpoca: s.campanha.contextoEpoca || null,
-              tipo: 'PERSONALIZADA',
-              eligibleProducts: s.produtosSugeridos.map((p) => ({
-                ...p,
-                pvp_atual: p.pvp,
-                custo_unitario: p.custo_unitario,
-              })),
-              totalEligibleSkus: s.totalArtigosDisponiveis,
-              totalStockUnits: s.totalUnidadesStock,
-              financials: {
-                ...fin,
-                margem_media_pct: Number(fin.margemFinalPct.toFixed(1)),
-                anti_dumping_valido: fin.cumpreAntiDumping,
-              },
-            };
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: true, suggestion: enriched }));
-          } catch (e: any) {
-            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: false, error: e.message }));
-          }
-        });
+        try {
+          const rawBody = await readRequestBody(req, 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(parsed.farmaciaId);
+          const s = await buildCustomCampaign(prisma, activeFarmacia.id, parsed);
+          const fin = calculateCampaignFinancials(s.produtosSugeridos, s.campanha.descontoSugeridoPct);
+          const enriched = {
+            ...s,
+            id: s.campanha.id,
+            nome: s.campanha.titulo,
+            icon: s.campanha.icone,
+            periodoLabel: s.campanha.epoca,
+            descricao: s.campanha.descricao,
+            tipoCampanha: s.campanha.tipoCampanha || 'EPOCA_CALENDARIO',
+            contextoEpoca: s.campanha.contextoEpoca || null,
+            tipo: 'PERSONALIZADA',
+            eligibleProducts: s.produtosSugeridos.map((p) => ({
+              ...p,
+              pvp_atual: p.pvp,
+              custo_unitario: p.custo_unitario,
+            })),
+            totalEligibleSkus: s.totalArtigosDisponiveis,
+            totalStockUnits: s.totalUnidadesStock,
+            financials: {
+              ...fin,
+              margem_media_pct: Number(fin.margemFinalPct.toFixed(1)),
+              anti_dumping_valido: fin.cumpreAntiDumping,
+            },
+          };
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: true, suggestion: enriched }));
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
         return;
       }
 
@@ -782,7 +1253,7 @@ async function startServer() {
       if (pathname === '/api/campaigns/product-360' && req.method === 'GET') {
         const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
         const q = String(parsedUrl.query.q || '').trim();
-        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
         const result = await analyzeProductMarketingAndCrossSell360(prisma, activeFarmacia.id, q);
         if (!result) {
           res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -798,17 +1269,27 @@ async function startServer() {
       if (pathname === '/api/campaigns/search-products' && req.method === 'GET') {
         const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
         const q = String(parsedUrl.query.q || '').trim();
-        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
         const items = await searchProductsForMarketingPicker(prisma, activeFarmacia.id, q);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ items }));
         return;
       }
 
+      // 2.5D-2. Endpoint Cestos Inteligentes de Stock (Validades, Monos, Top Margem) para o Assistente de Campanhas
+      if (pathname === '/api/campaigns/smart-baskets' && req.method === 'GET') {
+        const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+        const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+        const baskets = await getSmartCampaignBaskets(prisma, activeFarmacia.id);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, baskets }));
+        return;
+      }
+
       // 2.5E. Endpoint de Packs Clínicos & Cestos Temáticos (Por Sintoma / Propósito)
       if (pathname === '/api/packs' && req.method === 'GET') {
         const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
-        const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+        const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
         const packs = await generateClinicalThemePacks(prisma, activeFarmacia.id);
         const userSaved = customPacksStore.get(activeFarmacia.id) || [];
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -818,92 +1299,84 @@ async function startServer() {
 
       // 2.5F. Endpoint Guardar Pack Personalizado no Marketing
       if (pathname === '/api/packs/save' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const parsed = JSON.parse(body || '{}');
-            const farmIdQuery = String(parsed.farmaciaId || '').trim();
-            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
-            if (parsed.pack) {
-              const currentList = customPacksStore.get(activeFarmacia.id) || [];
-              currentList.unshift(parsed.pack);
-              customPacksStore.set(activeFarmacia.id, currentList);
-            }
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: true, message: 'Pack guardado com sucesso no Estúdio de Marketing!' }));
-          } catch (e: any) {
-            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
+        try {
+          const rawBody = await readRequestBody(req, 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const farmIdQuery = String(parsed.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          if (parsed.pack) {
+            const currentList = customPacksStore.get(activeFarmacia.id) || [];
+            currentList.unshift(parsed.pack);
+            customPacksStore.set(activeFarmacia.id, currentList);
           }
-        });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, message: 'Pack guardado com sucesso no Estúdio de Marketing!' }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
       // 2.5G. Endpoint Aplicar Tarefas Personalizadas do Copilot à Folha da Semana
       if (pathname === '/api/weekly-plan/apply' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const parsed = JSON.parse(body || '{}');
-            const farmIdQuery = String(parsed.farmaciaId || '').trim();
-            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
-            if (Array.isArray(parsed.tasks)) {
-              customWeeklyTasksStore.set(activeFarmacia.id, parsed.tasks);
-            }
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: true, message: 'Tarefas aplicadas com sucesso à Folha da Semana!' }));
-          } catch (e: any) {
-            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
+        try {
+          const rawBody = await readRequestBody(req, 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const farmIdQuery = String(parsed.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          if (Array.isArray(parsed.tasks)) {
+            customWeeklyTasksStore.set(activeFarmacia.id, parsed.tasks);
           }
-        });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, message: 'Tarefas aplicadas com sucesso à Folha da Semana!' }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
-            // Endpoint Descontinuar / Não Repor Produtos (Pilar 3)
+      // Endpoint Descontinuar / Não Repor Produtos (Pilar 3)
       if (pathname === '/api/products/discontinue' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const parsed = JSON.parse(body || '{}');
-            const farmIdQuery = String(parsed.farmaciaId || '').trim();
-            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
-            const cnp = String(parsed.cnp || '').trim();
-            const action = parsed.action || 'add';
-            const des = parsed.designacao || '';
+        try {
+          const rawBody = await readRequestBody(req, 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const farmIdQuery = String(parsed.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          const cnp = String(parsed.cnp || '').trim();
+          const action = parsed.action || 'add';
+          const des = parsed.designacao || '';
 
-            if (action === 'add') {
-              addDiscontinuedCnp(activeFarmacia.id, cnp, des, parsed.motivo);
-            } else {
-              removeDiscontinuedCnp(activeFarmacia.id, cnp);
-            }
-
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: true, cnp, action, message: 'Produto atualizado na lista de descontinuação (Pilar 3)!' }));
-          } catch (e: any) {
-            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
+          if (action === 'add') {
+            addDiscontinuedCnp(activeFarmacia.id, cnp, des, parsed.motivo);
+          } else {
+            removeDiscontinuedCnp(activeFarmacia.id, cnp);
           }
-        });
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, cnp, action, message: 'Produto atualizado na lista de descontinuação (Pilar 3)!' }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
       if (pathname === '/api/campaigns/generate' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const parsed = JSON.parse(body || '{}');
-            const farmaciaId = parsed.farmaciaId;
-            const campaignId = parsed.campaignId;
-            const descontoPct = parsed.discountPct !== undefined ? parsed.discountPct : (parsed.descontoPct !== undefined ? parsed.descontoPct : 15);
-            const canais = parsed.channels || parsed.canais || ['loja', 'redes', 'ecras', 'app'];
-            let selectedProducts = parsed.selectedProducts || [];
+        try {
+          const rawBody = await readRequestBody(req, 2 * 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const farmaciaId = parsed.farmaciaId;
+          const campaignId = parsed.campaignId;
+          const descontoPct = parsed.discountPct !== undefined ? parsed.discountPct : (parsed.descontoPct !== undefined ? parsed.descontoPct : 15);
+          const canais = parsed.channels || parsed.canais || ['loja', 'redes', 'ecras', 'app'];
+          let selectedProducts = parsed.selectedProducts || [];
 
-            const activeFarmacia = await getActiveFarmacia(farmaciaId);
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
             const allSuggestions = await getSeasonalCampaignSuggestions(prisma, activeFarmacia.id);
             const matchedSug = allSuggestions.find((s) => s.campanha.id === campaignId);
             const campDef =
@@ -994,121 +1467,131 @@ async function startServer() {
               emailDigestPreview: emailDigest.html,
             }));
           } catch (e: any) {
-            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            const status = e.statusCode || 400;
+            res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ success: false, error: e.message }));
           }
-        });
         return;
       }
 
       if (pathname === '/api/campaigns/send-email' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const { to, farmaciaId } = JSON.parse(body || '{}');
-            const activeFarmacia = await getActiveFarmacia(farmaciaId);
-            const destinatarios = ['direcao.tecnica@farmacia.pt', 'balcao.equipa@farmacia.pt'];
-            if (to) destinatarios.push(to);
+        try {
+          const rawBody = await readRequestBody(req, 256 * 1024);
+          const { to, farmaciaId } = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          const destinatarios = ['direcao.tecnica@farmacia.pt', 'balcao.equipa@farmacia.pt'];
+          if (to) destinatarios.push(to);
 
-            console.log(`[Email Campaign] Boletim executivo enviado para ${destinatarios.length} destinatários na ${activeFarmacia.nome}`);
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({
-              success: true,
-              ok: true,
-              message: `Boletim executivo e materiais de campanha enviados com sucesso`,
-              destinatarios: destinatarios.length,
-            }));
-          } catch (e: any) {
-            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: false, error: e.message }));
-          }
-        });
+          console.log(`[Email Campaign] Boletim executivo enviado para ${destinatarios.length} destinatários na ${activeFarmacia.nome}`);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({
+            success: true,
+            ok: true,
+            message: `Boletim executivo e materiais de campanha enviados com sucesso`,
+            destinatarios: destinatarios.length,
+          }));
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
         return;
       }
 
       // 3. Endpoint de Perguntas em Linguagem Natural / Consultas Rápidas (Multi-Tenant)
       if (pathname === '/api/ask' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const { question, farmaciaId, sessionId } = JSON.parse(body || '{}');
-            const activeFarmacia = await getActiveFarmacia(farmaciaId);
-            const q = String(question || '').trim();
+        try {
+          const rawBody = await readRequestBody(req, 256 * 1024);
+          const { question, farmaciaId, sessionId } = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          const q = String(question || '').trim();
 
-            if (!q) {
-              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-              res.end(JSON.stringify({ success: false, error: 'Pergunta não fornecida.' }));
-              return;
-            }
-
-            // Contexto de Segurança Multi-Tenant Estrito
-            const secContext: ToolSecurityContext = {
-              farmaciaId: activeFarmacia.id,
-              farmaciaNome: activeFarmacia.nome,
-              nif: activeFarmacia.nif,
-            };
-
-            const sid = sessionId || `session-${activeFarmacia.id}`;
-            const copilotRes = await askConversationalCopilot(prisma, secContext, q, sid);
-
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({
-              success: true,
-              text: copilotRes.text,
-              toolsUsed: copilotRes.toolsUsed,
-              sessionId: copilotRes.sessionId,
-              shoppingList: (copilotRes as any).shoppingList || null,
-              farmaciaNome: activeFarmacia.nome,
-              titulo: `Copilot — ${activeFarmacia.nome}`,
-              explicacao: copilotRes.text,
-            }));
-            return;
-          } catch (e: any) {
-            console.error('[API /api/ask Error]:', e);
-            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: false, error: e.message }));
-          }
-        });
-        return;
-      }
-
-      // 3.1. Endpoint para Limpar Sessão Conversacional do Copilot
-      if (pathname === '/api/copilot/clear' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const { sessionId } = JSON.parse(body || '{}');
-            if (sessionId) {
-              clearCopilotSession(sessionId);
-            }
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: true, message: 'Histórico da sessão reiniciado com sucesso.' }));
-          } catch (e: any) {
+          if (!q) {
             res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: false, error: e.message }));
+            res.end(JSON.stringify({ success: false, error: 'Pergunta não fornecida.' }));
+            return;
           }
-        });
+
+          // Contexto de Segurança Multi-Tenant Estrito & Anonimização para LLM
+          const secContext: ToolSecurityContext = {
+            farmaciaId: activeFarmacia.id,
+            farmaciaNome: 'Farmácia Comunitária',
+            nif: '',
+          };
+
+          // Isola estritamente o sessionId por farmácia para impedir leitura cruzada de conversas em RAM
+          const cleanSid = String(sessionId || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
+          const scopedSid = `${activeFarmacia.id}:${cleanSid}`;
+          const copilotRes = await askConversationalCopilot(prisma, secContext, q, scopedSid);
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({
+            success: true,
+            text: copilotRes.text,
+            toolsUsed: copilotRes.toolsUsed,
+            sessionId: cleanSid,
+            shoppingList: (copilotRes as any).shoppingList || null,
+            farmaciaNome: activeFarmacia.nome,
+            titulo: `Copilot — ${activeFarmacia.nome}`,
+            explicacao: copilotRes.text,
+          }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          console.error('[API /api/ask Error]:', e);
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
         return;
       }
 
-            // 2.5H. Endpoint Mobile Staff Auth PIN
+      // 3.1. Endpoint para Limpar Sessão Conversacional do Copilot (Isolado por Farmácia)
+      if (pathname === '/api/copilot/clear' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const { sessionId, farmaciaId } = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          const cleanSid = String(sessionId || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
+          clearCopilotSession(`${activeFarmacia.id}:${cleanSid}`);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: true, message: 'Histórico da sessão reiniciado com sucesso.' }));
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 2.5H. Endpoint Mobile Staff Auth PIN com Proteção Rate Limit
       if (pathname === '/api/mobile/auth-pin' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const { farmaciaId, pin } = JSON.parse(body || '{}');
-            const resAuth = await verifyMobileStaffPin(prisma, farmaciaId, pin);
-            res.writeHead(resAuth.valid ? 200 : 401, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: resAuth.valid, ...resAuth }));
-          } catch (e: any) {
-            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
+        try {
+          const clientIp = getClientIp(req);
+          if (isRateLimited(clientIp, 10, 5 * 60 * 1000)) {
+            res.writeHead(429, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Demasiadas tentativas de PIN incorreto. Aguarde 5 minutos.' }));
+            return;
           }
-        });
+
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const { farmaciaId, pin } = JSON.parse(rawBody || '{}');
+          const resAuth = await verifyMobileStaffPin(prisma, farmaciaId, pin);
+
+          if (!resAuth.valid) {
+            recordFailedAttempt(clientIp);
+          } else {
+            resetFailedAttempts(clientIp);
+          }
+
+          if (resAuth.valid && (resAuth as any).farmacia && (resAuth as any).farmacia.codigo_acesso) {
+            res.setHeader('Set-Cookie', `farmacia_access_code=${encodeURIComponent((resAuth as any).farmacia.codigo_acesso)}; Path=/; SameSite=Lax; Max-Age=2592000`);
+          }
+          res.writeHead(resAuth.valid ? 200 : 401, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: resAuth.valid, ...resAuth }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
@@ -1116,12 +1599,13 @@ async function startServer() {
       if (pathname === '/api/weekly-tasks' && req.method === 'GET') {
         try {
           const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
-          const activeFarmacia = await getActiveFarmacia(farmIdQuery);
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
           const tasksData = await getPharmacyWeeklyTasks(prisma, activeFarmacia.id);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true, farmaciaId: activeFarmacia.id, ...tasksData }));
         } catch (e: any) {
-          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
         }
         return;
@@ -1129,50 +1613,47 @@ async function startServer() {
 
       // 2.5J. Endpoint Toggle Tarefa Semanal (Supabase Sync)
       if (pathname === '/api/weekly-tasks/toggle' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const { farmaciaId, taskId, concluido, concluido_por, categoria, cnp_codigo, designacao, valor_impacto } = JSON.parse(body || '{}');
-            const farmIdQuery = String(farmaciaId || '').trim();
-            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
-            const saved = await toggleWeeklyTaskInDb(prisma, {
-              farmaciaId: activeFarmacia.id,
-              taskId,
-              concluido: !!concluido,
-              concluido_por: concluido_por || 'Equipa',
-              categoria,
-              cnp_codigo,
-              designacao,
-              valor_impacto: valor_impacto !== undefined ? Number(valor_impacto) : undefined,
-            });
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: true, task: saved }));
-          } catch (e: any) {
-            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
-          }
-        });
+        try {
+          const rawBody = await readRequestBody(req, 128 * 1024);
+          const { farmaciaId, taskId, concluido, concluido_por, categoria, cnp_codigo, designacao, valor_impacto } = JSON.parse(rawBody || '{}');
+          const farmIdQuery = String(farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          const cleanConcluidoPor = String(concluido_por || 'Equipa').trim().slice(0, 50);
+          const saved = await toggleWeeklyTaskInDb(prisma, {
+            farmaciaId: activeFarmacia.id,
+            taskId,
+            concluido: !!concluido,
+            concluido_por: cleanConcluidoPor,
+            categoria,
+            cnp_codigo,
+            designacao,
+            valor_impacto: valor_impacto !== undefined ? Number(valor_impacto) : undefined,
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, task: saved }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
       // 2.5K. Endpoint Reset Tarefas da Semana
       if (pathname === '/api/weekly-tasks/reset' && req.method === 'POST') {
-        let body = '';
-        req.on('data', (chunk) => (body += chunk));
-        req.on('end', async () => {
-          try {
-            const { farmaciaId } = JSON.parse(body || '{}');
-            const farmIdQuery = String(farmaciaId || '').trim();
-            const activeFarmacia = await getActiveFarmacia(farmIdQuery);
-            const resetRes = await resetWeeklyTasksInDb(prisma, activeFarmacia.id);
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify(resetRes));
-          } catch (e: any) {
-            res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: e.message }));
-          }
-        });
+        try {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const { farmaciaId } = JSON.parse(rawBody || '{}');
+          const farmIdQuery = String(farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          const resetRes = await resetWeeklyTasksInDb(prisma, activeFarmacia.id);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(resetRes));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
@@ -1184,6 +1665,10 @@ async function startServer() {
         parsedUrl.query.mobile === '1' ||
         parsedUrl.query.modo === 'equipa'
       ) {
+        const acessoParam = String(parsedUrl.query.acesso || parsedUrl.query.code || parsedUrl.query.accessCode || '').trim();
+        if (acessoParam) {
+          res.setHeader('Set-Cookie', `farmacia_access_code=${encodeURIComponent(acessoParam)}; Path=/; SameSite=Lax; Max-Age=2592000`);
+        }
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
@@ -1204,8 +1689,9 @@ async function startServer() {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('Não encontrado');
     } catch (err: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: err.message }));
+      const status = err.statusCode || 500;
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
     }
   });
 
@@ -2537,6 +3023,64 @@ function getDashboardHtml(): string {
       margin: 0 auto;
     }
 
+  
+    /* GAVETA LATERAL DIREITA (OFF-CANVAS SLIDE DRAWER) */
+    .drawer-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.45);
+      backdrop-filter: blur(3px);
+      z-index: 2000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .drawer-backdrop.active {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .slide-drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 520px;
+      max-width: 92vw;
+      height: 100vh;
+      background: #ffffff;
+      box-shadow: -8px 0 36px rgba(15, 23, 42, 0.2);
+      z-index: 2001;
+      transform: translateX(100%);
+      transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      flex-direction: column;
+    }
+    .slide-drawer.active {
+      transform: translateX(0);
+    }
+    .drawer-header {
+      padding: 18px 22px;
+      border-bottom: 1px solid #e2e8f0;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      background: #f8fafc;
+    }
+    .drawer-body {
+      padding: 22px;
+      overflow-y: auto;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .drawer-footer {
+      padding: 16px 22px;
+      border-top: 1px solid #e2e8f0;
+      background: #f8fafc;
+      display: flex;
+      gap: 10px;
+    }
+
   </style>
 </head>
 <body>
@@ -2607,6 +3151,9 @@ function getDashboardHtml(): string {
           <button class="btn btn-secondary" onclick="openAccessManagerModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;">
             🔑 Acessos & Links Isolados
           </button>
+          <button class="btn btn-secondary" onclick="openInteractiveImportModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;background:rgba(56,189,248,0.1);border-color:#38bdf8;color:#38bdf8;">
+            📥 Importação Inteligente (Novos Ficheiros)
+          </button>
           <button class="btn btn-secondary" onclick="openImportPharmacyModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;">
             📥 Importar Nova Farmácia
           </button>
@@ -2623,99 +3170,102 @@ function getDashboardHtml(): string {
     <!-- ÁREA PRINCIPAL COM CONTEÚDO DINÂMICO -->
     <div class="main-wrapper">
       <div class="main-content">
-    <div class="controls-card">
-      <div class="control-group" style="flex: 1; min-width: 190px;">
-        <label>Segmento / Estatuto</label>
-        <select id="selectTipoVenda" onchange="renderActiveTable()">
-          <option value="ALL" selected>Todos os Produtos</option>
-          <option value="LIVRE_TOTAL">🟢 Venda Livre + MNSRM (Balcão)</option>
-          <option value="GENERICO_MG">🧬 Só Genéricos (MG)</option>
-          <option value="MEDICAMENTO_MARCA">🏷️ Só Marca</option>
-          <option value="VENDA_LIVRE">🟢 Só PSBE / Cosmética</option>
-          <option value="MNSRM">🔵 Só MNSRM</option>
-          <option value="MSRM">🔴 Só MSRM (Receita)</option>
-        </select>
-      </div>
-      <div class="control-group" style="flex: 1; min-width: 180px;">
-        <label>Macro-Área / Balcão</label>
-        <select id="selectMacroArea" onchange="onMacroAreaChange()">
-          <option value="ALL" selected>Todas as Áreas</option>
-          <option value="MNSRM_OTC">🔵 Balcão / OTC (MNSRM)</option>
-          <option value="MSRM">🔴 Receita Médica (MSRM)</option>
-          <option value="DERMOCOSMETICA">🌸 Dermocosmética & Higiene</option>
-          <option value="NUTRICAO_SUPLEMENTOS">🌿 Nutrição & Suplementos</option>
-          <option value="DISPOSITIVOS_SAUDE">🩹 Dispositivos Médicos</option>
-        </select>
-      </div>
-      <div class="control-group" style="flex: 1.2; min-width: 210px;">
-        <label>Família / Categoria</label>
-        <select id="selectCategoria" onchange="renderActiveTable()">
-          <option value="ALL" selected>Todas as Categorias</option>
-        </select>
-      </div>
-      <div class="control-group" style="min-width: 160px;">
-        <label>Sazonalidade</label>
-        <select id="selectSazonalidade" onchange="renderActiveTable()">
-          <option value="ALL" selected>Todas as Épocas</option>
-          <option value="INVERNO">❄️ Inverno (Pico Atual)</option>
-          <option value="PRIMAVERA">🌸 Primavera</option>
-          <option value="VERAO">☀️ Verão</option>
-          <option value="TODO_O_ANO">🔄 Todo o Ano (Crónicos)</option>
-        </select>
-      </div>
-      <div class="control-group" style="min-width: 150px;">
-        <label>Critério de Monos</label>
-        <select id="selectDiasMonos" onchange="onMonosFilterChange()">
-          <option value="28">Últimas 4 Semanas (28 dias)</option>
-          <option value="60">Últimos 2 Meses (60 dias)</option>
-          <option value="90" selected>Últimos 3 Meses (90 dias)</option>
-          <option value="180">Últimos 6 Meses (180 dias)</option>
-          <option value="365">Últimos 12 Meses (365 dias)</option>
-        </select>
-      </div>
-      <div class="control-group" style="min-width: 140px;">
-        <label>Alerta Cobertura</label>
-        <select id="selectCobertura" onchange="onCoberturaFilterChange()">
-          <option value="2">> 2 Meses</option>
-          <option value="3">> 3 Meses</option>
-          <option value="4" selected>> 4 Meses</option>
-          <option value="6">> 6 Meses</option>
-        </select>
-      </div>
-      <div style="display:flex;gap:8px;align-items:flex-end;">
-        <button class="btn" id="btnRecalcular" onclick="loadAnalysis()">🔄 Recalcular</button>
-        <button class="btn btn-secondary" onclick="exportCurrentTabCsv()">📥 Exportar CSV</button>
-      </div>
-      <span id="calcFeedback" style="font-size:0.82rem;color:#34d399;font-weight:700;display:none;align-self:center;">✅ Atualizado!</span>
-    </div>
+        <!-- CABEÇALHO CONTEXTUAL DE GESTÃO DE STOCK (FILTROS GLOBAIS + 5 KPIS PRINCIPAIS - SÓ APARECE NAS TABELAS DE STOCK) -->
+        <div id="globalAnalyticsHeader" style="display: none;">
+          <div class="controls-card">
+            <div class="control-group" style="flex: 1; min-width: 190px;">
+              <label>Segmento / Estatuto</label>
+              <select id="selectTipoVenda" onchange="renderActiveTable()">
+                <option value="ALL" selected>Todos os Produtos</option>
+                <option value="LIVRE_TOTAL">🟢 Venda Livre + MNSRM (Balcão)</option>
+                <option value="GENERICO_MG">🧬 Só Genéricos (MG)</option>
+                <option value="MEDICAMENTO_MARCA">🏷️ Só Marca</option>
+                <option value="VENDA_LIVRE">🟢 Só PSBE / Cosmética</option>
+                <option value="MNSRM">🔵 Só MNSRM</option>
+                <option value="MSRM">🔴 Só MSRM (Receita)</option>
+              </select>
+            </div>
+            <div class="control-group" style="flex: 1; min-width: 180px;">
+              <label>Macro-Área / Balcão</label>
+              <select id="selectMacroArea" onchange="onMacroAreaChange()">
+                <option value="ALL" selected>Todas as Áreas</option>
+                <option value="MNSRM_OTC">🔵 Balcão / OTC (MNSRM)</option>
+                <option value="MSRM">🔴 Receita Médica (MSRM)</option>
+                <option value="DERMOCOSMETICA">🌸 Dermocosmética & Higiene</option>
+                <option value="NUTRICAO_SUPLEMENTOS">🌿 Nutrição & Suplementos</option>
+                <option value="DISPOSITIVOS_SAUDE">🩹 Dispositivos Médicos</option>
+              </select>
+            </div>
+            <div class="control-group" style="flex: 1.2; min-width: 210px;">
+              <label>Família / Categoria</label>
+              <select id="selectCategoria" onchange="renderActiveTable()">
+                <option value="ALL" selected>Todas as Categorias</option>
+              </select>
+            </div>
+            <div class="control-group" style="min-width: 160px;">
+              <label>Sazonalidade</label>
+              <select id="selectSazonalidade" onchange="renderActiveTable()">
+                <option value="ALL" selected>Todas as Épocas</option>
+                <option value="INVERNO">❄️ Inverno (Pico Atual)</option>
+                <option value="PRIMAVERA">🌸 Primavera</option>
+                <option value="VERAO">☀️ Verão</option>
+                <option value="TODO_O_ANO">🔄 Todo o Ano (Crónicos)</option>
+              </select>
+            </div>
+            <div class="control-group" style="min-width: 150px;">
+              <label>Critério de Monos</label>
+              <select id="selectDiasMonos" onchange="onMonosFilterChange()">
+                <option value="28">Últimas 4 Semanas (28 dias)</option>
+                <option value="60">Últimos 2 Meses (60 dias)</option>
+                <option value="90" selected>Últimos 3 Meses (90 dias)</option>
+                <option value="180">Últimos 6 Meses (180 dias)</option>
+                <option value="365">Últimos 12 Meses (365 dias)</option>
+              </select>
+            </div>
+            <div class="control-group" style="min-width: 140px;">
+              <label>Alerta Cobertura</label>
+              <select id="selectCobertura" onchange="onCoberturaFilterChange()">
+                <option value="2">> 2 Meses</option>
+                <option value="3">> 3 Meses</option>
+                <option value="4" selected>> 4 Meses</option>
+                <option value="6">> 6 Meses</option>
+              </select>
+            </div>
+            <div style="display:flex;gap:8px;align-items:flex-end;">
+              <button class="btn" id="btnRecalcular" onclick="loadAnalysis()">🔄 Recalcular</button>
+              <button class="btn btn-secondary" onclick="exportCurrentTabCsv()">📥 Exportar CSV</button>
+            </div>
+            <span id="calcFeedback" style="font-size:0.82rem;color:#34d399;font-weight:700;display:none;align-self:center;">✅ Atualizado!</span>
+          </div>
 
-    <div class="kpi-grid">
-      <div class="kpi-card">
-        <div class="kpi-label">Valor Total em Stock (s/ IVA)</div>
-        <div class="kpi-value" id="kpiStockValor">-- €</div>
-        <div class="kpi-sub" id="kpiStockSub">-- artigos | -- unidades</div>
-      </div>
-      <div class="kpi-card purple">
-        <div class="kpi-label">Genéricos (MG) vs. Marca</div>
-        <div class="kpi-value" id="kpiGenericosVal" style="color: #c084fc">-- € MG</div>
-        <div class="kpi-sub" id="kpiGenericosSub">-- Genéricos | -- Marca | -- Grupos DCI</div>
-      </div>
-      <div class="kpi-card success">
-        <div class="kpi-label">Venda Livre (PSBE + MNSRM)</div>
-        <div class="kpi-value" id="kpiEstatutoRatio" style="color: var(--success)">--% Livre</div>
-        <div class="kpi-sub" id="kpiEstatutoSub">-- PSBE | -- MNSRM | -- MSRM</div>
-      </div>
-      <div class="kpi-card warning">
-        <div class="kpi-label">Capital Imobilizado em "Monos"</div>
-        <div class="kpi-value" id="kpiMonosValor" style="color: var(--warning)">-- €</div>
-        <div class="kpi-sub" id="kpiMonosSub">-- artigos sem vendas no período</div>
-      </div>
-      <div class="kpi-card danger">
-        <div class="kpi-label">Capital em Risco de Caducidade</div>
-        <div class="kpi-value" id="kpiCaducidadeValor" style="color: var(--danger)">-- €</div>
-        <div class="kpi-sub" id="kpiCaducidadeSub">-- artigos (-- embalagens em risco)</div>
-      </div>
-    </div>
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-label">Valor Total em Stock (s/ IVA)</div>
+              <div class="kpi-value" id="kpiStockValor">-- €</div>
+              <div class="kpi-sub" id="kpiStockSub">-- artigos | -- unidades</div>
+            </div>
+            <div class="kpi-card purple">
+              <div class="kpi-label">Genéricos (MG) vs. Marca</div>
+              <div class="kpi-value" id="kpiGenericosVal" style="color: #c084fc">-- € MG</div>
+              <div class="kpi-sub" id="kpiGenericosSub">-- Genéricos | -- Marca | -- Grupos DCI</div>
+            </div>
+            <div class="kpi-card success">
+              <div class="kpi-label">Venda Livre (PSBE + MNSRM)</div>
+              <div class="kpi-value" id="kpiEstatutoRatio" style="color: var(--success)">--% Livre</div>
+              <div class="kpi-sub" id="kpiEstatutoSub">-- PSBE | -- MNSRM | -- MSRM</div>
+            </div>
+            <div class="kpi-card warning">
+              <div class="kpi-label">Capital Imobilizado em "Monos"</div>
+              <div class="kpi-value" id="kpiMonosValor" style="color: var(--warning)">-- €</div>
+              <div class="kpi-sub" id="kpiMonosSub">-- artigos sem vendas no período</div>
+            </div>
+            <div class="kpi-card danger">
+              <div class="kpi-label">Capital em Risco de Caducidade</div>
+              <div class="kpi-value" id="kpiCaducidadeValor" style="color: var(--danger)">-- €</div>
+              <div class="kpi-sub" id="kpiCaducidadeSub">-- artigos (-- embalagens em risco)</div>
+            </div>
+          </div>
+        </div>
 
 
 
@@ -2748,6 +3298,9 @@ function getDashboardHtml(): string {
           </div>
         </div>
       </div>
+
+      <!-- MISSÕES DE CAMPANHAS ATIVAS NA FOLHA DA SEMANA -->
+      <div id="planoActiveCampaignsBlock" style="display: none; margin-bottom: 20px;"></div>
 
       <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 20px; margin-bottom: 30px;">
         <!-- CARTÃO 1: VALIDADES URGENTES NA GAVETA -->
@@ -3101,6 +3654,9 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
+      <!-- BANNER DE CAMPANHAS ATIVAS NA FARMÁCIA -->
+      <div id="activeCampaignsBanner" style="display: none; margin-bottom: 22px;"></div>
+
       <!-- SUB-NAVEGAÇÃO DO ESTÚDIO DE MARKETING (4 EIXOS OPERACIONAIS) -->
       <div style="display: flex; gap: 10px; margin-bottom: 22px; flex-wrap: wrap;">
         <button class="btn" id="mktSubBtn-epoca" onclick="switchMarketingSubView('epoca')" style="background: #f43f5e; color: #fff; font-size: 0.88rem; padding: 10px 18px;">
@@ -3143,87 +3699,175 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
-      <!-- PAINEL CRIADOR DE CAMPANHAS À MEDIDA (EVENTO LIVRE OU PRODUTOS ESPECÍFICOS) -->
-      <div id="mktCustomBuilderPanel" style="display: none; margin-bottom: 26px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 14px; padding: 22px; box-shadow: 0 2px 8px rgba(0,0,0,0.05);">
-        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px; margin-bottom: 16px;">
+      <!-- PAINEL CONSTRUTOR DE CAMPANHAS À MEDIDA (ASSISTENTE LIMPO EM PASSOS) -->
+      <div id="mktCustomBuilderPanel" style="display: none; margin-bottom: 28px; background: #ffffff; border: 1.5px solid #e2e8f0; border-radius: 16px; padding: 26px; box-shadow: 0 4px 20px rgba(0,0,0,0.06);">
+        <!-- CABEÇALHO LIMPO -->
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; border-bottom: 1px solid #f1f5f9; padding-bottom: 16px;">
           <div>
-            <h3 style="font-size: 1.08rem; font-weight: 800; color: #e879f9; margin: 0; display: flex; align-items: center; gap: 8px;">
-              ✨ Construtor de Campanhas à Medida — Eventos Livres & Produtos Específicos
-            </h3>
-            <p style="font-size: 0.84rem; color: #334155; margin-top: 4px;">
-              Crie uma campanha para qualquer evento do calendário ou da sua localidade (<b>Halloween, Black Friday, Festas da Cidade, Aniversário</b>) ou escolha manualmente os produtos que quer escoar (ex: <b>Antigrippine Trieffect Tosse</b>).
-            </p>
-          </div>
-        </div>
-
-        <!-- ATALHOS DE EVENTOS ESPECIAIS (1 CLIQUE) -->
-        <div style="margin-bottom: 16px;">
-          <div style="font-size: 0.74rem; font-weight: 700; color: var(--muted); text-transform: uppercase; margin-bottom: 8px;">
-            ⚡ Eventos Rápidos (Clique para montar automaticamente com o seu stock):
-          </div>
-          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('halloween')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #f97316; color: #fb923c;">🎃 Halloween</button>
-            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('black_friday')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #f43f5e; color: #fb7185;">🖤 Black Friday / Cyber Week</button>
-            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('festas_cidade')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #eab308; color: #fde047;">🎉 Festas da Cidade / Romaria</button>
-            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('aniversario_farmacia')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #38bdf8; color: #38bdf8;">🎂 Aniversário da Farmácia</button>
-            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('evento_desportivo')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #10b981; color: #34d399;">🏃 Evento Desportivo / Caminhada</button>
-            <button class="btn btn-secondary" onclick="runPresetCustomCampaign('dia_mae_pai')" style="font-size: 0.82rem; padding: 7px 14px; border-color: #c084fc; color: #c084fc;">💝 Dia da Mãe / Pai / Família</button>
-          </div>
-        </div>
-
-        <!-- CONFIGURAÇÃO MANUAL (TEMA LIVRE + SELETOR DE PRODUTOS ESPECÍFICOS) -->
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px;">
-          <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
-            <label style="font-size: 0.8rem; font-weight: 700; color: #0f172a; display: block; margin-bottom: 6px;">
-              1️⃣ Nome do Evento ou Campanha Personalizada:
-            </label>
-            <input type="text" id="customCampName" placeholder="Ex: Especial Festas de S. João, Semana Anti-Gripe, Promo Antigrippine..." style="width: 100%; margin-bottom: 12px;" />
-
-            <label style="font-size: 0.8rem; font-weight: 700; color: #0f172a; display: block; margin-bottom: 6px;">
-              2️⃣ Palavras-Chave / Famílias a incluir (Opcional, separadas por vírgula):
-            </label>
-            <input type="text" id="customCampTerms" placeholder="Ex: antigrippine, tosse, vitamina c, creme maos, perfume..." style="width: 100%; margin-bottom: 12px;" />
-
-            <label style="font-size: 0.8rem; font-weight: 700; color: #0f172a; display: block; margin-bottom: 6px;">
-              3️⃣ Filtro de Stock:
-            </label>
-            <select id="customCampFocus" style="width: 100%;">
-              <option value="PRIORIDADE_VALIDADES_MONOS" selected>🔥 Priorizar Validades Críticas, Monos e Excesso de Stock</option>
-              <option value="SO_VALIDADES_E_MONOS">🧹 Incluir APENAS Produtos em Risco de Validade ou Monos</option>
-              <option value="TODOS_ELEGIVEIS">📦 Todos os Produtos Elegíveis com Stock e Margem</option>
-            </select>
-          </div>
-
-          <!-- PESQUISADOR E SELETOR DE PRODUTOS ESPECÍFICOS -->
-          <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; justify-content: space-between;">
-            <div>
-              <label style="font-size: 0.8rem; font-weight: 700; color: #0369a1; display: block; margin-bottom: 6px;">
-                🎯 Escolher Produtos Específicos do Stock (Ex: Antigrippine, Mucavex...):
-              </label>
-              <div style="display: flex; gap: 8px; margin-bottom: 8px;">
-                <input type="text" id="customProdSearchInput" placeholder="🔎 Escreva nome ou CNP (ex: Antigrippine, 5818711)..." oninput="searchProductsForCustomBuilder(this.value)" style="flex: 1;" />
-              </div>
-              <div id="customProdSearchResults" style="max-height: 135px; overflow-y: auto; border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 6px; background: rgba(2, 6, 23, 0.6); font-size: 0.78rem; margin-bottom: 10px;">
-                <span style="color: var(--muted);">Escreva acima para pesquisar qualquer produto em stock e adicioná-lo à campanha...</span>
-              </div>
-            </div>
-
-            <div>
-              <div style="font-size: 0.75rem; font-weight: 700; color: #e879f9; margin-bottom: 6px;">
-                📌 Produtos Fixados na Campanha (<span id="customPickedCount">0</span>):
-              </div>
-              <div id="customPickedProductsChips" style="display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px;">
-                <span style="font-size: 0.75rem; color: var(--muted);">Nenhum produto fixado manualmente (ou clique num produto acima).</span>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-size: 1.6rem;">✨</span>
+              <div>
+                <h3 style="font-size: 1.2rem; font-weight: 800; color: #0f172a; margin: 0;">
+                  Assistente de Campanhas à Medida & Liquidação de Stock
+                </h3>
+                <p style="font-size: 0.86rem; color: #64748b; margin-top: 4px;">
+                  Monte campanhas para eventos especiais ou selecione produtos em risco para escoar em 15 dias.
+                </p>
               </div>
             </div>
           </div>
-        </div>
-
-        <div style="display: flex; justify-content: flex-end; gap: 10px;">
-          <button class="btn btn-secondary" onclick="clearCustomCampaignBuilder()" style="font-size: 0.84rem;">Limpar Seleção</button>
-          <button class="btn" onclick="submitCustomCampaignBuilder()" style="background: linear-gradient(135deg, #a855f7, #ec4899); font-size: 0.9rem; padding: 10px 22px;">
-            🚀 Montar Campanha à Medida & Simular Descontos
+          <button class="btn btn-secondary" onclick="switchMarketingSubView('epoca')" style="font-size: 0.84rem; padding: 7px 16px; border-color: #cbd5e1; color: #475569; font-weight: 600;">
+            ✕ Voltar ao Catálogo Sazonal
           </button>
+        </div>
+
+        <!-- INDICADOR PROGRESSIVO DE PASSOS -->
+        <div style="display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap;">
+          <div id="wizardStepIndicator1" style="flex: 1; min-width: 220px; padding: 12px 16px; border-radius: 10px; background: #f1f5f9; border-left: 4px solid #a855f7; display: flex; align-items: center; gap: 10px;">
+            <span style="background: #a855f7; color: white; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 0.78rem; font-weight: 800;">1</span>
+            <div>
+              <div style="font-size: 0.86rem; font-weight: 700; color: #0f172a;">1. Tema ou Evento</div>
+              <div style="font-size: 0.74rem; color: #64748b;">Escolha um evento rápido ou tema livre</div>
+            </div>
+          </div>
+          <div id="wizardStepIndicator2" style="flex: 1; min-width: 220px; padding: 12px 16px; border-radius: 10px; background: #f8fafc; border-left: 4px solid #cbd5e1; display: flex; align-items: center; gap: 10px;">
+            <span style="background: #cbd5e1; color: #475569; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 0.78rem; font-weight: 800;">2</span>
+            <div>
+              <div style="font-size: 0.86rem; font-weight: 700; color: #0f172a;">2. Facilitador de Produtos</div>
+              <div style="font-size: 0.74rem; color: #64748b;">Cestos de Validades, Monos ou Pesquisa</div>
+            </div>
+          </div>
+          <div id="wizardStepIndicator3" style="flex: 1; min-width: 220px; padding: 12px 16px; border-radius: 10px; background: #f8fafc; border-left: 4px solid #cbd5e1; display: flex; align-items: center; gap: 10px;">
+            <span style="background: #cbd5e1; color: #475569; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 0.78rem; font-weight: 800;">3</span>
+            <div>
+              <div style="font-size: 0.86rem; font-weight: 700; color: #0f172a;">3. Simulação & Ativação</div>
+              <div style="font-size: 0.74rem; color: #64748b;">Desconto seguro e tarefas para a equipa</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PASSO 1: TEMA OU EVENTO (LIMPO & ESPAÇOSO) -->
+        <div id="customWizardStep1" style="display: block;">
+          <div style="font-size: 0.88rem; font-weight: 700; color: #334155; margin-bottom: 12px;">
+            ⚡ Eventos Rápidos do Calendário & Comunidade (Clique para avançar diretamente):
+          </div>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 22px;">
+            <button class="btn btn-secondary preset-event-card" onclick="selectWizardPreset('black_friday', 'Black Friday & Cyber Week', '🖤')" style="padding: 14px 16px; border-color: #f43f5e; color: #9f1239; background: #fff1f2; text-align: left; display: flex; flex-direction: column; gap: 4px; border-radius: 12px; cursor: pointer;">
+              <span style="font-size: 1.4rem;">🖤</span>
+              <b style="font-size: 0.88rem;">Black Friday</b>
+              <span style="font-size: 0.74rem; color: #e11d48;">Destaque promocional</span>
+            </button>
+            <button class="btn btn-secondary preset-event-card" onclick="selectWizardPreset('festas_cidade', 'Festas da Cidade & Romaria', '🎉')" style="padding: 14px 16px; border-color: #eab308; color: #854d0e; background: #fefce8; text-align: left; display: flex; flex-direction: column; gap: 4px; border-radius: 12px; cursor: pointer;">
+              <span style="font-size: 1.4rem;">🎉</span>
+              <b style="font-size: 0.88rem;">Festas da Cidade</b>
+              <span style="font-size: 0.74rem; color: #a16207;">Romarias & Verão local</span>
+            </button>
+            <button class="btn btn-secondary preset-event-card" onclick="selectWizardPreset('aniversario_farmacia', 'Aniversário da Farmácia', '🎂')" style="padding: 14px 16px; border-color: #0284c7; color: #075985; background: #f0f9ff; text-align: left; display: flex; flex-direction: column; gap: 4px; border-radius: 12px; cursor: pointer;">
+              <span style="font-size: 1.4rem;">🎂</span>
+              <b style="font-size: 0.88rem;">Aniversário Farmácia</b>
+              <span style="font-size: 0.74rem; color: #0284c7;">Agradecimento a utentes</span>
+            </button>
+            <button class="btn btn-secondary preset-event-card" onclick="selectWizardPreset('evento_desportivo', 'Evento Desportivo & Caminhada', '🏃')" style="padding: 14px 16px; border-color: #10b981; color: #065f46; background: #ecfdf5; text-align: left; display: flex; flex-direction: column; gap: 4px; border-radius: 12px; cursor: pointer;">
+              <span style="font-size: 1.4rem;">🏃</span>
+              <b style="font-size: 0.88rem;">Caminhada / Desporto</b>
+              <span style="font-size: 0.74rem; color: #059669;">Magnésio, sol e pés</span>
+            </button>
+            <button class="btn btn-secondary preset-event-card" onclick="selectWizardPreset('halloween', 'Especial Halloween & Outono', '🎃')" style="padding: 14px 16px; border-color: #f97316; color: #9a3412; background: #fff7ed; text-align: left; display: flex; flex-direction: column; gap: 4px; border-radius: 12px; cursor: pointer;">
+              <span style="font-size: 1.4rem;">🎃</span>
+              <b style="font-size: 0.88rem;">Halloween</b>
+              <span style="font-size: 0.74rem; color: #ea580c;">Crianças e higiene</span>
+            </button>
+            <button class="btn btn-secondary preset-event-card" onclick="selectWizardPreset('dia_mae_pai', 'Dia da Mãe / Pai / Família', '💝')" style="padding: 14px 16px; border-color: #c084fc; color: #6b21a8; background: #faf5ff; text-align: left; display: flex; flex-direction: column; gap: 4px; border-radius: 12px; cursor: pointer;">
+              <span style="font-size: 1.4rem;">💝</span>
+              <b style="font-size: 0.88rem;">Dia da Mãe / Pai</b>
+              <span style="font-size: 0.74rem; color: #9333ea;">Packs de presente & dermo</span>
+            </button>
+          </div>
+
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; margin-bottom: 20px;">
+            <div style="font-size: 0.86rem; font-weight: 700; color: #0f172a; margin-bottom: 8px;">
+              Ou escreva o Nome da Campanha Personalizada:
+            </div>
+            <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+              <input type="text" id="customCampName" placeholder="Ex: Semana da Vitamina C, Limpeza de Tosse Residual, Especial Cuidado Sénior..." style="flex: 1; min-width: 280px; padding: 10px 14px; font-size: 0.92rem;" />
+              <button class="btn" onclick="goToWizardStep(2)" style="background: #a855f7; color: white; font-weight: 700; padding: 10px 22px;">
+                Continuar para Escolha de Produtos ➡️
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- PASSO 2: FACILITADOR INTELIGENTE DE PRODUTOS (OS 3 CESTOS + CARRINHO) -->
+        <div id="customWizardStep2" style="display: none;">
+          <div style="display: grid; grid-template-columns: 1fr 340px; gap: 20px; align-items: start;">
+            <!-- COLUNA ESQUERDA: CESTOS INTELIGENTES & PESQUISA -->
+            <div>
+              <!-- ABAS DOS 3 CESTOS -->
+              <div style="display: flex; gap: 8px; border-bottom: 2px solid #e2e8f0; padding-bottom: 8px; margin-bottom: 14px; flex-wrap: wrap;">
+                <button id="btnBasketTabValidades" class="btn" onclick="switchSmartBasketTab('validades')" style="background: #ef4444; color: white; font-size: 0.82rem; padding: 8px 14px; font-weight: 700;">
+                  🔴 Validades Próximas (<span id="countBasketValidades">...</span>)
+                </button>
+                <button id="btnBasketTabMonos" class="btn btn-secondary" onclick="switchSmartBasketTab('monos')" style="font-size: 0.82rem; padding: 8px 14px; font-weight: 700; color: #b45309; border-color: #f59e0b; background: transparent;">
+                  🟡 Monos Parados (<span id="countBasketMonos">...</span>)
+                </button>
+                <button id="btnBasketTabMargem" class="btn btn-secondary" onclick="switchSmartBasketTab('topMargem')" style="font-size: 0.82rem; padding: 8px 14px; font-weight: 700; color: #047857; border-color: #10b981; background: transparent;">
+                  🟢 Top Margem (>40%) (<span id="countBasketMargem">...</span>)
+                </button>
+                <button id="btnBasketTabSearch" class="btn btn-secondary" onclick="switchSmartBasketTab('search')" style="font-size: 0.82rem; padding: 8px 14px; font-weight: 700; color: #0284c7; border-color: #0284c7; background: transparent;">
+                  🔍 Pesquisa Livre
+                </button>
+              </div>
+
+              <!-- CAIXA DE PESQUISA (MOSTRADA QUANDO NA ABA SEARCH) -->
+              <div id="basketSearchContainer" style="display: none; margin-bottom: 14px;">
+                <input type="text" id="customProdSearchInput" placeholder="🔎 Escreva o nome ou CNP (ex: Antigrippine, 5818711, Benuron, Vichy)..." oninput="searchProductsForCustomBuilder(this.value)" style="width: 100%; padding: 10px 14px; font-size: 0.9rem;" />
+              </div>
+
+              <!-- BOTÃO DE ADICIONAR TODOS DO CESTO ATIVO -->
+              <div id="basketBatchActionBar" style="display: flex; justify-content: space-between; align-items: center; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+                <span id="basketActiveDescription" style="font-size: 0.82rem; color: #475569; font-weight: 600;">Produtos identificados em armazém:</span>
+                <button id="btnAddAllFromBasketBtn" class="btn" onclick="addAllCurrentBasketToPicked()" style="background: #0f172a; color: white; font-size: 0.8rem; padding: 6px 14px; font-weight: 700;">
+                  + Adicionar Todos a Esta Campanha
+                </button>
+              </div>
+
+              <!-- LISTAGEM ESPAÇOSA DE PRODUTOS DO CESTO / PESQUISA -->
+              <div id="basketProductsList" style="max-height: 420px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 10px; background: white;">
+                <div style="padding: 24px; text-align: center; color: #64748b;">A carregar produtos do stock...</div>
+              </div>
+            </div>
+
+            <!-- COLUNA DIREITA: O CARRINHO DA CAMPANHA -->
+            <div style="background: #faf5ff; border: 1.5px solid #d8b4fe; border-radius: 12px; padding: 18px; position: sticky; top: 20px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <div style="font-weight: 800; color: #6b21a8; font-size: 0.95rem; display: flex; align-items: center; gap: 6px;">
+                  <span>🛒</span> Artigos Fixados (<span id="customPickedCount">0</span>)
+                </div>
+                <button class="btn btn-secondary" onclick="clearCustomPickedProducts()" style="font-size: 0.72rem; padding: 3px 8px; color: #dc2626; border-color: #fca5a5; background: white;">Limpar</button>
+              </div>
+
+              <div id="customPickedProductsList" style="max-height: 220px; overflow-y: auto; margin-bottom: 14px; border: 1px solid #e9d5ff; border-radius: 8px; background: white; padding: 6px;">
+                <span style="font-size: 0.78rem; color: #94a3b8; display: block; padding: 10px; text-align: center;">Nenhum produto adicionado ainda. Escolha produtos dos cestos à esquerda.</span>
+              </div>
+
+              <!-- INDICADORES CONSOLIDADOS DO CARRINHO -->
+              <div style="background: white; border: 1px solid #e9d5ff; border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 0.78rem; line-height: 1.6;">
+                <div>📦 Stock Total: <b id="cartTotalStock">0</b> un</div>
+                <div>💰 Custo Armazém: <b id="cartTotalCost" style="color: #b45309;">€0.00</b></div>
+                <div>🏷️ PVP Total: <b id="cartTotalPvp">€0.00</b></div>
+                <div>📈 Margem Média: <b id="cartAvgMargin" style="color: #059669;">0%</b></div>
+              </div>
+
+              <div style="display: flex; flex-direction: column; gap: 8px;">
+                <button class="btn" onclick="submitCustomCampaignWizard()" style="background: linear-gradient(135deg, #a855f7, #ec4899); color: white; font-weight: 800; font-size: 0.88rem; padding: 12px;">
+                  🚀 Simular Descontos & Ativar ➡️
+                </button>
+                <button class="btn btn-secondary" onclick="goToWizardStep(1)" style="font-size: 0.8rem; padding: 8px; color: #64748b; border-color: #cbd5e1; background: white;">
+                  ⬅️ Voltar ao Tema
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -3278,6 +3922,9 @@ function getDashboardHtml(): string {
               ✕ Fechar Detalhe & Voltar às Opções
             </button>
           </div>
+
+          <!-- ALERTA DE CAMPANHA ATIVA NESTE TEMA -->
+          <div id="selectedCampaignActiveAlert" style="display: none; margin-bottom: 18px;"></div>
 
           <!-- ANATOMIA DA ÉPOCA & ESTRATÉGIA DE ESCOAMENTO -->
           <div id="seasonAnatomyBox" style="display: none; margin-bottom: 18px; background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 10px; padding: 16px;">
@@ -3358,8 +4005,11 @@ function getDashboardHtml(): string {
           </div>
         </div>
 
-        <!-- BOTÃO PARA GERAR MATERIAIS -->
-        <div style="display: flex; justify-content: flex-end; gap: 12px;">
+        <!-- BOTÃO PARA GERAR MATERIAIS & ATIVAR CAMPANHA -->
+        <div style="display: flex; justify-content: flex-end; gap: 12px; flex-wrap: wrap;">
+          <button class="btn" id="btnActivateCampaignStep2" onclick="activateCurrentCampaignUi()" style="background: #10b981; color: white; font-weight: 700; font-size: 0.95rem; padding: 10px 24px; display: flex; align-items: center; gap: 8px;">
+            🚀 Ativar Campanha na Farmácia (Gerar Tarefas)
+          </button>
           <button class="btn" id="btnGenerateMaterials" onclick="generateCampaignMaterialsAction()" style="background: linear-gradient(135deg, #f43f5e, #e11d48); font-size: 0.95rem; padding: 10px 24px;">
             ✨ Gerar Materiais para os Canais Selecionados
           </button>
@@ -3378,9 +4028,12 @@ function getDashboardHtml(): string {
               Copie o texto com um clique e partilhe de imediato nas suas redes, ecrãs ou no balcão da farmácia.
             </p>
           </div>
-          <div style="display: flex; gap: 10px;">
+          <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+            <button class="btn" id="btnActivateCampaignMain" onclick="activateCurrentCampaignUi()" style="background: #10b981; color: white; font-weight: 700; display: flex; align-items: center; gap: 6px;">
+              🚀 Ativar Campanha na Farmácia
+            </button>
             <button class="btn btn-secondary" onclick="exportCampaignPlanCsv()">
-              📥 Exportar Lista de Preços (CSV)
+              📥 Exportar Lista (CSV)
             </button>
             <button class="btn" onclick="sendCampaignEmailToTeam()" style="background: #0284c7;">
               ✉️ Enviar Pacote por Email
@@ -3600,6 +4253,115 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
+  
+  <!-- MODAL 4B: IMPORTAÇÃO INTELIGENTE E INTERATIVA DE FICHEIROS (HISTÓRICO, DIÁRIOS & VALIDADES) -->
+  <div class="modal-backdrop" id="interactiveImportModal" style="display: none;" onclick="if(event.target===this) closeInteractiveImportModal()">
+    <div class="modal" style="max-width: 920px; width: 95vw; max-height: 90vh; overflow-y: auto;">
+      <div class="modal-header">
+        <div>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 1.3rem;">📥</span>
+            <h2 style="font-size: 1.15rem; color: #38bdf8; margin: 0;">Importação Inteligente de Ficheiros (Multi-Período)</h2>
+          </div>
+          <p style="font-size: 0.82rem; color: var(--muted); margin-top: 4px;">
+            Carregue ficheiros de vendas (anuais ou diários) e validades com controlo total sobre substituição, snapshots de stock e resolução de conflitos.
+          </p>
+        </div>
+        <button class="btn btn-secondary" onclick="closeInteractiveImportModal()">✕ Fechar</button>
+      </div>
+
+      <!-- Passo 1: Seleção de Ficheiros -->
+      <div id="importStep1" style="display: block;">
+        <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <label style="font-size: 0.85rem; font-weight: 700; color: #0f172a;">Origem dos Ficheiros:</label>
+            <div style="display: flex; gap: 8px;">
+              <button class="btn btn-secondary" onclick="loadAvenidaFolderFiles()" style="font-size: 0.78rem; padding: 5px 10px; border-color: #38bdf8; color: #0284c7;">
+                📁 Ficheiros da Pasta Avenida
+              </button>
+              <button class="btn btn-secondary" onclick="document.getElementById('impCustomFilesInput').click()" style="font-size: 0.78rem; padding: 5px 10px;">
+                📤 Carregar do Computador
+              </button>
+              <input type="file" id="impCustomFilesInput" multiple accept=".pdf,.csv" style="display:none;" onchange="handleCustomFilesSelected(event)" />
+            </div>
+          </div>
+
+          <div id="avenidaFilesContainer" style="max-height: 240px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: #f8fafc;">
+            <div style="text-align: center; color: var(--muted); padding: 16px; font-size: 0.82rem;">
+              Clique em "📁 Ficheiros da Pasta Avenida" ou selecione ficheiros do seu computador.
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px;">
+            <span id="selectedFilesSummary" style="font-size: 0.8rem; color: var(--muted);">0 ficheiros selecionados.</span>
+            <button class="btn" id="btnInspectFiles" onclick="runInteractiveInspection()" style="background: #0284c7; color: #ffffff; font-size: 0.84rem; padding: 8px 16px;" disabled>
+              🔍 Analisar & Inspecionar Ficheiros
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Passo 2: Diagnóstico e Perguntas / Decisões -->
+      <div id="importStep2" style="display: none;">
+        <div style="background: #ffffff; border: 1px solid #bae6fd; border-radius: 10px; padding: 16px; margin-bottom: 16px;">
+          <div style="font-size: 0.95rem; font-weight: 800; color: #0369a1; margin-bottom: 6px; display: flex; align-items: center; gap: 6px;">
+            <span>🛡️</span> Diagnóstico e Opções de Importação
+          </div>
+          <p style="font-size: 0.8rem; color: var(--muted); margin-bottom: 14px;">
+            O sistema analisou os documentos e detetou as opções abaixo. Confirme como deseja proceder para cada caso:
+          </p>
+
+          <div id="inspectionQuestionsContainer" style="display: flex; flex-direction: column; gap: 14px;">
+            <!-- Preenchido dinamicamente via JS -->
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--border);">
+            <button class="btn btn-secondary" onclick="backToImportStep1()">⬅️ Voltar à Seleção</button>
+            <button class="btn" id="btnExecuteImport" onclick="submitInteractiveImport()" style="background: #10b981; color: #ffffff; font-size: 0.86rem; padding: 9px 18px; font-weight: 700;">
+              🚀 Confirmar & Executar Importação
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Passo 3: Feedback e Progresso -->
+      <div id="importStep3" style="display: none; padding: 16px 20px;">
+        <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); margin-bottom: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span id="importProgressIcon" style="font-size: 1.4rem;">⏳</span>
+              <div style="font-size: 1.02rem; font-weight: 800; color: #0f172a;" id="importProgressTitle">
+                A processar e importar dados...
+              </div>
+            </div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: #0284c7; font-family: monospace;" id="importProgressPercent">
+              0%
+            </div>
+          </div>
+
+          <!-- Barra de Progresso Visual Dinâmica -->
+          <div style="background: #e2e8f0; border-radius: 999px; height: 16px; overflow: hidden; margin: 12px 0; border: 1px solid #cbd5e1;">
+            <div id="importProgressBar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #38bdf8, #10b981); border-radius: 999px; transition: width 0.35s ease-in-out;"></div>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; margin-top: 6px;">
+            <span style="font-weight: 700; color: #1e293b;" id="importProgressStepText">A iniciar processamento...</span>
+            <span style="color: var(--muted); font-size: 0.78rem;" id="importProgressDetailText">A preparar lotes seguros...</span>
+          </div>
+        </div>
+
+        <div id="importStatsReport" style="display: none; text-align: left; background: #f8fafc; border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-top: 16px;"></div>
+
+        <div style="text-align: right; margin-top: 18px;">
+          <button class="btn" id="btnCloseImportFinished" onclick="closeInteractiveImportModal(); loadAnalysis();" style="display: none; background: #10b981; color: #ffffff; padding: 9px 20px; font-weight: 700;">
+            ✅ Concluir & Atualizar Dashboard
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
   <!-- MODAL 5: IMPORTADOR WEB DE NOVA FARMÁCIA (PDF INVENTÁRIO + PDF VALIDADES + CSV VENDAS) -->
   <div class="modal-backdrop" id="importPharmacyModal" style="display: none;" onclick="if(event.target===this) closeImportPharmacyModal()">
     <div class="modal" style="max-width: 680px;">
@@ -3801,6 +4563,28 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
+
+  
+  <!-- GAVETA LATERAL DIREITA (SLIDE DRAWER) -->
+  <div id="slideDrawerBackdrop" class="drawer-backdrop" onclick="closeSlideDrawer()"></div>
+  <aside id="slideDrawer" class="slide-drawer" aria-label="Detalhes e Protocolo Operacional">
+    <div class="drawer-header">
+      <div style="flex: 1; padding-right: 12px;">
+        <div id="drawerBadge" style="margin-bottom: 6px;"></div>
+        <h3 id="drawerTitle" style="font-size: 1.15rem; font-weight: 800; color: #0f172a; margin: 0; line-height: 1.3;"></h3>
+        <p id="drawerSubtitle" style="font-size: 0.8rem; color: #64748b; margin: 4px 0 0; line-height: 1.4;"></p>
+      </div>
+      <button class="btn btn-secondary" onclick="closeSlideDrawer()" style="padding: 6px 12px; font-size: 0.82rem; font-weight: 700; border-radius: 8px; cursor: pointer;">
+        ✕ Fechar
+      </button>
+    </div>
+    <div id="drawerBody" class="drawer-body">
+      <!-- Conteúdo injetado dinamicamente -->
+    </div>
+    <div id="drawerFooter" class="drawer-footer">
+      <!-- Ações e botões injetados dinamicamente -->
+    </div>
+  </aside>
 
   <script>
     let currentReport = null;
@@ -4048,6 +4832,7 @@ function getDashboardHtml(): string {
     }
 
     function logoutAdmin() {
+      fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
       localStorage.removeItem('bi_pharma_access_code');
       localStorage.removeItem('bi_pharma_auth_role');
       localStorage.removeItem('bi_pharma_farmacia_id');
@@ -4130,7 +4915,7 @@ function getDashboardHtml(): string {
         const farms = await res.json();
         cachedAdminPharmacies = farms;
         const sel = document.getElementById('farmaciaSelector');
-        sel.innerHTML = farms.map(f => \`<option value="\${f.id}" \${f.id === activeFarmaciaId ? 'selected' : ''}>🏥 \${f.nome} (NIF: \${f.nif})</option>\`).join('');
+        sel.innerHTML = farms.map(f => \`<option value="\${escapeHtml(f.id)}" \${f.id === activeFarmaciaId ? 'selected' : ''}>🏥 \${escapeHtml(f.nome)} (NIF: \${escapeHtml(f.nif)})</option>\`).join('');
         if (!activeFarmaciaId && farms.length > 0) {
           activeFarmaciaId = farms[0].id;
           sel.value = activeFarmaciaId;
@@ -4173,22 +4958,6 @@ function getDashboardHtml(): string {
         if (ok) return;
       }
 
-      // 3.5 Em desenvolvimento local (localhost), entra diretamente com a primeira farmácia carregada
-      if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-        try {
-          const res = await fetch('/api/pharmacies');
-          const farms = await res.json();
-          if (Array.isArray(farms) && farms.length > 0) {
-            activeFarmaciaId = farms[0].id;
-            applyRoleUiState('ADMIN', farms[0]);
-            await loadPharmaciesDropdown();
-            return;
-          }
-        } catch (e) {
-          console.error('Erro no auto-login localhost:', e);
-        }
-      }
-
       // 4. Caso contrário, abre a janela de login (NUNCA entra em Admin sem password!)
       openAuthGateModal();
     }
@@ -4207,13 +4976,13 @@ function getDashboardHtml(): string {
               <div style="display: grid; grid-template-columns: 1.3fr 1fr auto; gap: 10px; align-items: end;">
                 <div>
                   <label style="font-size: 0.74rem; color: var(--muted); font-weight: 700; display: block; margin-bottom: 4px;">Nome Anónimo (Visível no Pitch/Cliente):</label>
-                  <input type="text" id="admNome_\${f.id}" value="\${f.nome}" style="width: 100%; font-weight: 700;" />
+                  <input type="text" id="admNome_\${escapeHtml(f.id)}" value="\${escapeHtml(f.nome)}" style="width: 100%; font-weight: 700;" />
                 </div>
                 <div>
                   <label style="font-size: 0.74rem; color: var(--muted); font-weight: 700; display: block; margin-bottom: 4px;">Código Isolado desta Farmácia:</label>
-                  <input type="text" id="admCode_\${f.id}" value="\${f.codigo_acesso || ''}" style="width: 100%; font-weight: 700; text-transform: uppercase; color: #38bdf8;" />
+                  <input type="text" id="admCode_\${escapeHtml(f.id)}" value="\${escapeHtml(f.codigo_acesso || '')}" style="width: 100%; font-weight: 700; text-transform: uppercase; color: #38bdf8;" />
                 </div>
-                <button class="btn" onclick="savePharmacyAdmin('\${f.id}')" style="padding: 9px 14px; font-size: 0.82rem;">💾 Guardar</button>
+                <button class="btn" onclick="savePharmacyAdmin('\${escapeHtml(f.id)}')" style="padding: 9px 14px; font-size: 0.82rem;">💾 Guardar</button>
               </div>
               <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 6px; border-top: 1px dashed rgba(148,163,184,0.2);">
                 <span style="font-size: 0.78rem; color: #94a3b8;">🔗 Link Isolado p/ Cliente: <code style="color:#38bdf8;background:rgba(2,6,23,0.7);padding:2px 6px;border-radius:4px;">\${shareUrl}</code></span>
@@ -4254,6 +5023,348 @@ function getDashboardHtml(): string {
         }
       } catch (e) {
         if (fb) fb.textContent = '⚠️ Erro de comunicação com o servidor.';
+      }
+    }
+
+    
+    let selectedImportFiles = [];
+    let currentInspectionResults = [];
+
+    function openInteractiveImportModal() {
+      var modal = document.getElementById('interactiveImportModal');
+      if (modal) modal.style.display = 'flex';
+      backToImportStep1();
+      loadAvenidaFolderFiles();
+    }
+
+    function closeInteractiveImportModal() {
+      var modal = document.getElementById('interactiveImportModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    function backToImportStep1() {
+      document.getElementById('importStep1').style.display = 'block';
+      document.getElementById('importStep2').style.display = 'none';
+      document.getElementById('importStep3').style.display = 'none';
+    }
+
+    async function loadAvenidaFolderFiles() {
+      var c = document.getElementById('avenidaFilesContainer');
+      if (!c) return;
+      c.innerHTML = '<div style="color:var(--muted);font-size:0.82rem;padding:10px;">⏳ A listar ficheiros da pasta Avenida...</div>';
+
+      try {
+        var res = await fetch('/api/admin/avenida-files');
+        var data = await res.json();
+        if (data.ok && Array.isArray(data.files) && data.files.length > 0) {
+          selectedImportFiles = data.files.map(function(f) {
+            return { name: f.name, size: f.sizeFormatted, fromAvenida: true, selected: true };
+          });
+          renderAvenidaFilesList();
+        } else {
+          c.innerHTML = '<div style="color:var(--muted);font-size:0.82rem;padding:10px;">Nenhum ficheiro encontrado na pasta Avenida.</div>';
+        }
+      } catch (e) {
+        c.innerHTML = '<div style="color:#ef4444;font-size:0.82rem;padding:10px;">Erro ao listar ficheiros da pasta Avenida.</div>';
+      }
+    }
+
+    function renderAvenidaFilesList() {
+      var c = document.getElementById('avenidaFilesContainer');
+      if (!c) return;
+      var html = '';
+      for (var idx = 0; idx < selectedImportFiles.length; idx++) {
+        var f = selectedImportFiles[idx];
+        var checkedAttr = f.selected ? 'checked' : '';
+        var originLabel = f.fromAvenida ? 'Pasta Servidor' : 'Upload Local';
+        var originColor = f.fromAvenida ? '#0284c7' : '#10b981';
+
+        html += '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#ffffff;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;">' +
+          '<div style="display:flex;align-items:center;gap:8px;">' +
+            '<input type="checkbox" id="chk_file_' + idx + '" ' + checkedAttr + ' onchange="toggleFileSelection(' + idx + ')" />' +
+            '<span style="font-weight:700;font-size:0.83rem;color:#0f172a;">' + f.name + '</span>' +
+            '<span style="font-size:0.75rem;color:var(--muted);background:#f1f5f9;padding:2px 6px;border-radius:4px;">' + (f.size || '') + '</span>' +
+          '</div>' +
+          '<span style="font-size:0.72rem;color:' + originColor + ';font-weight:700;">' + originLabel + '</span>' +
+        '</div>';
+      }
+      c.innerHTML = html;
+      updateSelectedFilesCount();
+    }
+
+    function toggleFileSelection(idx) {
+      if (selectedImportFiles[idx]) {
+        selectedImportFiles[idx].selected = !selectedImportFiles[idx].selected;
+        updateSelectedFilesCount();
+      }
+    }
+
+    function updateSelectedFilesCount() {
+      var count = selectedImportFiles.filter(function(f) { return f.selected; }).length;
+      var s = document.getElementById('selectedFilesSummary');
+      if (s) s.textContent = count + ' ficheiro(s) selecionado(s).';
+      var btn = document.getElementById('btnInspectFiles');
+      if (btn) btn.disabled = count === 0;
+    }
+
+    function handleCustomFilesSelected(ev) {
+      var fls = ev.target.files;
+      if (!fls || fls.length === 0) return;
+
+      for (var i = 0; i < fls.length; i++) {
+        var file = fls[i];
+        selectedImportFiles.push({
+          name: file.name,
+          size: (file.size / 1024).toFixed(1) + ' KB',
+          fromAvenida: false,
+          fileObject: file,
+          selected: true
+        });
+      }
+      renderAvenidaFilesList();
+    }
+
+    async function runInteractiveInspection() {
+      var activeFiles = selectedImportFiles.filter(function(f) { return f.selected; });
+      if (activeFiles.length === 0) return;
+
+      var btn = document.getElementById('btnInspectFiles');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ A analisar ficheiros...';
+      }
+
+      try {
+        var fromAvenidaNames = activeFiles.filter(function(f) { return f.fromAvenida; }).map(function(f) { return f.name; });
+        var uploadedFiles = [];
+        var uploads = activeFiles.filter(function(f) { return !f.fromAvenida; });
+        for (var i = 0; i < uploads.length; i++) {
+          var f = uploads[i];
+          var b64 = await fileToBase64(f.fileObject);
+          uploadedFiles.push({ name: f.name, base64: b64 });
+        }
+
+        var res = await fetch('/api/admin/inspect-import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            fromAvenida: fromAvenidaNames.length > 0,
+            fileNames: fromAvenidaNames,
+            files: uploadedFiles
+          })
+        });
+
+        var data = await res.json();
+        if (data.ok && Array.isArray(data.inspection)) {
+          currentInspectionResults = data.inspection;
+          renderInspectionQuestions();
+          document.getElementById('importStep1').style.display = 'none';
+          document.getElementById('importStep2').style.display = 'block';
+        } else {
+          alert('Erro na inspeção: ' + (data.error || 'Falha ao processar'));
+        }
+      } catch (e) {
+        alert('Erro ao inspecionar ficheiros: ' + e.message);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = '🔍 Analisar & Inspecionar Ficheiros';
+        }
+      }
+    }
+
+    function renderInspectionQuestions() {
+      var c = document.getElementById('inspectionQuestionsContainer');
+      if (!c) return;
+
+      var html = '';
+      for (var fileIdx = 0; fileIdx < currentInspectionResults.length; fileIdx++) {
+        var item = currentInspectionResults[fileIdx];
+        var typeBadge = item.fileType === 'VENDAS_DIARIO'
+          ? '<span class="badge badge-purple" style="font-size:0.75rem;">📅 Vendas Diárias</span>'
+          : item.fileType === 'VENDAS_MENSAL'
+          ? '<span class="badge badge-info" style="font-size:0.75rem;">📊 Vendas Mensais</span>'
+          : '<span class="badge badge-warning" style="font-size:0.75rem;">📦 Validades</span>';
+
+        html += '<div style="background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:12px 14px;">' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">' +
+            '<div style="display:flex;align-items:center;gap:8px;">' +
+              '<span style="font-weight:800;font-size:0.88rem;color:#0f172a;">' + item.fileName + '</span>' +
+              typeBadge +
+            '</div>' +
+            '<div style="font-size:0.75rem;color:var(--muted);">' +
+              (item.periodo ? 'Período: ' + item.periodo : '') + ' | ' + item.totalArtigos + ' artigos' +
+            '</div>' +
+          '</div>';
+
+        if (item.questions && item.questions.length > 0) {
+          for (var qIdx = 0; qIdx < item.questions.length; qIdx++) {
+            var q = item.questions[qIdx];
+            html += '<div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:6px;padding:10px 12px;margin-top:8px;">' +
+              '<div style="font-size:0.8rem;font-weight:700;color:#0284c7;margin-bottom:3px;">❓ ' + q.title + '</div>' +
+              '<div style="font-size:0.76rem;color:var(--muted);margin-bottom:8px;">' + q.description + '</div>' +
+              '<div style="display:flex;flex-direction:column;gap:6px;">';
+
+            for (var oIdx = 0; oIdx < q.options.length; oIdx++) {
+              var opt = q.options[oIdx];
+              var checkedRadio = opt.value === q.defaultValue ? 'checked' : '';
+              html += '<label style="display:flex;align-items:center;gap:8px;font-size:0.78rem;cursor:pointer;color:#334155;">' +
+                '<input type="radio" name="decision_' + fileIdx + '_' + q.id + '" value="' + opt.value + '" ' + checkedRadio + ' />' +
+                '<span>' + opt.label + '</span>' +
+              '</label>';
+            }
+            html += '</div></div>';
+          }
+        } else {
+          html += '<div style="font-size:0.76rem;color:#10b981;font-weight:700;margin-top:4px;">✅ Ficheiro pronto para importação sem conflitos.</div>';
+        }
+
+        html += '</div>';
+      }
+      c.innerHTML = html;
+    }
+
+    async function submitInteractiveImport() {
+      var decisions = {};
+
+      for (var fileIdx = 0; fileIdx < currentInspectionResults.length; fileIdx++) {
+        var item = currentInspectionResults[fileIdx];
+        decisions[item.fileName] = {};
+        if (item.questions) {
+          for (var qIdx = 0; qIdx < item.questions.length; qIdx++) {
+            var q = item.questions[qIdx];
+            var rad = document.querySelector('input[name="decision_' + fileIdx + '_' + q.id + '"]:checked');
+            if (rad) {
+              if (q.id === 'nif_action') decisions[item.fileName].nifAction = rad.value;
+              if (q.id === 'conflict_action') decisions[item.fileName].conflictAction = rad.value;
+              if (q.id === 'stock_action') decisions[item.fileName].stockAction = rad.value;
+              if (q.id === 'validades_action') decisions[item.fileName].validadesAction = rad.value;
+            }
+          }
+        }
+      }
+
+      document.getElementById('importStep2').style.display = 'none';
+      document.getElementById('importStep3').style.display = 'block';
+
+      var progressBar = document.getElementById('importProgressBar');
+      var progressPercent = document.getElementById('importProgressPercent');
+      var progressStep = document.getElementById('importProgressStepText');
+      var progressDetail = document.getElementById('importProgressDetailText');
+      var progressIcon = document.getElementById('importProgressIcon');
+
+      if (progressBar) progressBar.style.width = '3%';
+      if (progressPercent) progressPercent.textContent = '3%';
+      if (progressStep) progressStep.textContent = 'A enviar ficheiros para o servidor...';
+      if (progressDetail) progressDetail.textContent = 'A aguardar confirmação de início...';
+      if (progressIcon) progressIcon.textContent = '⏳';
+
+      document.getElementById('importProgressTitle').textContent = 'A processar e importar dados...';
+      document.getElementById('importStatsReport').style.display = 'none';
+      document.getElementById('btnCloseImportFinished').style.display = 'none';
+
+      // Polling de progresso em tempo real a cada 400ms
+      var pollTimer = setInterval(async function() {
+        try {
+          var pRes = await fetch('/api/admin/import-progress?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+          var pData = await pRes.json();
+          if (pData.ok && pData.progress) {
+            var prog = pData.progress;
+            if (progressBar && prog.percent > 0) progressBar.style.width = prog.percent + '%';
+            if (progressPercent && prog.percent > 0) progressPercent.textContent = prog.percent + '%';
+            if (progressStep && prog.step) progressStep.textContent = prog.step;
+            if (progressDetail && prog.detail) progressDetail.textContent = prog.detail;
+            if (prog.status === 'COMPLETED') {
+              if (progressIcon) progressIcon.textContent = '🎉';
+              if (progressBar) progressBar.style.width = '100%';
+              if (progressPercent) progressPercent.textContent = '100%';
+              clearInterval(pollTimer);
+            }
+          }
+        } catch (e) {}
+      }, 400);
+
+      try {
+        var fromAvenidaNames = selectedImportFiles.filter(function(f) { return f.selected && f.fromAvenida; }).map(function(f) { return f.name; });
+        var uploadedFiles = [];
+        var uploads = selectedImportFiles.filter(function(f) { return f.selected && !f.fromAvenida; });
+        for (var i = 0; i < uploads.length; i++) {
+          var f = uploads[i];
+          var b64 = await fileToBase64(f.fileObject);
+          uploadedFiles.push({ name: f.name, base64: b64 });
+        }
+
+        var res = await fetch('/api/admin/execute-import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            fromAvenida: fromAvenidaNames.length > 0,
+            fileNames: fromAvenidaNames,
+            files: uploadedFiles,
+            decisions: decisions
+          })
+        });
+
+        clearInterval(pollTimer);
+
+        var data = await res.json();
+        if (data.ok && data.stats) {
+          if (progressIcon) progressIcon.textContent = '🎉';
+          if (progressBar) progressBar.style.width = '100%';
+          if (progressPercent) progressPercent.textContent = '100%';
+          document.getElementById('importProgressTitle').textContent = '🎉 Importação Concluída com Sucesso!';
+          if (progressStep) progressStep.textContent = 'Processamento finalizado com sucesso.';
+          if (progressDetail) progressDetail.textContent = data.stats.filesProcessed + ' ficheiro(s) integrados.';
+
+          var r = document.getElementById('importStatsReport');
+          r.style.display = 'block';
+          var detailsHtml = '';
+          for (var dIdx = 0; dIdx < data.stats.detalhesPorFicheiro.length; dIdx++) {
+            var d = data.stats.detalhesPorFicheiro[dIdx];
+            var color = d.sucesso ? '#10b981' : '#ef4444';
+            detailsHtml += '<div style="font-size:0.74rem;background:#ffffff;padding:6px 10px;border-radius:4px;border:1px solid var(--border);display:flex;justify-content:space-between;">' +
+              '<span><b>' + d.fileName + '</b> (' + d.tipo + ')</span>' +
+              '<span style="color:' + color + ';">' + d.mensagem + '</span>' +
+            '</div>';
+          }
+
+          r.innerHTML = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">' +
+              '<div style="background:#ffffff;padding:10px;border-radius:6px;border:1px solid var(--border);">' +
+                '<div style="font-size:0.75rem;color:var(--muted);">Total Vendas Criadas/Atualizadas</div>' +
+                '<div style="font-size:1.15rem;font-weight:800;color:#0284c7;">' + data.stats.totalVendasCriadas + '</div>' +
+              '</div>' +
+              '<div style="background:#ffffff;padding:10px;border-radius:6px;border:1px solid var(--border);">' +
+                '<div style="font-size:0.75rem;color:var(--muted);">Snapshots de Stock Histórico</div>' +
+                '<div style="font-size:1.15rem;font-weight:800;color:#10b981;">' + data.stats.totalSnapshotsStockCriados + '</div>' +
+              '</div>' +
+              '<div style="background:#ffffff;padding:10px;border-radius:6px;border:1px solid var(--border);">' +
+                '<div style="font-size:0.75rem;color:var(--muted);">Inventário Ativo Atualizado</div>' +
+                '<div style="font-size:1.15rem;font-weight:800;color:#8b5cf6;">' + data.stats.totalInventarioAtivoAtualizado + '</div>' +
+              '</div>' +
+              '<div style="background:#ffffff;padding:10px;border-radius:6px;border:1px solid var(--border);">' +
+                '<div style="font-size:0.75rem;color:var(--muted);">Prazos de Validade Cruzados</div>' +
+                '<div style="font-size:1.15rem;font-weight:800;color:#f59e0b;">' + data.stats.totalValidadesCruzadas + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div style="font-size:0.78rem;font-weight:700;color:#0f172a;margin-bottom:6px;">Detalhes por Ficheiro:</div>' +
+            '<div style="display:flex;flex-direction:column;gap:6px;">' +
+              detailsHtml +
+            '</div>';
+
+          document.getElementById('btnCloseImportFinished').style.display = 'inline-block';
+        } else {
+          clearInterval(pollTimer);
+          if (progressIcon) progressIcon.textContent = '❌';
+          document.getElementById('importProgressTitle').textContent = '❌ Erro na Importação';
+          if (progressStep) progressStep.textContent = data.error || 'Falha ao executar importação.';
+        }
+      } catch (e) {
+        clearInterval(pollTimer);
+        if (progressIcon) progressIcon.textContent = '❌';
+        document.getElementById('importProgressTitle').textContent = '❌ Erro no Processamento';
+        if (progressStep) progressStep.textContent = e.message;
       }
     }
 
@@ -4383,7 +5494,9 @@ function getDashboardHtml(): string {
         currentReport = await res.json();
 
         const r = currentReport.resumo_executivo;
-        document.getElementById('tenantBadge').textContent = \`🏥 \${currentReport.farmacia.nome} | NIF: \${currentReport.farmacia.nif} | Ref: \${currentReport.parametros.data_referencia}\`;
+        const p = currentReport.parametros;
+        const lastSaleNote = p && p.data_ultima_venda ? \` | Última Venda Sifarma: \${p.data_ultima_venda}\` : '';
+        document.getElementById('tenantBadge').textContent = \`🏥 \${currentReport.farmacia.nome} | NIF: \${currentReport.farmacia.nif} | Ref: \${p ? p.data_referencia : ''}\${lastSaleNote}\`;
 
         document.getElementById('kpiStockValor').textContent = \`\${r.valor_total_stock_custo.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €\`;
         document.getElementById('kpiStockSub').textContent = \`\${r.total_artigos_inventario} artigos | \${r.total_unidades_stock} unidades\`;
@@ -4396,8 +5509,9 @@ function getDashboardHtml(): string {
         document.getElementById('kpiEstatutoRatio').textContent = \`\${pctLivre}% Sem Receita\`;
         document.getElementById('kpiEstatutoSub').textContent = \`\${r.artigos_venda_livre_psbe} PSBE | \${r.artigos_mnsrm} MNSRM | \${r.artigos_msrm_receita} MSRM\`;
 
+        const restosGavetaTxt = r.total_artigos_restos_gaveta ? \` (Restos ≤2 un: \${r.total_artigos_restos_gaveta})\` : '';
         document.getElementById('kpiMonosValor').textContent = \`\${r.valor_total_monos.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €\`;
-        document.getElementById('kpiMonosSub').textContent = \`\${r.total_artigos_monos} artigos (\${r.percentagem_capital_em_monos}% do stock) s/ vendas a \${diasMonos}d\`;
+        document.getElementById('kpiMonosSub').textContent = \`\${r.total_artigos_monos} artigos (\${r.percentagem_capital_em_monos}% do stock) s/ vendas a \${diasMonos}d\${restosGavetaTxt}\`;
 
         document.getElementById('kpiCaducidadeValor').textContent = \`\${r.valor_total_risco_caducidade.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €\`;
         document.getElementById('kpiCaducidadeSub').textContent = \`\${r.total_artigos_risco_caducidade} artigos (\${r.unidades_totais_risco_caducidade} emb. em risco)\`;
@@ -4429,6 +5543,8 @@ function getDashboardHtml(): string {
 
         renderActiveTable();
         renderWeeklyActionPlan();
+        loadActiveCampaigns();
+        switchTab(activeTab);
 
         if (feedback) {
           feedback.style.display = 'inline-block';
@@ -4450,6 +5566,12 @@ function getDashboardHtml(): string {
         const btn = document.getElementById('tabBtn-' + t);
         if (btn) btn.classList.toggle('active', t === tab);
       });
+
+      const analyticsHeader = document.getElementById('globalAnalyticsHeader');
+      const isAnalyticsTab = ['caducidade', 'genericos', 'monos', 'cobertura'].includes(tab);
+      if (analyticsHeader) {
+        analyticsHeader.style.display = isAnalyticsTab ? 'block' : 'none';
+      }
 
       const planoView = document.getElementById('tabContent-plano');
       const copilotView = document.getElementById('tabContent-copilot');
@@ -6946,7 +8068,8 @@ function getDashboardHtml(): string {
         if (customPanel) customPanel.style.display = 'block';
         if (flowEl) flowEl.style.display = 'block';
         if (step1Container) step1Container.style.display = 'none';
-        searchProductsForCustomBuilder(document.getElementById('customProdSearchInput')?.value || '');
+        goToWizardStep(1);
+        loadSmartCampaignBaskets();
       } else {
         if (crossEl) crossEl.style.display = 'none';
         if (customPanel) customPanel.style.display = 'none';
@@ -6956,106 +8079,292 @@ function getDashboardHtml(): string {
       }
     }
 
+    let smartBasketsData = null;
+    let activeBasketTab = 'validades';
+    let currentWizardStep = 1;
+    let activeWizardPreset = null;
+
+    function goToWizardStep(step) {
+      currentWizardStep = step;
+      const s1 = document.getElementById('customWizardStep1');
+      const s2 = document.getElementById('customWizardStep2');
+      const ind1 = document.getElementById('wizardStepIndicator1');
+      const ind2 = document.getElementById('wizardStepIndicator2');
+      const ind3 = document.getElementById('wizardStepIndicator3');
+
+      if (step === 1) {
+        if (s1) s1.style.display = 'block';
+        if (s2) s2.style.display = 'none';
+        if (ind1) { ind1.style.background = '#f1f5f9'; ind1.style.borderLeftColor = '#a855f7'; }
+        if (ind2) { ind2.style.background = '#f8fafc'; ind2.style.borderLeftColor = '#cbd5e1'; }
+      } else if (step === 2) {
+        const nameVal = document.getElementById('customCampName')?.value.trim();
+        if (!nameVal && !activeWizardPreset) {
+          alert('Por favor escolha um Evento Rápido ou indique um Nome para a Campanha.');
+          return;
+        }
+        if (s1) s1.style.display = 'none';
+        if (s2) s2.style.display = 'block';
+        if (ind1) { ind1.style.background = '#f8fafc'; ind1.style.borderLeftColor = '#10b981'; }
+        if (ind2) { ind2.style.background = '#f1f5f9'; ind2.style.borderLeftColor = '#a855f7'; }
+        loadSmartCampaignBaskets();
+      }
+    }
+
+    function selectWizardPreset(presetKey, title, icon) {
+      activeWizardPreset = presetKey;
+      const nEl = document.getElementById('customCampName');
+      if (nEl) nEl.value = title;
+      goToWizardStep(2);
+    }
+
+    async function loadSmartCampaignBaskets() {
+      if (smartBasketsData) {
+        renderCurrentSmartBasket();
+        return;
+      }
+      const listEl = document.getElementById('basketProductsList');
+      if (listEl) listEl.innerHTML = '<div style="padding: 24px; text-align: center; color: #64748b;">⏳ A auditar o stock e a carregar cestos inteligentes...</div>';
+      try {
+        const res = await fetch('/api/campaigns/smart-baskets?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        const data = await res.json();
+        smartBasketsData = data.baskets || { validades: [], monos: [], topMargem: [] };
+
+        const cVal = document.getElementById('countBasketValidades');
+        const cMon = document.getElementById('countBasketMonos');
+        const cMrg = document.getElementById('countBasketMargem');
+        if (cVal) cVal.textContent = (smartBasketsData.validades || []).length;
+        if (cMon) cMon.textContent = (smartBasketsData.monos || []).length;
+        if (cMrg) cMrg.textContent = (smartBasketsData.topMargem || []).length;
+
+        renderCurrentSmartBasket();
+      } catch (err) {
+        console.error('Falha ao carregar cestos de stock:', err);
+        if (listEl) listEl.innerHTML = '<div style="padding: 20px; color: #dc2626;">Erro ao carregar dados de stock.</div>';
+      }
+    }
+
+    function switchSmartBasketTab(tabKey) {
+      activeBasketTab = tabKey;
+      const btnVal = document.getElementById('btnBasketTabValidades');
+      const btnMon = document.getElementById('btnBasketTabMonos');
+      const btnMrg = document.getElementById('btnBasketTabMargem');
+      const btnSch = document.getElementById('btnBasketTabSearch');
+      const sBox = document.getElementById('basketSearchContainer');
+      const batchBar = document.getElementById('basketBatchActionBar');
+
+      if (btnVal) { btnVal.className = tabKey === 'validades' ? 'btn' : 'btn btn-secondary'; btnVal.style.background = tabKey === 'validades' ? '#ef4444' : 'transparent'; btnVal.style.color = tabKey === 'validades' ? '#ffffff' : '#b91c1c'; }
+      if (btnMon) { btnMon.className = tabKey === 'monos' ? 'btn' : 'btn btn-secondary'; btnMon.style.background = tabKey === 'monos' ? '#f59e0b' : 'transparent'; btnMon.style.color = tabKey === 'monos' ? '#ffffff' : '#b45309'; }
+      if (btnMrg) { btnMrg.className = tabKey === 'topMargem' ? 'btn' : 'btn btn-secondary'; btnMrg.style.background = tabKey === 'topMargem' ? '#10b981' : 'transparent'; btnMrg.style.color = tabKey === 'topMargem' ? '#ffffff' : '#047857'; }
+      if (btnSch) { btnSch.className = tabKey === 'search' ? 'btn' : 'btn btn-secondary'; btnSch.style.background = tabKey === 'search' ? '#0284c7' : 'transparent'; btnSch.style.color = tabKey === 'search' ? '#ffffff' : '#0369a1'; }
+
+      if (tabKey === 'search') {
+        if (sBox) sBox.style.display = 'block';
+        if (batchBar) batchBar.style.display = 'none';
+        searchProductsForCustomBuilder(document.getElementById('customProdSearchInput')?.value || '');
+      } else {
+        if (sBox) sBox.style.display = 'none';
+        if (batchBar) batchBar.style.display = 'flex';
+        renderCurrentSmartBasket();
+      }
+    }
+
+    function renderCurrentSmartBasket() {
+      const listEl = document.getElementById('basketProductsList');
+      const descEl = document.getElementById('basketActiveDescription');
+      if (!listEl || !smartBasketsData) return;
+
+      const items = smartBasketsData[activeBasketTab] || [];
+      if (descEl) {
+        if (activeBasketTab === 'validades') descEl.innerHTML = '🚨 <b>' + items.length + ' produtos com validade próxima</b> detectados em armazém:';
+        else if (activeBasketTab === 'monos') descEl.innerHTML = '🕸️ <b>' + items.length + ' monos parados</b> sem vendas para recuperar capital:';
+        else if (activeBasketTab === 'topMargem') descEl.innerHTML = '💎 <b>' + items.length + ' produtos com margem superior a 40%</b>:';
+      }
+
+      if (items.length === 0) {
+        listEl.innerHTML = '<div style="padding: 24px; text-align: center; color: #64748b;">Nenhum produto neste critério com stock atual.</div>';
+        return;
+      }
+
+      listEl.innerHTML = items.map(function(it) {
+        const isPicked = customPickedProducts.some(function(p) { return p.cnp === it.cnp; });
+        const valBadge = it.validade ? '<span style="background: #fee2e2; color: #b91c1c; font-size: 0.7rem; font-weight: 700; padding: 2px 6px; border-radius: 4px; margin-left: 6px;">📅 Val: ' + it.validade + '</span>' : '';
+        const capEmp = it.capitalEmpatadoEur ? '<span style="color: #b45309; font-size: 0.72rem; margin-left: 6px;">Empatado: €' + it.capitalEmpatadoEur.toFixed(2) + '</span>' : '';
+
+        return '<div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid #f1f5f9; gap: 10px; background: ' + (isPicked ? '#faf5ff' : 'white') + ';">' +
+          '<div style="flex: 1;">' +
+            '<div style="font-weight: 700; font-size: 0.86rem; color: #1e293b;">' +
+              '<span style="font-family: monospace; color: #0284c7; margin-right: 6px;">[' + it.cnp + ']</span>' +
+              it.designacao + valBadge +
+            '</div>' +
+            '<div style="font-size: 0.74rem; color: #64748b; margin-top: 3px; display: flex; gap: 10px; flex-wrap: wrap;">' +
+              '<span>📦 Stock: <b>' + it.stock + ' un</b></span>' +
+              '<span>💰 Custo: €' + Number(it.custo || 0).toFixed(2) + '</span>' +
+              '<span>🏷️ PVP: €' + Number(it.pvp || 0).toFixed(2) + '</span>' +
+              '<span style="color: #059669; font-weight: 700;">Margem: ' + (it.margemPct || 0) + '%</span>' + capEmp +
+            '</div>' +
+          '</div>' +
+          '<button class="btn ' + (isPicked ? 'btn-secondary' : '') + '" data-cnp="' + it.cnp + '" onclick="togglePickedProductByCnp(this.dataset.cnp)" style="font-size: 0.78rem; padding: 5px 12px; font-weight: 700; background: ' + (isPicked ? 'white' : '#a855f7') + '; color: ' + (isPicked ? '#6b21a8' : 'white') + '; border-color: #a855f7;">' +
+            (isPicked ? '✓ No Carrinho' : '+ Adicionar') +
+          '</button>' +
+        '</div>';
+      }).join('');
+    }
+
+    function addAllCurrentBasketToPicked() {
+      if (!smartBasketsData) return;
+      const items = smartBasketsData[activeBasketTab] || [];
+      items.forEach(function(it) {
+        if (!customPickedProducts.some(function(p) { return p.cnp === it.cnp; })) {
+          customPickedProducts.push({
+            cnp: it.cnp,
+            designacao: it.designacao,
+            stock: it.stock,
+            pvp: it.pvp,
+            custo: it.custo || (it.pvp * 0.6),
+            margemPct: it.margemPct || 30
+          });
+        }
+      });
+      renderCustomPickedList();
+      renderCurrentSmartBasket();
+    }
+
+    function togglePickedProductByCnp(cnp) {
+      const existing = customPickedProducts.find(function(p) { return p.cnp === cnp; });
+      if (existing) {
+        customPickedProducts = customPickedProducts.filter(function(p) { return p.cnp !== cnp; });
+      } else {
+        let it = null;
+        if (smartBasketsData) {
+          const all = (smartBasketsData.validades || []).concat(smartBasketsData.monos || []).concat(smartBasketsData.topMargem || []);
+          it = all.find(function(x) { return x.cnp === cnp; });
+        }
+        if (it) {
+          customPickedProducts.push({
+            cnp: it.cnp,
+            designacao: it.designacao,
+            stock: it.stock,
+            pvp: it.pvp,
+            custo: it.custo || (it.pvp * 0.6),
+            margemPct: it.margemPct || 30
+          });
+        }
+      }
+      renderCustomPickedList();
+      if (activeBasketTab === 'search') {
+        searchProductsForCustomBuilder(document.getElementById('customProdSearchInput')?.value || '');
+      } else {
+        renderCurrentSmartBasket();
+      }
+    }
+
     async function searchProductsForCustomBuilder(query) {
-      const box = document.getElementById('customProdSearchResults');
+      const box = document.getElementById('basketProductsList');
       if (!box) return;
       try {
-        const res = await fetch(\`/api/campaigns/search-products?farmaciaId=\${activeFarmaciaId}&q=\${encodeURIComponent(query || '')}\`);
+        const res = await fetch('/api/campaigns/search-products?farmaciaId=' + encodeURIComponent(activeFarmaciaId) + '&q=' + encodeURIComponent(query || ''));
         const data = await res.json();
         const items = data.items || [];
         if (items.length === 0) {
-          box.innerHTML = '<span style="color:var(--muted);">Nenhum produto com stock encontrado para esta pesquisa.</span>';
+          box.innerHTML = '<div style="padding: 24px; text-align: center; color: #64748b;">Nenhum produto com stock encontrado para esta pesquisa.</div>';
           return;
         }
-        box.innerHTML = items.map(it => {
-          const alreadyPicked = customPickedProducts.some(p => p.cnp === it.cnp);
-          return \`
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 6px;border-bottom:1px solid rgba(148,163,184,0.12);gap:8px;">
-              <div>
-                <b>[\${it.cnp}]</b> \${it.designacao.slice(0, 38)}
-                <span class="badge \${it.riscoValidade ? 'badge-danger' : 'badge-info'}" style="font-size:0.66rem;margin-left:4px;">\${it.stock} un · \${it.validade || 'S/Val'}</span>
-                <span style="color:#34d399;font-size:0.72rem;margin-left:4px;">Mrg \${it.margemPct}%</span>
-              </div>
-              <button class="btn \${alreadyPicked ? 'btn-secondary' : ''}" onclick="addPickedProductForCampaign('\${it.cnp}', '\${escapeJsString(it.designacao)}', \${it.stock}, \${it.pvp})" style="font-size:0.72rem;padding:3px 9px;background:\${alreadyPicked ? 'transparent' : '#a855f7'};">
-                \${alreadyPicked ? '✓ Fixado' : '+ Incluir'}
-              </button>
-            </div>
-          \`;
+        box.innerHTML = items.map(function(it) {
+          const isPicked = customPickedProducts.some(function(p) { return p.cnp === it.cnp; });
+          return '<div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid #f1f5f9; gap: 10px; background: ' + (isPicked ? '#faf5ff' : 'white') + ';">' +
+            '<div style="flex: 1;">' +
+              '<div style="font-weight: 700; font-size: 0.86rem; color: #1e293b;">' +
+                '<span style="font-family: monospace; color: #0284c7; margin-right: 6px;">[' + it.cnp + ']</span>' +
+                it.designacao +
+              '</div>' +
+              '<div style="font-size: 0.74rem; color: #64748b; margin-top: 3px; display: flex; gap: 10px; flex-wrap: wrap;">' +
+                '<span>📦 Stock: <b>' + it.stock + ' un</b></span>' +
+                '<span>💰 Custo: €' + Number(it.custo || 0).toFixed(2) + '</span>' +
+                '<span>🏷️ PVP: €' + Number(it.pvp || 0).toFixed(2) + '</span>' +
+                '<span style="color: #059669; font-weight: 700;">Margem: ' + (it.margemPct || 0) + '%</span>' +
+              '</div>' +
+            '</div>' +
+            '<button class="btn ' + (isPicked ? 'btn-secondary' : '') + '" data-cnp="' + it.cnp + '" onclick="togglePickedProductByCnp(this.dataset.cnp)" style="font-size: 0.78rem; padding: 5px 12px; font-weight: 700; background: ' + (isPicked ? 'white' : '#a855f7') + '; color: ' + (isPicked ? '#6b21a8' : 'white') + '; border-color: #a855f7;">' +
+              (isPicked ? '✓ No Carrinho' : '+ Adicionar') +
+            '</button>' +
+          '</div>';
         }).join('');
       } catch (e) {
         console.error(e);
       }
     }
 
-    function addPickedProductForCampaign(cnp, designacao, stock, pvp) {
-      if (!customPickedProducts.some(p => p.cnp === cnp)) {
-        customPickedProducts.push({ cnp, designacao, stock, pvp });
-      }
-      renderCustomPickedChips();
-      searchProductsForCustomBuilder(document.getElementById('customProdSearchInput')?.value || '');
-    }
-
-    function removePickedProductForCampaign(cnp) {
-      customPickedProducts = customPickedProducts.filter(p => p.cnp !== cnp);
-      renderCustomPickedChips();
-      searchProductsForCustomBuilder(document.getElementById('customProdSearchInput')?.value || '');
-    }
-
-    function renderCustomPickedChips() {
+    function renderCustomPickedList() {
+      const listEl = document.getElementById('customPickedProductsList');
       const countEl = document.getElementById('customPickedCount');
-      const chipsEl = document.getElementById('customPickedProductsChips');
+      const stEl = document.getElementById('cartTotalStock');
+      const costEl = document.getElementById('cartTotalCost');
+      const pvpEl = document.getElementById('cartTotalPvp');
+      const mrgEl = document.getElementById('cartAvgMargin');
+
       if (countEl) countEl.textContent = customPickedProducts.length;
-      if (!chipsEl) return;
+
+      const totalStock = customPickedProducts.reduce(function(acc, p) { return acc + (p.stock || 0); }, 0);
+      const totalCost = customPickedProducts.reduce(function(acc, p) { return acc + (p.stock || 0) * (p.custo || 0); }, 0);
+      const totalPvp = customPickedProducts.reduce(function(acc, p) { return acc + (p.stock || 0) * (p.pvp || 0); }, 0);
+      const avgMargem = customPickedProducts.length > 0 ? (customPickedProducts.reduce(function(acc, p) { return acc + (p.margemPct || 0); }, 0) / customPickedProducts.length).toFixed(1) : '0';
+
+      if (stEl) stEl.textContent = totalStock;
+      if (costEl) costEl.textContent = '€' + totalCost.toFixed(2);
+      if (pvpEl) pvpEl.textContent = '€' + totalPvp.toFixed(2);
+      if (mrgEl) mrgEl.textContent = avgMargem + '%';
+
+      if (!listEl) return;
       if (customPickedProducts.length === 0) {
-        chipsEl.innerHTML = '<span style="font-size: 0.75rem; color: var(--muted);">Nenhum produto fixado manualmente (ou clique em "+ Incluir" na lista acima).</span>';
+        listEl.innerHTML = '<span style="font-size: 0.78rem; color: #94a3b8; display: block; padding: 12px; text-align: center;">Nenhum produto adicionado ainda. Escolha produtos dos cestos à esquerda.</span>';
         return;
       }
-      chipsEl.innerHTML = customPickedProducts.map(p => \`
-        <span class="badge badge-purple" style="display:inline-flex;align-items:center;gap:6px;padding:5px 10px;font-size:0.76rem;">
-          🎯 [\${p.cnp}] \${p.designacao.slice(0, 26)} (\${p.stock} un)
-          <span style="cursor:pointer;color:#fb7185;font-weight:800;" onclick="removePickedProductForCampaign('\${p.cnp}')">✕</span>
-        </span>
-      \`).join('');
+
+      listEl.innerHTML = customPickedProducts.map(function(p) {
+        return '<div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-bottom: 1px solid #f3e8ff; font-size: 0.78rem; gap: 6px;">' +
+          '<div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;" title="' + p.designacao + '">' +
+            '<b>[' + p.cnp + ']</b> ' + p.designacao +
+          '</div>' +
+          '<div style="display: flex; align-items: center; gap: 6px;">' +
+            '<span style="font-weight: 700; color: #0f172a;">' + p.stock + 'un</span>' +
+            '<button class="btn btn-secondary" data-cnp="' + p.cnp + '" onclick="togglePickedProductByCnp(this.dataset.cnp)" style="padding: 2px 6px; font-size: 0.72rem; color: #ef4444; border: none; background: transparent; cursor: pointer;">✕</button>' +
+          '</div>' +
+        '</div>';
+      }).join('');
     }
 
-    function clearCustomCampaignBuilder() {
+    function clearCustomPickedProducts() {
       customPickedProducts = [];
-      const nEl = document.getElementById('customCampName');
-      const tEl = document.getElementById('customCampTerms');
-      if (nEl) nEl.value = '';
-      if (tEl) tEl.value = '';
-      renderCustomPickedChips();
-      searchProductsForCustomBuilder('');
+      renderCustomPickedList();
+      if (activeBasketTab === 'search') {
+        searchProductsForCustomBuilder(document.getElementById('customProdSearchInput')?.value || '');
+      } else {
+        renderCurrentSmartBasket();
+      }
     }
 
-    async function runPresetCustomCampaign(presetKey) {
-      await buildAndOpenCustomCampaign({
-        modo: 'EVENTO',
-        eventoPreset: presetKey,
-        focoStock: document.getElementById('customCampFocus')?.value || 'PRIORIDADE_VALIDADES_MONOS',
-        cnpsSelecionados: customPickedProducts.map(p => p.cnp),
-      });
-    }
-
-    async function submitCustomCampaignBuilder() {
+    async function submitCustomCampaignWizard() {
       const nomePersonalizado = document.getElementById('customCampName')?.value.trim() || '';
-      const termosPesquisa = document.getElementById('customCampTerms')?.value.trim() || '';
-      const focoStock = document.getElementById('customCampFocus')?.value || 'PRIORIDADE_VALIDADES_MONOS';
-      const cnpsSelecionados = customPickedProducts.map(p => p.cnp);
+      const cnpsSelecionados = customPickedProducts.map(function(p) { return p.cnp; });
 
-      if (!nomePersonalizado && !termosPesquisa && cnpsSelecionados.length === 0) {
-        alert('Indique um nome/tema, palavras-chave ou selecione pelo menos 1 produto específico para a sua campanha.');
+      if (!nomePersonalizado && !activeWizardPreset) {
+        alert('Por favor indique um nome para a campanha.');
+        goToWizardStep(1);
         return;
       }
 
-      const modo = cnpsSelecionados.length > 0 && !termosPesquisa ? 'PRODUTOS' : 'EVENTO';
+      if (cnpsSelecionados.length === 0) {
+        alert('Por favor selecione pelo menos 1 produto dos cestos inteligentes à esquerda.');
+        return;
+      }
+
       await buildAndOpenCustomCampaign({
-        modo,
-        eventoPreset: 'custom',
-        nomePersonalizado,
-        termosPesquisa,
-        cnpsSelecionados,
-        focoStock,
+        modo: 'PRODUTOS',
+        eventoPreset: activeWizardPreset || 'custom',
+        nomePersonalizado: nomePersonalizado || (activeWizardPreset ? activeWizardPreset.toUpperCase() : 'Campanha Personalizada'),
+        cnpsSelecionados: cnpsSelecionados,
+        focoStock: 'TODOS_ELEGIVEIS'
       });
     }
 
@@ -7170,11 +8479,11 @@ function getDashboardHtml(): string {
 
             <!-- META DE EQUIPA & ESTATUTO REGULATÓRIO / ANTI-DUMPING -->
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:16px;">
-              <div style="background:rgba(244,63,94,0.12);border-left:4px solid #f43f5e;padding:10px 14px;border-radius:6px;font-size:0.82rem;color:#f8fafc;">
+              <div style="background:#fff1f2;border:1px solid #fecdd3;border-left:4px solid #f43f5e;padding:10px 14px;border-radius:6px;font-size:0.82rem;color:#881337;">
                 <b>🏁 Meta Operacional da Equipa:</b><br/>
                 \${p.metaEquipaTexto}
               </div>
-              <div style="background:rgba(16,185,129,0.1);border-left:4px solid #10b981;padding:10px 14px;border-radius:6px;font-size:0.82rem;color:#f8fafc;">
+              <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-left:4px solid #10b981;padding:10px 14px;border-radius:6px;font-size:0.82rem;color:#166534;">
                 <b>🛡️ Estatuto & Preço Promocional Anti-Dumping:</b><br/>
                 \${p.elegivelDesconto
                   ? \`PVP Normal: <b>\${p.pvpAtual.toFixed(2)}€</b> → PVP Promo (-\${p.descontoSeguroPct}%): <b style="color:#34d399">\${p.pvpPromoRecomendado.toFixed(2)}€</b> (Margem líquida: <b>\${p.margemPosDescontoPct}%</b> ✅)<br/>\`
@@ -7240,8 +8549,8 @@ function getDashboardHtml(): string {
             </div>
 
             <!-- SCRIPT PRONTO DE BALCÃO -->
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;background:rgba(56,189,248,0.1);border-left:4px solid #38bdf8;padding:10px 14px;border-radius:6px;">
-              <div style="flex:1;min-width:260px;font-size:0.84rem;color:#f1f5f9;font-style:italic;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;background:#f0f9ff;border:1px solid #bae6fd;border-left:4px solid #0284c7;padding:10px 14px;border-radius:6px;">
+              <div style="flex:1;min-width:260px;font-size:0.84rem;color:#881337;font-style:italic;">
                 💬 <b>Script de Balcão (10s):</b> \${d.scriptBalcaoPronto}
               </div>
               <button class="copy-btn" onclick="copyToClipboard('\${escapeJsString(d.scriptBalcaoPronto)}', this)" style="width:auto;padding:6px 14px;">
@@ -7285,64 +8594,157 @@ function getDashboardHtml(): string {
       \`;
     }
 
+    
+    function openSlideDrawer(title, subtitle, badgeHtml, bodyHtml, footerHtml) {
+      var tEl = document.getElementById('drawerTitle');
+      var sEl = document.getElementById('drawerSubtitle');
+      var bEl = document.getElementById('drawerBadge');
+      var bodyEl = document.getElementById('drawerBody');
+      var fEl = document.getElementById('drawerFooter');
+      if (tEl) tEl.innerText = title || '';
+      if (sEl) sEl.innerText = subtitle || '';
+      if (bEl) bEl.innerHTML = badgeHtml || '';
+      if (bodyEl) bodyEl.innerHTML = bodyHtml || '';
+      if (fEl) fEl.innerHTML = footerHtml || '<button class="btn btn-secondary" onclick="closeSlideDrawer()" style="width:100%;">Fechar</button>';
+      var bd = document.getElementById('slideDrawerBackdrop');
+      var dr = document.getElementById('slideDrawer');
+      if (bd) bd.classList.add('active');
+      if (dr) dr.classList.add('active');
+      document.body.style.overflow = 'hidden';
+    }
+
+    function closeSlideDrawer() {
+      var bd = document.getElementById('slideDrawerBackdrop');
+      var dr = document.getElementById('slideDrawer');
+      if (bd) bd.classList.remove('active');
+      if (dr) dr.classList.remove('active');
+      document.body.style.overflow = '';
+    }
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') closeSlideDrawer();
+    });
+
+    function copyDrawerScript(btn) {
+      var text = window.__activeDrawerScript || '';
+      if (text) copyToClipboard(text, btn);
+    }
+
+    function openCrossSellingDrawer(idx) {
+      var plan = currentCrossSellingPlans && currentCrossSellingPlans[idx];
+      if (!plan) return;
+
+      var badgeHtml = '<span class="badge" style="background:#dcfce7;color:#15803d;border:1px solid #86efac;font-weight:800;font-size:0.78rem;padding:4px 8px;border-radius:6px;">Potencial: ' + Number(plan.impactoFinanceiroPotencialEur || 0).toFixed(2) + ' €</span>';
+      
+      var locoHtml = (plan.locomotivasReais || []).map(function(l) {
+        return '<span style="background:#f3e8ff;color:#6b21a8;border:1px solid #d8b4fe;padding:5px 10px;border-radius:6px;font-size:0.8rem;font-weight:700;">' +
+          l.designacao.slice(0, 32) + ' <b style="color:#581c87;">(' + l.vmm + '/mês)</b></span>';
+      }).join('');
+
+      var prodHtml = (plan.produtosAEscoar || []).map(function(p) {
+        return '<div style="display:flex;justify-content:space-between;align-items:center;background:#ffffff;border:1px solid #dcfce7;border-radius:8px;padding:10px 12px;margin-bottom:8px;">' +
+          '<div style="color:#0f172a;padding-right:8px;">' +
+            '<div style="font-weight:700;color:#0f172a;font-size:0.86rem;"><b style="color:#047857;">[' + p.cnp + ']</b> ' + p.designacao + '</div>' +
+            '<div style="margin-top:4px;"><span style="background:#fef3c7;color:#92400e;border:1px solid #fde68a;padding:2px 7px;border-radius:4px;font-size:0.72rem;font-weight:700;">' + p.criterioEscoamento + '</span></div>' +
+          '</div>' +
+          '<div style="text-align:right;white-space:nowrap;">' +
+            '<div style="font-size:0.88rem;font-weight:800;color:#0f172a;">' + p.stock + ' un em stock</div>' +
+            '<div style="font-size:0.82rem;color:#15803d;font-weight:700;margin-top:2px;">Promo -' + p.descontoSeguroPct + '%: ' + p.pvpPromo.toFixed(2) + '€</div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+
+      var scriptClean = (plan.scriptBalcao10s || '');
+      window.__activeDrawerScript = scriptClean;
+      var scriptEscaped = escapeJsString(scriptClean);
+
+      var bodyHtml = '' +
+        '<!-- SCRIPT VERBAL DE ATENDIMENTO -->' +
+        '<div style="background:#fff1f2;border:1px solid #fecdd3;border-left:5px solid #e11d48;padding:16px;border-radius:10px;box-shadow:0 1px 3px rgba(225,29,72,0.06);">' +
+          '<div style="font-size:0.76rem;font-weight:800;color:#9f1239;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;">💬 Script Verbal de Atendimento (10 segundos):</div>' +
+          '<div style="font-size:0.95rem;color:#881337;font-style:italic;line-height:1.6;font-weight:500;">"' + scriptClean + '"</div>' +
+          '<button class="btn" onclick="copyDrawerScript(this)" style="margin-top:12px;background:#e11d48;color:#ffffff;border-color:#e11d48;font-size:0.82rem;font-weight:700;padding:8px 16px;border-radius:6px;width:100%;display:flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;">' +
+            '📋 Copiar Script para o Balcão' +
+          '</button>' +
+        '</div>' +
+
+        '<!-- GATILHO DA PRESCRIÇÃO / BALCÃO -->' +
+        '<div style="background:#f0f9ff;border:1px solid #bae6fd;border-left:4px solid #0284c7;border-radius:8px;padding:12px 14px;">' +
+          '<div style="font-size:0.75rem;font-weight:800;color:#0369a1;text-transform:uppercase;margin-bottom:4px;">🎯 Gatilho no Atendimento:</div>' +
+          '<div style="font-size:0.88rem;color:#0f172a;font-weight:600;line-height:1.45;">' + (plan.gatilhoDispensa || '') + '</div>' +
+        '</div>' +
+
+        '<!-- PRODUTOS EM STOCK A ESCOAR -->' +
+        '<div>' +
+          '<div style="font-size:0.78rem;font-weight:800;color:#166534;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">📦 Produtos em Stock a Escoar na Boleia (' + (plan.produtosAEscoar || []).length + '):</div>' +
+          prodHtml +
+        '</div>' +
+
+        '<!-- LOCOMOTIVAS REAIS -->' +
+        '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:14px;">' +
+          '<div style="font-size:0.76rem;font-weight:800;color:#475569;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">🚂 Locomotivas que Puxam a Venda:</div>' +
+          '<div style="display:flex;flex-wrap:wrap;gap:8px;">' + locoHtml + '</div>' +
+        '</div>';
+
+      var footerHtml = '<button class="btn btn-secondary" onclick="closeSlideDrawer()" style="width:100%;padding:10px;font-size:0.86rem;font-weight:700;">Concluir Leitura</button>';
+
+      openSlideDrawer(
+        (plan.icone || '🎯') + ' ' + (plan.tituloProtocolo || ''),
+        'Protocolo Operacional de Balcão e Escoamento',
+        badgeHtml,
+        bodyHtml,
+        footerHtml
+      );
+    }
+
     function renderCrossSellingProtocols() {
-      const grid = document.getElementById('crossSellingGrid');
+      var grid = document.getElementById('crossSellingGrid');
       if (!grid) return;
       if (!currentCrossSellingPlans || currentCrossSellingPlans.length === 0) {
         grid.innerHTML = '<div style="padding:24px;color:var(--muted);">Nenhum protocolo de Cross-Selling disponível de momento.</div>';
         return;
       }
 
-      grid.innerHTML = currentCrossSellingPlans.map(plan => \`
-        <div class="omnichannel-card" style="border-color:rgba(56,189,248,0.35);">
-          <div>
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px;">
-              <div style="font-weight:800;font-size:1rem;color:#f8fafc;">\${plan.icone} \${plan.tituloProtocolo}</div>
-              <span class="badge badge-success">Potencial: \${plan.impactoFinanceiroPotencialEur.toFixed(2)} €</span>
-            </div>
-            <div style="font-size:0.8rem;color:#38bdf8;margin-bottom:12px;">
-              <b>🎯 Gatilho no Atendimento:</b> \${plan.gatilhoDispensa}
-            </div>
+      grid.innerHTML = currentCrossSellingPlans.map(function(plan, idx) {
+        var topProd = (plan.produtosAEscoar && plan.produtosAEscoar[0]) ? plan.produtosAEscoar[0].designacao.slice(0, 32) : 'Produtos em stock';
+        var topLoco = (plan.locomotivasReais && plan.locomotivasReais[0]) ? plan.locomotivasReais[0].designacao.slice(0, 26) : 'Receita médica';
 
-            <div style="background: #ffffff;border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px;">
-              <div style="font-size:0.74rem;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:6px;">
-                🚂 Locomotivas Reais da Farmácia (O que o cliente vem pedir):
-              </div>
-              <div style="display:flex;flex-wrap:wrap;gap:6px;">
-                \${plan.locomotivasReais.map(l => \`
-                  <span class="badge badge-purple" title="Vendas no período: \${l.vendasPeriodo} un">\${l.designacao.slice(0, 28)} (\${l.vmm}/mês)</span>
-                \`).join('')}
-              </div>
-            </div>
+        return '<div class="omnichannel-card" style="background:#ffffff;border:1px solid #cbd5e1;border-radius:12px;padding:18px;box-shadow:0 1px 4px rgba(15,23,42,0.05);display:flex;flex-direction:column;justify-content:space-between;transition:all 0.15s ease;">' +
+          '<div>' +
+            '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:12px;">' +
+              '<div style="font-weight:800;font-size:1.02rem;color:#0f172a;line-height:1.3;">' +
+                (plan.icone || '🎯') + ' ' + (plan.tituloProtocolo || '') +
+              '</div>' +
+              '<span class="badge" style="background:#dcfce7;color:#15803d;border:1px solid #86efac;font-weight:800;font-size:0.75rem;padding:3px 7px;border-radius:6px;white-space:nowrap;">' +
+                'Potencial: ' + Number(plan.impactoFinanceiroPotencialEur || 0).toFixed(2) + ' €' +
+              '</span>' +
+            '</div>' +
 
-            <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px;margin-bottom:12px;">
-              <div style="font-size:0.74rem;font-weight:700;color:#34d399;text-transform:uppercase;margin-bottom:6px;">
-                📦 Produtos em Stock a Escoar na Boleia (Prioridade Equipa):
-              </div>
-              <div style="display:flex;flex-direction:column;gap:6px;font-size:0.8rem;">
-                \${plan.produtosAEscoar.map(p => \`
-                  <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px dashed rgba(148,163,184,0.15);padding-bottom:4px;">
-                    <div>
-                      <b>[\${p.cnp}]</b> \${p.designacao.slice(0, 34)}
-                      <span class="badge badge-warning" style="margin-left:4px;font-size:0.68rem;">\${p.criterioEscoamento}</span>
-                    </div>
-                    <div style="text-align:right;white-space:nowrap;">
-                      <b>\${p.stock} un</b> · Promo -\${p.descontoSeguroPct}%: <b style="color:#34d399;">\${p.pvpPromo.toFixed(2)}€</b>
-                    </div>
-                  </div>
-                \`).join('')}
-              </div>
-            </div>
+            '<!-- GATILHO COMPACTO -->' +
+            '<div style="font-size:0.82rem;color:#0369a1;background:#f0f9ff;border:1px solid #bae6fd;border-left:3px solid #0284c7;border-radius:6px;padding:8px 10px;margin-bottom:12px;line-height:1.4;">' +
+              '<b style="color:#0369a1;font-size:0.7rem;text-transform:uppercase;display:block;margin-bottom:2px;">🎯 Gatilho no Atendimento:</b>' +
+              '<span style="color:#0f172a;font-weight:600;">' + (plan.gatilhoDispensa || '') + '</span>' +
+            '</div>' +
 
-            <div style="font-size:0.82rem;background:rgba(244,63,94,0.1);border-left:3px solid #fb7185;padding:9px 12px;border-radius:6px;color:#f1f5f9;font-style:italic;">
-              \${plan.scriptBalcao10s}
-            </div>
-          </div>
-          <button class="copy-btn" onclick="copyToClipboard('\${escapeJsString(plan.scriptBalcao10s)}', this)" style="margin-top:12px;">
-            📋 Copiar Script de Cross-Selling p/ Equipa
-          </button>
-        </div>
-      \`).join('');
+            '<!-- SÍNTESE OPERACIONAL -->' +
+            '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:0.8rem;color:#475569;display:flex;flex-direction:column;gap:5px;">' +
+              '<div style="display:flex;justify-content:space-between;">' +
+                '<span>📦 <b>' + (plan.produtosAEscoar || []).length + ' produtos</b> a escoar:</span>' +
+                '<span style="color:#0f172a;font-weight:600;">' + topProd + '...</span>' +
+              '</div>' +
+              '<div style="display:flex;justify-content:space-between;">' +
+                '<span>🚂 <b>' + (plan.locomotivasReais || []).length + ' locomotivas</b> que puxam:</span>' +
+                '<span style="color:#6b21a8;font-weight:600;">' + topLoco + '...</span>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+
+          '<!-- BOTÃO QUE DESLIZA A GAVETA -->' +
+          '<button class="btn btn-secondary" onclick="openCrossSellingDrawer(' + idx + ')" style="width:100%;font-size:0.82rem;font-weight:700;padding:9px;color:#0284c7;background:#f0f9ff;border:1.5px solid #bae6fd;border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:all 0.15s ease;">' +
+            '<span>📖 Ver Script Verbal & Detalhes</span> <span style="font-size:0.95rem;">→</span>' +
+          '</button>' +
+        '</div>';
+      }).join('');
     }
 
     async function loadCampaignSuggestions() {
@@ -7415,18 +8817,28 @@ function getDashboardHtml(): string {
           : (c.tipo === 'SAZONAL_CLIMA' ? '<span class="badge badge-info">❄️ Época Sazonal</span>' : '<span class="badge badge-success">🩺 Efeméride</span>');
 
         const dores = c.contextoEpoca?.doresUtente ? c.contextoEpoca.doresUtente.slice(0, 2).join('; ') : '';
+        const activeInst = (currentActiveCampaigns || []).find(a => a.campanhaId === c.id);
+        const badgeAtiva = activeInst
+          ? \`<span class="badge" style="background:#10b981;color:white;font-weight:700;">🟢 Ativa (\${activeInst.totalProdutos} SKUs)</span>\`
+          : '';
+        const bannerAtivaCard = activeInst
+          ? \`<div style="background:#ecfdf5;border:1px solid #10b981;border-radius:6px;padding:6px 10px;margin-bottom:10px;color:#065f46;font-size:0.78rem;font-weight:600;">🟢 <b>Em Curso:</b> \${activeInst.totalProdutos} de \${c.totalEligibleSkus} SKUs ativados (-\${activeInst.descontoAplicadoPct}%)</div>\`
+          : '';
 
         return \`
           <div class="campaign-card \${isSel ? 'selected' : ''}" id="campCard-\${c.id}">
             <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">
               <span style="font-size:1.8rem;">\${c.icon}</span>
               <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">
+                \${badgeAtiva}
                 <span class="badge badge-purple">\${c.periodoLabel}</span>
                 \${badgeTipo}
               </div>
             </div>
             <div style="font-weight:700;font-size:1.05rem;color:var(--text);margin-bottom:6px;">\${c.nome}</div>
             
+            \${bannerAtivaCard}
+
             <!-- ENQUADRAMENTO DA ÉPOCA -->
             <div style="font-size:0.84rem;color:var(--text-secondary);margin-bottom:12px;line-height:1.45;background:#f8fafc;padding:10px 12px;border-radius:8px;border-left:3px solid var(--primary);border:1px solid var(--border);">
               <div><b>📌 Enquadramento:</b> \${c.descricao}</div>
@@ -7494,6 +8906,28 @@ function getDashboardHtml(): string {
       const titleDesc = document.getElementById('selectedCampaignTitleDesc');
       if (titleDesc) {
         titleDesc.innerHTML = \`Plano ativo: <b style="color:#fb7185;">\${selectedCampaign.icon} \${selectedCampaign.nome}</b> (\${selectedCampaign.periodoLabel}) — \${selectedCampaign.descricao}\`;
+      }
+
+      const activeInst = (currentActiveCampaigns || []).find(a => a.campanhaId === campId);
+      const activeAlertBox = document.getElementById('selectedCampaignActiveAlert');
+      if (activeAlertBox) {
+        if (activeInst) {
+          activeAlertBox.style.display = 'block';
+          activeAlertBox.innerHTML = \`
+            <div style="background: #ecfdf5; border: 1.5px solid #10b981; border-radius: 10px; padding: 14px 18px; margin-bottom: 6px; color: #065f46;">
+              <div style="font-weight: 800; font-size: 0.95rem; display: flex; align-items: center; gap: 8px;">
+                <span>🟢</span> Esta Campanha está atualmente EM CURSO na Farmácia!
+              </div>
+              <div style="font-size: 0.84rem; margin-top: 6px; line-height: 1.5;">
+                • Estão atualmente <b>\${activeInst.totalProdutos} produtos ativos</b> com desconto de <b>-\${activeInst.descontoAplicadoPct}%</b> (válida de \${activeInst.dataInicio} a \${activeInst.dataFim || 'em curso'}).<br/>
+                • A lista abaixo contém todos os <b>\${selectedCampaign.eligibleProducts.length} produtos elegíveis</b> em stock no tema de Inverno da farmácia. Os que estão ativos encontram-se assinalados com <span style="background:#10b981;color:white;padding:1px 6px;border-radius:4px;font-size:0.72rem;font-weight:700;">⭐ Ativo na Farmácia</span>.
+              </div>
+            </div>
+          \`;
+        } else {
+          activeAlertBox.style.display = 'none';
+          activeAlertBox.innerHTML = '';
+        }
       }
 
       const anatomyBox = document.getElementById('seasonAnatomyBox');
@@ -7598,14 +9032,21 @@ function getDashboardHtml(): string {
                   ? 'badge-purple'
                   : 'badge-success';
 
+            const activeInst = (currentActiveCampaigns || []).find(a => a.campanhaId === selectedCampaign.id);
+            const isCurrentlyActive = activeInst && (activeInst.produtos || []).some(ap => ap.cnp_codigo === p.cnp_codigo);
+            const activeBadge = isCurrentlyActive
+              ? '<span class="badge" style="background:#10b981;color:#ffffff;font-size:0.7rem;font-weight:700;margin-left:6px;">⭐ Ativo na Farmácia</span>'
+              : '';
+            const rowBg = isCurrentlyActive ? 'style="background: #f0fdf4;"' : '';
+
             return \`
-              <tr id="campRow-\${p.cnp_codigo}">
+              <tr id="campRow-\${p.cnp_codigo}" \${rowBg}>
                 <td style="text-align: center;">
                   <input type="checkbox" class="campaign-sku-check" value="\${p.cnp_codigo}" checked onchange="recalculateCampaignFinancialsClient()" />
                 </td>
                 <td><b>\${p.cnp_codigo}</b></td>
                 <td>
-                  <div style="font-weight: 600; color: var(--text);">\${p.designacao}</div>
+                  <div style="font-weight: 600; color: var(--text);">\${p.designacao}\${activeBadge}</div>
                   <div style="font-size: 0.75rem; color: #38bdf8; margin-top: 2px;">\${p.motivo_selecao || ''}</div>
                 </td>
                 <td>
@@ -7802,7 +9243,7 @@ function getDashboardHtml(): string {
               </div>
               <div style="font-size:0.84rem;margin-bottom:10px;">
                 <b style="color:#fb7185;">🎯 Script de Atendimento (10 segundos):</b>
-                <div style="background: #ffffff;border-left:3px solid #fb7185;padding:10px 12px;border-radius:6px;margin-top:6px;color:#f1f5f9;font-style:italic;">
+                <div style="background:#fff1f2;border:1px solid #fecdd3;border-left:4px solid #e11d48;padding:10px 12px;border-radius:6px;margin-top:6px;color:#881337;font-style:italic;">
                   "\${m.loja.script_balcao}"
                 </div>
               </div>
@@ -7831,7 +9272,7 @@ function getDashboardHtml(): string {
                 </span>
                 <span class="badge badge-purple">Instagram & Facebook</span>
               </div>
-              <div style="background: #ffffff;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px;font-size:0.84rem;color:#f1f5f9;white-space:pre-line;line-height:1.45;">
+              <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;padding:12px;margin-bottom:12px;font-size:0.84rem;color:#0f172a;white-space:pre-line;line-height:1.45;">
                 <b>\${m.redes.headline}</b><br/><br/>
                 \${m.redes.copy_post}<br/><br/>
                 <b>\${m.redes.call_to_action}</b><br/><br/>
@@ -7861,7 +9302,7 @@ function getDashboardHtml(): string {
               </div>
               <div style="background: #ffffff;border:1px dashed #38bdf8;border-radius:8px;padding:16px;margin-bottom:12px;text-align:center;">
                 <div style="font-size:1.05rem;font-weight:800;color:#38bdf8;margin-bottom:10px;">\${m.ecras.slide_titulo}</div>
-                <div style="display:flex;flex-direction:column;gap:6px;font-size:0.86rem;color:#e2e8f0;margin-bottom:10px;">
+                <div style="display:flex;flex-direction:column;gap:6px;font-size:0.86rem;color:#0f172a;margin-bottom:10px;">
                   \${m.ecras.slide_linhas.map(l => \`<div>• \${l}</div>\`).join('')}
                 </div>
                 <div style="font-size:0.75rem;color:var(--muted);border-top:1px solid var(--border);padding-top:8px;">\${m.ecras.slide_rodape}</div>
@@ -8047,6 +9488,275 @@ function getDashboardHtml(): string {
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = \`campanha_\${selectedCampaign.id}_\${new Date().toISOString().slice(0, 10)}.csv\`;
+      a.click();
+    }
+
+    
+    // ========================================================================
+    // GESTÃO DE CAMPANHAS ATIVAS (ATIVAÇÃO, HISTÓRICO E GERAÇÃO DE TAREFAS)
+    // ========================================================================
+    let currentActiveCampaigns = [];
+
+    async function loadActiveCampaigns() {
+      if (!activeFarmaciaId) return;
+      try {
+        const res = await fetch('/api/campaigns/active?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        const data = await res.json();
+        currentActiveCampaigns = (data && data.ok && Array.isArray(data.campanhas)) ? data.campanhas : [];
+        renderActiveCampaignsBanner();
+        renderPlanoActiveCampaignsBlock();
+      } catch (err) {
+        console.warn('Aviso: falha ao carregar campanhas ativas:', err);
+      }
+    }
+
+    function renderActiveCampaignsBanner() {
+      const banner = document.getElementById('activeCampaignsBanner');
+      if (!banner) return;
+
+      if (!currentActiveCampaigns || currentActiveCampaigns.length === 0) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        return;
+      }
+
+      banner.style.display = 'block';
+      banner.innerHTML = currentActiveCampaigns.map(function(c) {
+        var icone = c.icone || '🎯';
+        var dataFim = c.dataFim || 'Em curso';
+        var rowsHtml = (c.produtos || []).map(function(p) {
+          return '<tr style="border-bottom: 1px solid #e2e8f0;">' +
+            '<td style="padding: 8px 10px; font-family: monospace; font-weight: 700; color: #0284c7;">' + p.cnp_codigo + '</td>' +
+            '<td style="padding: 8px 10px; font-weight: 600; color: #1e293b;">' + (p.designacao || 'Produto') + '</td>' +
+            '<td style="padding: 8px 10px; color: #64748b;">' + (p.laboratorio_titular || '—') + '</td>' +
+            '<td style="padding: 8px 10px; text-align: center; font-weight: 700; color: #0f172a;">' + p.stock_atual + ' un</td>' +
+            '<td style="padding: 8px 10px; text-align: right; color: #64748b;">€' + Number(p.custo_unitario || 0).toFixed(2) + '</td>' +
+            '<td style="padding: 8px 10px; text-align: right; text-decoration: line-through; color: #94a3b8;">€' + Number(p.pvp_atual || 0).toFixed(2) + '</td>' +
+            '<td style="padding: 8px 10px; text-align: right; font-weight: 800; color: #059669;">€' + Number(p.pvp_campanha || 0).toFixed(2) + '</td>' +
+            '<td style="padding: 8px 10px; text-align: center;"><span style="background: #d1fae5; color: #065f46; font-weight: 800; padding: 2px 8px; border-radius: 9999px; font-size: 0.74rem;">' + (p.margem_pct || 0) + '%</span></td>' +
+          '</tr>';
+        }).join('');
+
+        return '<div style="background: linear-gradient(135deg, #ecfdf5 0%, #f0fdf4 100%); border: 1.5px solid #10b981; border-radius: 12px; padding: 18px 22px; margin-bottom: 14px; box-shadow: 0 2px 6px rgba(16, 185, 129, 0.12);">' +
+          '<div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">' +
+            '<div>' +
+              '<div style="display: flex; align-items: center; gap: 10px;">' +
+                '<span style="font-size: 1.4rem;">' + icone + '</span>' +
+                '<div>' +
+                  '<span style="background: #10b981; color: white; font-size: 0.72rem; font-weight: 800; padding: 3px 8px; border-radius: 6px; text-transform: uppercase;">Campanha Ativa</span>' +
+                  '<span style="font-size: 1.1rem; font-weight: 800; color: #065f46; margin-left: 6px;">' + c.titulo + '</span>' +
+                '</div>' +
+              '</div>' +
+              '<div style="font-size: 0.84rem; color: #047857; margin-top: 6px; display: flex; gap: 16px; flex-wrap: wrap;">' +
+                '<span>📅 Período: <b>' + c.dataInicio + '</b> até <b>' + dataFim + '</b></span>' +
+                '<span>🏷️ Desconto: <b>-' + c.descontoAplicadoPct + '%</b></span>' +
+                '<span>📦 Produtos em Foco: <b>' + c.totalProdutos + ' SKUs</b></span>' +
+                '<span>⚡ <b>3 Tarefas Criadas para a Equipa no Balcão e Sifarma</b></span>' +
+              '</div>' +
+            '</div>' +
+            '<div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">' +
+              '<button class="btn btn-secondary" data-campid="' + c.id + '" onclick="toggleActiveCampaignProducts(this.dataset.campid)" style="font-size: 0.8rem; padding: 7px 14px; border-color: #059669; color: #065f46; background: #ffffff; font-weight: 700;">' +
+                '👁️ Ver ' + c.totalProdutos + ' Artigos em Campanha' +
+              '</button>' +
+              '<button class="btn btn-secondary" data-campid="' + c.id + '" onclick="exportActiveCampaignCsv(this.dataset.campid)" style="font-size: 0.8rem; padding: 7px 14px; border-color: #10b981; color: #065f46; background: #ffffff;">' +
+                '📥 Exportar Preços' +
+              '</button>' +
+              '<button class="btn" data-campid="' + c.id + '" onclick="deactivateCampaignUi(this.dataset.campid)" style="background: #047857; font-size: 0.8rem; padding: 7px 16px; color: white; font-weight: 700;">' +
+                '✅ Concluir Campanha' +
+              '</button>' +
+            '</div>' +
+          '</div>' +
+          '<div id="activeProductsPanel_' + c.id + '" style="display: none; margin-top: 16px; padding-top: 14px; border-top: 1px dashed #6ee7b7;">' +
+            '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">' +
+              '<div style="font-size: 0.86rem; font-weight: 700; color: #065f46;">📋 Artigos com Preço Promocional em Vigor (' + c.totalProdutos + ' SKUs):</div>' +
+              '<div style="font-size: 0.76rem; color: #047857;">Estes ' + c.totalProdutos + ' artigos têm PVP promocional ativo e tarefas atribuídas à equipa.</div>' +
+            '</div>' +
+            '<div style="overflow-x: auto; background: white; border-radius: 8px; border: 1px solid #d1fae5;">' +
+              '<table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.82rem;">' +
+                '<thead style="background: #f0fdf4; border-bottom: 2px solid #a7f3d0; font-size: 0.74rem; color: #065f46; text-transform: uppercase;">' +
+                  '<tr>' +
+                    '<th style="padding: 8px 10px;">CNP</th>' +
+                    '<th style="padding: 8px 10px;">Designação</th>' +
+                    '<th style="padding: 8px 10px;">Laboratório</th>' +
+                    '<th style="padding: 8px 10px; text-align: center;">Stock Físico</th>' +
+                    '<th style="padding: 8px 10px; text-align: right;">Custo Unit. s/IVA</th>' +
+                    '<th style="padding: 8px 10px; text-align: right;">PVP Normal</th>' +
+                    '<th style="padding: 8px 10px; text-align: right; color: #047857; font-weight: 800;">PVP Campanha (-' + c.descontoAplicadoPct + '%)</th>' +
+                    '<th style="padding: 8px 10px; text-align: center;">Margem Preservada</th>' +
+                  '</tr>' +
+                '</thead>' +
+                '<tbody>' + rowsHtml + '</tbody>' +
+              '</table>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    function toggleActiveCampaignProducts(campId) {
+      const panel = document.getElementById('activeProductsPanel_' + campId);
+      if (!panel) return;
+      panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    }
+
+        function goToCampaignsTab() {
+      switchTab('campaigns');
+    }
+
+    function renderPlanoActiveCampaignsBlock() {
+      const block = document.getElementById('planoActiveCampaignsBlock');
+      if (!block) return;
+
+      if (!currentActiveCampaigns || currentActiveCampaigns.length === 0) {
+        block.style.display = 'none';
+        block.innerHTML = '';
+        return;
+      }
+
+      block.style.display = 'block';
+      const c = currentActiveCampaigns[0];
+      var icone = c.icone || '🎯';
+      block.innerHTML = '<div style="background: linear-gradient(135deg, #fff1f2 0%, #ffffff 100%); border: 1.5px solid #fda4af; border-radius: 12px; padding: 16px 20px; box-shadow: 0 2px 4px rgba(225, 29, 72, 0.06); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">' +
+        '<div>' +
+          '<div style="font-weight: 800; color: #9f1239; font-size: 0.98rem; display: flex; align-items: center; gap: 8px;">' +
+            '<span>' + icone + '</span>' +
+            '<span>Missões da Campanha Ativa: ' + c.titulo + '</span>' +
+            '<span class="badge badge-danger">-' + c.descontoAplicadoPct + '% Promo</span>' +
+          '</div>' +
+          '<div style="font-size: 0.82rem; color: #4c0519; margin-top: 4px;">' +
+            'Ações prioritárias para a equipa cumprir esta semana no balcão e no Sifarma (' + c.totalProdutos + ' produtos em escoamento).' +
+          '</div>' +
+        '</div>' +
+        '<div style="display: flex; gap: 8px; flex-wrap: wrap;">' +
+          '<button class="btn btn-secondary" onclick="goToCampaignsTab()" style="font-size: 0.78rem; padding: 6px 12px; border-color: #f43f5e; color: #e11d48;">' +
+            '🔍 Ver Produtos & Script de Balcão →' +
+          '</button>' +
+        '</div>' +
+      '</div>';
+    }
+
+    async function activateCurrentCampaignUi() {
+      if (!selectedCampaign) {
+        alert('Selecione primeiro uma campanha para ativar.');
+        return;
+      }
+
+      const discountPct = parseInt(document.getElementById('campaignDiscountRange')?.value || '15', 10);
+      const discount = discountPct / 100;
+      const includedCnps = new Set(getIncludedCnpCodigos());
+
+      const filtered = selectedCampaign.eligibleProducts.filter(p => includedCnps.has(p.cnp_codigo));
+      if (filtered.length === 0) {
+        alert('Atenção: selecione pelo menos um produto na tabela da campanha.');
+        return;
+      }
+
+      const confirmMsg = 'Pretende ATIVAR a campanha "' + selectedCampaign.titulo + '" na Farmácia por 15 dias com -' + discountPct + '% de desconto?\\n\\n' +
+        '• Serão integrados ' + filtered.length + ' produtos com margem protegida.\\n' +
+        '• Serão geradas automaticamente 3 tarefas práticas na Folha da Semana e no telemóvel da equipa.';
+
+      if (!confirm(confirmMsg)) return;
+
+      const formattedProducts = filtered.map(p => {
+        const pvpNormal = p.pvp_atual || (p.custo_unitario * 1.5);
+        const pvpCampanha = Number((pvpNormal * (1 - discount)).toFixed(2));
+        const taxaIva = p.taxa_iva || 0.23;
+        const custoComIva = p.custo_unitario * (1 + taxaIva);
+        const margemPct = Number((((pvpCampanha - custoComIva) / pvpCampanha) * 100).toFixed(1));
+
+        return {
+          cnp_codigo: p.cnp_codigo,
+          designacao: p.designacao,
+          laboratorio_titular: p.laboratorio_titular,
+          stock_atual: p.stock_atual,
+          custo_unitario: p.custo_unitario,
+          pvp_atual: pvpNormal,
+          pvp_campanha: pvpCampanha,
+          desconto_pct: discountPct,
+          margem_pct: margemPct
+        };
+      });
+
+      try {
+        const btn = document.getElementById('btnActivateCampaignMain') || document.getElementById('btnActivateCampaignStep2');
+        if (btn) { btn.disabled = true; btn.innerHTML = '⏳ A ativar...'; }
+
+        const res = await fetch('/api/campaigns/activate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            campanhaId: selectedCampaign.id,
+            titulo: selectedCampaign.titulo,
+            icone: selectedCampaign.icone || '🎯',
+            descontoPct: discountPct,
+            produtos: formattedProducts,
+            diasDuracao: 15,
+            criadoPor: 'Diretor'
+          })
+        });
+
+        const data = await res.json();
+        if (data && data.success) {
+          alert('🎉 ' + data.mensagem);
+          await loadActiveCampaigns();
+          await fetchWeeklyTasksFromDb();
+        } else {
+          alert('Erro ao ativar campanha: ' + (data.error || 'Falha no servidor'));
+        }
+      } catch (err) {
+        console.error('Falha ao ativar campanha:', err);
+        alert('Erro ao contactar o servidor.');
+      } finally {
+        const btn = document.getElementById('btnActivateCampaignMain') || document.getElementById('btnActivateCampaignStep2');
+        if (btn) { btn.disabled = false; btn.innerHTML = '🚀 Ativar Campanha na Farmácia'; }
+      }
+    }
+
+    async function deactivateCampaignUi(campId) {
+      if (!confirm('Pretende concluir esta campanha ativa? As metas serão arquivadas.')) return;
+      try {
+        const res = await fetch('/api/campaigns/deactivate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            campanhaId: campId,
+            estado: 'CONCLUIDA'
+          })
+        });
+        const data = await res.json();
+        if (data && data.success) {
+          await loadActiveCampaigns();
+          await fetchWeeklyTasksFromDb();
+        }
+      } catch (err) {
+        console.error('Falha ao concluir campanha:', err);
+      }
+    }
+
+    function exportActiveCampaignCsv(activeCampId) {
+      const camp = currentActiveCampaigns.find(function(c) { return c.id === activeCampId; });
+      if (!camp || !camp.produtos) return;
+      const headers = ['CNP', 'Designacao', 'Laboratorio', 'Stock', 'CustoSemIva', 'PVP_Normal', 'PVP_Campanha', 'Desconto_Pct', 'Margem_Pct'];
+      const rows = camp.produtos.map(function(p) {
+        return [
+          p.cnp_codigo,
+          '"' + (p.designacao || '').replace(/"/g, '""') + '"',
+          '"' + (p.laboratorio_titular || '').replace(/"/g, '""') + '"',
+          p.stock_atual,
+          p.custo_unitario.toFixed(2),
+          p.pvp_atual.toFixed(2),
+          p.pvp_campanha.toFixed(2),
+          p.desconto_pct + '%',
+          p.margem_pct + '%'
+        ].join(';');
+      });
+      const csvContent = [headers.join(';')].concat(rows).join('\\n');
+      const blob = new Blob(['\\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'campanha_ativa_' + camp.campanhaId + '_' + new Date().toISOString().slice(0, 10) + '.csv';
       a.click();
     }
 

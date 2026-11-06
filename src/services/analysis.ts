@@ -139,6 +139,7 @@ export interface PharmacyAnalysisReport {
   };
   parametros: {
     data_referencia: string;
+    data_ultima_venda: string | null;
     periodo_monos_dias: number;
     data_corte_monos: string;
     limite_cobertura_meses: number;
@@ -160,6 +161,11 @@ export interface PharmacyAnalysisReport {
     total_artigos_excesso_cobertura: number;
     total_artigos_monos: number;
     valor_total_monos: number;
+    total_artigos_restos_gaveta: number;
+    valor_total_restos_gaveta: number;
+    total_artigos_monos_profundidade: number;
+    valor_total_monos_profundidade: number;
+    data_ultima_venda: string | null;
     percentagem_capital_em_monos: number;
     total_artigos_com_validade_registada: number;
     total_artigos_risco_caducidade: number;
@@ -362,28 +368,45 @@ export async function analyzePharmacyInventory(
     orderBy: { data_venda: 'asc' },
   });
 
-  let dataReferencia = options.dataReferencia;
-  if (!dataReferencia) {
-    const maxExtracao = inventarios.reduce<Date | null>(
-      (max, item) => (!max || item.data_extracao > max ? item.data_extracao : max),
-      null
-    );
-    dataReferencia = maxExtracao ?? new Date();
+  // Em Tempo Real: a data atual é sempre a referência oficial para o cálculo de janelas
+  const dataReferencia = options.dataReferencia ?? new Date();
+
+  // Localiza a data da última venda registada na farmácia para nota de transparência
+  let dataUltimaVenda: Date | null = null;
+  for (const v of vendas) {
+    if (!dataUltimaVenda || v.data_venda > dataUltimaVenda) {
+      dataUltimaVenda = v.data_venda;
+    }
   }
 
   const periodoMonosDias = options.periodoMonosDias ?? 90;
   const limiteCoberturaMeses = options.limiteCoberturaMeses ?? 4;
 
+  // Janela móvel de 12 meses anteriores à data de referência para cálculo rigoroso de VMM
+  const dataInicioVmm = new Date(dataReferencia);
+  dataInicioVmm.setUTCFullYear(dataInicioVmm.getUTCFullYear() - 1);
+
+  // Filtra deduplicação mensal vs diário: se um mês tiver vendas 'MENSAL', ignora 'DIARIO' para esse mesmo mês
+  const monthlyKeySet = new Set<string>();
+  for (const v of vendas) {
+    if ((v as any).granularidade === 'MENSAL') {
+      const k = `${v.cnp_codigo}_${v.data_venda.getUTCFullYear()}-${String(v.data_venda.getUTCMonth() + 1).padStart(2, '0')}`;
+      monthlyKeySet.add(k);
+    }
+  }
+
+  // Identifica meses distintos no período de referência dos últimos 12 meses
+  const mesesDistintosSet = new Set<string>();
+  for (const v of vendas) {
+    if (v.data_venda >= dataInicioVmm && v.data_venda <= dataReferencia) {
+      const ym = `${v.data_venda.getUTCFullYear()}-${String(v.data_venda.getUTCMonth() + 1).padStart(2, '0')}`;
+      mesesDistintosSet.add(ym);
+    }
+  }
+
   let mesesHistoricoVMM = options.mesesHistoricoVMM;
   if (!mesesHistoricoVMM) {
-    if (vendas.length > 0) {
-      const mesesDistintos = new Set(
-        vendas.map((v) => `${v.data_venda.getUTCFullYear()}-${String(v.data_venda.getUTCMonth() + 1).padStart(2, '0')}`)
-      );
-      mesesHistoricoVMM = mesesDistintos.size > 12 ? 12 : Math.max(1, mesesDistintos.size);
-    } else {
-      mesesHistoricoVMM = 12;
-    }
+    mesesHistoricoVMM = mesesDistintosSet.size > 0 ? Math.min(12, Math.max(1, mesesDistintosSet.size)) : 12;
   }
 
   const dataCorteMonos = new Date(dataReferencia.getTime() - periodoMonosDias * 24 * 60 * 60 * 1000);
@@ -398,13 +421,23 @@ export async function analyzePharmacyInventory(
   >();
 
   for (const venda of vendas) {
+    const k = `${venda.cnp_codigo}_${venda.data_venda.getUTCFullYear()}-${String(venda.data_venda.getUTCMonth() + 1).padStart(2, '0')}`;
+    // Se o mês já tem o total MENSAL consolidado, ignora registos pontuais DIARIO para não duplicar contagem
+    if ((venda as any).granularidade === 'DIARIO' && monthlyKeySet.has(k)) {
+      continue;
+    }
+
     const atual = vendasPorProduto.get(venda.cnp_codigo) ?? {
       totalUnidades: 0,
       unidadesRecentesMonos: 0,
       ultimaDataVenda: null,
     };
 
-    atual.totalUnidades += venda.quantidade;
+    // Apenas soma no VMM se estiver dentro da janela de 12 meses
+    if (venda.data_venda >= dataInicioVmm && venda.data_venda <= dataReferencia) {
+      atual.totalUnidades += venda.quantidade;
+    }
+
     if (venda.data_venda >= dataCorteMonos && venda.data_venda <= dataReferencia) {
       atual.unidadesRecentesMonos += venda.quantidade;
     }
@@ -825,6 +858,7 @@ export async function analyzePharmacyInventory(
     },
     parametros: {
       data_referencia: dataReferencia.toISOString().slice(0, 10),
+      data_ultima_venda: dataUltimaVenda ? dataUltimaVenda.toISOString().slice(0, 10) : null,
       periodo_monos_dias: periodoMonosDias,
       data_corte_monos: dataCorteMonos.toISOString().slice(0, 10),
       limite_cobertura_meses: limiteCoberturaMeses,
@@ -846,6 +880,15 @@ export async function analyzePharmacyInventory(
       total_artigos_excesso_cobertura: alertasExcessoCobertura.length,
       total_artigos_monos: monos.length,
       valor_total_monos: round2(valorTotalMonos),
+      total_artigos_restos_gaveta: monos.filter((m) => m.stock_atual <= 2).length,
+      valor_total_restos_gaveta: round2(
+        monos.filter((m) => m.stock_atual <= 2).reduce((s, m) => s + m.capital_imobilizado, 0)
+      ),
+      total_artigos_monos_profundidade: monos.filter((m) => m.stock_atual >= 3).length,
+      valor_total_monos_profundidade: round2(
+        monos.filter((m) => m.stock_atual >= 3).reduce((s, m) => s + m.capital_imobilizado, 0)
+      ),
+      data_ultima_venda: dataUltimaVenda ? dataUltimaVenda.toISOString().slice(0, 10) : null,
       percentagem_capital_em_monos:
         valorTotalStockCusto > 0 ? round2((valorTotalMonos / valorTotalStockCusto) * 100) : 0,
       total_artigos_com_validade_registada: totalArtigosComValidade,

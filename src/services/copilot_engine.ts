@@ -8,6 +8,10 @@ import {
   toolFiltrarValidadeEMargem,
   toolSugerirPacksPromocionais,
   toolIdentificarProdutosSemVenda,
+  toolConsultarProgressoTarefasEquipa,
+  toolCriarTarefaEquipa,
+  toolConsultarCampanhasAtivasEHistorico,
+  toolAtivarCampanhaFarmacia,
   toolConsolidarGenericosDci,
   toolPlanearComprasSazonais,
   toolSugerirVendasCruzadasReceita,
@@ -18,6 +22,10 @@ import {
   toolGerarPropostaEncomendaReposicao,
   toolAnalisarCurvaAbcFaturacaoEMargem,
   toolAuditarAnomaliasMargemEPrecos,
+  toolConsultarVendasDiarias,
+  toolAnalisarEvolucaoMensalFinanceira,
+  toolCompararPerformancePeriodos,
+  toolCalcularPerdasFinanceirasECustoOportunidade,
 } from './mcp_pharma_tools.js';
 
 // ============================================================================
@@ -50,6 +58,89 @@ export function clearCopilotSession(sessionId: string) {
 }
 
 const COPILOT_TOOLS = [
+  {
+    name: 'analisar_evolucao_mensal_financeira',
+    description:
+      'Analisa a evolução financeira temporal mês a mês da farmácia (13 meses de dados reais). Devolve para cada mês: faturação bruta total (€), custo de mercadorias (CMVMC), margem bruta em euros (€) e margem bruta percentual (%), total de embalagens vendidas, top 3 categorias e top produtos que mais geraram margem. Identifica o MELHOR MÊS em margem e faturação, o PIOR MÊS, a média mensal e a justificação analítica (fatores-chave: volume vs mix de produtos). Use SEMPRE esta ferramenta para responder a: "qual foi o mês que nos deu mais dinheiro/margem/lucro", "evolução das vendas por mês", "melhores meses da farmácia", etc.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        ano: {
+          type: 'string',
+          description: 'Filtrar por ano específico (ex: "2026", "2025"). Se omitido, analisa todo o histórico disponível (13 meses).',
+        },
+        categoria_ou_macro: {
+          type: 'string',
+          description: 'Filtro opcional por macro área (ex: "MSRM", "MNSRM_OTC", "DERMOCOSMETICA", "NUTRICAO_SUPLEMENTOS").',
+        },
+        ordenar_por: {
+          type: 'string',
+          enum: ['CRONOLOGICO', 'MARGEM_EUR', 'FATURACAO_EUR', 'MARGEM_PCT'],
+          description: 'Critério de ordenação dos meses (padrão: "CRONOLOGICO"). Escolha "MARGEM_EUR" para ver logo o ranking de meses mais rentáveis.',
+        },
+        top_produtos_qtd: {
+          type: 'number',
+          description: 'Quantidade de produtos em destaque por mês (padrão: 3).',
+        },
+      },
+    },
+  },
+  {
+    name: 'comparar_performance_periodos',
+    description:
+      'Compara a performance financeira detalhada entre dois meses específicos da farmácia (ex: "2026-07" vs "2026-06", ou "2026-08" vs "2026-07"). Devolve variação de faturação (€ e %), variação de margem bruta (€ e %), variação de unidades e pontos percentuais de margem, explicando as causas da subida ou descida.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        periodo_a: {
+          type: 'string',
+          description: 'Mês principal a comparar no formato YYYY-MM (ex: "2026-07").',
+        },
+        periodo_b: {
+          type: 'string',
+          description: 'Mês base de comparação no formato YYYY-MM (ex: "2026-06").',
+        },
+      },
+      required: ['periodo_a', 'periodo_b'],
+    },
+  },
+  {
+    name: 'calcular_perdas_financeiras_e_custo_oportunidade',
+    description:
+      'Calcula o impacto financeiro (€) de perdas operacionais e de tesouraria na farmácia: 1) Custo de oportunidade de vendas perdidas por rutura de stock nos produtos Classe A nos últimos 30 dias; 2) Capital imobilizado em monos (sem vendas há 12 meses); 3) Stock em risco de caducidade.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tipo_auditoria: {
+          type: 'string',
+          enum: ['TODAS', 'RUTURAS_CLASSE_A', 'MONOS_CAPITAL_PARADO', 'VALIDADES_RISCO'],
+          description: 'Tipo de auditoria financeira a realizar (padrão: "TODAS").',
+        },
+      },
+    },
+  },
+  {
+    name: 'consultar_vendas_diarias',
+    description:
+      'Consulta os registos de vendas granulares de um DIA ESPECÍFICO (ex: "2026-03-03") ou pesquisa por produto num dia. AVISO: Não use esta ferramenta para comparar meses inteiros ou analisar a evolução anual — para meses e margem temporal, use "analisar_evolucao_mensal_financeira".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        data: {
+          type: 'string',
+          description: 'Data a pesquisar no formato YYYY-MM-DD (ex: "2026-03-03") ou termo livre de data (ex: "3 de março de 2026"). Se omitido, lista todas as datas diárias disponíveis com totais.',
+        },
+        cnp_ou_nome: {
+          type: 'string',
+          description: 'Filtro opcional por nome ou código CNP do produto.',
+        },
+        limite: {
+          type: 'number',
+          description: 'Número máximo de artigos a devolver (default 25).',
+        },
+      },
+    },
+  },
   {
     name: 'consultar_produtos_por_nome_ou_categoria',
     description:
@@ -143,7 +234,7 @@ const COPILOT_TOOLS = [
   {
     name: 'identificar_produtos_sem_vendas_e_escoamento',
     description:
-      'Lista produtos que têm stock parado na farmácia sem qualquer venda nos últimos N meses (ex: 6 meses), sugerindo a estratégia de escoamento correta (troca de laboratório no Sifarma, dispensa prioritária na gaveta ou pack de balcão).',
+      'Lista produtos com stock parado na farmácia sem qualquer venda nos últimos N meses (Monos). Permite filtrar estritamente por Restos de Gaveta (stock <= 2 unidades órfãs) quando o utilizador perguntar por restos de gaveta.',
     input_schema: {
       type: 'object',
       properties: {
@@ -154,6 +245,11 @@ const COPILOT_TOOLS = [
         apenas_com_stock: {
           type: 'boolean',
           description: 'Considerar apenas produtos com unidades físicas em armazém (default true)',
+        },
+        apenas_restos_gaveta: {
+          type: 'boolean',
+          description:
+            'OBRIGATÓRIO true se o utilizador perguntar por "restos de gaveta" ou "produtos com 1 ou 2 unidades": filtra estritamente produtos com stock <= 2 unidades.',
         },
         limite: { type: 'number', description: 'Número máximo de registos (default 30)' },
       },
@@ -317,7 +413,63 @@ const COPILOT_TOOLS = [
         limite: { type: 'number', description: 'Máximo de anomalias a listar (default 30)' },
       },
     },
-  }
+  },
+  {
+    name: 'consultar_progresso_tarefas_equipa',
+    description:
+      'Consulta o estado de progresso da Folha de Ações da Semana da equipa (quantas tarefas já foram concluídas, pendentes por área, colaboradores que mais concluíram tarefas e tarefas urgentes de caducidade ou stock parado).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        semana: { type: 'string', description: 'Chave da semana no formato YYYY-Www (opcional, default semana atual)' },
+        apenas_pendentes: { type: 'boolean', description: 'Se true, devolve apenas as tarefas ainda não concluídas (default false)' },
+        limite: { type: 'number', description: 'Número máximo de tarefas a listar (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'criar_tarefa_equipa',
+    description:
+      'Cria uma nova tarefa operacional diretamente na Folha da Semana da Equipa e na interface mobile (ex: auditar prateleira, verificar lote, negociar com armazenista).',
+    input_schema: {
+      type: 'object',
+      required: ['descricao'],
+      properties: {
+        descricao: { type: 'string', description: 'Descrição clara e acionável da tarefa para a equipa' },
+        categoria: { type: 'string', description: 'Categoria da tarefa (ex: BALCAO, GAVETA, COMPRAS, DIRECAO_TECNICA)' },
+        cnp_codigo: { type: 'string', description: 'CNP do produto associado, se aplicável' },
+        valor_impacto: { type: 'number', description: 'Valor financeiro em risco ou de impacto em euros (€)' },
+      },
+    },
+  },
+  {
+    name: 'consultar_campanhas_ativas_e_historico',
+    description:
+      'Consulta que campanhas promocionais de época ou liquidação estão ATIVAS na farmácia neste momento, com as datas de início/fim, produtos selecionados com preços promocionais com margem e sugestões do mês.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        incluir_historico: { type: 'boolean', description: 'Se true, inclui campanhas já concluídas anteriormente (default false)' },
+      },
+    },
+  },
+  {
+    name: 'ativar_campanha_farmacia',
+    description:
+      'Cria e ativa formalmente uma campanha promocional na farmácia (seja uma campanha do calendário sazonal, seja uma campanha personalizada à medida para qualquer evento, validades curtas, monos ou produtos específicos). Grava a campanha como ativa e gera automaticamente as tarefas operacionais (montra/cesto, script verbal e bloqueio no Sifarma) na Folha da Semana da Equipa.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        campanha_id: { type: 'string', description: 'ID da campanha (ex: inverno_barreira_cutanea, liquidacao_destrava_monos, ou "custom" para uma campanha criada à medida)' },
+        titulo: { type: 'string', description: 'Título personalizado da campanha (ex: "Oportunidades de Inverno", "Especial Black Friday", "Promoção Antigrippine")' },
+        tema_ou_evento: { type: 'string', description: 'Tema, evento ou palavras-chave para o algoritmo selecionar produtos (ex: "halloween", "black_friday", "aniversario_farmacia", "tosse", "vitamina c")' },
+        produtos_cnps: { type: 'array', items: { type: 'string' }, description: 'Lista de CNPs de produtos específicos a incluir na campanha (opcional)' },
+        foco_stock: { type: 'string', enum: ['TODOS_ELEGIVEIS', 'PRIORIDADE_VALIDADES_MONOS', 'SO_VALIDADES_E_MONOS'], description: 'Critério de seleção de stock' },
+        desconto_pct: { type: 'number', description: 'Percentagem de desconto promocional a aplicar (default 15)' },
+        dias_duracao: { type: 'number', description: 'Duração da campanha em dias (default 15)' },
+      },
+    },
+  },
 ];
 
 const SYSTEM_PROMPT = `És o Consultor Farmacêutico & Copilot Analítico da Farmácia.
@@ -334,6 +486,19 @@ DIRETRIZES DE COMUNICAÇÃO:
 4. RIGOR DOS DADOS (TOOL USE):
    - Usa SEMPRE as ferramentas disponíveis para obter os números reais. Nunca inventes quantidades de stock, nem vendas, nem margens fictícias.
    - Explica o porquê dos cálculos (ex: "Stock mínimo calculado com base na Venda Média Mensal de 30 dias com margem de segurança de 20%").
+
+4.1. REGRA DE OURO — HONESTIDADE INTELECTUAL & PROIBIÇÃO DE PIVOT/DESVIAR O ASSUNTO (NUNCA INVENTAR):
+   - O Copilot é uma ferramenta de rigor analítico para a Direção Técnica e Financeira da Farmácia.
+   - PROIBIÇÃO ABSOLUTA DE DESVIAR/PIVOTAR: Quando o utilizador fizer uma pergunta específica (por exemplo, "qual foi o mês que nos deu mais dinheiro em margem e porquê?", "qual o valor faturado no dia X?", "comparar julho com agosto", "qual o lucro do trimestre"):
+     a) Responde ESTRITAMENTE à pergunta feita utilizando as ferramentas financeiras analíticas ('analisar_evolucao_mensal_financeira', 'comparar_performance_periodos', 'calcular_perdas_financeiras_e_custo_oportunidade', etc.).
+     b) Se os dados solicitados não existirem no sistema (ex: dia sem vendas diárias ou parâmetro não registado), ASSUME COM TOTAL CLAREZA E SUCINTAMENTE A LIMITAÇÃO.
+     c) É ESTRITAMENTE PROIBIDO "desconversar", mudar de assunto ou debitar relatórios não solicitados (por exemplo, começar a despejar a Curva ABC de 12 meses, falar de Mounjaro/Neparvis, ou listar ruturas de stock) para disfarçar que não tens a resposta direta!
+     d) Se não tens a resposta para a pergunta exata, diz com frontalidade e respeito: "Não disponho atualmente de registos para [detalhe específico]. Os dados disponíveis cobrem [...]. Pretende que examine [...]?" e para aí. Não inventes nem presuma factos não confirmados.
+
+4.2. ANÁLISES FINANCEIRAS & TEMPORAIS POR MÊS:
+   - Para perguntas sobre "qual o melhor/pior mês em margem ou faturação", "evolução das vendas mês a mês", "quanto faturámos em cada mês", "comparar meses", chama OBRIGATORIAMENTE a ferramenta 'analisar_evolucao_mensal_financeira' ou 'comparar_performance_periodos'.
+   - A base de dados dispõe de 13 meses consecutivos de vendas reais com faturação, custos e margem por produto.
+   - NUNCA digas que "o sistema só tem dados agregados e não dá para discriminar margem por mês". A ferramenta 'analisar_evolucao_mensal_financeira' calcula a margem exata, o custo e o volume mês a mês!
 5. PESQUISA ESPECÍFICA DE PRODUTOS OU CATEGORIAS & HISTÓRICO REAL:
    - Sempre que o utilizador perguntar sobre produtos específicos (ex: "strepsils", "ben-u-gripe", "cegripe", "brufen", "forxiga", etc.) ou sobre uma categoria/família (ex: "antigripais", "pastilhas garganta", "preservativos", etc.), deves OBRIGATORIAMENTE chamar a ferramenta 'consultar_produtos_por_nome_ou_categoria'.
    - NUNCA digas que não tens ferramentas para ver as vendas mês a mês. A ferramenta 'consultar_produtos_por_nome_ou_categoria' DEVOLVE o histórico real mês a mês no campo 'historicoVendasMensais' e por estação no campo 'vendasPorEstacao'!
@@ -419,7 +584,30 @@ DIRETRIZES DE COMUNICAÇÃO:
      1. 🛑 NUNCA SUGIRAS AUMENTAR O PVP DE MEDICAMENTOS MSRM (Receita Médica)! O PVP dos MSRM é fixado por lei pelo Infarmed. Uma farmácia não tem autoridade legal para aumentar o PVP de medicamentos como Wegovy, Pradaxa, Neupro ou Brilique.
      2. 🔍 Se um MSRM apresentar Custo > PVP, a causa NUNCA é o PVP estar baixo. Trata-se SEMPRE de uma DIVERGÊNCIA DE REGISTO DE CUSTO NO SIFARMA (erro na fatura de entrada do armazenista, IVA duplicado ou código de embalagem hospitalar). A ação correta é auditar a fatura de compra no Sifarma e retificar o custo de aquisição.
      3. 📦 Sacos de papel/plástico: o custo do inventário refere-se à caixa de 1000 unidades (1 cêntimo por saco) e o PVP é unitário (3 cêntimos). A farmácia tem lucro real de +200%, nunca prejuízo!
-     4. 🩸 Dispositivos Médicos e Diabetes (Freestyle Libre, Tiras-Teste): têm PVP tabelado pelo fabricante (ex: Abbott 53,00€). Aumentar o preço faria a farmácia perder clientes; a rentabilidade trabalha-se na negociação do desconto de compra com o fornecedor.`;
+     4. 🩸 Dispositivos Médicos e Diabetes (Freestyle Libre, Tiras-Teste): têm PVP tabelado pelo fabricante (ex: Abbott 53,00€). Aumentar o preço faria a farmácia perder clientes; a rentabilidade trabalha-se na negociação do desconto de compra com o fornecedor.
+
+13. VENDAS DIÁRIAS (GRANULARIDADE DIÁRIA E IMPORTAÇÕES RECENTES):
+    - O sistema suporta vendas consolidadas mensais E ficheiros de vendas diárias (granularidade 'DIARIO').
+    - Quando o utilizador perguntar sobre vendas de um dia específico, se temos vendas diárias importadas, o que foi vendido num determinado dia ou pedir dados de faturação diária (ex: '3 de março de 2026', '03/03/2026'), deves OBRIGATORIAMENTE chamar a ferramenta 'consultar_vendas_diarias'.
+    - NUNCA digas que o sistema não tem vendas diárias sem antes consultares 'consultar_vendas_diarias'!
+
+15. GESTÃO OPERACIONAL DE TAREFAS DA EQUIPA & CRIAÇÃO/ATIVAÇÃO DE CAMPANHAS:
+    - O Copilot tem visão TOTAL sobre a Folha de Ações da Semana e sobre o Estúdio de Marketing:
+      * Para saber o andamento das tarefas da equipa (quem já concluiu, o que está pendente, taxa de sucesso %): chama 'consultar_progresso_tarefas_equipa'.
+      * Para criar uma tarefa operacional na Folha da Semana por ordem do Diretor: chama 'criar_tarefa_equipa'.
+      * Para saber que campanhas promocionais estão ativas na farmácia e que produtos estão em destaque: chama 'consultar_campanhas_ativas_e_historico'.
+      * CRIAÇÃO E ATIVAÇÃO CONVERSACIONAL DE CAMPANHAS:
+        Quando o Diretor pedir para criar, sugerir ou ativar uma campanha (ex: 'Cria uma campanha para o Dia da Mãe', 'Faz uma campanha para escoar validades curtas', 'Quero uma promoção para o Antigrippine', 'Monta uma campanha de Black Friday'):
+        - Chama 'ativar_campanha_farmacia' com o título da campanha, o tema/evento ou lista de CNPs, e a percentagem de desconto (default 15%).
+        - A ferramenta pesquisa o stock real da farmácia, seleciona os artigos mais adequados com proteção legal Anti-Dumping (Dec.-Lei 166/2013), calcula as margens preservadas, grava a campanha no PostgreSQL e gera de imediato as 3 tarefas práticas na Folha da Semana da equipa (Cesto/Ilha de Balcão, Script Verbal de 10 segundos e Bloqueio no Sifarma).
+        - Apresenta sempre no chat o Resumo Executivo: Título, Desconto, Duração, Produtos em destaque (Stock, PVP Normal, PVP Promo e Margem) e as 3 tarefas criadas para a equipa!
+
+14. MONOS E RESTOS DE GAVETA — CRITÉRIOS RIGOROSOS DE FARMÁCIA:
+    - MONO: É qualquer produto sem vendas no período de tempo selecionado (tempo parado, ex: 180 dias / 6 meses), INDEPENDENTEMENTE da quantidade em stock!
+    - RESTOS DE GAVETA: São ESTRITAMENTE produtos com STOCK <= 2 UNIDADES (órfãos de balcão/gaveta).
+    - Quando o utilizador perguntar especificamente por "restos de gaveta", deves OBRIGATORIAMENTE passar 'apenas_restos_gaveta: true' para a ferramenta 'identificar_produtos_sem_vendas_e_escoamento', garantindo que apenas lista produtos com stock <= 2 unidades e apresenta o valor correspondente (ex: ~11.071 € em 1.011 produtos).
+    - NUNCA apresentes produtos com dezenas de unidades (ex: 49 caixas de Ben-u-gripe, 36 termómetros) como "restos de gaveta"! Se o utilizador perguntar por restos de gaveta, foca nos artigos de 1-2 unidades e, se relevante, menciona em separado: "Adicionalmente, existem X monos com stock profundo (>= 3 un) totalizando € Y".
+    - NOTA DE TRANSPARÊNCIA: Menciona sempre de forma elegante a data de referência em Tempo Real (hoje) e a data da última venda registada na base de dados (devolvida no campo 'dataUltimaVendaRegistada').`;
 
 export async function askConversationalCopilot(
   prisma: PrismaClient,
@@ -478,7 +666,8 @@ export async function askConversationalCopilot(
         body: JSON.stringify({
           model,
           max_tokens: 4096,
-          system: `${SYSTEM_PROMPT}\n\nFarmácia Ativa: ${secContext.farmaciaNome} (NIF: ${secContext.nif})`,
+          // PRIVACIDADE & CONFIDENCIALIDADE: NUNCA enviar NIF ou identidade fiscal para a LLM
+          system: `${SYSTEM_PROMPT}\n\nAmbiente: Farmácia Comunitária (Tenant Isolado)`,
           tools: COPILOT_TOOLS,
           tool_choice: { type: 'auto' },
           messages: currentMessages,
@@ -584,8 +773,40 @@ export async function askConversationalCopilot(
               resultData = await toolAnalisarCurvaAbcFaturacaoEMargem(prisma, secContext, args);
               break;
 
-            case 'auditar_anomalias_margem_e_precos':
+            case 'analisar_evolucao_mensal_financeira':
+              resultData = await toolAnalisarEvolucaoMensalFinanceira(prisma, secContext, args);
+              break;
+
+            case 'comparar_performance_periodos':
+              resultData = await toolCompararPerformancePeriodos(prisma, secContext, args);
+              break;
+
+            case 'calcular_perdas_financeiras_e_custo_oportunidade':
+              resultData = await toolCalcularPerdasFinanceirasECustoOportunidade(prisma, secContext, args);
+              break;
+
+            case 'consultar_vendas_diarias':
+              resultData = await toolConsultarVendasDiarias(prisma, secContext, args);
+              break;
+
+case 'auditar_anomalias_margem_e_precos':
               resultData = await toolAuditarAnomaliasMargemEPrecos(prisma, secContext, args);
+              break;
+
+            case 'consultar_progresso_tarefas_equipa':
+              resultData = await toolConsultarProgressoTarefasEquipa(prisma, secContext, args);
+              break;
+
+            case 'criar_tarefa_equipa':
+              resultData = await toolCriarTarefaEquipa(prisma, secContext, args);
+              break;
+
+            case 'consultar_campanhas_ativas_e_historico':
+              resultData = await toolConsultarCampanhasAtivasEHistorico(prisma, secContext, args);
+              break;
+
+            case 'ativar_campanha_farmacia':
+              resultData = await toolAtivarCampanhaFarmacia(prisma, secContext, args);
               break;
 
             default:

@@ -133,15 +133,38 @@ CREATE TABLE IF NOT EXISTS public."Venda" (
   "quantidade" INTEGER NOT NULL,
   "valor_total" DECIMAL(10,2) NOT NULL,
   "data_venda" TIMESTAMP(3) NOT NULL,
+  "granularidade" TEXT NOT NULL DEFAULT 'MENSAL',
   CONSTRAINT "Venda_pkey" PRIMARY KEY ("id"),
   CONSTRAINT "Venda_farmaciaId_fkey" FOREIGN KEY ("farmaciaId") REFERENCES public."Farmacia"("id") ON DELETE RESTRICT ON UPDATE CASCADE,
   CONSTRAINT "Venda_cnp_codigo_fkey" FOREIGN KEY ("cnp_codigo") REFERENCES public."ProdutoMestre"("cnp_codigo") ON DELETE RESTRICT ON UPDATE CASCADE
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS "Venda_farmaciaId_cnp_codigo_data_venda_key" ON public."Venda"("farmaciaId", "cnp_codigo", "data_venda");
+ALTER TABLE public."Venda" ADD COLUMN IF NOT EXISTS "granularidade" TEXT DEFAULT 'MENSAL';
+DROP INDEX IF EXISTS public."Venda_farmaciaId_cnp_codigo_data_venda_key";
+CREATE UNIQUE INDEX IF NOT EXISTS "Venda_farmaciaId_cnp_codigo_data_venda_granularidade_key" ON public."Venda"("farmaciaId", "cnp_codigo", "data_venda", "granularidade");
 CREATE INDEX IF NOT EXISTS "Venda_farmaciaId_idx" ON public."Venda"("farmaciaId");
 CREATE INDEX IF NOT EXISTS "Venda_cnp_codigo_idx" ON public."Venda"("cnp_codigo");
 CREATE INDEX IF NOT EXISTS "Venda_data_venda_idx" ON public."Venda"("data_venda");
+CREATE INDEX IF NOT EXISTS "Venda_farmaciaId_granularidade_data_venda_idx" ON public."Venda"("farmaciaId", "granularidade", "data_venda");
+
+-- Snapshots históricos de stock
+CREATE TABLE IF NOT EXISTS public."InventarioSnapshot" (
+  "id" TEXT NOT NULL,
+  "farmaciaId" TEXT NOT NULL,
+  "cnp_codigo" TEXT NOT NULL,
+  "data_snapshot" TIMESTAMP(3) NOT NULL,
+  "quantidade" INTEGER NOT NULL,
+  "custo_unitario" DECIMAL(10,2) NOT NULL,
+  "valor_total" DECIMAL(10,2) NOT NULL,
+  "data_extracao" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "InventarioSnapshot_pkey" PRIMARY KEY ("id"),
+  CONSTRAINT "InventarioSnapshot_farmaciaId_fkey" FOREIGN KEY ("farmaciaId") REFERENCES public."Farmacia"("id") ON DELETE RESTRICT ON UPDATE CASCADE,
+  CONSTRAINT "InventarioSnapshot_cnp_codigo_fkey" FOREIGN KEY ("cnp_codigo") REFERENCES public."ProdutoMestre"("cnp_codigo") ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS "InventarioSnapshot_farmaciaId_cnp_codigo_data_snapshot_key" ON public."InventarioSnapshot"("farmaciaId", "cnp_codigo", "data_snapshot");
+CREATE INDEX IF NOT EXISTS "InventarioSnapshot_farmaciaId_data_snapshot_idx" ON public."InventarioSnapshot"("farmaciaId", "data_snapshot");
+CREATE INDEX IF NOT EXISTS "InventarioSnapshot_cnp_codigo_idx" ON public."InventarioSnapshot"("cnp_codigo");
 
 -- Preços e margens específicos de cada farmácia (PVP e MG% do ficheiro de vendas de cada farmácia)
 CREATE TABLE IF NOT EXISTS public."PrecoFarmacia" (
@@ -179,4 +202,50 @@ CREATE TABLE IF NOT EXISTS public."TarefaEquipa" (
 CREATE UNIQUE INDEX IF NOT EXISTS "TarefaEquipa_farmaciaId_week_key_task_id_key" ON public."TarefaEquipa"("farmaciaId", "week_key", "task_id");
 CREATE INDEX IF NOT EXISTS "TarefaEquipa_farmaciaId_week_key_idx" ON public."TarefaEquipa"("farmaciaId", "week_key");
 CREATE INDEX IF NOT EXISTS "TarefaEquipa_concluido_idx" ON public."TarefaEquipa"("concluido");
+
+-- ============================================================================
+-- HARDENING & ROW LEVEL SECURITY (RLS) — PROTEÇÃO MULTI-TENANT NO SUPABASE
+-- Previne leitura ou escrita direta via PostgREST / anon key por clientes externos
+-- ============================================================================
+ALTER TABLE public."Farmacia" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public."ProdutoMestre" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public."StagingInventario" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public."StagingValidades" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public."StagingVendas" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public."Inventario" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public."Venda" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public."InventarioSnapshot" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public."PrecoFarmacia" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public."TarefaEquipa" ENABLE ROW LEVEL SECURITY;
+
+-- Concede acesso apenas aos papéis de backend autorizados (postgres / service_role)
+DROP POLICY IF EXISTS backend_only_farmacia ON public."Farmacia";
+CREATE POLICY backend_only_farmacia ON public."Farmacia" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
+
+DROP POLICY IF EXISTS backend_only_produtomestre ON public."ProdutoMestre";
+CREATE POLICY backend_only_produtomestre ON public."ProdutoMestre" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
+
+DROP POLICY IF EXISTS backend_only_staging_inv ON public."StagingInventario";
+CREATE POLICY backend_only_staging_inv ON public."StagingInventario" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
+
+DROP POLICY IF EXISTS backend_only_staging_val ON public."StagingValidades";
+CREATE POLICY backend_only_staging_val ON public."StagingValidades" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
+
+DROP POLICY IF EXISTS backend_only_staging_ven ON public."StagingVendas";
+CREATE POLICY backend_only_staging_ven ON public."StagingVendas" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
+
+DROP POLICY IF EXISTS backend_only_inventario ON public."Inventario";
+CREATE POLICY backend_only_inventario ON public."Inventario" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
+
+DROP POLICY IF EXISTS backend_only_venda ON public."Venda";
+CREATE POLICY backend_only_venda ON public."Venda" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
+
+DROP POLICY IF EXISTS backend_only_snapshot ON public."InventarioSnapshot";
+CREATE POLICY backend_only_snapshot ON public."InventarioSnapshot" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
+
+DROP POLICY IF EXISTS backend_only_precofarmacia ON public."PrecoFarmacia";
+CREATE POLICY backend_only_precofarmacia ON public."PrecoFarmacia" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
+
+DROP POLICY IF EXISTS backend_only_tarefa ON public."TarefaEquipa";
+CREATE POLICY backend_only_tarefa ON public."TarefaEquipa" FOR ALL USING (current_user IN ('postgres', 'service_role')) WITH CHECK (current_user IN ('postgres', 'service_role'));
 

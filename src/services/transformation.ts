@@ -432,6 +432,7 @@ export async function transformStagingVendas(
     pvp?: Prisma.Decimal;
     margem?: Prisma.Decimal;
     data_venda: Date;
+    granularidade?: string;
   }
 
   const validRows: ValidVendaRow[] = [];
@@ -604,10 +605,11 @@ export async function transformStagingVendas(
         salesToUpsert.map((r) =>
           prisma.venda.upsert({
             where: {
-              farmaciaId_cnp_codigo_data_venda: {
+              farmaciaId_cnp_codigo_data_venda_granularidade: {
                 farmaciaId,
                 cnp_codigo: r.cnp_codigo,
                 data_venda: r.data_venda,
+                granularidade: r.granularidade || 'MENSAL',
               },
             },
             update: {
@@ -620,6 +622,7 @@ export async function transformStagingVendas(
               quantidade: r.quantidade,
               valor_total: r.valor_total,
               data_venda: r.data_venda,
+              granularidade: r.granularidade || 'MENSAL',
             },
           })
         )

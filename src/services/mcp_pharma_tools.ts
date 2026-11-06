@@ -98,7 +98,7 @@ export async function toolCalcularStockMinimoECobertura(
   const artigosExcesso = itens.filter((i) => i.excessoUnidades > 0 && i.stockAtual >= 3);
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     periodoCalculadoDias: dias,
     resumoGeral: {
       totalArtigosAnalisados: itens.length,
@@ -191,7 +191,7 @@ export async function toolFiltrarValidadeEMargem(
   resultados.sort((a, b) => a.validade.localeCompare(b.validade));
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     criterios: {
       anoLimite,
       margemMinimaPct: margemMinima,
@@ -229,7 +229,7 @@ export async function toolSugerirPacksPromocionais(
   const candidatos = validadeResult.produtos;
   if (candidatos.length < tamanhoPack) {
     return {
-      farmacia: ctx.farmaciaNome,
+      farmacia: 'Farmácia Comunitária',
       mensagem: `Não existem produtos de venda livre suficientes com validade até ${anoLimite} para formar packs de ${tamanhoPack}.`,
       packs: [],
     };
@@ -277,7 +277,7 @@ export async function toolSugerirPacksPromocionais(
   }
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     totalPacksGerados: packs.length,
     margemMinimaGarantidaPct: margemMinima,
     packs,
@@ -290,14 +290,16 @@ export async function toolSugerirPacksPromocionais(
 export async function toolIdentificarProdutosSemVenda(
   prisma: PrismaClient,
   ctx: ToolSecurityContext,
-  args: { meses_sem_venda?: number; apenas_com_stock?: boolean; limite?: number }
+  args: { meses_sem_venda?: number; apenas_com_stock?: boolean; limite?: number; apenas_restos_gaveta?: boolean }
 ) {
   const meses = args.meses_sem_venda || 6;
   const apenasComStock = args.apenas_com_stock ?? true;
+  const apenasRestosGaveta = args.apenas_restos_gaveta ?? false;
   const limite = args.limite || 30;
 
-  const dataCorte = new Date();
-  dataCorte.setMonth(dataCorte.getMonth() - meses);
+  // Em Tempo Real: ancorado na data atual
+  const dataReferencia = new Date();
+  const dataCorte = new Date(dataReferencia.getTime() - meses * 30 * 24 * 60 * 60 * 1000);
 
   // Produtos que têm stock nesta farmácia
   const inventarios = await prisma.inventario.findMany({
@@ -322,17 +324,32 @@ export async function toolIdentificarProdutosSemVenda(
     stockMap.set(inv.cnp_codigo, existing);
   }
 
-  // Verifica vendas nos últimos X meses para esta farmácia
-  const vendasRecentes = await prisma.venda.findMany({
-    where: {
-      farmaciaId: ctx.farmaciaId,
-      data_venda: { gte: dataCorte },
-      quantidade: { gt: 0 },
-    },
-    select: { cnp_codigo: true },
+  // Busca vendas para identificar data da última venda e deduplicação MENSAL vs DIARIO
+  const vendas = await prisma.venda.findMany({
+    where: { farmaciaId: ctx.farmaciaId },
+    orderBy: { data_venda: 'asc' },
   });
 
-  const cnpsComVendas = new Set(vendasRecentes.map((v: { cnp_codigo: string }) => v.cnp_codigo));
+  let dataUltimaVenda: Date | null = null;
+  const monthlyKeySet = new Set<string>();
+  for (const v of vendas) {
+    if (!dataUltimaVenda || v.data_venda > dataUltimaVenda) {
+      dataUltimaVenda = v.data_venda;
+    }
+    if ((v as any).granularidade === 'MENSAL') {
+      const k = `${v.cnp_codigo}_${v.data_venda.getUTCFullYear()}-${String(v.data_venda.getUTCMonth() + 1).padStart(2, '0')}`;
+      monthlyKeySet.add(k);
+    }
+  }
+
+  const cnpsComVendas = new Set<string>();
+  for (const v of vendas) {
+    const k = `${v.cnp_codigo}_${v.data_venda.getUTCFullYear()}-${String(v.data_venda.getUTCMonth() + 1).padStart(2, '0')}`;
+    if ((v as any).granularidade === 'DIARIO' && monthlyKeySet.has(k)) continue;
+    if (v.data_venda >= dataCorte && v.data_venda <= dataReferencia && v.quantidade > 0) {
+      cnpsComVendas.add(v.cnp_codigo);
+    }
+  }
 
   const produtosParados = [];
 
@@ -342,14 +359,17 @@ export async function toolIdentificarProdutosSemVenda(
     const prod = data.produto;
     const isMsrm = prod.tipo_venda === 'MSRM' || prod.tipo_venda === 'MSRM_GENERICO';
     const isGenerico = prod.tipo_venda === 'GENERICO_MG' || prod.tipo_venda === 'MSRM_GENERICO';
+    const ehRestoGaveta = data.qtd <= 2;
 
     let estrategiaSugerida = '';
-    if (isGenerico) {
-      estrategiaSugerida = '🧬 TROCA DE LABORATÓRIO: Priorizar a dispensa deste laboratório na gaveta de genéricos ao balcão e colocar Ponto de Encomenda = 0 no Sifarma para outros laboratórios.';
+    if (ehRestoGaveta) {
+      estrategiaSugerida = '🧺 RESTO DE GAVETA (≤2 un): Colocar no cesto de balcão ou dispensar prioritariamente na receita médica para eliminar o código e libertar espaço de gaveta.';
+    } else if (isGenerico) {
+      estrategiaSugerida = '🧬 MONO PROFUNDO (GENÉRICO): Priorizar a dispensa deste laboratório na gaveta de genéricos ao balcão e colocar Ponto de Encomenda = 0 no Sifarma para outros laboratórios.';
     } else if (isMsrm) {
-      estrategiaSugerida = '🏷️ DISPENSA NA RECEITA: Colocar etiqueta vermelha na gaveta física para dispensar na próxima receita médica ou verificar devolução comercial ao armazenista.';
+      estrategiaSugerida = '🏷️ MONO PROFUNDO (MSRM): Colocar etiqueta de destaque na gaveta física para dispensar na próxima receita médica ou avaliar devolução comercial ao armazenista.';
     } else {
-      estrategiaSugerida = '🧺 CESTO DE OPORTUNIDADE / PACK: Criar pack promocional com artigo de alta rotação ou colocar no cesto do balcão com 20% de desconto.';
+      estrategiaSugerida = '📦 MONO PROFUNDO (VENDA LIVRE): Criar pack promocional ou destaque de balcão com desconto de 15-20% para destravar o capital empatado.';
     }
 
     produtosParados.push({
@@ -360,6 +380,8 @@ export async function toolIdentificarProdutosSemVenda(
       custoUnitarioEur: Number(data.custo.toFixed(2)),
       capitalImobilizadoEur: Number((data.qtd * data.custo).toFixed(2)),
       tipoVenda: prod.tipo_venda || 'OUTRO',
+      ehRestoGaveta,
+      tipoClassificacao: ehRestoGaveta ? 'Resto de Gaveta (≤ 2 un)' : 'Mono com Profundidade (≥ 3 un)',
       mesesSemVenda: meses,
       estrategiaDispensa: estrategiaSugerida,
     });
@@ -367,14 +389,45 @@ export async function toolIdentificarProdutosSemVenda(
 
   produtosParados.sort((a, b) => b.capitalImobilizadoEur - a.capitalImobilizadoEur);
 
+  const todosRestos = produtosParados.filter((p) => p.ehRestoGaveta);
+  const todosProfundos = produtosParados.filter((p) => !p.ehRestoGaveta);
+
+  const listaFiltrada = apenasRestosGaveta ? todosRestos : produtosParados;
+
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
+    modoTempoReal: true,
+    dataReferencia: dataReferencia.toISOString().slice(0, 10),
+    dataUltimaVendaRegistada: dataUltimaVenda ? dataUltimaVenda.toISOString().slice(0, 10) : null,
     mesesSemVendas: meses,
-    totalArtigosSemVenda: produtosParados.length,
+    filtroAplicado: apenasRestosGaveta ? 'Restos de Gaveta (Stock ≤ 2 unidades)' : 'Todos os Monos Parados',
+    totalArtigosSemVenda: listaFiltrada.length,
     capitalTotalImobilizadoEur: Number(
-      produtosParados.reduce((s, p) => s + p.capitalImobilizadoEur, 0).toFixed(2)
+      listaFiltrada.reduce((s, p) => s + p.capitalImobilizadoEur, 0).toFixed(2)
     ),
-    produtos: produtosParados.slice(0, limite),
+    subdivisaoMonos: {
+      restosGaveta: {
+        descricao: 'Artigos órfãos com stock ≤ 2 unidades a limpar',
+        skus: todosRestos.length,
+        capitalImobilizadoEur: Number(
+          todosRestos.reduce((s, p) => s + p.capitalImobilizadoEur, 0).toFixed(2)
+        ),
+      },
+      monosProfundidade: {
+        descricao: 'Artigos parados com stock ≥ 3 unidades para packs/devolução',
+        skus: todosProfundos.length,
+        capitalImobilizadoEur: Number(
+          todosProfundos.reduce((s, p) => s + p.capitalImobilizadoEur, 0).toFixed(2)
+        ),
+      },
+      totalGeralMonos: {
+        skus: produtosParados.length,
+        capitalImobilizadoEur: Number(
+          produtosParados.reduce((s, p) => s + p.capitalImobilizadoEur, 0).toFixed(2)
+        ),
+      },
+    },
+    produtos: listaFiltrada.slice(0, limite),
   };
 }
 
@@ -434,7 +487,7 @@ export async function toolConsolidarGenericosDci(
   grupos.sort((a, b) => b.totalArtigosDci - a.totalArtigosDci);
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     totalMoleculasAnalisadas: grupos.length,
     grupos: grupos.slice(0, limite),
   };
@@ -512,7 +565,7 @@ export async function toolPlanearComprasSazonais(
   });
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     planoAnualCompras: plano,
     avisoLogistica: 'Os prazos de entrega e condições comerciais dependem do acordo específico da farmácia com o seu armazenista ou laboratório. O BI Pharma não possui dados de lead times contratuais de fornecedores.',
   };
@@ -624,7 +677,7 @@ export async function toolSugerirVendasCruzadasReceita(
   });
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     vendasCruzadasSugeridas: resultados,
   };
 }
@@ -733,7 +786,7 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
   }
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     termoPesquisado: query,
     totalArtigosEncontrados: scored.length,
     artigos: matched.map((s) => {
@@ -848,7 +901,7 @@ export async function toolCompararSimilaresERentabilidade(
 
   if (matches.length === 0) {
     return {
-      farmacia: ctx.farmaciaNome,
+      farmacia: 'Farmácia Comunitária',
       termoPesquisado: query,
       totalEncontrados: 0,
       mensagem: `Nenhum produto semelhante encontrado para "${query}".`,
@@ -899,7 +952,7 @@ export async function toolCompararSimilaresERentabilidade(
   }
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     termoPesquisado: query,
     totalSimilaresAnalisados: items.length,
     destaques: {
@@ -943,7 +996,7 @@ export async function toolAvaliarAcordoAnualComprasEscalonadas(
 
   if (matched.length === 0) {
     return {
-      farmacia: ctx.farmaciaNome,
+      farmacia: 'Farmácia Comunitária',
       marcaAvaliada: query,
       totalArtigos: 0,
       mensagem: `Nenhum produto encontrado para a marca ou gama "${query}".`,
@@ -1038,7 +1091,7 @@ export async function toolAvaliarAcordoAnualComprasEscalonadas(
   }));
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     marcaAvaliada: query,
     totalCodigosNaGama: matched.length,
     auditoriaHistorica: {
@@ -1087,7 +1140,7 @@ export async function toolCalcularNiveisSazonaisDinamicos(
 
   if (matched.length === 0) {
     return {
-      farmacia: ctx.farmaciaNome,
+      farmacia: 'Farmácia Comunitária',
       termoPesquisado: query,
       totalArtigos: 0,
       mensagem: `Nenhum produto encontrado para "${query}".`,
@@ -1183,7 +1236,7 @@ export async function toolCalcularNiveisSazonaisDinamicos(
   });
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     categoriaAnalisada: query,
     mesAtualReferencia: 'Outubro (Início Outono / Preparação Inverno)',
     totalArtigosAnalisados: resultados.length,
@@ -1472,7 +1525,7 @@ export async function toolGerarPropostaEncomendaReposicao(
   const consumiveis = propostasAprovadas.filter((p) => p.canalSugerido === 'CONSUMIVEIS_LOJA');
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     periodoCoberturaDesejado: `${dias} dias (${dias === 7 ? 'Semanal' : dias === 14 ? 'Quinzenal' : `${dias} dias`})`,
     mesReferencia: currentMonth === 11 ? 'Novembro (Outono / Preparação de Inverno)' : `Mês ${currentMonth}`,
     resumoExecutivo: {
@@ -1589,7 +1642,7 @@ export async function toolAnalisarCurvaAbcFaturacaoEMargem(
   const artigosClasseAEmRisco = itensClassificados.filter((i) => i.alertaCritico.includes('RISCO DE RUTURA'));
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     tipoAnalise: tipo === 'FATURACAO' ? 'Curva ABC de Faturação (Receita)' : 'Curva ABC de Lucro Bruto (Margem)',
     universoArtigosAnalisados: validos.length,
     distribuicaoPareto: {
@@ -1697,7 +1750,7 @@ export async function toolAuditarAnomaliasMargemEPrecos(
   const totalNegativas = formatadas.filter((f) => f.tipoAnomalia.includes('PREJUÍZO')).length;
 
   return {
-    farmacia: ctx.farmaciaNome,
+    farmacia: 'Farmácia Comunitária',
     totalAnomaliasDetetadas: formatadas.length,
     resumo: {
       artigosComPrejuizoMargemNegativa: totalNegativas,
@@ -1707,5 +1760,842 @@ export async function toolAuditarAnomaliasMargemEPrecos(
         : 'Não foram encontradas margens negativas.',
     },
     anomaliasPrioritarias: formatadas.slice(0, limite),
+  };
+}
+
+
+/**
+ * 15. Consultar Vendas Diárias Desagregadas (Granularidade 'DIARIO')
+ * Permite ao Copilot auditar dias específicos, consultar faturação diária, produtos mais vendidos
+ * e verificar quais os ficheiros diários importados no sistema.
+ */
+export async function toolConsultarVendasDiarias(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  params: {
+    data?: string;
+    cnp_ou_nome?: string;
+    limite?: number;
+  }
+) {
+  const limite = Math.min(params.limite || 25, 100);
+
+  // 1. Descobre todas as datas com registos diários para a farmácia
+  const datasDisponiveisRaw = await prisma.venda.groupBy({
+    by: ['data_venda'],
+    where: {
+      farmaciaId: ctx.farmaciaId,
+      granularidade: 'DIARIO',
+    },
+    _count: { id: true },
+    _sum: { quantidade: true, valor_total: true },
+    orderBy: { data_venda: 'desc' },
+  });
+
+  const datasDisponiveis = datasDisponiveisRaw.map((d) => ({
+    data: d.data_venda.toISOString().slice(0, 10),
+    totalLinhas: d._count.id,
+    totalUnidades: d._sum.quantidade || 0,
+    totalFaturadoEur: Number(Number(d._sum.valor_total || 0).toFixed(2)),
+  }));
+
+  if (datasDisponiveis.length === 0) {
+    return {
+      farmacia: 'Farmácia Comunitária',
+      mensagem: 'Não existem registos de vendas diárias importados para esta farmácia. O sistema dispõe de dados mensais contínuos dos últimos 13 meses na tabela de vendas. Para análises de evolução temporal, comparação entre meses, faturação mensal ou melhor/pior mês em margem de lucro, execute obrigatoriamente a ferramenta "analisar_evolucao_mensal_financeira".',
+      datasDisponiveis: [],
+    };
+  }
+
+  // 2. Tenta resolver a data pretendida
+  let dataFiltro = null;
+  if (params.data) {
+    const rawData = params.data.trim();
+    const isoMatch = rawData.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if (isoMatch) {
+      const y = isoMatch[1];
+      const m = isoMatch[2].padStart(2, '0');
+      const d = isoMatch[3].padStart(2, '0');
+      dataFiltro = `${y}-${m}-${d}`;
+    } else {
+      const ptMatch = rawData.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})/);
+      if (ptMatch) {
+        const d = ptMatch[1].padStart(2, '0');
+        const m = ptMatch[2].padStart(2, '0');
+        const y = ptMatch[3];
+        dataFiltro = `${y}-${m}-${d}`;
+      } else {
+        const meses: Record<string, string> = {
+          janeiro: '01', fevereiro: '02', marco: '03', março: '03', abril: '04',
+          maio: '05', junho: '06', julho: '07', agosto: '08', setembro: '09',
+          outubro: '10', novembro: '11', dezembro: '12'
+        };
+        const textMatch = rawData.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').match(/(\d{1,2})\s*(?:de\s*)?([a-z]+)\s*(?:de\s*)?(\d{4})/);
+        if (textMatch && meses[textMatch[2]]) {
+          const d = textMatch[1].padStart(2, '0');
+          const m = meses[textMatch[2]];
+          const y = textMatch[3];
+          dataFiltro = `${y}-${m}-${d}`;
+        }
+      }
+    }
+  }
+
+  if (!dataFiltro && datasDisponiveis.length === 1) {
+    dataFiltro = datasDisponiveis[0].data;
+  }
+
+  if (!dataFiltro) {
+    return {
+      farmacia: 'Farmácia Comunitária',
+      mensagem: `Existem ${datasDisponiveis.length} dia(s) com vendas diárias importadas no sistema. Por favor indique uma das datas para ver o detalhe das vendas.`,
+      datasDisponiveis,
+    };
+  }
+
+  const startOfDay = new Date(`${dataFiltro}T00:00:00.000Z`);
+  const endOfDay = new Date(`${dataFiltro}T23:59:59.999Z`);
+
+  const whereClause: any = {
+    farmaciaId: ctx.farmaciaId,
+    granularidade: 'DIARIO',
+    data_venda: {
+      gte: startOfDay,
+      lte: endOfDay,
+    },
+  };
+
+  if (params.cnp_ou_nome) {
+    const q = params.cnp_ou_nome.trim().toLowerCase();
+    whereClause.OR = [
+      { cnp_codigo: { contains: q } },
+      { produto: { designacao: { contains: q, mode: 'insensitive' } } },
+    ];
+  }
+
+  const vendas = await prisma.venda.findMany({
+    where: whereClause,
+    include: { produto: true },
+    orderBy: [{ quantidade: 'desc' }, { valor_total: 'desc' }],
+  });
+
+  const totalUnidades = vendas.reduce((acc, v) => acc + v.quantidade, 0);
+  const totalFaturado = vendas.reduce((acc, v) => acc + Number(v.valor_total || 0), 0);
+
+  return {
+    farmacia: 'Farmácia Comunitária',
+    dataConsultada: dataFiltro,
+    totalArtigosDistintosVendidos: vendas.length,
+    totalUnidadesVendidas: totalUnidades,
+    faturacaoTotalDiaEur: Number(totalFaturado.toFixed(2)),
+    artigosVendidosNoDia: vendas.slice(0, limite).map((v) => ({
+      cnp: v.cnp_codigo,
+      designacao: v.produto ? v.produto.designacao : 'Sem designação',
+      quantidade: v.quantidade,
+      valorTotalEur: Number(Number(v.valor_total || 0).toFixed(2)),
+      tipoVenda: v.produto ? v.produto.tipo_venda : 'MSRM',
+      categoria: v.produto ? v.produto.categoria : 'Geral',
+      pvpUnitarioEur: (v.produto && v.produto.pvp) ? Number(v.produto.pvp) : null,
+    })),
+    datasDisponiveisNoSistema: datasDisponiveis.map((d) => d.data),
+  };
+}
+
+// ============================================================================
+// 15B. ANÁLISE TEMPORAL MÊS-A-MÊS, MARGENS E PERFORMANCE FINANCEIRA
+// ============================================================================
+export async function toolAnalisarEvolucaoMensalFinanceira(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: {
+    ano?: string;
+    categoria_ou_macro?: string;
+    ordenar_por?: 'MARGEM_EUR' | 'FATURACAO_EUR' | 'MARGEM_PCT' | 'CRONOLOGICO';
+    top_produtos_qtd?: number;
+  }
+) {
+  const topQtd = Math.min(Math.max(args.top_produtos_qtd || 3, 1), 10);
+
+  // 1. Catálogo e Preços da Farmácia autenticada
+  const precos = await prisma.precoFarmacia.findMany({
+    where: { farmaciaId: ctx.farmaciaId },
+    select: { cnp_codigo: true, pvp: true, custo_ref: true, margem: true },
+  });
+  const precoMap = new Map<string, { pvp: number; custo: number; margem: number }>();
+  precos.forEach((p) => {
+    precoMap.set(p.cnp_codigo, {
+      pvp: Number(p.pvp || 0),
+      custo: Number(p.custo_ref || 0),
+      margem: Number(p.margem || 0),
+    });
+  });
+
+  const produtos = await prisma.produtoMestre.findMany({
+    select: { cnp_codigo: true, designacao: true, categoria: true, macro_area: true, pvp: true, margem_padrao: true },
+  });
+  const prodMap = new Map<string, any>();
+  produtos.forEach((p) => {
+    prodMap.set(p.cnp_codigo, p);
+  });
+
+  // 2. Vendas da farmácia
+  const vendasRaw = await prisma.venda.findMany({
+    where: { farmaciaId: ctx.farmaciaId },
+    select: { cnp_codigo: true, quantidade: true, valor_total: true, data_venda: true },
+    orderBy: { data_venda: 'asc' },
+  });
+
+  if (vendasRaw.length === 0) {
+    return {
+      farmacia: ctx.farmaciaNome,
+      mensagem: 'Não existem registos de vendas importados para esta farmácia.',
+      meses: [],
+    };
+  }
+
+  // 3. Agrupamento por Mês
+  const filterMacro = (args.categoria_ou_macro || '').trim().toUpperCase();
+  const filterAno = (args.ano || '').trim();
+
+  const monthlyStats = new Map<
+    string,
+    {
+      mes: string;
+      faturacaoTotalEur: number;
+      custoTotalEur: number;
+      margemBrutaTotalEur: number;
+      unidadesTotal: number;
+      skusSet: Set<string>;
+      categoriasMap: Map<string, number>;
+      produtosMap: Map<string, { cnp: string; designacao: string; margemEur: number; faturacaoEur: number; unidades: number }>;
+    }
+  >();
+
+  for (const v of vendasRaw) {
+    const mesKey = v.data_venda.toISOString().slice(0, 7); // "YYYY-MM"
+    if (filterAno && !mesKey.startsWith(filterAno)) continue;
+
+    const masterInfo = prodMap.get(v.cnp_codigo);
+    const cat = masterInfo?.macro_area || 'OUTROS';
+    if (filterMacro && !cat.toUpperCase().includes(filterMacro)) continue;
+
+    if (!monthlyStats.has(mesKey)) {
+      monthlyStats.set(mesKey, {
+        mes: mesKey,
+        faturacaoTotalEur: 0,
+        custoTotalEur: 0,
+        margemBrutaTotalEur: 0,
+        unidadesTotal: 0,
+        skusSet: new Set<string>(),
+        categoriasMap: new Map<string, number>(),
+        produtosMap: new Map(),
+      });
+    }
+
+    const st = monthlyStats.get(mesKey)!;
+    const qtd = Number(v.quantidade || 0);
+    const fat = Number(v.valor_total || 0);
+
+    st.faturacaoTotalEur += fat;
+    st.unidadesTotal += qtd;
+    st.skusSet.add(v.cnp_codigo);
+
+    const pInfo = precoMap.get(v.cnp_codigo);
+    let custoUnit = 0;
+    if (pInfo && pInfo.custo > 0) {
+      custoUnit = pInfo.custo;
+    } else if (masterInfo && masterInfo.pvp && masterInfo.margem_padrao) {
+      const margemPct = Number(masterInfo.margem_padrao);
+      custoUnit = Number(masterInfo.pvp) * (1 - margemPct / 100);
+    } else {
+      custoUnit = (fat / (qtd || 1)) * 0.7;
+    }
+
+    const custoTotalItem = custoUnit * qtd;
+    const margemTotalItem = fat - custoTotalItem;
+
+    st.custoTotalEur += custoTotalItem;
+    st.margemBrutaTotalEur += margemTotalItem;
+
+    st.categoriasMap.set(cat, (st.categoriasMap.get(cat) || 0) + margemTotalItem);
+
+    const pName = masterInfo?.designacao || v.cnp_codigo;
+    if (!st.produtosMap.has(v.cnp_codigo)) {
+      st.produtosMap.set(v.cnp_codigo, {
+        cnp: v.cnp_codigo,
+        designacao: pName,
+        margemEur: 0,
+        faturacaoEur: 0,
+        unidades: 0,
+      });
+    }
+    const pStat = st.produtosMap.get(v.cnp_codigo)!;
+    pStat.margemEur += margemTotalItem;
+    pStat.faturacaoEur += fat;
+    pStat.unidades += qtd;
+  }
+
+  const mesesFormatados: any[] = [];
+  for (const [mes, st] of monthlyStats.entries()) {
+    const margemPct = st.faturacaoTotalEur > 0 ? (st.margemBrutaTotalEur / st.faturacaoTotalEur) * 100 : 0;
+
+    const topCategorias = [...st.categoriasMap.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([macroArea, mVal]) => ({
+        macroArea,
+        margemBrutaEur: Math.round(mVal * 100) / 100,
+        pesoNaMargemPct: st.margemBrutaTotalEur > 0 ? Math.round((mVal / st.margemBrutaTotalEur) * 1000) / 10 : 0,
+      }));
+
+    const topProdutos = [...st.produtosMap.values()]
+      .sort((a, b) => b.margemEur - a.margemEur)
+      .slice(0, topQtd)
+      .map((p) => ({
+        cnp: p.cnp,
+        designacao: p.designacao,
+        margemBrutaEur: Math.round(p.margemEur * 100) / 100,
+        faturacaoEur: Math.round(p.faturacaoEur * 100) / 100,
+        unidades: p.unidades,
+      }));
+
+    mesesFormatados.push({
+      mes,
+      faturacaoTotalEur: Math.round(st.faturacaoTotalEur * 100) / 100,
+      custoTotalEur: Math.round(st.custoTotalEur * 100) / 100,
+      margemBrutaTotalEur: Math.round(st.margemBrutaTotalEur * 100) / 100,
+      margemBrutaPct: Math.round(margemPct * 10) / 10,
+      unidadesTotal: st.unidadesTotal,
+      skusDistintos: st.skusSet.size,
+      topCategorias,
+      topProdutos,
+    });
+  }
+
+  // Ordenação
+  const ordenarPor = args.ordenar_por || 'CRONOLOGICO';
+  if (ordenarPor === 'MARGEM_EUR') {
+    mesesFormatados.sort((a, b) => b.margemBrutaTotalEur - a.margemBrutaTotalEur);
+  } else if (ordenarPor === 'FATURACAO_EUR') {
+    mesesFormatados.sort((a, b) => b.faturacaoTotalEur - a.faturacaoTotalEur);
+  } else if (ordenarPor === 'MARGEM_PCT') {
+    mesesFormatados.sort((a, b) => b.margemBrutaPct - a.margemBrutaPct);
+  } else {
+    mesesFormatados.sort((a, b) => a.mes.localeCompare(b.mes));
+  }
+
+  // Ranking geral
+  const byMargem = [...mesesFormatados].sort((a, b) => b.margemBrutaTotalEur - a.margemBrutaTotalEur);
+  const byFat = [...mesesFormatados].sort((a, b) => b.faturacaoTotalEur - a.faturacaoTotalEur);
+
+  const melhorMesMargem = byMargem[0];
+  const piorMesMargem = byMargem[byMargem.length - 1];
+  const melhorMesFaturacao = byFat[0];
+
+  const totalFat = mesesFormatados.reduce((s, m) => s + m.faturacaoTotalEur, 0);
+  const totalMargem = mesesFormatados.reduce((s, m) => s + m.margemBrutaTotalEur, 0);
+  const totalUnid = mesesFormatados.reduce((s, m) => s + m.unidadesTotal, 0);
+
+  const mediaMensalMargemEur = mesesFormatados.length > 0 ? Math.round((totalMargem / mesesFormatados.length) * 100) / 100 : 0;
+  const mediaMensalFaturacaoEur = mesesFormatados.length > 0 ? Math.round((totalFat / mesesFormatados.length) * 100) / 100 : 0;
+
+  return {
+    farmacia: ctx.farmaciaNome,
+    totalMesesAnalisados: mesesFormatados.length,
+    destaquesGerais: {
+      melhorMesMargem: {
+        mes: melhorMesMargem?.mes,
+        margemBrutaEur: melhorMesMargem?.margemBrutaTotalEur,
+        faturacaoEur: melhorMesMargem?.faturacaoTotalEur,
+        margemPct: melhorMesMargem?.margemBrutaPct,
+        unidades: melhorMesMargem?.unidadesTotal,
+        fatoresChave: [
+          `Pico de volume de vendas com ${melhorMesMargem?.unidadesTotal} embalagens dispensadas.`,
+          `Forte contributo da categoria ${melhorMesMargem?.topCategorias[0]?.macroArea} com €${melhorMesMargem?.topCategorias[0]?.margemBrutaEur} (${melhorMesMargem?.topCategorias[0]?.pesoNaMargemPct}% do lucro bruto total).`,
+          `Medicamento/artigo mais lucrativo do mês: ${melhorMesMargem?.topProdutos[0]?.designacao} (€${melhorMesMargem?.topProdutos[0]?.margemBrutaEur} de margem).`,
+        ],
+      },
+      melhorMesFaturacao: {
+        mes: melhorMesFaturacao?.mes,
+        faturacaoEur: melhorMesFaturacao?.faturacaoTotalEur,
+        margemBrutaEur: melhorMesFaturacao?.margemBrutaTotalEur,
+      },
+      piorMesMargem: {
+        mes: piorMesMargem?.mes,
+        margemBrutaEur: piorMesMargem?.margemBrutaTotalEur,
+        faturacaoEur: piorMesMargem?.faturacaoTotalEur,
+        nota: piorMesMargem?.mes === '2026-10' ? 'Mês incompleto / extração parcial de dados' : 'Mês de menor volume',
+      },
+      mediaMensalFaturacaoEur,
+      mediaMensalMargemEur,
+      totaisPeriodo: {
+        faturacaoTotalEur: Math.round(totalFat * 100) / 100,
+        margemBrutaTotalEur: Math.round(totalMargem * 100) / 100,
+        margemMediaPct: totalFat > 0 ? Math.round((totalMargem / totalFat) * 1000) / 10 : 0,
+        unidadesTotal: totalUnid,
+      },
+    },
+    evolucaoMensal: mesesFormatados,
+  };
+}
+
+// ============================================================================
+// 15C. COMPARAR PERFORMANCE FINANCEIRA ENTRE DOIS PERÍODOS
+// ============================================================================
+export async function toolCompararPerformancePeriodos(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: {
+    periodo_a: string; // ex: "2026-07"
+    periodo_b: string; // ex: "2026-06"
+  }
+) {
+  const pA = args.periodo_a.trim();
+  const pB = args.periodo_b.trim();
+
+  // Executa evolução mensal completa
+  const dadosGerais = await toolAnalisarEvolucaoMensalFinanceira(prisma, ctx, { ordenar_por: 'CRONOLOGICO' });
+  const mesesList = dadosGerais.evolucaoMensal || [];
+  const stA = mesesList.find((m: any) => m.mes === pA);
+  const stB = mesesList.find((m: any) => m.mes === pB);
+
+  if (!stA || !stB) {
+    return {
+      error: `Um ou ambos os períodos não foram encontrados nos registos da farmácia (${pA}: ${stA ? 'Encontrado' : 'Não encontrado'}, ${pB}: ${stB ? 'Encontrado' : 'Não encontrado'}). Meses disponíveis: ${mesesList.map((m: any) => m.mes).join(', ')}`,
+    };
+  }
+
+  const deltaFatEur = Math.round((stA.faturacaoTotalEur - stB.faturacaoTotalEur) * 100) / 100;
+  const deltaFatPct = stB.faturacaoTotalEur > 0 ? Math.round((deltaFatEur / stB.faturacaoTotalEur) * 1000) / 10 : 0;
+
+  const deltaMargemEur = Math.round((stA.margemBrutaTotalEur - stB.margemBrutaTotalEur) * 100) / 100;
+  const deltaMargemPct = stB.margemBrutaTotalEur > 0 ? Math.round((deltaMargemEur / stB.margemBrutaTotalEur) * 1000) / 10 : 0;
+
+  const deltaUnid = stA.unidadesTotal - stB.unidadesTotal;
+  const deltaUnidPct = stB.unidadesTotal > 0 ? Math.round((deltaUnid / stB.unidadesTotal) * 1000) / 10 : 0;
+
+  const deltaMargemPontosPct = Math.round((stA.margemBrutaPct - stB.margemBrutaPct) * 10) / 10;
+
+  return {
+    farmacia: ctx.farmaciaNome,
+    periodoA: stA.mes,
+    periodoB: stB.mes,
+    comparativo: {
+      faturacao: {
+        periodoA: stA.faturacaoTotalEur,
+        periodoB: stB.faturacaoTotalEur,
+        variacaoEur: deltaFatEur,
+        variacaoPct: deltaFatPct,
+      },
+      margemBruta: {
+        periodoAEur: stA.margemBrutaTotalEur,
+        periodoBEur: stB.margemBrutaTotalEur,
+        variacaoEur: deltaMargemEur,
+        variacaoPct: deltaMargemPct,
+        margemPctA: stA.margemBrutaPct,
+        margemPctB: stB.margemBrutaPct,
+        variacaoPontosMargem: deltaMargemPontosPct,
+      },
+      unidades: {
+        periodoA: stA.unidadesTotal,
+        periodoB: stB.unidadesTotal,
+        variacaoUnid: deltaUnid,
+        variacaoPct: deltaUnidPct,
+      },
+    },
+    topCategoriasPeriodoA: stA.topCategorias,
+    topCategoriasPeriodoB: stB.topCategorias,
+    diagnosticoExplicativo: `No comparativo de ${stA.mes} face a ${stB.mes}, a margem bruta variou €${deltaMargemEur > 0 ? '+' : ''}${deltaMargemEur} (${deltaMargemPct > 0 ? '+' : ''}${deltaMargemPct}%), com uma variação de volume de ${deltaUnid > 0 ? '+' : ''}${deltaUnid} embalagens.`,
+  };
+}
+
+// ============================================================================
+// 15D. CÁLCULO DE PERDAS FINANCEIRAS E CUSTO DE OPORTUNIDADE (RUTURAS & MONOS)
+// ============================================================================
+export async function toolCalcularPerdasFinanceirasECustoOportunidade(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: {
+    tipo_auditoria?: 'TODAS' | 'RUTURAS_CLASSE_A' | 'MONOS_CAPITAL_PARADO' | 'VALIDADES_RISCO';
+  }
+) {
+  const tipo = args.tipo_auditoria || 'TODAS';
+  const catalog = await getPharmacyCatalog(prisma, ctx.farmaciaId);
+
+  // 1. Ruturas em Artigos Classe A ou com VMM > 0 (Custo de oportunidade estimado a 30 dias)
+  const itensComVenda = catalog.filter((it) => it.vendasQtd > 0);
+  const totalFat = itensComVenda.reduce((s, it) => s + it.faturacao, 0);
+
+  // Ordena por faturação para achar Classe A (80% acumulado)
+  const sortedByFat = [...itensComVenda].sort((a, b) => b.faturacao - a.faturacao);
+  let acum = 0;
+  const classeACnps = new Set<string>();
+  for (const it of sortedByFat) {
+    acum += it.faturacao;
+    classeACnps.add(it.cnp);
+    if (totalFat > 0 && (acum / totalFat) >= 0.8) break;
+  }
+
+  const ruturasClasseA = catalog.filter((it) => it.stock === 0 && classeACnps.has(it.cnp));
+  const perdasRutura30dias = ruturasClasseA.map((it) => {
+    const vmm = it.vendasQtd / 12.0;
+    const margemUnit = Math.max(it.pvp - it.custo, 0);
+    const perdaFaturacao30d = Math.round(vmm * it.pvp * 100) / 100;
+    const perdaMargem30d = Math.round(vmm * margemUnit * 100) / 100;
+    return {
+      cnp: it.cnp,
+      designacao: it.designacao,
+      tipoVenda: it.tipoVenda,
+      vendasAnuaisQtd: it.vendasQtd,
+      vmm: Math.round(vmm * 10) / 10,
+      pvp: it.pvp,
+      margemUnitEur: Math.round(margemUnit * 100) / 100,
+      perdaFaturacaoEstimada30dEur: perdaFaturacao30d,
+      perdaMargemEstimada30dEur: perdaMargem30d,
+    };
+  }).sort((a, b) => b.perdaMargemEstimada30dEur - a.perdaMargemEstimada30dEur);
+
+  const totalPerdaMargemRuturas = perdasRutura30dias.reduce((s, it) => s + it.perdaMargemEstimada30dEur, 0);
+  const totalPerdaFaturacaoRuturas = perdasRutura30dias.reduce((s, it) => s + it.perdaFaturacaoEstimada30dEur, 0);
+
+  // 2. Monos & Capital Imobilizado (Stock > 0 e 0 vendas nos 12 meses)
+  const monos = catalog.filter((it) => it.stock > 0 && (it.vendasQtd === 0 || it.faturacao === 0));
+  const totalCapitalParadoMonos = monos.reduce((s, it) => s + (it.stock * it.custo), 0);
+  const topMonos = [...monos].sort((a, b) => (b.stock * b.custo) - (a.stock * a.custo)).slice(0, 15).map((it) => ({
+    cnp: it.cnp,
+    designacao: it.designacao,
+    stock: it.stock,
+    custoUnit: it.custo,
+    capitalImobilizadoEur: Math.round((it.stock * it.custo) * 100) / 100,
+  }));
+
+  return {
+    farmacia: ctx.farmaciaNome,
+    tipoAuditoria: tipo,
+    resumoFinanceiro: {
+      ruturasClasseA: {
+        totalArtigosEsgotados: ruturasClasseA.length,
+        perdaFaturacaoEstimadaMensalEur: Math.round(totalPerdaFaturacaoRuturas * 100) / 100,
+        perdaMargemEstimadaMensalEur: Math.round(totalPerdaMargemRuturas * 100) / 100,
+      },
+      monosCapitalImobilizado: {
+        totalArtigosSemRotacao: monos.length,
+        capitalTotalParadoEur: Math.round(totalCapitalParadoMonos * 100) / 100,
+      },
+    },
+    topRuturasCriticas: perdasRutura30dias.slice(0, 10),
+    topCapitalParado: topMonos,
+  };
+}
+
+
+// ============================================================================
+// 16. CONSULTAR PROGRESSO DAS TAREFAS DA EQUIPA (FOLHA DA SEMANA & MOBILE)
+// ============================================================================
+export async function toolConsultarProgressoTarefasEquipa(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: { semana?: string; apenas_pendentes?: boolean; limite?: number }
+) {
+  const { getCurrentWeekKey } = await import('./weekly_tasks');
+  const weekKey = args.semana || getCurrentWeekKey();
+  const apenasPendentes = args.apenas_pendentes ?? false;
+  const limite = args.limite || 20;
+
+  const tarefas = await prisma.tarefaEquipa.findMany({
+    where: {
+      farmaciaId: ctx.farmaciaId,
+      week_key: weekKey,
+      ...(apenasPendentes ? { concluido: false } : {}),
+    },
+    orderBy: [{ concluido: 'asc' }, { valor_impacto: 'desc' }],
+  });
+
+  const total = tarefas.length;
+  const concluidas = tarefas.filter((t) => t.concluido).length;
+  const pendentes = total - concluidas;
+  const taxaConclusaoPct = total > 0 ? Number(((concluidas / total) * 100).toFixed(1)) : 0;
+
+  const valorTotalImpacto = tarefas.reduce((s, t) => s + (t.valor_impacto ? Number(t.valor_impacto) : 0), 0);
+  const valorConcluido = tarefas
+    .filter((t) => t.concluido)
+    .reduce((s, t) => s + (t.valor_impacto ? Number(t.valor_impacto) : 0), 0);
+
+  // Agrupamento por Categoria
+  const porCategoria: Record<string, { total: number; concluidas: number; valorTotal: number }> = {};
+  for (const t of tarefas) {
+    const cat = t.categoria || 'OUTRO';
+    if (!porCategoria[cat]) porCategoria[cat] = { total: 0, concluidas: 0, valorTotal: 0 };
+    porCategoria[cat].total++;
+    if (t.concluido) porCategoria[cat].concluidas++;
+    if (t.valor_impacto) porCategoria[cat].valorTotal += Number(t.valor_impacto);
+  }
+
+  // Colaboradores que mais marcaram tarefas
+  const colaboradoresMap: Record<string, number> = {};
+  for (const t of tarefas) {
+    if (t.concluido && t.concluido_por) {
+      colaboradoresMap[t.concluido_por] = (colaboradoresMap[t.concluido_por] || 0) + 1;
+    }
+  }
+
+  return {
+    farmacia: 'Farmácia Comunitária',
+    semana: weekKey,
+    resumo: {
+      totalTarefas: total,
+      tarefasConcluidas: concluidas,
+      tarefasPendentes: pendentes,
+      taxaConclusaoPct,
+      valorTotalImpactoEur: Number(valorTotalImpacto.toFixed(2)),
+      valorJaProtegidoEur: Number(valorConcluido.toFixed(2)),
+    },
+    desdobramentoPorArea: porCategoria,
+    rankingColaboradores: colaboradoresMap,
+    tarefasApresentadas: tarefas.slice(0, limite).map((t) => ({
+      taskId: t.task_id,
+      categoria: t.categoria,
+      designacao: t.designacao || 'Sem descrição',
+      cnp: t.cnp_codigo,
+      concluido: t.concluido,
+      concluidoPor: t.concluido_por,
+      concluidoEm: t.concluido_em ? t.concluido_em.toISOString().slice(0, 16).replace('T', ' ') : null,
+      valorImpactoEur: t.valor_impacto ? Number(t.valor_impacto) : null,
+      campanhaId: t.campanha_id,
+    })),
+  };
+}
+
+// ============================================================================
+// 17. CRIAR TAREFA OPERACIONAL NA FOLHA DA SEMANA
+// ============================================================================
+export async function toolCriarTarefaEquipa(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: {
+    descricao: string;
+    categoria?: string;
+    cnp_codigo?: string;
+    valor_impacto?: number;
+    campanha_id?: string;
+  }
+) {
+  const { getCurrentWeekKey } = await import('./weekly_tasks');
+  const weekKey = getCurrentWeekKey();
+  const cat = args.categoria || 'DIRECAO_TECNICA';
+  const taskId = `MANUAL_${Date.now()}_${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+
+  const tarefa = await prisma.tarefaEquipa.create({
+    data: {
+      farmaciaId: ctx.farmaciaId,
+      week_key: weekKey,
+      task_id: taskId,
+      categoria: cat,
+      designacao: args.descricao,
+      cnp_codigo: args.cnp_codigo || null,
+      campanha_id: args.campanha_id || null,
+      concluido: false,
+      concluido_por: null,
+      valor_impacto: args.valor_impacto !== undefined ? Number(args.valor_impacto) : null,
+    },
+  });
+
+  return {
+    success: true,
+    taskId: tarefa.task_id,
+    semana: weekKey,
+    descricao: tarefa.designacao,
+    categoria: tarefa.categoria,
+    mensagem: `✅ Tarefa criada com sucesso na Folha da Semana da Equipa: "${tarefa.designacao}"`,
+  };
+}
+
+// ============================================================================
+// 18. CONSULTAR CAMPANHAS ATIVAS E HISTÓRICO NO ESTÚDIO DE MARKETING
+// ============================================================================
+export async function toolConsultarCampanhasAtivasEHistorico(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args?: { incluir_historico?: boolean }
+) {
+  const { getActiveCampaigns } = await import('./active_campaigns');
+  const { getSeasonalCampaignSuggestions } = await import('./campaigns');
+
+  const ativas = await getActiveCampaigns(prisma, ctx.farmaciaId);
+
+  let historico: any[] = [];
+  if (args && args.incluir_historico) {
+    historico = await prisma.campanhaAtiva.findMany({
+      where: {
+        farmaciaId: ctx.farmaciaId,
+        estado: { in: ['CONCLUIDA', 'CANCELADA'] },
+      },
+      orderBy: { criadoEm: 'desc' },
+      take: 10,
+    });
+  }
+
+  // Sugestões do motor para o mês atual
+  const sugestoes = await getSeasonalCampaignSuggestions(prisma, ctx.farmaciaId);
+
+  return {
+    farmacia: 'Farmácia Comunitária',
+    totalCampanhasAtivas: ativas.length,
+    campanhasAtivas: ativas.map((c) => ({
+      id: c.id,
+      campanhaId: c.campanhaId,
+      titulo: c.titulo,
+      icone: c.icone,
+      dataInicio: c.dataInicio,
+      dataFim: c.dataFim,
+      descontoAplicadoPct: c.descontoAplicadoPct,
+      totalProdutos: c.totalProdutos,
+      topProdutosAprovados: c.produtos.slice(0, 5).map((p: any) => ({
+        cnp: p.cnp_codigo,
+        designacao: p.designacao,
+        stock: p.stock_atual,
+        pvpNormalEur: p.pvp_atual,
+        pvpPromocionalEur: p.pvp_campanha,
+        margemPct: p.margem_pct,
+      })),
+    })),
+    sugestoesDisponiveisNoEstudio: sugestoes.slice(0, 5).map((s) => ({
+      id: s.campanha.id,
+      titulo: s.campanha.titulo,
+      icone: s.campanha.icone,
+      epoca: s.campanha.epoca,
+      totalProdutosElegiveis: s.totalArtigosDisponiveis,
+      unidadesStock: s.totalUnidadesStock,
+      descontoSugeridoPct: s.campanha.descontoSugeridoPct,
+    })),
+    historicoConcluidas: historico.map((h) => ({
+      id: h.id,
+      titulo: h.titulo,
+      estado: h.estado,
+      dataInicio: h.dataInicio.toISOString().slice(0, 10),
+      dataFim: h.dataFim ? h.dataFim.toISOString().slice(0, 10) : null,
+    })),
+  };
+}
+
+// ============================================================================
+// 19. ATIVAR CAMPANHA NA FARMÁCIA (GERANDO TAREFAS AUTOMÁTICAS P/ EQUIPA)
+// ============================================================================
+export async function toolAtivarCampanhaFarmacia(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: {
+    campanha_id?: string;
+    titulo?: string;
+    icone?: string;
+    tema_ou_evento?: string;
+    produtos_cnps?: string[];
+    foco_stock?: 'TODOS_ELEGIVEIS' | 'PRIORIDADE_VALIDADES_MONOS' | 'SO_VALIDADES_E_MONOS';
+    desconto_pct?: number;
+    dias_duracao?: number;
+    criado_por?: string;
+  }
+) {
+  const { activateCampaign } = await import('./active_campaigns');
+  const { getSeasonalCampaignSuggestions } = await import('./campaigns');
+
+  const sugestoes = await getSeasonalCampaignSuggestions(prisma, ctx.farmaciaId);
+  let tituloFinal = args.titulo || 'Campanha Personalizada da Farmácia';
+  let iconeFinal = args.icone || '🎯';
+  let campanhaIdFinal = args.campanha_id || `custom_${Date.now()}`;
+  let produtosSugeridos: any[] = [];
+  let descPct = args.desconto_pct || 15;
+
+  if (args.campanha_id && args.campanha_id !== 'custom') {
+    const encontrada = sugestoes.find((s) => s.campanha.id === args.campanha_id || s.campanha.id.includes(args.campanha_id!));
+    if (encontrada) {
+      tituloFinal = encontrada.campanha.titulo;
+      iconeFinal = encontrada.campanha.icone;
+      campanhaIdFinal = encontrada.campanha.id;
+      descPct = args.desconto_pct || encontrada.campanha.descontoSugeridoPct || 15;
+      produtosSugeridos = encontrada.produtosSugeridos;
+    }
+  }
+
+  if (produtosSugeridos.length === 0) {
+    const { buildCustomCampaign } = await import('./campaigns');
+    const customResult = await buildCustomCampaign(prisma, ctx.farmaciaId, {
+      modo: (args.produtos_cnps && args.produtos_cnps.length > 0) ? 'PRODUTOS' : 'EVENTO',
+      eventoPreset: (args.tema_ou_evento as any) || 'custom',
+      nomePersonalizado: args.titulo,
+      termosPesquisa: args.tema_ou_evento,
+      cnpsSelecionados: args.produtos_cnps,
+      focoStock: args.foco_stock || 'PRIORIDADE_VALIDADES_MONOS',
+      descontoDesejadoPct: descPct,
+    });
+
+    if (!customResult || !customResult.produtosSugeridos || customResult.produtosSugeridos.length === 0) {
+      return {
+        success: false,
+        mensagem: `Não foi possível encontrar produtos elegíveis para montar a campanha "${args.titulo || args.tema_ou_evento || 'personalizada'}". Verifique o stock da farmácia ou os CNPs indicados.`,
+      };
+    }
+
+    tituloFinal = customResult.campanha.titulo;
+    iconeFinal = customResult.campanha.icone;
+    campanhaIdFinal = customResult.campanha.id;
+    descPct = args.desconto_pct || customResult.campanha.descontoSugeridoPct || 15;
+    produtosSugeridos = customResult.produtosSugeridos;
+  }
+
+  const discount = descPct / 100;
+
+  const produtosFormatados = produtosSugeridos.map((p) => {
+    const pvpNormal = p.pvp || (p.custo_unitario * 1.5);
+    const pvpCampanha = Number((pvpNormal * (1 - discount)).toFixed(2));
+    const taxaIva = (p as any).taxa_iva || 0.23;
+    const custoComIva = p.custo_unitario * (1 + taxaIva);
+    const margemPct = Number((((pvpCampanha - custoComIva) / pvpCampanha) * 100).toFixed(1));
+
+    return {
+      cnp_codigo: p.cnp_codigo,
+      designacao: p.designacao,
+      laboratorio_titular: (p as any).laboratorio_titular,
+      stock_atual: p.stock_atual,
+      custo_unitario: p.custo_unitario,
+      pvp_atual: pvpNormal,
+      pvp_campanha: pvpCampanha,
+      desconto_pct: descPct,
+      margem_pct: margemPct,
+    };
+  });
+
+  const res = await activateCampaign(prisma, {
+    farmaciaId: ctx.farmaciaId,
+    campanhaId: campanhaIdFinal,
+    titulo: tituloFinal,
+    icone: iconeFinal,
+    descontoPct: descPct,
+    produtos: produtosFormatados,
+    diasDuracao: args.dias_duracao || 15,
+    criadoPor: args.criado_por || 'Copilot (Direção Técnica)',
+  });
+
+  return {
+    success: true,
+    campanhaAtivada: {
+      id: res.campanhaAtiva.id,
+      campanhaId: res.campanhaAtiva.campanhaId,
+      titulo: res.campanhaAtiva.titulo,
+      icone: res.campanhaAtiva.icone,
+      descontoPct: descPct,
+      totalProdutos: produtosFormatados.length,
+      dataFim: res.campanhaAtiva.dataFim ? res.campanhaAtiva.dataFim.toISOString().slice(0, 10) : null,
+      produtosDestaque: produtosFormatados.slice(0, 5).map((p) => ({
+        cnp: p.cnp_codigo,
+        designacao: p.designacao,
+        stock: p.stock_atual,
+        pvpNormal: p.pvp_atual,
+        pvpPromo: p.pvp_campanha,
+        margemPct: p.margem_pct,
+      })),
+    },
+    tarefasGeradasParaEquipa: res.tarefasCriadas,
+    mensagem: `🎯 Campanha "${res.campanhaAtiva.titulo}" ATIVADA com sucesso na Farmácia! Foram geradas ${res.tarefasCriadas} tarefas operacionais na Folha da Semana e na interface mobile da equipa.`,
   };
 }
