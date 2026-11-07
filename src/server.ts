@@ -4394,46 +4394,46 @@ function getDashboardHtml(): string {
       <div id="finOpsContent" style="display: none;">
         <!-- 4 KPI CARDS -->
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 24px;">
-          <div style="background: rgba(168,85,247,0.08); border: 1px solid rgba(168,85,247,0.3); border-radius: 12px; padding: 14px 18px;">
-            <div style="font-size: 0.78rem; font-weight: 700; color: #c084fc; text-transform: uppercase;">💰 Custo Global Acumulado</div>
-            <div id="finOpsKpiCustoTotal" style="font-size: 1.6rem; font-weight: 800; color: #f8fafc; margin-top: 4px;">€ 0.00</div>
-            <div style="font-size: 0.72rem; color: var(--muted); margin-top: 2px;">Convertido em EUR (Anthropic API)</div>
+          <div style="background: rgba(168,85,247,0.06); border: 1.5px solid rgba(168,85,247,0.25); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #9333ea; text-transform: uppercase;">💰 Custo Global Acumulado</div>
+            <div id="finOpsKpiCustoTotal" style="font-size: 1.6rem; font-weight: 800; color: #0f172a; margin-top: 4px;">€ 0.00</div>
+            <div style="font-size: 0.72rem; color: #64748b; margin-top: 2px;">Convertido em EUR (Anthropic API)</div>
           </div>
 
-          <div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.3); border-radius: 12px; padding: 14px 18px;">
-            <div style="font-size: 0.78rem; font-weight: 700; color: #38bdf8; text-transform: uppercase;">💬 Total de Perguntas</div>
-            <div id="finOpsKpiPerguntas" style="font-size: 1.6rem; font-weight: 800; color: #f8fafc; margin-top: 4px;">0</div>
-            <div style="font-size: 0.72rem; color: var(--muted); margin-top: 2px;">Consultas ao motor do Copilot</div>
+          <div style="background: rgba(56,189,248,0.06); border: 1.5px solid rgba(56,189,248,0.25); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #0284c7; text-transform: uppercase;">💬 Total de Perguntas</div>
+            <div id="finOpsKpiPerguntas" style="font-size: 1.6rem; font-weight: 800; color: #0f172a; margin-top: 4px;">0</div>
+            <div style="font-size: 0.72rem; color: #64748b; margin-top: 2px;">Consultas ao motor do Copilot</div>
           </div>
 
-          <div style="background: rgba(52,211,153,0.08); border: 1px solid rgba(52,211,153,0.3); border-radius: 12px; padding: 14px 18px;">
-            <div style="font-size: 0.78rem; font-weight: 700; color: #34d399; text-transform: uppercase;">⚡ Custo Médio / Pergunta</div>
-            <div id="finOpsKpiCustoMedio" style="font-size: 1.6rem; font-weight: 800; color: #f8fafc; margin-top: 4px;">€ 0.000</div>
-            <div style="font-size: 0.72rem; color: var(--muted); margin-top: 2px;">Média ponderada por interação</div>
+          <div style="background: rgba(52,211,153,0.06); border: 1.5px solid rgba(52,211,153,0.25); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #059669; text-transform: uppercase;">⚡ Custo Médio / Pergunta</div>
+            <div id="finOpsKpiCustoMedio" style="font-size: 1.6rem; font-weight: 800; color: #0f172a; margin-top: 4px;">€ 0.000</div>
+            <div style="font-size: 0.72rem; color: #64748b; margin-top: 2px;">Média ponderada por interação</div>
           </div>
 
-          <div style="background: rgba(234,179,8,0.08); border: 1px solid rgba(234,179,8,0.3); border-radius: 12px; padding: 14px 18px;">
-            <div style="font-size: 0.78rem; font-weight: 700; color: #eab308; text-transform: uppercase;">🛡️ Poupança Prompt Caching</div>
-            <div id="finOpsKpiPoupanca" style="font-size: 1.6rem; font-weight: 800; color: #f8fafc; margin-top: 4px;">€ 0.00</div>
-            <div style="font-size: 0.72rem; color: var(--muted); margin-top: 2px;">Tokens reaproveitados (-90% custo)</div>
+          <div style="background: rgba(234,179,8,0.06); border: 1.5px solid rgba(234,179,8,0.25); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #d97706; text-transform: uppercase;">🛡️ Poupança Prompt Caching</div>
+            <div id="finOpsKpiPoupanca" style="font-size: 1.6rem; font-weight: 800; color: #0f172a; margin-top: 4px;">€ 0.00</div>
+            <div style="font-size: 0.72rem; color: #64748b; margin-top: 2px;">Tokens reaproveitados (-90% custo)</div>
           </div>
         </div>
 
         <!-- TABELA 1: CONSUMO POR FARMÁCIA -->
-        <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 24px;">
-          <h3 style="font-size: 0.95rem; font-weight: 700; color: #f1f5f9; margin-bottom: 12px; display:flex; align-items:center; gap:8px;">
+        <div style="background: #ffffff; border: 1.5px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+          <h3 style="font-size: 0.95rem; font-weight: 800; color: #0f172a; margin-bottom: 12px; display:flex; align-items:center; gap:8px;">
             🏥 Consumo Consolidado por Farmácia (Balanço de Clientes)
           </h3>
           <div style="overflow-x: auto;">
             <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
               <thead>
-                <tr style="border-bottom: 1.5px solid var(--border); color: var(--muted); text-align: left; font-size: 0.78rem; text-transform: uppercase;">
+                <tr style="border-bottom: 1.5px solid #cbd5e1; color: #475569; text-align: left; font-size: 0.78rem; text-transform: uppercase; font-weight: 700;">
                   <th style="padding: 10px 14px;">Farmácia</th>
                   <th style="padding: 10px 14px; text-align: center;">Perguntas</th>
                   <th style="padding: 10px 14px; text-align: right;">Input Tokens</th>
                   <th style="padding: 10px 14px; text-align: right;">Output Tokens</th>
                   <th style="padding: 10px 14px; text-align: right;">Cache Read</th>
-                  <th style="padding: 10px 14px; text-align: right; color:#34d399;">Custo Acumulado</th>
+                  <th style="padding: 10px 14px; text-align: right; color:#059669;">Custo Acumulado</th>
                   <th style="padding: 10px 14px; text-align: right;">Custo Médio</th>
                 </tr>
               </thead>
@@ -4445,14 +4445,14 @@ function getDashboardHtml(): string {
         </div>
 
         <!-- TABELA 2: AUDITORIA EM TEMPO REAL -->
-        <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
-          <h3 style="font-size: 0.95rem; font-weight: 700; color: #f1f5f9; margin-bottom: 12px; display:flex; align-items:center; gap:8px;">
+        <div style="background: #ffffff; border: 1.5px solid #e2e8f0; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+          <h3 style="font-size: 0.95rem; font-weight: 800; color: #0f172a; margin-bottom: 12px; display:flex; align-items:center; gap:8px;">
             📋 Auditoria em Tempo Real — Últimas Interações com o Copilot
           </h3>
           <div style="overflow-x: auto; max-height: 320px; overflow-y: auto;">
             <table style="width: 100%; border-collapse: collapse; font-size: 0.82rem;">
-              <thead style="position: sticky; top: 0; background: var(--surface); border-bottom: 1.5px solid var(--border);">
-                <tr style="color: var(--muted); text-align: left; font-size: 0.75rem; text-transform: uppercase;">
+              <thead style="position: sticky; top: 0; background: #f8fafc; border-bottom: 1.5px solid #cbd5e1;">
+                <tr style="color: #475569; text-align: left; font-size: 0.75rem; text-transform: uppercase; font-weight: 700;">
                   <th style="padding: 8px 10px;">Data/Hora</th>
                   <th style="padding: 8px 10px;">Farmácia</th>
                   <th style="padding: 8px 10px;">Pergunta</th>
@@ -5294,29 +5294,29 @@ function getDashboardHtml(): string {
         var tbodyFarms = document.getElementById('finOpsFarmaciasTbody');
         if (tbodyFarms) {
           if (!data.farmacias || data.farmacias.length === 0) {
-            tbodyFarms.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--muted);">Nenhuma farmácia registada.</td></tr>';
+            tbodyFarms.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px;color:#64748b;">Nenhuma farmácia registada.</td></tr>';
           } else {
             tbodyFarms.innerHTML = data.farmacias.map(function(f) {
-              return '<tr style="border-bottom: 1px solid var(--border);">' +
-                '<td style="padding: 12px 14px; font-weight: 700; color: #f1f5f9;">' +
-                  '🏥 ' + escapeHtml(f.nome) + ' <span style="font-size:0.75rem; color:var(--muted); font-weight:normal;">(' + escapeHtml(f.nif) + ')</span>' +
+              return '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+                '<td style="padding: 12px 14px; font-weight: 700; color: #0f172a;">' +
+                  '🏥 ' + escapeHtml(f.nome) + ' <span style="font-size:0.75rem; color:#64748b; font-weight:normal;">(' + escapeHtml(f.nif) + ')</span>' +
                 '</td>' +
-                '<td style="padding: 12px 14px; text-align: center; font-weight: 700; color: #38bdf8;">' +
+                '<td style="padding: 12px 14px; text-align: center; font-weight: 800; color: #0284c7;">' +
                   f.totalPerguntas +
                 '</td>' +
-                '<td style="padding: 12px 14px; text-align: right; color: var(--muted); font-family: monospace;">' +
+                '<td style="padding: 12px 14px; text-align: right; color: #475569; font-family: monospace;">' +
                   Number(f.totalInputTokens || 0).toLocaleString('pt-PT') +
                 '</td>' +
-                '<td style="padding: 12px 14px; text-align: right; color: var(--muted); font-family: monospace;">' +
+                '<td style="padding: 12px 14px; text-align: right; color: #475569; font-family: monospace;">' +
                   Number(f.totalOutputTokens || 0).toLocaleString('pt-PT') +
                 '</td>' +
-                '<td style="padding: 12px 14px; text-align: right; color: #a78bfa; font-family: monospace;">' +
+                '<td style="padding: 12px 14px; text-align: right; color: #7c3aed; font-family: monospace; font-weight:600;">' +
                   Number(f.totalCacheReadTokens || 0).toLocaleString('pt-PT') +
                 '</td>' +
-                '<td style="padding: 12px 14px; text-align: right; font-weight: 800; color: #34d399; font-size: 0.95rem;">' +
+                '<td style="padding: 12px 14px; text-align: right; font-weight: 800; color: #059669; font-size: 0.95rem;">' +
                   '€ ' + Number(f.custoTotalEur || 0).toFixed(3) +
                 '</td>' +
-                '<td style="padding: 12px 14px; text-align: right; color: var(--muted); font-size: 0.82rem;">' +
+                '<td style="padding: 12px 14px; text-align: right; color: #64748b; font-size: 0.82rem;">' +
                   '€ ' + Number(f.custoMedioEur || 0).toFixed(3) +
                 '</td>' +
               '</tr>';
@@ -5328,26 +5328,26 @@ function getDashboardHtml(): string {
         var tbodyLogs = document.getElementById('finOpsLogsTbody');
         if (tbodyLogs) {
           if (!data.logsRecentes || data.logsRecentes.length === 0) {
-            tbodyLogs.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:16px;color:var(--muted);">Ainda não foram registadas perguntas ao Copilot.</td></tr>';
+            tbodyLogs.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:16px;color:#64748b;">Ainda não foram registadas perguntas ao Copilot.</td></tr>';
           } else {
             tbodyLogs.innerHTML = data.logsRecentes.slice(0, 40).map(function(l) {
               var d = new Date(l.data);
               var dataHora = d.toLocaleDateString('pt-PT', { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
               var toolsBadges = (l.ferramentas && l.ferramentas.length > 0)
-                ? l.ferramentas.map(function(t) { return '<span class="badge" style="background:rgba(168,85,247,0.15);color:#c084fc;font-size:0.68rem;margin-right:4px;">' + escapeHtml(t) + '</span>'; }).join('')
-                : '<span style="color:var(--muted);font-size:0.75rem;">Conversa Direta</span>';
+                ? l.ferramentas.map(function(t) { return '<span class="badge" style="background:#f3e8ff;color:#7e22ce;border:1px solid #d8b4fe;font-size:0.68rem;margin-right:4px;font-weight:600;">' + escapeHtml(t) + '</span>'; }).join('')
+                : '<span style="color:#64748b;font-size:0.75rem;">Conversa Direta</span>';
 
-              return '<tr style="border-bottom: 1px solid var(--border); font-size: 0.82rem;">' +
-                '<td style="padding: 8px 10px; color: var(--muted); white-space: nowrap;">' + dataHora + '</td>' +
-                '<td style="padding: 8px 10px; font-weight: 600; color: #e2e8f0; white-space: nowrap;">' + escapeHtml(l.farmaciaNome) + '</td>' +
-                '<td style="padding: 8px 10px; color: #f8fafc; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="' + escapeHtml(l.pergunta) + '">' +
+              return '<tr style="border-bottom: 1px solid #f1f5f9; font-size: 0.82rem;">' +
+                '<td style="padding: 8px 10px; color: #64748b; white-space: nowrap;">' + dataHora + '</td>' +
+                '<td style="padding: 8px 10px; font-weight: 700; color: #0f172a; white-space: nowrap;">' + escapeHtml(l.farmaciaNome) + '</td>' +
+                '<td style="padding: 8px 10px; color: #1e293b; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight:500;" title="' + escapeHtml(l.pergunta) + '">' +
                   escapeHtml(l.pergunta) +
                 '</td>' +
                 '<td style="padding: 8px 10px;">' + toolsBadges + '</td>' +
-                '<td style="padding: 8px 10px; text-align: right; font-family: monospace; color: var(--muted); font-size: 0.76rem;">' +
+                '<td style="padding: 8px 10px; text-align: right; font-family: monospace; color: #475569; font-size: 0.76rem;">' +
                   'In: ' + Number(l.inputTokens || 0).toLocaleString('pt-PT') + ' | Out: ' + Number(l.outputTokens || 0).toLocaleString('pt-PT') +
                 '</td>' +
-                '<td style="padding: 8px 10px; text-align: right; font-weight: 700; color: #34d399;">' +
+                '<td style="padding: 8px 10px; text-align: right; font-weight: 800; color: #059669;">' +
                   '€ ' + Number(l.custoEur || 0).toFixed(4) +
                 '</td>' +
               '</tr>';
