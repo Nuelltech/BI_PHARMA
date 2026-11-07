@@ -609,12 +609,68 @@ DIRETRIZES DE COMUNICAÇÃO:
     - NUNCA apresentes produtos com dezenas de unidades (ex: 49 caixas de Ben-u-gripe, 36 termómetros) como "restos de gaveta"! Se o utilizador perguntar por restos de gaveta, foca nos artigos de 1-2 unidades e, se relevante, menciona em separado: "Adicionalmente, existem X monos com stock profundo (>= 3 un) totalizando € Y".
     - NOTA DE TRANSPARÊNCIA: Menciona sempre de forma elegante a data de referência em Tempo Real (hoje) e a data da última venda registada na base de dados (devolvida no campo 'dataUltimaVendaRegistada').`;
 
+// ============================================================================
+// CÁLCULO DE CUSTOS FINOPS & TELEMETRIA DE TOKENS (CLAUDE / ANTHROPIC)
+// ============================================================================
+export interface CopilotUsageStats {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  custoEstimadoEur: number;
+  duracaoMs: number;
+}
+
+export interface CopilotChatResponse {
+  text: string;
+  toolsUsed: string[];
+  sessionId: string;
+  shoppingList?: any[];
+  usage?: CopilotUsageStats;
+}
+
+export function calculateClaudeCostEur(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+  cacheCreationTokens = 0,
+  cacheReadTokens = 0
+): number {
+  const USD_TO_EUR = 0.92;
+
+  let inputPerMillion = 0.80;
+  let outputPerMillion = 4.00;
+  let cacheWritePerMillion = 1.00;
+  let cacheReadPerMillion = 0.08;
+
+  const m = (model || '').toLowerCase();
+  if (m.includes('sonnet')) {
+    inputPerMillion = 3.00;
+    outputPerMillion = 15.00;
+    cacheWritePerMillion = 3.75;
+    cacheReadPerMillion = 0.30;
+  } else if (m.includes('opus')) {
+    inputPerMillion = 15.00;
+    outputPerMillion = 75.00;
+    cacheWritePerMillion = 18.75;
+    cacheReadPerMillion = 1.50;
+  }
+
+  const costUsd =
+    (inputTokens / 1_000_000) * inputPerMillion +
+    (outputTokens / 1_000_000) * outputPerMillion +
+    (cacheCreationTokens / 1_000_000) * cacheWritePerMillion +
+    (cacheReadTokens / 1_000_000) * cacheReadPerMillion;
+
+  return Number((costUsd * USD_TO_EUR).toFixed(5));
+}
+
 export async function askConversationalCopilot(
   prisma: PrismaClient,
   secContext: ToolSecurityContext,
   question: string,
   sessionId = 'default'
-): Promise<{ text: string; toolsUsed: string[]; sessionId: string; shoppingList?: any[] }> {
+): Promise<CopilotChatResponse> {
   pruneOldSessions();
   sessionTimestamps.set(sessionId, Date.now());
 
@@ -649,6 +705,13 @@ export async function askConversationalCopilot(
   // Modelos suportados na conta (preferindo haiku 4.5 ou sonnet 4.5)
   const model = 'claude-haiku-4-5-20251001';
 
+  // Métricas de telemetria e FinOps
+  const startTime = Date.now();
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let totalCacheCreationTokens = 0;
+  let totalCacheReadTokens = 0;
+
   try {
     let currentMessages = [...history];
     let maxSteps = 4;
@@ -661,13 +724,20 @@ export async function askConversationalCopilot(
         headers: {
           'x-api-key': apiKey,
           'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'prompt-caching-2024-07-31',
           'content-type': 'application/json',
         },
         body: JSON.stringify({
           model,
           max_tokens: 4096,
           // PRIVACIDADE & CONFIDENCIALIDADE: NUNCA enviar NIF ou identidade fiscal para a LLM
-          system: `${SYSTEM_PROMPT}\n\nAmbiente: Farmácia Comunitária (Tenant Isolado)`,
+          system: [
+            {
+              type: 'text',
+              text: `${SYSTEM_PROMPT}\n\nAmbiente: Farmácia Comunitária (Tenant Isolado)`,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
           tools: COPILOT_TOOLS,
           tool_choice: { type: 'auto' },
           messages: currentMessages,
@@ -681,6 +751,12 @@ export async function askConversationalCopilot(
       }
 
       const data = (await response.json()) as any;
+      const usage = data.usage || {};
+      totalInputTokens += usage.input_tokens || 0;
+      totalOutputTokens += usage.output_tokens || 0;
+      totalCacheCreationTokens += usage.cache_creation_input_tokens || 0;
+      totalCacheReadTokens += usage.cache_read_input_tokens || 0;
+
       const content = data.content || [];
 
       // Verifica se a LLM pediu para executar ferramentas
@@ -695,11 +771,45 @@ export async function askConversationalCopilot(
         history.push({ role: 'assistant', content: finalText });
         sessionHistory.set(sessionId, history);
 
+        const duracaoMs = Date.now() - startTime;
+        const custoEstimadoEur = calculateClaudeCostEur(
+          model,
+          totalInputTokens,
+          totalOutputTokens,
+          totalCacheCreationTokens,
+          totalCacheReadTokens
+        );
+
+        // Registo FinOps assíncrono em base de dados
+        prisma.copilotUsageLog.create({
+          data: {
+            farmaciaId: secContext.farmaciaId,
+            sessionId,
+            modelo: model,
+            pergunta: question.slice(0, 1000),
+            input_tokens: totalInputTokens,
+            output_tokens: totalOutputTokens,
+            cache_creation_input_tokens: totalCacheCreationTokens,
+            cache_read_input_tokens: totalCacheReadTokens,
+            custo_estimado_eur: custoEstimadoEur,
+            ferramentas_executadas: toolsUsed,
+            duracao_ms: duracaoMs,
+          },
+        }).catch((err: any) => console.error('[Copilot FinOps] Erro ao gravar log:', err.message));
+
         return {
           text: finalText,
           toolsUsed,
           sessionId,
           shoppingList: capturedShoppingList || undefined,
+          usage: {
+            inputTokens: totalInputTokens,
+            outputTokens: totalOutputTokens,
+            cacheCreationTokens: totalCacheCreationTokens,
+            cacheReadTokens: totalCacheReadTokens,
+            custoEstimadoEur,
+            duracaoMs,
+          },
         };
       }
 
@@ -831,10 +941,43 @@ case 'auditar_anomalias_margem_e_precos':
     }
 
     // Se esgotou os passos sem resposta final de texto
+    const duracaoMs = Date.now() - startTime;
+    const custoEstimadoEur = calculateClaudeCostEur(
+      model,
+      totalInputTokens,
+      totalOutputTokens,
+      totalCacheCreationTokens,
+      totalCacheReadTokens
+    );
+
+    prisma.copilotUsageLog.create({
+      data: {
+        farmaciaId: secContext.farmaciaId,
+        sessionId,
+        modelo: model,
+        pergunta: question.slice(0, 1000),
+        input_tokens: totalInputTokens,
+        output_tokens: totalOutputTokens,
+        cache_creation_input_tokens: totalCacheCreationTokens,
+        cache_read_input_tokens: totalCacheReadTokens,
+        custo_estimado_eur: custoEstimadoEur,
+        ferramentas_executadas: toolsUsed,
+        duracao_ms: duracaoMs,
+      },
+    }).catch((err: any) => console.error('[Copilot FinOps] Erro ao gravar log:', err.message));
+
     return {
       text: 'Foram analisados os dados da farmácia, mas a resposta excedeu o limite de passos. Por favor tente especificar mais a sua pergunta.',
       toolsUsed,
       sessionId,
+      usage: {
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        cacheCreationTokens: totalCacheCreationTokens,
+        cacheReadTokens: totalCacheReadTokens,
+        custoEstimadoEur,
+        duracaoMs,
+      },
     };
   } catch (err: any) {
     console.error('[Copilot Engine Error]:', err.message);

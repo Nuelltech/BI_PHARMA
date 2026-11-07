@@ -727,6 +727,113 @@ async function startServer() {
         return;
       }
 
+      // 0B-2. Endpoint Admin: Telemetria & FinOps de IA (Tokens e Custos por Farmácia)
+      if (pathname === '/api/admin/copilot-finops' && req.method === 'GET') {
+        try {
+          const farmacias = await prisma.farmacia.findMany({
+            select: { id: true, nome: true, nif: true, codigo_acesso: true },
+            orderBy: { criadoEm: 'asc' },
+          });
+
+          const allLogs = await prisma.copilotUsageLog.findMany({
+            orderBy: { criadoEm: 'desc' },
+            take: 50,
+          });
+
+          // Métricas por Farmácia
+          const farmaciaStats = await Promise.all(
+            farmacias.map(async (f) => {
+              const logs = await prisma.copilotUsageLog.findMany({
+                where: { farmaciaId: f.id },
+                select: {
+                  input_tokens: true,
+                  output_tokens: true,
+                  cache_creation_input_tokens: true,
+                  cache_read_input_tokens: true,
+                  custo_estimado_eur: true,
+                  criadoEm: true,
+                },
+                orderBy: { criadoEm: 'desc' },
+              });
+
+              const totalPerguntas = logs.length;
+              const totalInput = logs.reduce((s, l) => s + l.input_tokens, 0);
+              const totalOutput = logs.reduce((s, l) => s + l.output_tokens, 0);
+              const totalCacheRead = logs.reduce((s, l) => s + l.cache_read_input_tokens, 0);
+              const totalCacheCreation = logs.reduce((s, l) => s + l.cache_creation_input_tokens, 0);
+              const custoTotalEur = logs.reduce((s, l) => s + Number(l.custo_estimado_eur || 0), 0);
+              const custoMedioEur = totalPerguntas > 0 ? custoTotalEur / totalPerguntas : 0;
+              const ultimaAtividade = logs.length > 0 ? logs[0].criadoEm : null;
+
+              return {
+                farmaciaId: f.id,
+                nome: f.nome,
+                nif: maskNif(f.nif),
+                codigo_acesso: f.codigo_acesso,
+                totalPerguntas,
+                totalInputTokens: totalInput,
+                totalOutputTokens: totalOutput,
+                totalCacheReadTokens: totalCacheRead,
+                totalCacheCreationTokens: totalCacheCreation,
+                custoTotalEur: Number(custoTotalEur.toFixed(4)),
+                custoMedioEur: Number(custoMedioEur.toFixed(4)),
+                ultimaAtividade: ultimaAtividade ? ultimaAtividade.toISOString() : null,
+              };
+            })
+          );
+
+          // Totais Globais
+          const globalTotalPerguntas = farmaciaStats.reduce((s, f) => s + f.totalPerguntas, 0);
+          const globalTotalInput = farmaciaStats.reduce((s, f) => s + f.totalInputTokens, 0);
+          const globalTotalOutput = farmaciaStats.reduce((s, f) => s + f.totalOutputTokens, 0);
+          const globalTotalCacheRead = farmaciaStats.reduce((s, f) => s + f.totalCacheReadTokens, 0);
+          const globalCustoTotalEur = farmaciaStats.reduce((s, f) => s + f.custoTotalEur, 0);
+          const globalCustoMedioEur = globalTotalPerguntas > 0 ? globalCustoTotalEur / globalTotalPerguntas : 0;
+
+          // Poupança estimada pelo Prompt Caching
+          const poupancaCachingEur = Number(((globalTotalCacheRead / 1_000_000) * (0.80 - 0.08) * 0.92).toFixed(4));
+
+          const farmMap = new Map(farmacias.map((f) => [f.id, f.nome]));
+          const logsFormatados = allLogs.map((l) => ({
+            id: l.id,
+            farmaciaNome: farmMap.get(l.farmaciaId) || 'Farmácia',
+            farmaciaId: l.farmaciaId,
+            pergunta: l.pergunta,
+            modelo: l.modelo,
+            inputTokens: l.input_tokens,
+            outputTokens: l.output_tokens,
+            cacheReadTokens: l.cache_read_input_tokens,
+            custoEur: Number(Number(l.custo_estimado_eur || 0).toFixed(4)),
+            ferramentas: l.ferramentas_executadas,
+            duracaoMs: l.duracao_ms,
+            data: l.criadoEm.toISOString(),
+          }));
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              resumoGlobal: {
+                totalPerguntas: globalTotalPerguntas,
+                totalInputTokens: globalTotalInput,
+                totalOutputTokens: globalTotalOutput,
+                totalCacheReadTokens: globalTotalCacheRead,
+                custoTotalEur: Number(globalCustoTotalEur.toFixed(4)),
+                custoMedioEur: Number(globalCustoMedioEur.toFixed(4)),
+                poupancaCachingEur,
+              },
+              farmacias: farmaciaStats,
+              logsRecentes: logsFormatados,
+            })
+          );
+          return;
+        } catch (e: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+          return;
+        }
+      }
+
       // 0C. Endpoint Admin: Importar Nova Farmácia via Browser (PDF Inventário + PDF Validades + CSV Vendas)
       if (pathname === '/api/admin/import-pharmacy' && req.method === 'POST') {
         const tmpFiles: string[] = [];
@@ -1534,6 +1641,7 @@ async function startServer() {
             farmaciaNome: activeFarmacia.nome,
             titulo: `Copilot — ${activeFarmacia.nome}`,
             explicacao: copilotRes.text,
+            usage: (copilotRes as any).usage || null,
           }));
         } catch (e: any) {
           const status = e.statusCode || 500;
@@ -3151,6 +3259,9 @@ function getDashboardHtml(): string {
           <button class="btn btn-secondary" onclick="openAccessManagerModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;">
             🔑 Acessos & Links Isolados
           </button>
+          <button class="btn btn-secondary" onclick="openFinOpsModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;background:rgba(168,85,247,0.1);border-color:#a855f7;color:#c084fc;font-weight:700;">
+            🤖 Consumo IA & Tokens (FinOps)
+          </button>
           <button class="btn btn-secondary" onclick="openInteractiveImportModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;background:rgba(56,189,248,0.1);border-color:#38bdf8;color:#38bdf8;">
             📥 Importação Inteligente (Novos Ficheiros)
           </button>
@@ -4253,6 +4364,113 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
+  <!-- MODAL 4C: GESTÃO DE FINOPS & CONSUMO DE IA (TOKENS & EUROS) -->
+  <div class="modal-backdrop" id="copilotFinOpsModal" style="display: none;" onclick="if(event.target===this) closeFinOpsModal()">
+    <div class="modal" style="max-width: 960px; max-height: 90vh; overflow-y: auto;">
+      <div class="modal-header" style="border-bottom: 1px solid var(--border); padding-bottom: 14px; margin-bottom: 20px;">
+        <div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:1.4rem;">🤖</span>
+            <h2 style="font-size: 1.25rem; font-weight: 800; color: #c084fc; margin:0;">
+              Telemetria & FinOps de IA — Consumo de Tokens por Farmácia
+            </h2>
+          </div>
+          <p style="font-size: 0.84rem; color: var(--muted); margin-top: 4px;">
+            Auditoria em tempo real de tokens consumidos (Input/Output/Cache) e custo real em Euros (€) com os modelos Claude da Anthropic.
+          </p>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary" onclick="loadFinOpsData()" style="font-size:0.8rem; padding:6px 12px;">🔄 Atualizar</button>
+          <button class="btn btn-secondary" onclick="exportFinOpsCsv()" style="font-size:0.8rem; padding:6px 12px; background:rgba(52,211,153,0.1); border-color:#34d399; color:#34d399;">📥 Exportar CSV</button>
+          <button class="btn btn-secondary" onclick="closeFinOpsModal()" style="font-size:0.8rem; padding:6px 12px;">✕ Fechar</button>
+        </div>
+      </div>
+
+      <div id="finOpsLoading" style="text-align: center; padding: 40px 10px;">
+        <span class="spinner-sm" style="display:inline-block; width:24px; height:24px; border:3px solid rgba(168,85,247,0.3); border-top-color:#a855f7; border-radius:50%; animation:spin 0.8s linear infinite;"></span>
+        <p style="color:var(--muted); font-size:0.86rem; margin-top:10px;">A calcular telemetria de tokens no Supabase...</p>
+      </div>
+
+      <div id="finOpsContent" style="display: none;">
+        <!-- 4 KPI CARDS -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 24px;">
+          <div style="background: rgba(168,85,247,0.08); border: 1px solid rgba(168,85,247,0.3); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #c084fc; text-transform: uppercase;">💰 Custo Global Acumulado</div>
+            <div id="finOpsKpiCustoTotal" style="font-size: 1.6rem; font-weight: 800; color: #f8fafc; margin-top: 4px;">€ 0.00</div>
+            <div style="font-size: 0.72rem; color: var(--muted); margin-top: 2px;">Convertido em EUR (Anthropic API)</div>
+          </div>
+
+          <div style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.3); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #38bdf8; text-transform: uppercase;">💬 Total de Perguntas</div>
+            <div id="finOpsKpiPerguntas" style="font-size: 1.6rem; font-weight: 800; color: #f8fafc; margin-top: 4px;">0</div>
+            <div style="font-size: 0.72rem; color: var(--muted); margin-top: 2px;">Consultas ao motor do Copilot</div>
+          </div>
+
+          <div style="background: rgba(52,211,153,0.08); border: 1px solid rgba(52,211,153,0.3); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #34d399; text-transform: uppercase;">⚡ Custo Médio / Pergunta</div>
+            <div id="finOpsKpiCustoMedio" style="font-size: 1.6rem; font-weight: 800; color: #f8fafc; margin-top: 4px;">€ 0.000</div>
+            <div style="font-size: 0.72rem; color: var(--muted); margin-top: 2px;">Média ponderada por interação</div>
+          </div>
+
+          <div style="background: rgba(234,179,8,0.08); border: 1px solid rgba(234,179,8,0.3); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #eab308; text-transform: uppercase;">🛡️ Poupança Prompt Caching</div>
+            <div id="finOpsKpiPoupanca" style="font-size: 1.6rem; font-weight: 800; color: #f8fafc; margin-top: 4px;">€ 0.00</div>
+            <div style="font-size: 0.72rem; color: var(--muted); margin-top: 2px;">Tokens reaproveitados (-90% custo)</div>
+          </div>
+        </div>
+
+        <!-- TABELA 1: CONSUMO POR FARMÁCIA -->
+        <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 24px;">
+          <h3 style="font-size: 0.95rem; font-weight: 700; color: #f1f5f9; margin-bottom: 12px; display:flex; align-items:center; gap:8px;">
+            🏥 Consumo Consolidado por Farmácia (Balanço de Clientes)
+          </h3>
+          <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+              <thead>
+                <tr style="border-bottom: 1.5px solid var(--border); color: var(--muted); text-align: left; font-size: 0.78rem; text-transform: uppercase;">
+                  <th style="padding: 10px 14px;">Farmácia</th>
+                  <th style="padding: 10px 14px; text-align: center;">Perguntas</th>
+                  <th style="padding: 10px 14px; text-align: right;">Input Tokens</th>
+                  <th style="padding: 10px 14px; text-align: right;">Output Tokens</th>
+                  <th style="padding: 10px 14px; text-align: right;">Cache Read</th>
+                  <th style="padding: 10px 14px; text-align: right; color:#34d399;">Custo Acumulado</th>
+                  <th style="padding: 10px 14px; text-align: right;">Custo Médio</th>
+                </tr>
+              </thead>
+              <tbody id="finOpsFarmaciasTbody">
+                <!-- Preenchido via JavaScript -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- TABELA 2: AUDITORIA EM TEMPO REAL -->
+        <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+          <h3 style="font-size: 0.95rem; font-weight: 700; color: #f1f5f9; margin-bottom: 12px; display:flex; align-items:center; gap:8px;">
+            📋 Auditoria em Tempo Real — Últimas Interações com o Copilot
+          </h3>
+          <div style="overflow-x: auto; max-height: 320px; overflow-y: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 0.82rem;">
+              <thead style="position: sticky; top: 0; background: var(--surface); border-bottom: 1.5px solid var(--border);">
+                <tr style="color: var(--muted); text-align: left; font-size: 0.75rem; text-transform: uppercase;">
+                  <th style="padding: 8px 10px;">Data/Hora</th>
+                  <th style="padding: 8px 10px;">Farmácia</th>
+                  <th style="padding: 8px 10px;">Pergunta</th>
+                  <th style="padding: 8px 10px;">Ferramentas</th>
+                  <th style="padding: 8px 10px; text-align: right;">Tokens</th>
+                  <th style="padding: 8px 10px; text-align: right; color:#34d399;">Custo (€)</th>
+                </tr>
+              </thead>
+              <tbody id="finOpsLogsTbody">
+                <!-- Preenchido via JavaScript -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   
   <!-- MODAL 4B: IMPORTAÇÃO INTELIGENTE E INTERATIVA DE FICHEIROS (HISTÓRICO, DIÁRIOS & VALIDADES) -->
   <div class="modal-backdrop" id="interactiveImportModal" style="display: none;" onclick="if(event.target===this) closeInteractiveImportModal()">
@@ -5027,6 +5245,142 @@ function getDashboardHtml(): string {
     }
 
     
+    // ==========================================
+    // FINOPS & TELEMETRIA IA (CONSUMO DE TOKENS)
+    // ==========================================
+    var finOpsDataCache = null;
+
+    function openFinOpsModal() {
+      var modal = document.getElementById('copilotFinOpsModal');
+      if (modal) modal.style.display = 'flex';
+      loadFinOpsData();
+    }
+
+    function closeFinOpsModal() {
+      var modal = document.getElementById('copilotFinOpsModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    async function loadFinOpsData() {
+      var loadingEl = document.getElementById('finOpsLoading');
+      var contentEl = document.getElementById('finOpsContent');
+      if (loadingEl) loadingEl.style.display = 'block';
+      if (contentEl) contentEl.style.display = 'none';
+
+      try {
+        var res = await fetch('/api/admin/copilot-finops');
+        var data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Erro ao carregar dados');
+
+        finOpsDataCache = data;
+
+        // Métricas Globais
+        var rg = data.resumoGlobal;
+        var kpiCusto = document.getElementById('finOpsKpiCustoTotal');
+        var kpiPerguntas = document.getElementById('finOpsKpiPerguntas');
+        var kpiMedio = document.getElementById('finOpsKpiCustoMedio');
+        var kpiPoupanca = document.getElementById('finOpsKpiPoupanca');
+
+        if (kpiCusto) kpiCusto.textContent = '€ ' + Number(rg.custoTotalEur || 0).toFixed(2);
+        if (kpiPerguntas) kpiPerguntas.textContent = (rg.totalPerguntas || 0) + ' interações';
+        if (kpiMedio) kpiMedio.textContent = '€ ' + Number(rg.custoMedioEur || 0).toFixed(3);
+        if (kpiPoupanca) kpiPoupanca.textContent = '€ ' + Number(rg.poupancaCachingEur || 0).toFixed(2);
+
+        // Atualiza Badge no Sidebar se existir
+        var badgeSidebar = document.getElementById('badge-finops-total');
+        if (badgeSidebar) badgeSidebar.textContent = '€ ' + Number(rg.custoTotalEur || 0).toFixed(2);
+
+        // Tabela por Farmácia
+        var tbodyFarms = document.getElementById('finOpsFarmaciasTbody');
+        if (tbodyFarms) {
+          if (!data.farmacias || data.farmacias.length === 0) {
+            tbodyFarms.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--muted);">Nenhuma farmácia registada.</td></tr>';
+          } else {
+            tbodyFarms.innerHTML = data.farmacias.map(function(f) {
+              return '<tr style="border-bottom: 1px solid var(--border);">' +
+                '<td style="padding: 12px 14px; font-weight: 700; color: #f1f5f9;">' +
+                  '🏥 ' + escapeHtml(f.nome) + ' <span style="font-size:0.75rem; color:var(--muted); font-weight:normal;">(' + escapeHtml(f.nif) + ')</span>' +
+                '</td>' +
+                '<td style="padding: 12px 14px; text-align: center; font-weight: 700; color: #38bdf8;">' +
+                  f.totalPerguntas +
+                '</td>' +
+                '<td style="padding: 12px 14px; text-align: right; color: var(--muted); font-family: monospace;">' +
+                  Number(f.totalInputTokens || 0).toLocaleString('pt-PT') +
+                '</td>' +
+                '<td style="padding: 12px 14px; text-align: right; color: var(--muted); font-family: monospace;">' +
+                  Number(f.totalOutputTokens || 0).toLocaleString('pt-PT') +
+                '</td>' +
+                '<td style="padding: 12px 14px; text-align: right; color: #a78bfa; font-family: monospace;">' +
+                  Number(f.totalCacheReadTokens || 0).toLocaleString('pt-PT') +
+                '</td>' +
+                '<td style="padding: 12px 14px; text-align: right; font-weight: 800; color: #34d399; font-size: 0.95rem;">' +
+                  '€ ' + Number(f.custoTotalEur || 0).toFixed(3) +
+                '</td>' +
+                '<td style="padding: 12px 14px; text-align: right; color: var(--muted); font-size: 0.82rem;">' +
+                  '€ ' + Number(f.custoMedioEur || 0).toFixed(3) +
+                '</td>' +
+              '</tr>';
+            }).join('');
+          }
+        }
+
+        // Tabela das Últimas Perguntas
+        var tbodyLogs = document.getElementById('finOpsLogsTbody');
+        if (tbodyLogs) {
+          if (!data.logsRecentes || data.logsRecentes.length === 0) {
+            tbodyLogs.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:16px;color:var(--muted);">Ainda não foram registadas perguntas ao Copilot.</td></tr>';
+          } else {
+            tbodyLogs.innerHTML = data.logsRecentes.slice(0, 40).map(function(l) {
+              var d = new Date(l.data);
+              var dataHora = d.toLocaleDateString('pt-PT', { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+              var toolsBadges = (l.ferramentas && l.ferramentas.length > 0)
+                ? l.ferramentas.map(function(t) { return '<span class="badge" style="background:rgba(168,85,247,0.15);color:#c084fc;font-size:0.68rem;margin-right:4px;">' + escapeHtml(t) + '</span>'; }).join('')
+                : '<span style="color:var(--muted);font-size:0.75rem;">Conversa Direta</span>';
+
+              return '<tr style="border-bottom: 1px solid var(--border); font-size: 0.82rem;">' +
+                '<td style="padding: 8px 10px; color: var(--muted); white-space: nowrap;">' + dataHora + '</td>' +
+                '<td style="padding: 8px 10px; font-weight: 600; color: #e2e8f0; white-space: nowrap;">' + escapeHtml(l.farmaciaNome) + '</td>' +
+                '<td style="padding: 8px 10px; color: #f8fafc; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="' + escapeHtml(l.pergunta) + '">' +
+                  escapeHtml(l.pergunta) +
+                '</td>' +
+                '<td style="padding: 8px 10px;">' + toolsBadges + '</td>' +
+                '<td style="padding: 8px 10px; text-align: right; font-family: monospace; color: var(--muted); font-size: 0.76rem;">' +
+                  'In: ' + Number(l.inputTokens || 0).toLocaleString('pt-PT') + ' | Out: ' + Number(l.outputTokens || 0).toLocaleString('pt-PT') +
+                '</td>' +
+                '<td style="padding: 8px 10px; text-align: right; font-weight: 700; color: #34d399;">' +
+                  '€ ' + Number(l.custoEur || 0).toFixed(4) +
+                '</td>' +
+              '</tr>';
+            }).join('');
+          }
+        }
+
+        if (loadingEl) loadingEl.style.display = 'none';
+        if (contentEl) contentEl.style.display = 'block';
+      } catch (err) {
+        if (loadingEl) loadingEl.innerHTML = '<p style="color:#ef4444;text-align:center;">Erro ao carregar telemetria FinOps: ' + escapeHtml(err.message) + '</p>';
+      }
+    }
+
+    function exportFinOpsCsv() {
+      if (!finOpsDataCache || !finOpsDataCache.farmacias) {
+        alert('Não existem dados carregados para exportar.');
+        return;
+      }
+      var csv = 'Farmacia;NIF;Total Perguntas;Input Tokens;Output Tokens;Cache Read Tokens;Custo Total EUR;Custo Medio EUR\\r\\n';
+      finOpsDataCache.farmacias.forEach(function(f) {
+        csv += '"' + f.nome + '";"' + f.nif + '";' + f.totalPerguntas + ';' + f.totalInputTokens + ';' + f.totalOutputTokens + ';' + f.totalCacheReadTokens + ';' + f.custoTotalEur + ';' + f.custoMedioEur + '\\r\\n';
+      });
+      var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'finops_copilot_tokens_' + new Date().toISOString().slice(0, 10) + '.csv';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+
     let selectedImportFiles = [];
     let currentInspectionResults = [];
 
@@ -7693,10 +8047,22 @@ function getDashboardHtml(): string {
             '</div></div>';
         }
 
+        let telemetryHtml = '';
+        if (data.usage) {
+          const totTok = (data.usage.inputTokens || 0) + (data.usage.outputTokens || 0);
+          const durSec = ((data.usage.duracaoMs || 0) / 1000).toFixed(1);
+          const costStr = Number(data.usage.custoEstimadoEur || 0).toFixed(4);
+          telemetryHtml = '<div style="margin-top: 10px; padding-top: 8px; border-top: 1px dashed #e2e8f0; font-size: 0.73rem; color: #64748b; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">' +
+            '<span>⚡ ' + durSec + 's · ' + totTok.toLocaleString('pt-PT') + ' tokens</span>' +
+            '<span style="color:#059669; font-weight:700;">💰 Custo estimado: ~€ ' + costStr + '</span>' +
+          '</div>';
+        }
+
         assistantBubble.innerHTML = badgeHtml +
           '<div>' + formattedHtml + '</div>' +
           actionButtonsHtml +
-          '<div style="margin-top: 10px; font-size: 0.72rem; color: #94a3b8; text-align: right;">' +
+          telemetryHtml +
+          '<div style="margin-top: 6px; font-size: 0.72rem; color: #94a3b8; text-align: right;">' +
           'Copilot • ' + new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) +
           '</div>';
 

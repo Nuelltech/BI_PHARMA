@@ -24,6 +24,7 @@ model Farmacia {
   precos             PrecoFarmacia[]
   tarefasEquipa      TarefaEquipa[]
   campanhasAtivas    CampanhaAtiva[]
+  copilotUsageLogs   CopilotUsageLog[]
   criadoEm           DateTime            @default(now())
 }
 
@@ -236,6 +237,30 @@ model CampanhaAtiva {
   farmacia              Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
 
   @@index([farmaciaId, estado])
+}
+
+// ==========================================
+// TELEMETRIA E FINOPS IA (CONSUMO DE TOKENS)
+// ==========================================
+model CopilotUsageLog {
+  id                          String    @id @default(uuid())
+  farmaciaId                  String
+  sessionId                   String?
+  modelo                      String    // ex: "claude-haiku-4-5-20251001", "claude-3-5-sonnet"
+  pergunta                    String    @db.Text
+  input_tokens                Int       @default(0)
+  output_tokens               Int       @default(0)
+  cache_creation_input_tokens Int       @default(0)
+  cache_read_input_tokens     Int       @default(0)
+  custo_estimado_eur          Decimal   @db.Decimal(10, 5)
+  ferramentas_executadas      Json?     // Lista de ferramentas executadas
+  duracao_ms                  Int?
+  criadoEm                    DateTime  @default(now())
+
+  farmacia                    Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+
+  @@index([farmaciaId, criadoEm])
+  @@index([criadoEm])
 }
 
 // ============================================================================
