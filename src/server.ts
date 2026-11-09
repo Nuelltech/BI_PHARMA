@@ -6179,7 +6179,7 @@ function getDashboardHtml(): string {
 
         if (loadingEl) loadingEl.style.display = 'none';
         if (contentEl) contentEl.style.display = 'block';
-      } catch (err: any) {
+      } catch (err) {
         console.error('Erro ao carregar governança MCP:', err);
         if (loadingEl) loadingEl.style.display = 'none';
         alert('Erro ao carregar dados de governança: ' + err.message);
