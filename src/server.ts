@@ -5862,7 +5862,7 @@ function getDashboardHtml(): string {
                 '<td>' + new Date(s.connectedAt).toLocaleTimeString('pt-PT') + '</td>' +
                 '<td>' + new Date(s.lastActivity).toLocaleTimeString('pt-PT') + '</td>' +
                 '<td><span class="badge badge-info">' + s.totalToolCalls + '</span></td>' +
-                '<td style="text-align:right;"><button class="btn btn-secondary" onclick="disconnectSessionAction(\'' + escapeHtml(s.sessionId) + '\')" style="font-size:0.75rem;padding:4px 8px;border-color:#ef4444;color:#ef4444;">⚡ Desconectar</button></td>' +
+                '<td style="text-align:right;"><button class="btn btn-secondary" onclick="disconnectSessionAction(this.dataset.id)" data-id="' + escapeHtml(s.sessionId) + '" style="font-size:0.75rem;padding:4px 8px;border-color:#ef4444;color:#ef4444;">⚡ Desconectar</button></td>' +
                 '</tr>';
             }).join('');
           }
@@ -5894,9 +5894,9 @@ function getDashboardHtml(): string {
                 '<td><span class="badge badge-info">' + c.totalChamadas + '</span></td>' +
                 '<td style="text-align:right;">' +
                   '<div style="display:flex;gap:4px;justify-content:flex-end;">' +
-                    '<button class="btn btn-secondary" onclick="copyConnectorUrl(\'' + escapeHtml(c.token) + '\')" style="font-size:0.74rem;padding:4px 8px;" title="Copiar URL para Claude Web">📋 URL Claude</button>' +
-                    '<button class="btn btn-secondary" onclick="toggleConnectorAction(\'' + escapeHtml(c.id) + '\', ' + (!c.ativo) + ')" style="font-size:0.74rem;padding:4px 8px;">' + (c.ativo ? '⏸️ Pausar' : '▶️ Ativar') + '</button>' +
-                    '<button class="btn btn-secondary" onclick="deleteConnectorAction(\'' + escapeHtml(c.id) + '\')" style="font-size:0.74rem;padding:4px 6px;color:#ef4444;" title="Eliminar Conector">🗑️</button>' +
+                    '<button class="btn btn-secondary" onclick="copyConnectorUrl(this.dataset.token)" data-token="' + escapeHtml(c.token) + '" style="font-size:0.74rem;padding:4px 8px;" title="Copiar URL para Claude Web">📋 URL Claude</button>' +
+                    '<button class="btn btn-secondary" onclick="toggleConnectorAction(this.dataset.id, this.dataset.nextActive === \'1\')" data-id="' + escapeHtml(c.id) + '" data-next-active="' + (c.ativo ? '0' : '1') + '" style="font-size:0.74rem;padding:4px 8px;">' + (c.ativo ? '⏸️ Pausar' : '▶️ Ativar') + '</button>' +
+                    '<button class="btn btn-secondary" onclick="deleteConnectorAction(this.dataset.id)" data-id="' + escapeHtml(c.id) + '" style="font-size:0.74rem;padding:4px 6px;color:#ef4444;" title="Eliminar Conector">🗑️</button>' +
                   '</div>' +
                 '</td>' +
                 '</tr>';
