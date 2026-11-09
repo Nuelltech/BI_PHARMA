@@ -20,6 +20,16 @@ import { processQuestionWithLlmOrLocal } from './services/llm_router';
 import { askConversationalCopilot, clearCopilotSession } from './services/copilot_engine';
 import { addDiscontinuedCnp, removeDiscontinuedCnp, getDiscontinuedList } from './services/discontinued_products';
 import { ToolSecurityContext } from './services/mcp_pharma_tools';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { createPharmaMcpServer } from './services/mcp_server_factory';
+
+interface McpActiveSession {
+  server: any;
+  transport: SSEServerTransport;
+  secContext: ToolSecurityContext;
+  lastActivity: number;
+}
+const mcpActiveSessions = new Map<string, McpActiveSession>();
 import {
   ingestInventarioPdf,
   ingestValidadesPdf,
@@ -426,12 +436,18 @@ async function startServer() {
       const parsedUrl = url.parse(req.url || '/', true);
       const pathname = parsedUrl.pathname || '/';
 
-      const allowedOrigin = process.env.ALLOWED_ORIGIN || (IS_PROD ? '' : '*');
+      const isMcpRoute = pathname.startsWith('/mcp') || pathname.startsWith('/sse');
+      const allowedOrigin = isMcpRoute
+        ? (req.headers.origin || '*')
+        : (process.env.ALLOWED_ORIGIN || (IS_PROD ? '' : '*'));
       if (allowedOrigin) {
         res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
       }
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-access-code');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-access-code, mcp-session-id, last-event-id');
+      if (isMcpRoute) {
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
       // Cabeçalhos Defensivos de Segurança Web
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('X-Frame-Options', 'SAMEORIGIN');
@@ -444,8 +460,12 @@ async function startServer() {
       }
 
       async function resolveAccessContext(explicitCode?: string | null) {
+        let authBearer = '';
+        if (req.headers.authorization && req.headers.authorization.toLowerCase().startsWith('bearer ')) {
+          authBearer = req.headers.authorization.slice(7).trim();
+        }
         const headerToken = String(req.headers['x-access-code'] || '').trim();
-        const candidateToken = headerToken || (explicitCode ? explicitCode.trim() : '');
+        const candidateToken = headerToken || authBearer || (explicitCode ? explicitCode.trim() : '');
 
         // O Modo Admin SÓ é aceite através do Token Efémero Assinado e Ativo
         if (candidateToken && isValidAdminSession(candidateToken)) {
@@ -477,6 +497,7 @@ async function startServer() {
         const rawCode = String(
           explicitCode ||
             headerToken ||
+            authBearer ||
             parsedUrl.query.accessCode ||
             parsedUrl.query.acesso ||
             cookieCode ||
@@ -558,6 +579,97 @@ async function startServer() {
           throw err;
         }
         return f;
+      }
+
+      // ======================================================================
+      // 🔌 MCP (MODEL CONTEXT PROTOCOL) SSE & MESSAGE ENDPOINTS (CLAUDE WEB)
+      // ======================================================================
+      if (pathname === '/mcp' || pathname === '/mcp/sse' || pathname === '/sse') {
+        const authCtx = await resolveAccessContext();
+        if (!authCtx.authenticated || !authCtx.lockedFarmacia) {
+          res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(
+            JSON.stringify({
+              error: 'Autenticação da farmácia obrigatória para conectar via MCP.',
+              detalhe: 'Forneça o código no URL (?acesso=FARM-A-279188) ou no cabeçalho Authorization: Bearer <CODIGO>.',
+            })
+          );
+          return;
+        }
+
+        const farm = authCtx.lockedFarmacia;
+        const secContext: ToolSecurityContext = {
+          farmaciaId: farm.id,
+          farmaciaNome: farm.nome,
+          nif: farm.nif,
+        };
+
+        const isEventStream = req.headers.accept && req.headers.accept.includes('text/event-stream');
+
+        // Se for um probe/ping HTTP normal (ex: verificação do Claude ou navegador)
+        if (!isEventStream && req.method === 'GET') {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(
+            JSON.stringify({
+              name: `bi-pharma-${farm.nome.toLowerCase().replace(/[^a-z0-9]/g, '-')}`,
+              version: '1.0.0',
+              protocol: 'mcp-sse',
+              status: 'online',
+              farmacia: {
+                id: farm.id,
+                nome: farm.nome,
+                nif: farm.nif,
+              },
+              endpoint: `/mcp/messages?acesso=${encodeURIComponent(farm.codigo_acesso || '')}`,
+              message: 'Servidor MCP pronto. Conecte com cliente MCP compatível com SSE.',
+            })
+          );
+          return;
+        }
+
+        // Estabelecer SSE Stream para o Claude Web
+        const postEndpoint = `/mcp/messages?acesso=${encodeURIComponent(farm.codigo_acesso || '')}`;
+        const transport = new SSEServerTransport(postEndpoint, res, {
+          enableDnsRebindingProtection: false,
+        });
+
+        const mcpServer = createPharmaMcpServer(prisma, secContext);
+        const sId = transport.sessionId;
+
+        mcpActiveSessions.set(sId, {
+          server: mcpServer,
+          transport,
+          secContext,
+          lastActivity: Date.now(),
+        });
+
+        transport.onclose = () => {
+          mcpActiveSessions.delete(sId);
+        };
+
+        console.log(`🔌 [MCP SSE CONNECT]: Sessão iniciada para ${farm.nome} (Session: ${sId})`);
+        await mcpServer.connect(transport);
+        return;
+      }
+
+      if (pathname === '/mcp/messages' || pathname === '/sse/messages') {
+        const querySessionId = String(parsedUrl.query.sessionId || req.headers['mcp-session-id'] || '').trim();
+        if (!querySessionId) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'sessionId obrigatório para enviar mensagens MCP.' }));
+          return;
+        }
+
+        const session = mcpActiveSessions.get(querySessionId);
+        if (!session) {
+          res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'Sessão MCP não encontrada ou expirada.' }));
+          return;
+        }
+
+        session.lastActivity = Date.now();
+        await session.transport.handlePostMessage(req, res);
+        return;
       }
 
       // 0A. Endpoint de Autenticação / Validação (Código Exclusivo de Farmácia vs Password de Administrador)
