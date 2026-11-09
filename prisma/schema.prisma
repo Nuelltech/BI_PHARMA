@@ -25,6 +25,9 @@ model Farmacia {
   tarefasEquipa      TarefaEquipa[]
   campanhasAtivas    CampanhaAtiva[]
   copilotUsageLogs   CopilotUsageLog[]
+  mcpPermitido       Boolean             @default(true)
+  mcpConnectors      McpConnector[]
+  mcpAuditLogs       McpAuditLog[]
   criadoEm           DateTime            @default(now())
 }
 
@@ -261,6 +264,50 @@ model CopilotUsageLog {
 
   @@index([farmaciaId, criadoEm])
   @@index([criadoEm])
+}
+
+// ==========================================
+// GOVERNANÇA DE CONECTORES & AGENTES IA (MCP)
+// ==========================================
+model McpConnector {
+  id              String        @id @default(uuid())
+  farmaciaId      String
+  farmacia        Farmacia      @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+  nome            String        // Ex: "Claude Web - Diretor Dr. Manuel", "Cursor - Equipa"
+  token           String        @unique // Ex: "mcp_live_farm_a_..."
+  agenteTipo      String        @default("CLAUDE_WEB") // "CLAUDE_WEB", "CLAUDE_DESKTOP", "GEMINI", "CHATGPT", "CURSOR", "OUTRO"
+  perfilPermissao String        @default("COMPLETO") // "COMPLETO", "GESTAO_COMPRAS", "BALCAO_CLINICO"
+  ativo           Boolean       @default(true)
+  criadoPor       String?       @default("DIRETOR")
+  ultimoAcessoEm  DateTime?
+  ultimoIp        String?
+  ultimoUserAgent String?
+  totalChamadas   Int           @default(0)
+  criadoEm        DateTime      @default(now())
+  atualizadoEm    DateTime      @updatedAt
+
+  logs            McpAuditLog[]
+
+  @@index([farmaciaId])
+  @@index([token])
+}
+
+model McpAuditLog {
+  id           String        @id @default(uuid())
+  farmaciaId   String
+  farmacia     Farmacia      @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+  connectorId  String?
+  connector    McpConnector? @relation(fields: [connectorId], references: [id], onDelete: SetNull)
+  ferramenta   String        // Nome da ferramenta MCP executada
+  parametros   String?       @db.Text // Argumentos JSON passados
+  sucesso      Boolean       @default(true)
+  duracaoMs    Int?
+  ip           String?
+  userAgent    String?
+  criadoEm     DateTime      @default(now())
+
+  @@index([farmaciaId, criadoEm])
+  @@index([connectorId])
 }
 
 // ============================================================================

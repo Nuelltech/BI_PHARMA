@@ -23,11 +23,31 @@ import { ToolSecurityContext } from './services/mcp_pharma_tools';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { createPharmaMcpServer } from './services/mcp_server_factory';
 
+import {
+  resolveMcpAuthentication,
+  recordMcpAuditLog,
+  createMcpConnector,
+  toggleMcpConnector,
+  deleteMcpConnector,
+  toggleGlobalMcpAccess,
+  getMcpGovernanceReport,
+  McpPermissionProfile,
+} from './services/mcp_governance';
+
 interface McpActiveSession {
+  sessionId: string;
   server: any;
   transport: SSEServerTransport;
-  secContext: ToolSecurityContext;
-  lastActivity: number;
+  farmaciaId: string;
+  farmaciaNome: string;
+  connectorId?: string | null;
+  connectorNome?: string | null;
+  token: string;
+  ip?: string;
+  userAgent?: string;
+  connectedAt: Date;
+  lastActivity: Date;
+  totalToolCalls: number;
 }
 const mcpActiveSessions = new Map<string, McpActiveSession>();
 import {
@@ -585,24 +605,48 @@ async function startServer() {
       // 🔌 MCP (MODEL CONTEXT PROTOCOL) SSE & MESSAGE ENDPOINTS (CLAUDE WEB)
       // ======================================================================
       if (pathname === '/mcp' || pathname === '/mcp/sse' || pathname === '/sse') {
-        const authCtx = await resolveAccessContext();
-        if (!authCtx.authenticated || !authCtx.lockedFarmacia) {
-          res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(
-            JSON.stringify({
-              error: 'Autenticação da farmácia obrigatória para conectar via MCP.',
-              detalhe: 'Forneça o código no URL (?acesso=FARM-A-279188) ou no cabeçalho Authorization: Bearer <CODIGO>.',
-            })
-          );
+        const clientIp = getClientIp(req);
+        const userAgent = String(req.headers['user-agent'] || '');
+
+        let rawAuthToken = String(
+          parsedUrl.query.token ||
+          parsedUrl.query.acesso ||
+          parsedUrl.query.code ||
+          req.headers['x-access-code'] ||
+          ''
+        ).trim();
+
+        if (!rawAuthToken && req.headers.authorization && req.headers.authorization.toLowerCase().startsWith('bearer ')) {
+          rawAuthToken = req.headers.authorization.slice(7).trim();
+        }
+
+        const authRes = await resolveMcpAuthentication(prisma, rawAuthToken, { ip: clientIp, userAgent });
+
+        if (!authRes.allowed || !authRes.farmacia) {
+          let statusCode = 401;
+          let errorMsg = 'Autenticação MCP inválida ou ausente.';
+          if (authRes.reason === 'MCP_DISABLED_BY_PHARMACY') {
+            statusCode = 403;
+            errorMsg = 'O acesso de agentes externos de IA (MCP) foi desativado nas definições desta farmácia.';
+          } else if (authRes.reason === 'CONNECTOR_REVOKED') {
+            statusCode = 403;
+            errorMsg = 'Este conector MCP foi revogado ou pausado pelo Diretor da farmácia.';
+          }
+          res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: errorMsg, code: authRes.reason }));
           return;
         }
 
-        const farm = authCtx.lockedFarmacia;
+        const farm = authRes.farmacia;
         const secContext: ToolSecurityContext = {
           farmaciaId: farm.id,
           farmaciaNome: farm.nome,
           nif: farm.nif,
         };
+
+        const connectorId = authRes.connector?.id || null;
+        const connectorNome = authRes.connector?.nome || null;
+        const effectiveToken = rawAuthToken;
 
         const isEventStream = req.headers.accept && req.headers.accept.includes('text/event-stream');
 
@@ -620,34 +664,67 @@ async function startServer() {
                 nome: farm.nome,
                 nif: farm.nif,
               },
-              endpoint: `/mcp/messages?acesso=${encodeURIComponent(farm.codigo_acesso || '')}`,
-              message: 'Servidor MCP pronto. Conecte com cliente MCP compatível com SSE.',
+              conector: authRes.connector ? { nome: authRes.connector.nome, perfil: authRes.perfilPermissao } : null,
+              endpoint: `/mcp/messages?token=${encodeURIComponent(effectiveToken)}`,
+              message: 'Servidor MCP pronto com governança ativa. Conecte com cliente MCP compatível com SSE.',
             })
           );
           return;
         }
 
         // Estabelecer SSE Stream para o Claude Web
-        const postEndpoint = `/mcp/messages?acesso=${encodeURIComponent(farm.codigo_acesso || '')}`;
+        const postEndpoint = `/mcp/messages?token=${encodeURIComponent(effectiveToken)}`;
         const transport = new SSEServerTransport(postEndpoint, res, {
           enableDnsRebindingProtection: false,
         });
 
-        const mcpServer = createPharmaMcpServer(prisma, secContext);
         const sId = transport.sessionId;
 
+        const mcpServer = createPharmaMcpServer(prisma, secContext, {
+          perfilPermissao: authRes.perfilPermissao,
+          connectorId: connectorId || undefined,
+          ip: clientIp,
+          userAgent,
+          onAudit: async (auditData) => {
+            const s = mcpActiveSessions.get(sId);
+            if (s) {
+              s.totalToolCalls++;
+              s.lastActivity = new Date();
+            }
+            await recordMcpAuditLog(prisma, {
+              farmaciaId: farm.id,
+              connectorId,
+              ferramenta: auditData.ferramenta,
+              parametros: auditData.parametros,
+              sucesso: auditData.sucesso,
+              duracaoMs: auditData.duracaoMs,
+              ip: clientIp,
+              userAgent,
+            });
+          },
+        });
+
         mcpActiveSessions.set(sId, {
+          sessionId: sId,
           server: mcpServer,
           transport,
-          secContext,
-          lastActivity: Date.now(),
+          farmaciaId: farm.id,
+          farmaciaNome: farm.nome,
+          connectorId,
+          connectorNome,
+          token: effectiveToken,
+          ip: clientIp,
+          userAgent,
+          connectedAt: new Date(),
+          lastActivity: new Date(),
+          totalToolCalls: 0,
         });
 
         transport.onclose = () => {
           mcpActiveSessions.delete(sId);
         };
 
-        console.log(`🔌 [MCP SSE CONNECT]: Sessão iniciada para ${farm.nome} (Session: ${sId})`);
+        console.log(`🔌 [MCP SSE CONNECT]: Sessão iniciada para "${connectorNome || farm.nome}" (Session: ${sId}, IP: ${clientIp})`);
         await mcpServer.connect(transport);
         return;
       }
@@ -667,8 +744,149 @@ async function startServer() {
           return;
         }
 
-        session.lastActivity = Date.now();
+        session.lastActivity = new Date();
         await session.transport.handlePostMessage(req, res);
+        return;
+      }
+
+      // ======================================================================
+      // 🛡️ API DE GOVERNANÇA DE CONECTORES & AGENTES IA (MCP)
+      // ======================================================================
+      if (pathname === '/api/mcp/governance' && req.method === 'GET') {
+        try {
+          const authCtx = await resolveAccessContext();
+          if (!authCtx.authenticated) {
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Acesso não autorizado.' }));
+            return;
+          }
+          const farm = await requireActiveFarmacia(parsedUrl.query.farmaciaId as string);
+          const sessionsArray = Array.from(mcpActiveSessions.values());
+          const report = await getMcpGovernanceReport(prisma, farm.id, sessionsArray);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, ...report }));
+        } catch (err: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      if (pathname === '/api/mcp/governance/toggle-global' && req.method === 'POST') {
+        try {
+          const farm = await requireActiveFarmacia();
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const body = JSON.parse(rawBody || '{}');
+          const permitido = Boolean(body.permitido);
+          await toggleGlobalMcpAccess(prisma, farm.id, permitido);
+
+          if (!permitido) {
+            for (const [sId, s] of mcpActiveSessions.entries()) {
+              if (s.farmaciaId === farm.id) {
+                try { s.transport.close(); } catch {}
+                mcpActiveSessions.delete(sId);
+              }
+            }
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, permitido }));
+        } catch (err: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      if (pathname === '/api/mcp/governance/connectors/create' && req.method === 'POST') {
+        try {
+          const farm = await requireActiveFarmacia();
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const body = JSON.parse(rawBody || '{}');
+          if (!body.nome || !body.nome.trim()) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Nome do conetor é obrigatório.' }));
+            return;
+          }
+          const connector = await createMcpConnector(prisma, farm.id, {
+            nome: body.nome.trim(),
+            agenteTipo: body.agenteTipo || 'CLAUDE_WEB',
+            perfilPermissao: body.perfilPermissao || 'COMPLETO',
+            criadoPor: body.criadoPor || 'DIRETOR',
+          });
+          res.writeHead(201, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, connector }));
+        } catch (err: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      if (pathname === '/api/mcp/governance/connectors/toggle' && req.method === 'POST') {
+        try {
+          const farm = await requireActiveFarmacia();
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const body = JSON.parse(rawBody || '{}');
+          await toggleMcpConnector(prisma, body.connectorId, farm.id, Boolean(body.ativo));
+
+          if (!body.ativo) {
+            for (const [sId, s] of mcpActiveSessions.entries()) {
+              if (s.connectorId === body.connectorId) {
+                try { s.transport.close(); } catch {}
+                mcpActiveSessions.delete(sId);
+              }
+            }
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      if (pathname === '/api/mcp/governance/connectors/delete' && req.method === 'POST') {
+        try {
+          const farm = await requireActiveFarmacia();
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const body = JSON.parse(rawBody || '{}');
+          await deleteMcpConnector(prisma, body.connectorId, farm.id);
+
+          for (const [sId, s] of mcpActiveSessions.entries()) {
+            if (s.connectorId === body.connectorId) {
+              try { s.transport.close(); } catch {}
+              mcpActiveSessions.delete(sId);
+            }
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
+      if (pathname === '/api/mcp/governance/sessions/disconnect' && req.method === 'POST') {
+        try {
+          const farm = await requireActiveFarmacia();
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const body = JSON.parse(rawBody || '{}');
+          const session = mcpActiveSessions.get(body.sessionId);
+          if (session && session.farmaciaId === farm.id) {
+            try { session.transport.close(); } catch {}
+            mcpActiveSessions.delete(body.sessionId);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
         return;
       }
 
@@ -3371,6 +3589,10 @@ function getDashboardHtml(): string {
           <button class="btn btn-secondary" onclick="openAccessManagerModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;">
             🔑 Acessos & Links Isolados
           </button>
+          <button class="btn btn-secondary" onclick="openMcpGovernanceModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;background:rgba(14,165,233,0.1);border-color:#0ea5e9;color:#0284c7;font-weight:700;">
+            🔌 Agentes & Conectores IA (MCP)
+            <span id="mcpLiveBadge" style="display:none;background:#10b981;color:#ffffff;border-radius:10px;padding:1px 6px;font-size:0.65rem;margin-left:auto;">0 live</span>
+          </button>
           <button class="btn btn-secondary" onclick="openFinOpsModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;background:rgba(168,85,247,0.1);border-color:#a855f7;color:#c084fc;font-weight:700;">
             🤖 Consumo IA & Tokens (FinOps)
           </button>
@@ -4584,6 +4806,205 @@ function getDashboardHtml(): string {
   </div>
 
   
+  <!-- MODAL 4D: GOVERNANÇA DE CONECTORES & AGENTES IA (MCP) -->
+  <div class="modal-backdrop" id="mcpGovernanceModal" style="display: none;" onclick="if(event.target===this) closeMcpGovernanceModal()">
+    <div class="modal" style="max-width: 1040px; max-height: 92vh; overflow-y: auto;">
+      <div class="modal-header" style="border-bottom: 1px solid var(--border); padding-bottom: 14px; margin-bottom: 20px;">
+        <div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:1.4rem;">🔌</span>
+            <h2 style="font-size: 1.25rem; font-weight: 800; color: #0284c7; margin:0;">
+              Governança de Agentes & Conectores IA (MCP)
+            </h2>
+          </div>
+          <p style="font-size: 0.84rem; color: var(--muted); margin-top: 4px;">
+            Controlo de acessos externos via Model Context Protocol (Claude, Gemini, ChatGPT). Monitorize sessões ativas em direto, gere tokens dedicados e audite chamadas a ferramentas.
+          </p>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary" onclick="loadMcpGovernanceData()" style="font-size:0.8rem; padding:6px 12px;">🔄 Atualizar</button>
+          <button class="btn btn-secondary" onclick="closeMcpGovernanceModal()" style="font-size:0.8rem; padding:6px 12px;">✕ Fechar</button>
+        </div>
+      </div>
+
+      <div id="mcpGovLoading" style="text-align: center; padding: 40px 10px;">
+        <span class="spinner-sm" style="display:inline-block; width:24px; height:24px; border:3px solid rgba(2,132,199,0.3); border-top-color:#0284c7; border-radius:50%; animation:spin 0.8s linear infinite;"></span>
+        <p style="color:var(--muted); font-size:0.86rem; margin-top:10px;">A verificar sessões e conetores de IA...</p>
+      </div>
+
+      <div id="mcpGovContent" style="display: none;">
+        <!-- INTERRUPTOR GLOBAL (KILL SWITCH) -->
+        <div id="mcpGlobalBanner" style="display: flex; justify-content: space-between; align-items: center; background: #f8fafc; border: 1.5px solid var(--border); border-radius: 12px; padding: 14px 20px; margin-bottom: 20px;">
+          <div>
+            <div style="font-size: 0.95rem; font-weight: 800; color: #0f172a; display: flex; align-items: center; gap: 8px;">
+              🛡️ Acesso Externo MCP à Farmácia:
+              <span id="mcpGlobalStatusBadge" class="badge badge-success" style="font-size: 0.8rem;">ATIVO</span>
+            </div>
+            <p style="font-size: 0.8rem; color: #64748b; margin-top: 3px; max-width: 650px;">
+              Quando ativo, agentes autorizados com chave válida podem consultar ferramentas da farmácia. Se desativar este interruptor, todos os LLMs externos são desconectados imediatamente.
+            </p>
+          </div>
+          <div>
+            <button class="btn" id="btnToggleGlobalMcp" onclick="toggleGlobalMcpAction()" style="font-size: 0.82rem; padding: 8px 16px; font-weight: 700;">
+              ⏸️ Desativar MCP Global
+            </button>
+          </div>
+        </div>
+
+        <!-- 3 SUMMARY CARDS -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 24px;">
+          <div style="background: rgba(16,185,129,0.06); border: 1.5px solid rgba(16,185,129,0.25); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #047857; text-transform: uppercase;">🟢 Sessões em Direto (Live)</div>
+            <div id="mcpKpiLiveSessions" style="font-size: 1.6rem; font-weight: 800; color: #0f172a; margin-top: 4px;">0</div>
+            <div style="font-size: 0.72rem; color: #64748b; margin-top: 2px;">Ligações SSE ativas agora</div>
+          </div>
+
+          <div style="background: rgba(2,132,199,0.06); border: 1.5px solid rgba(2,132,199,0.25); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #0369a1; text-transform: uppercase;">🔑 Conectores Registados</div>
+            <div id="mcpKpiConnectorsCount" style="font-size: 1.6rem; font-weight: 800; color: #0f172a; margin-top: 4px;">0</div>
+            <div style="font-size: 0.72rem; color: #64748b; margin-top: 2px;">Tokens e LLMs autorizados</div>
+          </div>
+
+          <div style="background: rgba(168,85,247,0.06); border: 1.5px solid rgba(168,85,247,0.25); border-radius: 12px; padding: 14px 18px;">
+            <div style="font-size: 0.78rem; font-weight: 700; color: #7e22ce; text-transform: uppercase;">📊 Ferramentas Executadas</div>
+            <div id="mcpKpiTotalCalls" style="font-size: 1.6rem; font-weight: 800; color: #0f172a; margin-top: 4px;">0</div>
+            <div style="font-size: 0.72rem; color: #64748b; margin-top: 2px;">Auditoria de operações externas</div>
+          </div>
+        </div>
+
+        <!-- SECÇÃO 1: SESSÕES EM DIRETO -->
+        <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <div>
+              <div style="font-size: 0.95rem; font-weight: 800; color: #0f172a; display: flex; align-items: center; gap: 6px;">
+                <span>🟢</span> Quem está ligado agora (Sessões SSE em Tempo Real)
+              </div>
+              <p style="font-size: 0.78rem; color: #64748b; margin-top: 2px;">Agentes externos atualmente conectados com streaming SSE ativo ao vivo.</p>
+            </div>
+          </div>
+          <div style="overflow-x: auto;">
+            <table class="data-table" style="font-size: 0.82rem;">
+              <thead>
+                <tr>
+                  <th>Agente / Conector</th>
+                  <th>IP de Origem</th>
+                  <th>User-Agent / Cliente</th>
+                  <th>Ligado desde</th>
+                  <th>Última Atividade</th>
+                  <th>Chamadas</th>
+                  <th style="text-align: right;">Ação</th>
+                </tr>
+              </thead>
+              <tbody id="mcpActiveSessionsTbody">
+                <!-- Preenchido via JS -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- SECÇÃO 2: CONECTORES AUTORIZADOS -->
+        <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px;">
+            <div>
+              <div style="font-size: 0.95rem; font-weight: 800; color: #0f172a; display: flex; align-items: center; gap: 6px;">
+                <span>🔑</span> Conectores Autorizados (Tokens com Nome & Permissões)
+              </div>
+              <p style="font-size: 0.78rem; color: #64748b; margin-top: 2px;">Crie tokens individuais para cada utilizador ou agente sem expor o código principal da farmácia.</p>
+            </div>
+            <button class="btn" onclick="openCreateConnectorModal()" style="font-size: 0.82rem; padding: 7px 14px; background: #0284c7; color: #fff; font-weight: 700;">
+              + Criar Novo Conector
+            </button>
+          </div>
+          <div style="overflow-x: auto;">
+            <table class="data-table" style="font-size: 0.82rem;">
+              <thead>
+                <tr>
+                  <th>Nome do Conector</th>
+                  <th>Tipo de Agente</th>
+                  <th>Perfil de Permissões</th>
+                  <th>Estado</th>
+                  <th>Último Acesso</th>
+                  <th>Total Chamadas</th>
+                  <th style="text-align: right;">Ações & Links</th>
+                </tr>
+              </thead>
+              <tbody id="mcpConnectorsTbody">
+                <!-- Preenchido via JS -->
+              </tbody>
+            </table>
+          </div>
+          <div id="mcpFeedbackNotice" style="margin-top: 10px; font-size: 0.82rem; color: #10b981; font-weight: 700; display: none;"></div>
+        </div>
+
+        <!-- SECÇÃO 3: AUDITORIA DE CHAMADAS -->
+        <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 12px; padding: 18px;">
+          <div style="font-size: 0.95rem; font-weight: 800; color: #0f172a; margin-bottom: 4px; display: flex; align-items: center; gap: 6px;">
+            <span>📜</span> Livro de Auditoria MCP (Últimas Operações Externas)
+          </div>
+          <p style="font-size: 0.78rem; color: #64748b; margin-bottom: 14px;">Registo permanente de cada ferramenta executada por LLMs externos, duração e IP.</p>
+          <div style="overflow-x: auto; max-height: 320px; overflow-y: auto;">
+            <table class="data-table" style="font-size: 0.8rem;">
+              <thead>
+                <tr>
+                  <th>Data/Hora</th>
+                  <th>Conector / Agente</th>
+                  <th>Ferramenta Executada</th>
+                  <th>IP</th>
+                  <th>Duração</th>
+                  <th>Estado</th>
+                </tr>
+              </thead>
+              <tbody id="mcpAuditLogsTbody">
+                <!-- Preenchido via JS -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL SECUNDÁRIO: CRIAR NOVO CONECTOR MCP -->
+  <div class="modal-backdrop" id="mcpCreateModal" style="display: none; z-index: 10001;" onclick="if(event.target===this) closeCreateConnectorModal()">
+    <div class="modal" style="max-width: 500px;">
+      <div class="modal-header" style="border-bottom: 1px solid var(--border); padding-bottom: 10px; margin-bottom: 16px;">
+        <h3 style="font-size: 1.1rem; color: #0284c7; margin: 0; font-weight: 800;">🔑 Criar Novo Conector de IA</h3>
+        <button class="btn btn-secondary" onclick="closeCreateConnectorModal()">✕</button>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 14px;">
+        <div>
+          <label style="font-size: 0.78rem; font-weight: 700; color: #0f172a; display: block; margin-bottom: 4px;">Nome de Identificação:</label>
+          <input type="text" id="newConnectorNome" placeholder="Ex: Claude Web - Portátil Consultório" style="width: 100%; padding: 8px 10px; font-size: 0.86rem;" />
+        </div>
+        <div>
+          <label style="font-size: 0.78rem; font-weight: 700; color: #0f172a; display: block; margin-bottom: 4px;">Tipo de Agente / LLM:</label>
+          <select id="newConnectorTipo" style="width: 100%; padding: 8px 10px; font-size: 0.86rem;">
+            <option value="CLAUDE_WEB" selected>Anthropic Claude Web (Browser)</option>
+            <option value="CLAUDE_DESKTOP">Anthropic Claude Desktop (App PC/Mac)</option>
+            <option value="CURSOR">Cursor IDE / Windsurf</option>
+            <option value="GEMINI">Google Gemini / AI Studio</option>
+            <option value="CHATGPT">OpenAI ChatGPT / Custom GPT</option>
+            <option value="OUTRO">Outro Agente Externo</option>
+          </select>
+        </div>
+        <div>
+          <label style="font-size: 0.78rem; font-weight: 700; color: #0f172a; display: block; margin-bottom: 4px;">Perfil de Permissões:</label>
+          <select id="newConnectorPerfil" style="width: 100%; padding: 8px 10px; font-size: 0.86rem;">
+            <option value="COMPLETO" selected>🔓 Completo (Operações de Stock + Dados Financeiros e Margem)</option>
+            <option value="GESTAO_COMPRAS">📦 Gestão & Compras (Propostas de Encomenda, Monos e Validades)</option>
+            <option value="BALCAO_CLINICO">🩺 Balcão Clínico (Apenas Pesquisa, Stock e Similares - Sem Margens em €)</option>
+          </select>
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px;">
+          <button class="btn btn-secondary" onclick="closeCreateConnectorModal()">Cancelar</button>
+          <button class="btn" onclick="submitCreateConnector()" style="background: #0284c7; color: #fff; font-weight: 700;">
+            Gerar Conector & Chave
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- MODAL 4B: IMPORTAÇÃO INTELIGENTE E INTERATIVA DE FICHEIROS (HISTÓRICO, DIÁRIOS & VALIDADES) -->
   <div class="modal-backdrop" id="interactiveImportModal" style="display: none;" onclick="if(event.target===this) closeInteractiveImportModal()">
     <div class="modal" style="max-width: 920px; width: 95vw; max-height: 90vh; overflow-y: auto;">
@@ -5357,6 +5778,310 @@ function getDashboardHtml(): string {
     }
 
     
+    // ==========================================
+    // GOVERNANÇA DE AGENTES & CONECTORES IA (MCP)
+    // ==========================================
+    var mcpGovernanceCache = null;
+
+    function openMcpGovernanceModal() {
+      var modal = document.getElementById('mcpGovernanceModal');
+      if (modal) modal.style.display = 'flex';
+      loadMcpGovernanceData();
+    }
+
+    function closeMcpGovernanceModal() {
+      var modal = document.getElementById('mcpGovernanceModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    async function loadMcpGovernanceData() {
+      var loadingEl = document.getElementById('mcpGovLoading');
+      var contentEl = document.getElementById('mcpGovContent');
+      if (loadingEl) loadingEl.style.display = 'block';
+      if (contentEl) contentEl.style.display = 'none';
+
+      try {
+        var query = activeFarmaciaId ? '?farmaciaId=' + encodeURIComponent(activeFarmaciaId) : '';
+        var res = await fetch('/api/mcp/governance' + query);
+        var data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Erro ao carregar dados de governança');
+
+        mcpGovernanceCache = data;
+
+        // KPI Cards
+        var kpiLive = document.getElementById('mcpKpiLiveSessions');
+        var kpiConn = document.getElementById('mcpKpiConnectorsCount');
+        var kpiCalls = document.getElementById('mcpKpiTotalCalls');
+        var liveBadge = document.getElementById('mcpLiveBadge');
+
+        var totalCalls = (data.conectores || []).reduce(function(s, c) { return s + (c.totalChamadas || 0); }, 0);
+
+        if (kpiLive) kpiLive.textContent = String(data.totalSessoesAtivasEmDireto || 0);
+        if (kpiConn) kpiConn.textContent = String(data.totalConectoresRegistados || 0);
+        if (kpiCalls) kpiCalls.textContent = String(totalCalls);
+
+        if (liveBadge) {
+          if ((data.totalSessoesAtivasEmDireto || 0) > 0) {
+            liveBadge.style.display = 'inline-block';
+            liveBadge.textContent = data.totalSessoesAtivasEmDireto + ' live';
+          } else {
+            liveBadge.style.display = 'none';
+          }
+        }
+
+        // Global Banner
+        var statusBadge = document.getElementById('mcpGlobalStatusBadge');
+        var btnToggle = document.getElementById('btnToggleGlobalMcp');
+        if (statusBadge && btnToggle) {
+          if (data.mcpPermitido) {
+            statusBadge.className = 'badge badge-success';
+            statusBadge.textContent = 'ATIVO';
+            btnToggle.textContent = '⏸️ Desativar MCP Global';
+            btnToggle.style.background = '#e2e8f0';
+            btnToggle.style.color = '#334155';
+          } else {
+            statusBadge.className = 'badge badge-danger';
+            statusBadge.textContent = 'BLOQUEADO';
+            btnToggle.textContent = '▶️ Reativar MCP Global';
+            btnToggle.style.background = '#10b981';
+            btnToggle.style.color = '#ffffff';
+          }
+        }
+
+        // Tabela 1: Sessões Ativas em Direto
+        var tbodySessions = document.getElementById('mcpActiveSessionsTbody');
+        if (tbodySessions) {
+          if (!data.sessoesAtivas || data.sessoesAtivas.length === 0) {
+            tbodySessions.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px;color:#64748b;">Nenhum agente externo ligado em streaming neste momento.</td></tr>';
+          } else {
+            tbodySessions.innerHTML = data.sessoesAtivas.map(function(s) {
+              return '<tr>' +
+                '<td><span style="font-weight:700;color:#0f172a;">' + escapeHtml(s.connectorNome) + '</span><br><code style="font-size:0.7rem;color:#64748b;">' + escapeHtml(s.tokenMasked) + '</code></td>' +
+                '<td><code style="color:#0284c7;">' + escapeHtml(s.ip) + '</code></td>' +
+                '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escapeHtml(s.userAgent) + '">' + escapeHtml(s.userAgent) + '</td>' +
+                '<td>' + new Date(s.connectedAt).toLocaleTimeString('pt-PT') + '</td>' +
+                '<td>' + new Date(s.lastActivity).toLocaleTimeString('pt-PT') + '</td>' +
+                '<td><span class="badge badge-info">' + s.totalToolCalls + '</span></td>' +
+                '<td style="text-align:right;"><button class="btn btn-secondary" onclick="disconnectSessionAction(\'' + escapeHtml(s.sessionId) + '\')" style="font-size:0.75rem;padding:4px 8px;border-color:#ef4444;color:#ef4444;">⚡ Desconectar</button></td>' +
+                '</tr>';
+            }).join('');
+          }
+        }
+
+        // Tabela 2: Conectores Registados
+        var tbodyConn = document.getElementById('mcpConnectorsTbody');
+        if (tbodyConn) {
+          if (!data.conectores || data.conectores.length === 0) {
+            tbodyConn.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px;color:#64748b;">Nenhum conector específico criado. O sistema aceita o código mestre geral da farmácia.</td></tr>';
+          } else {
+            tbodyConn.innerHTML = data.conectores.map(function(c) {
+              var statusHtml = c.ativo
+                ? '<span class="badge badge-success">🟢 Ativo</span>'
+                : '<span class="badge badge-danger">⏸️ Pausado</span>';
+
+              var perfilLabel = '🔓 Completo';
+              if (c.perfilPermissao === 'GESTAO_COMPRAS') perfilLabel = '📦 Gestão Compras';
+              if (c.perfilPermissao === 'BALCAO_CLINICO') perfilLabel = '🩺 Balcão Clínico';
+
+              var shareUrl = window.location.origin + '/mcp?token=' + encodeURIComponent(c.token);
+
+              return '<tr>' +
+                '<td><span style="font-weight:700;color:#0f172a;">' + escapeHtml(c.nome) + '</span><br><code style="font-size:0.7rem;color:#64748b;">' + escapeHtml(c.tokenMasked) + '</code></td>' +
+                '<td><span class="badge badge-purple">' + escapeHtml(c.agenteTipo) + '</span></td>' +
+                '<td><span style="font-size:0.76rem;color:#334155;font-weight:600;">' + perfilLabel + '</span></td>' +
+                '<td>' + statusHtml + '</td>' +
+                '<td>' + (c.ultimoAcessoEm ? new Date(c.ultimoAcessoEm).toLocaleString('pt-PT') : 'Nunca') + '</td>' +
+                '<td><span class="badge badge-info">' + c.totalChamadas + '</span></td>' +
+                '<td style="text-align:right;">' +
+                  '<div style="display:flex;gap:4px;justify-content:flex-end;">' +
+                    '<button class="btn btn-secondary" onclick="copyConnectorUrl(\'' + escapeHtml(c.token) + '\')" style="font-size:0.74rem;padding:4px 8px;" title="Copiar URL para Claude Web">📋 URL Claude</button>' +
+                    '<button class="btn btn-secondary" onclick="toggleConnectorAction(\'' + escapeHtml(c.id) + '\', ' + (!c.ativo) + ')" style="font-size:0.74rem;padding:4px 8px;">' + (c.ativo ? '⏸️ Pausar' : '▶️ Ativar') + '</button>' +
+                    '<button class="btn btn-secondary" onclick="deleteConnectorAction(\'' + escapeHtml(c.id) + '\')" style="font-size:0.74rem;padding:4px 6px;color:#ef4444;" title="Eliminar Conector">🗑️</button>' +
+                  '</div>' +
+                '</td>' +
+                '</tr>';
+            }).join('');
+          }
+        }
+
+        // Tabela 3: Auditoria
+        var tbodyAudit = document.getElementById('mcpAuditLogsTbody');
+        if (tbodyAudit) {
+          if (!data.auditLogs || data.auditLogs.length === 0) {
+            tbodyAudit.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:16px;color:#64748b;">Nenhuma execução de ferramenta registada ainda.</td></tr>';
+          } else {
+            tbodyAudit.innerHTML = data.auditLogs.map(function(log) {
+              var statusHtml = log.sucesso
+                ? '<span style="color:#10b981;font-weight:700;">✅ Sucesso</span>'
+                : '<span style="color:#ef4444;font-weight:700;">⛔ Bloqueado</span>';
+
+              return '<tr>' +
+                '<td>' + new Date(log.criadoEm).toLocaleString('pt-PT') + '</td>' +
+                '<td><span style="font-weight:600;color:#0f172a;">' + escapeHtml(log.connectorNome) + '</span></td>' +
+                '<td><code style="background:rgba(2,132,199,0.08);color:#0284c7;padding:2px 6px;border-radius:4px;font-size:0.74rem;">' + escapeHtml(log.ferramenta) + '</code></td>' +
+                '<td><code style="font-size:0.72rem;color:#64748b;">' + escapeHtml(log.ip || '-') + '</code></td>' +
+                '<td>' + (log.duracaoMs ? log.duracaoMs + 'ms' : '-') + '</td>' +
+                '<td>' + statusHtml + '</td>' +
+                '</tr>';
+            }).join('');
+          }
+        }
+
+        if (loadingEl) loadingEl.style.display = 'none';
+        if (contentEl) contentEl.style.display = 'block';
+      } catch (err) {
+        console.error('Erro ao carregar governança MCP:', err);
+        if (loadingEl) loadingEl.style.display = 'none';
+        alert('Erro ao carregar dados de governança: ' + err.message);
+      }
+    }
+
+    async function toggleGlobalMcpAction() {
+      if (!mcpGovernanceCache) return;
+      var novoEstado = !mcpGovernanceCache.mcpPermitido;
+      var msg = novoEstado
+        ? 'Tem a certeza que deseja reativar o acesso de agentes externos de IA (MCP)?'
+        : 'Tem a certeza que deseja BLOQUEAR imediatamente todos os acessos MCP? Todas as sessões em direto serão expulsas.';
+
+      if (!confirm(msg)) return;
+
+      try {
+        var res = await fetch('/api/mcp/governance/toggle-global', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ permitido: novoEstado })
+        });
+        var data = await res.json();
+        if (data.ok) {
+          loadMcpGovernanceData();
+        } else {
+          alert('Erro ao alterar estado global: ' + (data.error || 'Erro desconhecido'));
+        }
+      } catch (err) {
+        alert('Erro ao comunicar com o servidor: ' + err.message);
+      }
+    }
+
+    function openCreateConnectorModal() {
+      var modal = document.getElementById('mcpCreateModal');
+      if (modal) modal.style.display = 'flex';
+      var input = document.getElementById('newConnectorNome');
+      if (input) { input.value = ''; input.focus(); }
+    }
+
+    function closeCreateConnectorModal() {
+      var modal = document.getElementById('mcpCreateModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    async function submitCreateConnector() {
+      var nome = (document.getElementById('newConnectorNome').value || '').trim();
+      var agenteTipo = document.getElementById('newConnectorTipo').value;
+      var perfilPermissao = document.getElementById('newConnectorPerfil').value;
+
+      if (!nome) {
+        alert('Por favor, indique um nome de identificação para o conetor (ex: Claude Web - Dr. Manuel).');
+        return;
+      }
+
+      try {
+        var res = await fetch('/api/mcp/governance/connectors/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            nome: nome,
+            agenteTipo: agenteTipo,
+            perfilPermissao: perfilPermissao,
+            criadoPor: activeAuthRole === 'ADMIN' ? 'ADMIN' : 'DIRETOR'
+          })
+        });
+        var data = await res.json();
+        if (data.ok) {
+          closeCreateConnectorModal();
+          loadMcpGovernanceData();
+          var fb = document.getElementById('mcpFeedbackNotice');
+          if (fb) {
+            fb.style.display = 'block';
+            fb.textContent = '✅ Conetor "' + nome + '" criado com sucesso! Chave gerada pronta a usar.';
+            setTimeout(function() { fb.style.display = 'none'; }, 4000);
+          }
+        } else {
+          alert('Erro ao criar conetor: ' + (data.error || 'Erro desconhecido'));
+        }
+      } catch (err) {
+        alert('Erro ao criar conetor: ' + err.message);
+      }
+    }
+
+    async function toggleConnectorAction(connectorId, novoAtivo) {
+      try {
+        var res = await fetch('/api/mcp/governance/connectors/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ connectorId: connectorId, ativo: novoAtivo })
+        });
+        var data = await res.json();
+        if (data.ok) {
+          loadMcpGovernanceData();
+        } else {
+          alert('Erro ao alterar conetor: ' + (data.error || 'Erro desconhecido'));
+        }
+      } catch (err) {
+        alert('Erro ao comunicar com o servidor: ' + err.message);
+      }
+    }
+
+    async function deleteConnectorAction(connectorId) {
+      if (!confirm('Tem a certeza que deseja eliminar permanentemente este conetor? Qualquer agente que use esta chave deixará de ter acesso.')) return;
+
+      try {
+        var res = await fetch('/api/mcp/governance/connectors/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ connectorId: connectorId })
+        });
+        var data = await res.json();
+        if (data.ok) {
+          loadMcpGovernanceData();
+        } else {
+          alert('Erro ao eliminar conetor: ' + (data.error || 'Erro desconhecido'));
+        }
+      } catch (err) {
+        alert('Erro ao comunicar com o servidor: ' + err.message);
+      }
+    }
+
+    async function disconnectSessionAction(sessionId) {
+      if (!confirm('Deseja desconectar imediatamente esta sessão em direto? O cliente MCP será desligado na hora.')) return;
+
+      try {
+        var res = await fetch('/api/mcp/governance/sessions/disconnect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: sessionId })
+        });
+        var data = await res.json();
+        if (data.ok) {
+          loadMcpGovernanceData();
+        } else {
+          alert('Erro ao desconectar sessão: ' + (data.error || 'Erro desconhecido'));
+        }
+      } catch (err) {
+        alert('Erro ao comunicar com o servidor: ' + err.message);
+      }
+    }
+
+    function copyConnectorUrl(token) {
+      var url = window.location.origin + '/mcp?token=' + encodeURIComponent(token);
+      navigator.clipboard.writeText(url);
+      var fb = document.getElementById('mcpFeedbackNotice');
+      if (fb) {
+        fb.style.display = 'block';
+        fb.textContent = '📋 URL copiado para a área de transferência! Cole diretamente no Claude Web: ' + url;
+        setTimeout(function() { fb.style.display = 'none'; }, 4000);
+      }
+    }
+
     // ==========================================
     // FINOPS & TELEMETRIA IA (CONSUMO DE TOKENS)
     // ==========================================

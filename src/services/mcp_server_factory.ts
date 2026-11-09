@@ -27,8 +27,27 @@ import {
   toolConsultarCampanhasAtivasEHistorico,
   toolAtivarCampanhaFarmacia,
 } from './mcp_pharma_tools.js';
+import { checkToolPermission } from './mcp_governance.js';
 
-export function createPharmaMcpServer(prisma: PrismaClient, secContext: ToolSecurityContext): Server {
+export interface McpServerOptions {
+  perfilPermissao?: string;
+  connectorId?: string;
+  ip?: string;
+  userAgent?: string;
+  onAudit?: (data: {
+    ferramenta: string;
+    parametros: any;
+    sucesso: boolean;
+    duracaoMs: number;
+    error?: string;
+  }) => Promise<void>;
+}
+
+export function createPharmaMcpServer(
+  prisma: PrismaClient,
+  secContext: ToolSecurityContext,
+  options?: McpServerOptions
+): Server {
   const server = new Server(
     {
       name: `bi-pharma-${secContext.farmaciaNome.toLowerCase().replace(/[^a-z0-9]/g, '-')}`,
@@ -272,6 +291,30 @@ export function createPharmaMcpServer(prisma: PrismaClient, secContext: ToolSecu
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    const t0 = Date.now();
+
+    // 1. Verificação de Permissão do Perfil de Segurança
+    const permCheck = checkToolPermission(options?.perfilPermissao || 'COMPLETO', name);
+    if (!permCheck.allowed) {
+      if (options?.onAudit) {
+        options.onAudit({
+          ferramenta: name,
+          parametros: args,
+          sucesso: false,
+          duracaoMs: Date.now() - t0,
+          error: permCheck.reason,
+        }).catch(() => {});
+      }
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: `⛔ [ACESSO RECUSADO POR GOVERNANÇA]: ${permCheck.reason}`,
+          },
+        ],
+      };
+    }
 
     try {
       let result: any;
@@ -340,6 +383,15 @@ export function createPharmaMcpServer(prisma: PrismaClient, secContext: ToolSecu
           throw new Error(`Ferramenta desconhecida: "${name}"`);
       }
 
+      if (options?.onAudit) {
+        options.onAudit({
+          ferramenta: name,
+          parametros: args,
+          sucesso: true,
+          duracaoMs: Date.now() - t0,
+        }).catch(() => {});
+      }
+
       return {
         content: [
           {
@@ -349,6 +401,16 @@ export function createPharmaMcpServer(prisma: PrismaClient, secContext: ToolSecu
         ],
       };
     } catch (error: any) {
+      if (options?.onAudit) {
+        options.onAudit({
+          ferramenta: name,
+          parametros: args,
+          sucesso: false,
+          duracaoMs: Date.now() - t0,
+          error: error.message,
+        }).catch(() => {});
+      }
+
       return {
         isError: true,
         content: [
