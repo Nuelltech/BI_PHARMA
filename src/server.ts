@@ -22,6 +22,15 @@ import { addDiscontinuedCnp, removeDiscontinuedCnp, getDiscontinuedList } from '
 import { ToolSecurityContext } from './services/mcp_pharma_tools';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { createPharmaMcpServer } from './services/mcp_server_factory';
+import {
+  getBaseIssuerUrl,
+  getProtectedResourceMetadata,
+  getAuthorizationServerMetadata,
+  registerOAuthClient,
+  createOAuthAuthorizationCode,
+  exchangeOAuthToken,
+  renderOAuthConsentPage,
+} from './services/mcp_oauth';
 
 import {
   resolveMcpAuthentication,
@@ -456,7 +465,11 @@ async function startServer() {
       const parsedUrl = url.parse(req.url || '/', true);
       const pathname = parsedUrl.pathname || '/';
 
-      const isMcpRoute = pathname.startsWith('/mcp') || pathname.startsWith('/sse');
+      const isMcpRoute =
+        pathname.startsWith('/mcp') ||
+        pathname.startsWith('/sse') ||
+        pathname.startsWith('/oauth') ||
+        pathname.startsWith('/.well-known');
       const allowedOrigin = isMcpRoute
         ? (req.headers.origin || '*')
         : (process.env.ALLOWED_ORIGIN || (IS_PROD ? '' : '*'));
@@ -599,6 +612,243 @@ async function startServer() {
           throw err;
         }
         return f;
+      }
+
+      // ======================================================================
+      // 🔐 MCP OAUTH 2.1 & METADATA (RFC 8414, RFC 9728, RFC 7591)
+      // ======================================================================
+      const baseUrl = getBaseIssuerUrl(req);
+
+      if (
+        pathname === '/.well-known/oauth-protected-resource' ||
+        pathname === '/.well-known/oauth-protected-resource/mcp' ||
+        pathname === '/mcp/.well-known/oauth-protected-resource'
+      ) {
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(JSON.stringify(getProtectedResourceMetadata(baseUrl)));
+        return;
+      }
+
+      if (
+        pathname === '/.well-known/oauth-authorization-server' ||
+        pathname === '/.well-known/openid-configuration'
+      ) {
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(JSON.stringify(getAuthorizationServerMetadata(baseUrl)));
+        return;
+      }
+
+      if (pathname === '/oauth/jwks') {
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(JSON.stringify({ keys: [] }));
+        return;
+      }
+
+      if (pathname === '/oauth/register' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          let bodyObj = {};
+          try {
+            bodyObj = JSON.parse(rawBody || '{}');
+          } catch {}
+          const registered = registerOAuthClient(baseUrl, bodyObj);
+          res.writeHead(201, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Access-Control-Allow-Origin': '*',
+          });
+          res.end(JSON.stringify(registered));
+        } catch (err: any) {
+          res.writeHead(400, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Access-Control-Allow-Origin': '*',
+          });
+          res.end(JSON.stringify({ error: 'invalid_client_metadata', error_description: err?.message || 'Erro ao registar cliente OAuth' }));
+        }
+        return;
+      }
+
+      if (pathname === '/oauth/authorize') {
+        const farmacias = await prisma.farmacia.findMany({
+          orderBy: { criadoEm: 'asc' },
+          select: { id: true, nome: true, nif: true, codigo_acesso: true },
+        });
+
+        if (req.method === 'GET') {
+          const clientId = String(parsedUrl.query.client_id || '');
+          const redirectUri = String(parsedUrl.query.redirect_uri || 'https://claude.ai/api/mcp/auth_callback');
+          const state = String(parsedUrl.query.state || '');
+          const codeChallenge = String(parsedUrl.query.code_challenge || '');
+          const codeChallengeMethod = String(parsedUrl.query.code_challenge_method || 'S256');
+          const autoApprove = parsedUrl.query.auto === '1' || parsedUrl.query.auto_approve === 'true';
+
+          if (autoApprove && farmacias.length > 0) {
+            const targetFarm = farmacias[0];
+            const authCode = createOAuthAuthorizationCode({
+              clientId,
+              redirectUri,
+              codeChallenge,
+              codeChallengeMethod,
+              state,
+              farmaciaId: targetFarm.id,
+              farmaciaNome: targetFarm.nome,
+              perfilPermissao: 'COMPLETO',
+            });
+            const redirectUrl = new URL(redirectUri);
+            redirectUrl.searchParams.set('code', authCode);
+            if (state) redirectUrl.searchParams.set('state', state);
+            redirectUrl.searchParams.set('iss', baseUrl);
+            res.writeHead(302, { Location: redirectUrl.toString() });
+            res.end();
+            return;
+          }
+
+          const html = renderOAuthConsentPage({
+            baseUrl,
+            clientId,
+            redirectUri,
+            state,
+            codeChallenge,
+            codeChallengeMethod,
+            farmacias,
+          });
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(html);
+          return;
+        }
+
+        if (req.method === 'POST') {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const contentType = String(req.headers['content-type'] || '');
+          const params: Record<string, string> = {};
+          if (contentType.includes('application/json')) {
+            try {
+              const obj = JSON.parse(rawBody || '{}');
+              for (const [k, v] of Object.entries(obj)) params[k] = String(v);
+            } catch {}
+          } else {
+            const searchParams = new URLSearchParams(rawBody);
+            for (const [k, v] of searchParams.entries()) params[k] = v;
+          }
+
+          const clientId = params.client_id || String(parsedUrl.query.client_id || '');
+          const redirectUri = params.redirect_uri || String(parsedUrl.query.redirect_uri || 'https://claude.ai/api/mcp/auth_callback');
+          const state = params.state || String(parsedUrl.query.state || '');
+          const codeChallenge = params.code_challenge || String(parsedUrl.query.code_challenge || '');
+          const codeChallengeMethod = params.code_challenge_method || String(parsedUrl.query.code_challenge_method || 'S256');
+          const farmaciaId = params.farmacia_id || (farmacias[0]?.id ?? '');
+          const perfilPermissao = (params.perfil_permissao as McpPermissionProfile) || 'COMPLETO';
+
+          const chosenFarm = farmacias.find((f) => f.id === farmaciaId) || farmacias[0];
+          if (!chosenFarm) {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Nenhuma farmácia disponível para autorização.');
+            return;
+          }
+
+          const authCode = createOAuthAuthorizationCode({
+            clientId,
+            redirectUri,
+            codeChallenge,
+            codeChallengeMethod,
+            state,
+            farmaciaId: chosenFarm.id,
+            farmaciaNome: chosenFarm.nome,
+            perfilPermissao: perfilPermissao,
+          });
+
+          const redirectUrl = new URL(redirectUri);
+          redirectUrl.searchParams.set('code', authCode);
+          if (state) redirectUrl.searchParams.set('state', state);
+          redirectUrl.searchParams.set('iss', baseUrl);
+
+          res.writeHead(302, { Location: redirectUrl.toString() });
+          res.end();
+          return;
+        }
+      }
+
+      if (pathname === '/oauth/token' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const contentType = String(req.headers['content-type'] || '');
+          const params: Record<string, string> = {};
+          if (contentType.includes('application/json')) {
+            try {
+              const obj = JSON.parse(rawBody || '{}');
+              for (const [k, v] of Object.entries(obj)) params[k] = String(v);
+            } catch {}
+          } else {
+            const searchParams = new URLSearchParams(rawBody);
+            for (const [k, v] of searchParams.entries()) params[k] = v;
+          }
+
+          const grantType = params.grant_type;
+          const code = params.code;
+          const codeVerifier = params.code_verifier;
+          const clientId = params.client_id;
+          const redirectUri = params.redirect_uri;
+
+          if (grantType !== 'authorization_code') {
+            res.writeHead(400, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Access-Control-Allow-Origin': '*',
+            });
+            res.end(JSON.stringify({ error: 'unsupported_grant_type', error_description: 'Apenas authorization_code é suportado.' }));
+            return;
+          }
+
+          if (!code) {
+            res.writeHead(400, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Access-Control-Allow-Origin': '*',
+            });
+            res.end(JSON.stringify({ error: 'invalid_request', error_description: 'O parâmetro code é obrigatório.' }));
+            return;
+          }
+
+          const tokenResult = await exchangeOAuthToken(prisma, {
+            code,
+            codeVerifier,
+            clientId,
+            redirectUri,
+          });
+
+          res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-store',
+            'Pragma': 'no-cache',
+          });
+          res.end(
+            JSON.stringify({
+              access_token: tokenResult.accessToken,
+              token_type: tokenResult.tokenType,
+              expires_in: tokenResult.expiresIn,
+              scope: tokenResult.scope,
+            })
+          );
+        } catch (err: any) {
+          res.writeHead(400, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Access-Control-Allow-Origin': '*',
+          });
+          res.end(
+            JSON.stringify({
+              error: 'invalid_grant',
+              error_description: err?.message || 'Falha ao trocar código de autorização.',
+            })
+          );
+        }
+        return;
       }
 
       // ======================================================================
@@ -5929,7 +6179,7 @@ function getDashboardHtml(): string {
 
         if (loadingEl) loadingEl.style.display = 'none';
         if (contentEl) contentEl.style.display = 'block';
-      } catch (err) {
+      } catch (err: any) {
         console.error('Erro ao carregar governança MCP:', err);
         if (loadingEl) loadingEl.style.display = 'none';
         alert('Erro ao carregar dados de governança: ' + err.message);
