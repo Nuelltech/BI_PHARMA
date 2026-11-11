@@ -7,6 +7,7 @@ import {
   exploreVocabulary,
   getPharmacyCatalog,
   searchCatalog,
+  getSmartCrossSelling,
 } from './product_catalog';
 
 // ============================================================================
@@ -32,7 +33,9 @@ REGRAS:
 4. "temos", "em stock", "disponível", "o que há" → apenas_com_stock=true. "esgotado", "em falta", "rutura" → apenas_sem_stock=true. "mais vendidos" → ordenar_por="vendas"; "mais margem" → "margem"; "mais lucro/dinheiro" → "lucro".
 5. Antes de entregar, REVÊ a lista: exclui falsos positivos que não correspondem à intenção do utilizador (ex: água termal "Avène Eau Thermal" não é perfume; "pérolas perfumadas" e repelentes "Perfume Protect" não são perfumes; "Nexium Control" não é um preservativo). Se a pesquisa ficou demasiado larga ou vazia, refaz com outros termos.
 6. Para análises de gestão (eliminar laboratórios parados, ajustar stocks, aumento/crescimento de vendas nos últimos meses [analise_aumento_vendas], queda/quebra de vendas [analise_queda_vendas], substituição de produtos, campanhas sazonais, venda cruzada, melhor margem por DCI, trade-off volume/margem, comparar produtos, perfis clínicos, stock parado para cardíacos) usa diretamente a ferramenta analítica correspondente. Atenção: distingue sempre AUMENTO/SUBIDA de vendas (analise_aumento_vendas) de QUEDA/QUEBRA de vendas (analise_queda_vendas).
-7. Em entregar_resposta, resposta_curta tem 1 a 3 frases em português de Portugal e responde diretamente à pergunta. Não escrevas totais numéricos — o sistema calcula-os e mostra-os.`;
+7. Em entregar_resposta, resposta_curta tem 1 a 3 frases em português de Portugal e responde diretamente à pergunta. Não escrevas totais numéricos — o sistema calcula-os e mostra-os.
+8. Para perguntas de venda cruzada, packs ou produtos complementares (ex: "o que sugerir com este produto", "cross-selling de Ibuprofeno", "que complementar com antibiótico"), usa SEMPRE sugerir_venda_cruzada para garantir que nunca há duplicação perigosa de DCI ou AINEs e que MSRMs não são recomendados por impulso.
+9. Podes filtrar diretamente por dci (ex: "Paracetamol", "Ibuprofeno") ou laboratorio (ex: "Pierre Fabre", "Generis", "Isdin") na ferramenta pesquisar_produtos.`;
 
 const AGENT_TOOLS = [
   {
@@ -73,10 +76,30 @@ const AGENT_TOOLS = [
           description: 'Filtro de estatuto/segmento',
         },
         categoria: { type: 'string', description: 'Texto a procurar na categoria interna (opcional)' },
+        dci: { type: 'string', description: 'Princípio Ativo / DCI exato (ex: "Ibuprofeno", "Paracetamol", "Óxido de zinco")' },
+        laboratorio: { type: 'string', description: 'Laboratório ou marca fabricante (ex: "Pierre Fabre", "Generis", "Isdin", "Bayer")' },
+        papel_recomendacao: {
+          type: 'string',
+          enum: ['TRATAMENTO_PRINCIPAL', 'ALIVIO_SINTOMATICO', 'COADJUVANTE_PROTECAO', 'HIGIENE_BARREIRA', 'CUIDADO_ROTINA', 'TRATAMENTO_PRESCRITO'],
+          description: 'Papel do produto no cesto',
+        },
         ordenar_por: { type: 'string', enum: ['vendas', 'lucro', 'margem', 'stock', 'faturacao', 'nome'] },
         limite: { type: 'number', description: 'Máximo de resultados (opcional)' },
       },
       required: ['grupos_termos'],
+    },
+  },
+  {
+    name: 'sugerir_venda_cruzada',
+    description:
+      'Gera recomendações de cross-selling ou packs complementares seguros para um produto, aplicando guard-rails clínicos (sem duplicação de DCI, sem duplicação de AINEs, sem MSRM). Devolve os produtos compatíveis com maior margem e stock.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        cnp: { type: 'string', description: 'Código CNP do artigo principal para o qual se procura complemento' },
+        limite: { type: 'number', description: 'Número de sugestões desejadas (default: 5)' },
+      },
+      required: ['cnp'],
     },
   },
   {
@@ -231,6 +254,9 @@ export async function runCopilotAgent(
           apenas_sem_stock: !!input.apenas_sem_stock,
           segmento: input.segmento,
           categoria: input.categoria,
+          dci: input.dci,
+          laboratorio: input.laboratorio,
+          papel_recomendacao: input.papel_recomendacao,
           ordenar_por: input.ordenar_por,
           limite: input.limite,
         };
@@ -238,6 +264,26 @@ export async function runCopilotAgent(
         lastRows = searchCatalog(catalog, params);
         trace.push(`pesquisar_produtos(${describeParams(params)}) → ${lastRows.length}`);
         toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: formatRowsForLlm(lastRows) });
+        continue;
+      }
+
+      // 3.1. Recomendação de venda cruzada segura
+      if (tu.name === 'sugerir_venda_cruzada') {
+        const cnp = String(input.cnp || '').trim();
+        const limite = input.limite || 5;
+        trace.push(`sugerir_venda_cruzada(${cnp})`);
+        const suggestions = getSmartCrossSelling(cnp, catalog, limite);
+        lastRows = suggestions.map((s) => s.produto);
+        const txt =
+          suggestions.length > 0
+            ? suggestions
+                .map(
+                  (s, idx) =>
+                    `${idx + 1}. [${s.produto.cnp}] ${s.produto.designacao} (Stock: ${s.produto.stock}, PVP: ${s.produto.pvp.toFixed(2)}€, Margem: ${s.produto.margem.toFixed(1)}%)\n   Papel: ${s.papel} | Segurança: ${s.seguranca}\n   Motivo: ${s.motivoClinico}`
+                )
+                .join('\n\n')
+            : 'Não foram encontradas sugestões seguras com stock para este artigo.';
+        toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: txt });
         continue;
       }
 

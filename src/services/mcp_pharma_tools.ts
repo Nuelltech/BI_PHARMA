@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import { getPharmacyCatalog, CatalogItem } from './product_catalog.js';
+import { getPharmacyCatalog, CatalogItem, getSmartCrossSelling } from './product_catalog.js';
 import { getDiscontinuedCnps } from './discontinued_products.js';
 
 // ============================================================================
@@ -2597,5 +2597,57 @@ export async function toolAtivarCampanhaFarmacia(
     },
     tarefasGeradasParaEquipa: res.tarefasCriadas,
     mensagem: `🎯 Campanha "${res.campanhaAtiva.titulo}" ATIVADA com sucesso na Farmácia! Foram geradas ${res.tarefasCriadas} tarefas operacionais na Folha da Semana e na interface mobile da equipa.`,
+  };
+}
+
+/**
+ * 23. Sugerir Venda Cruzada e Produtos Complementares Seguros (Base de Dados Rica)
+ */
+export async function toolSugerirVendaCruzadaEComplementares(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: { cnp: string; limite?: number }
+) {
+  const catalog = await getPharmacyCatalog(prisma, ctx.farmaciaId);
+  const target = catalog.find((i) => i.cnp === args.cnp.trim());
+
+  if (!target) {
+    return {
+      success: false,
+      mensagem: `Artigo com CNP ${args.cnp} não encontrado no inventário da farmácia ${ctx.farmaciaNome}.`,
+    };
+  }
+
+  const sugestoes = getSmartCrossSelling(target.cnp, catalog, args.limite || 5);
+
+  return {
+    success: true,
+    produtoAlvo: {
+      cnp: target.cnp,
+      designacao: target.designacao,
+      dci: target.dci,
+      dosagem: target.dosagem,
+      laboratorio: target.laboratorioTitular,
+      categoria: target.categoria,
+      papel: target.papelRecomendacao,
+      stock: target.stock,
+      pvp: target.pvp,
+      margemPct: target.margem,
+    },
+    totalSugestoes: sugestoes.length,
+    sugestoesComplementares: sugestoes.map((s) => ({
+      cnp: s.produto.cnp,
+      designacao: s.produto.designacao,
+      dci: s.produto.dci,
+      dosagem: s.produto.dosagem,
+      laboratorio: s.produto.laboratorioTitular,
+      categoria: s.produto.categoria,
+      papel: s.papel,
+      motivoClinico: s.motivoClinico,
+      seguranca: s.seguranca,
+      stockAtual: s.produto.stock,
+      pvp: s.produto.pvp,
+      margemPct: s.produto.margem,
+    })),
   };
 }

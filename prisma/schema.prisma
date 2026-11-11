@@ -47,6 +47,15 @@ model ProdutoMestre {
   pvp                     Decimal?            @db.Decimal(10, 2)
   margem_padrao           Decimal?            @db.Decimal(10, 2)
   taxa_iva                Int?
+  dci                     String?             // DCI / Princípio Ativo (auditado)
+  dosagem                 String?             // Dosagem normalizada (ex: 500 mg, 1000 mg)
+  forma_farmaceutica      String?             // Forma galénica (Comprimido, Xarope, Gel, etc.)
+  embalagem               String?             // Descrição da embalagem / volume
+  laboratorio_titular     String?             // Fabricante / Titular de AIM
+  indicacoes_clinicas     String?             // Finalidade terapêutica / o que faz
+  papel_recomendacao      String?             // TRATAMENTO_PRINCIPAL, ALIVIO_SINTOMATICO, COADJUVANTE_PROTECAO, HIGIENE_BARREIRA
+  contraindicacoes_aviso  String?             // Alertas clínicos (ex: duplicado_aines, evitar_hipertensao, etc.)
+  fonte_enriquecimento    String?             // INFARMED_OFICIAL, FIRSTPHARMA_HMR, SIFARMA_DESCRICAO
   inventarios             Inventario[]
   inventariosSnapshot     InventarioSnapshot[]
   vendas                  Venda[]

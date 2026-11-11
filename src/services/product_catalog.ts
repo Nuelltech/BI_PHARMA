@@ -15,7 +15,7 @@ import type { CopilotResponse } from './copilot';
 export interface CatalogItem {
   cnp: string;
   designacao: string;
-  norm: string; // designação normalizada + categoria + subcategoria + DCI
+  norm: string; // designação normalizada + categoria + subcategoria + DCI + marca + papel
   categoria: string;
   normCategoria: string;
   subcategoria?: string;
@@ -26,6 +26,16 @@ export interface CatalogItem {
   ehGenerico: boolean;
   moleculaDci?: string | null;
   grupoDci?: string | null;
+  // Atributos de Informação Técnica Rica (Auditados)
+  dci?: string | null;
+  dosagem?: string | null;
+  formaFarmaceutica?: string | null;
+  embalagem?: string | null;
+  laboratorioTitular?: string | null;
+  indicacoesClinicas?: string | null;
+  papelRecomendacao?: string | null; // TRATAMENTO_PRINCIPAL | ALIVIO_SINTOMATICO | COADJUVANTE_PROTECAO | HIGIENE_BARREIRA | CUIDADO_ROTINA | TRATAMENTO_PRESCRITO
+  contraindicacoesAviso?: string | null;
+  fonteEnriquecimento?: string | null;
   stock: number;
   custo: number;
   pvp: number;
@@ -42,6 +52,9 @@ export interface CatalogSearchParams {
   apenas_sem_stock?: boolean;
   segmento?: 'VENDA_LIVRE' | 'MNSRM' | 'MSRM' | 'GENERICO' | 'SEM_RECEITA' | 'TODOS';
   categoria?: string;
+  dci?: string;
+  laboratorio?: string;
+  papel_recomendacao?: string;
   ordenar_por?: 'vendas' | 'lucro' | 'margem' | 'stock' | 'faturacao' | 'nome';
   limite?: number;
 }
@@ -124,6 +137,15 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
       categoria: true,
       subcategoria: true,
       sazonalidade: true,
+      dci: true,
+      dosagem: true,
+      forma_farmaceutica: true,
+      embalagem: true,
+      laboratorio_titular: true,
+      indicacoes_clinicas: true,
+      papel_recomendacao: true,
+      contraindicacoes_aviso: true,
+      fonte_enriquecimento: true,
     },
   });
 
@@ -171,9 +193,15 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
 
     const cat = p.categoria || c.categoria || '';
     const subcat = p.subcategoria || c.subcategoria || '';
-    const dci = c.molecula_dci || '';
-    // Incluir designação, categoria, subcategoria e DCI na string pesquisável
-    const searchableText = `${p.designacao} ${cat} ${subcat} ${dci}`;
+    const dci = p.dci || c.molecula_dci || '';
+    const lab = p.laboratorio_titular || '';
+    const ind = p.indicacoes_clinicas || '';
+    const papel = p.papel_recomendacao || '';
+    const dosagem = p.dosagem || '';
+    const embalagem = p.embalagem || '';
+
+    // Incluir designação, categoria, subcategoria, DCI, laboratório/marca, dosagem e papel na string pesquisável
+    const searchableText = `${p.designacao} ${cat} ${subcat} ${dci} ${lab} ${ind} ${papel} ${dosagem} ${embalagem}`;
 
     return {
       cnp: p.cnp_codigo,
@@ -187,8 +215,17 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
       sazonalidade: p.sazonalidade || c.sazonalidade,
       tipoVenda: c.tipo_venda,
       ehGenerico: !!c.eh_generico,
-      moleculaDci: c.molecula_dci,
+      moleculaDci: c.molecula_dci || p.dci,
       grupoDci: c.grupo_equivalencia_dci,
+      dci: dci || null,
+      dosagem: dosagem || null,
+      formaFarmaceutica: p.forma_farmaceutica || null,
+      embalagem: embalagem || null,
+      laboratorioTitular: lab || null,
+      indicacoesClinicas: ind || null,
+      papelRecomendacao: papel || null,
+      contraindicacoesAviso: p.contraindicacoes_aviso || null,
+      fonteEnriquecimento: p.fonte_enriquecimento || null,
       stock: inv?.stock || 0,
       custo,
       pvp,
@@ -262,6 +299,9 @@ export function searchCatalog(items: CatalogItem[], params: CatalogSearchParams)
     }
 
     if (categoriaNorm && !it.normCategoria.includes(categoriaNorm)) return false;
+    if (params.dci && (!it.dci || !normalizeText(it.dci).includes(normalizeText(params.dci)))) return false;
+    if (params.laboratorio && (!it.laboratorioTitular || !normalizeText(it.laboratorioTitular).includes(normalizeText(params.laboratorio)))) return false;
+    if (params.papel_recomendacao && it.papelRecomendacao !== params.papel_recomendacao) return false;
     if (excluir.some((t) => termMatches(it.norm, t))) return false;
     if (grupos.length > 0 && !grupos.every((g) => g.some((t) => termMatches(it.norm, t)))) return false;
     return true;
@@ -519,4 +559,181 @@ export async function localSmartSearch(
       (filtros.length ? `; filtros: ${filtros.join(', ')}` : '') +
       `. Ordenado por ${params.ordenar_por}. Clique num produto para ver o histórico.`,
   });
+}
+
+// ============================================================================
+// MOTOR DE RECOMENDAÇÃO CLÍNICA & CROSS-SELLING SEGURO (ZERO ERROS GROSSEIROS)
+// ============================================================================
+
+export interface CrossSellingSuggestion {
+  produto: CatalogItem;
+  papel: string;
+  motivoClinico: string;
+  seguranca: string;
+}
+
+export function getSmartCrossSelling(targetCnp: string, catalog: CatalogItem[], limite = 5): CrossSellingSuggestion[] {
+  const target = catalog.find((i) => i.cnp === targetCnp);
+  if (!target) return [];
+
+  const targetDci = (target.dci || '').toLowerCase();
+  const targetCat = (target.categoria || '').toLowerCase();
+  const targetSubcat = (target.subcategoria || '').toLowerCase();
+  const targetAvisos = (target.contraindicacoesAviso || '').toLowerCase();
+
+  const isNsaid =
+    targetDci.includes('ibuprofeno') ||
+    targetDci.includes('cetoprofeno') ||
+    targetDci.includes('diclofenac') ||
+    targetDci.includes('naproxeno') ||
+    targetDci.includes('ácido acetilsalicílico') ||
+    targetDci.includes('acido acetilsalicilico');
+
+  const isAntibiotic =
+    targetDci.includes('amoxicilina') ||
+    targetDci.includes('azitromicina') ||
+    targetDci.includes('ciprofloxacina') ||
+    targetDci.includes('clavulanico') ||
+    targetCat.includes('antibiot');
+
+  const isGripesOuDor = targetCat.includes('dor') || targetCat.includes('gripe') || targetCat.includes('respirat');
+  const isSolar = targetSubcat.includes('solar') || targetCat.includes('solar');
+  const isAcne = targetSubcat.includes('acne') || targetCat.includes('acne');
+  const isPodologia = targetCat.includes('podologia') || targetSubcat.includes('podologia') || targetSubcat.includes('fungos');
+
+  const suggestions: CrossSellingSuggestion[] = [];
+  const seenCnps = new Set<string>([target.cnp]);
+
+  // Candidatos seguros: apenas artigos de venda livre ou MNSRM, com stock > 0
+  const pool = catalog.filter((it) => it.cnp !== target.cnp && it.stock > 0 && it.tipoVenda !== 'MSRM');
+
+  for (const item of pool) {
+    if (seenCnps.has(item.cnp)) continue;
+    const itemDci = (item.dci || '').toLowerCase();
+    const itemCat = (item.categoria || '').toLowerCase();
+    const itemSubcat = (item.subcategoria || '').toLowerCase();
+    const itemNorm = item.norm;
+
+    // GUARD-RAIL 1: NUNCA duplicar o mesmo DCI / Princípio Ativo
+    if (targetDci && itemDci && (itemDci.includes(targetDci) || targetDci.includes(itemDci))) {
+      continue;
+    }
+
+    // GUARD-RAIL 2: NUNCA duplicar AINEs orais (ex: Ibuprofeno + Aspirina)
+    if (isNsaid && (itemDci.includes('ibuprofeno') || itemDci.includes('cetoprofeno') || itemDci.includes('naproxeno') || itemDci.includes('acetilsalicilico'))) {
+      continue;
+    }
+
+    // REGRA 1: Antibiótico -> Probiótico / Flora Intestinal (mitigador de efeito secundário)
+    if (isAntibiotic && (itemCat.includes('probiot') || itemSubcat.includes('probiot') || itemNorm.includes('probiot') || itemNorm.includes('flora'))) {
+      suggestions.push({
+        produto: item,
+        papel: 'COADJUVANTE_PROTECAO',
+        motivoClinico: 'Reposição da flora intestinal e prevenção de diarreia associada ao antibiótico (tomar com 2h de intervalo).',
+        seguranca: '✅ Seguro · Sem sobreposição química',
+      });
+      seenCnps.add(item.cnp);
+      continue;
+    }
+
+    // REGRA 2: AINE Oral -> Gel/Pomada Tópica ou Protetor de Barreira Gástrica
+    if (isNsaid) {
+      if (itemSubcat.includes('dor topica') || itemNorm.includes('gel topico') || itemNorm.includes('pomada')) {
+        suggestions.push({
+          produto: item,
+          papel: 'ALIVIO_SINTOMATICO',
+          motivoClinico: 'Ação analgésica e anti-inflamatória tópica localizada para reforçar o alívio sem sobrecarregar a via oral.',
+          seguranca: '✅ Seguro · Aplicação tópica complementar',
+        });
+        seenCnps.add(item.cnp);
+        continue;
+      }
+      if (itemCat.includes('digestiv') || itemSubcat.includes('azia') || itemNorm.includes('antiacido')) {
+        suggestions.push({
+          produto: item,
+          papel: 'COADJUVANTE_PROTECAO',
+          motivoClinico: 'Proteção da mucosa gástrica contra irritação gástrica provocada pelo anti-inflamatório.',
+          seguranca: '✅ Seguro · Barreira digestiva',
+        });
+        seenCnps.add(item.cnp);
+        continue;
+      }
+    }
+
+    // REGRA 3: Dor / Gripes -> Lavagem Salina, Pastilhas Garganta ou Vitamina C
+    if (isGripesOuDor) {
+      if (itemSubcat.includes('garganta') || itemNorm.includes('pastilhas garganta') || itemNorm.includes('spray garganta')) {
+        suggestions.push({
+          produto: item,
+          papel: 'ALIVIO_SINTOMATICO',
+          motivoClinico: 'Alívio local da irritação da garganta e dor ao engolir.',
+          seguranca: '✅ Seguro · Ação antissética e emoliente local',
+        });
+        seenCnps.add(item.cnp);
+        continue;
+      }
+      if (itemNorm.includes('agua do mar') || itemNorm.includes('soro') || itemSubcat.includes('descongestionante')) {
+        suggestions.push({
+          produto: item,
+          papel: 'HIGIENE_BARREIRA',
+          motivoClinico: 'Desobstrução e lavagem mecânica das fossas nasais para acelerar a recuperação respiratória.',
+          seguranca: '✅ Seguro · Solução salina natural',
+        });
+        seenCnps.add(item.cnp);
+        continue;
+      }
+    }
+
+    // REGRA 4: Protetor Solar -> Pós-Solar / After-Sun ou Bálsamo Labial
+    if (isSolar) {
+      if (itemNorm.includes('pos-solar') || itemNorm.includes('after sun') || itemNorm.includes('after-sun') || itemNorm.includes('leite reparador')) {
+        suggestions.push({
+          produto: item,
+          papel: 'COADJUVANTE_PROTECAO',
+          motivoClinico: 'Hidratação profunda e reparação celular pós-exposição solar.',
+          seguranca: '✅ Sinergia Dermocosmética',
+        });
+        seenCnps.add(item.cnp);
+        continue;
+      }
+      if (itemNorm.includes('labial') && (itemNorm.includes('solar') || itemNorm.includes('batom'))) {
+        suggestions.push({
+          produto: item,
+          papel: 'HIGIENE_BARREIRA',
+          motivoClinico: 'Proteção labial específica contra radiação UV e cieiro.',
+          seguranca: '✅ Sinergia Dermocosmética',
+        });
+        seenCnps.add(item.cnp);
+        continue;
+      }
+    }
+
+    // REGRA 5: Tratamento Antiacne -> Creme Hidratante Compensador
+    if (isAcne && (itemNorm.includes('compens') || itemNorm.includes('hydra') || itemNorm.includes('reparador') || itemNorm.includes('b5'))) {
+      suggestions.push({
+        produto: item,
+        papel: 'COADJUVANTE_PROTECAO',
+        motivoClinico: 'Hidratação e alívio da descamação provocada por tratamentos secantes antiacne.',
+        seguranca: '✅ Sem risco de oclusão de poros',
+      });
+      seenCnps.add(item.cnp);
+      continue;
+    }
+
+    // REGRA 6: Podologia / Fungos -> Acessórios ou Pó Secante
+    if (isPodologia && (itemNorm.includes('lima') || itemNorm.includes('raspador') || itemNorm.includes('spray calçado'))) {
+      suggestions.push({
+        produto: item,
+        papel: 'HIGIENE_BARREIRA',
+        motivoClinico: 'Higiene e desinfeção física para evitar re-infeção fúngica.',
+        seguranca: '✅ Acessório complementar seguro',
+      });
+      seenCnps.add(item.cnp);
+      continue;
+    }
+  }
+
+  // Ordenar por maior margem e rotação de vendas da farmácia
+  suggestions.sort((a, b) => b.produto.margem - a.produto.margem || b.produto.vendasQtd - a.produto.vendasQtd);
+  return suggestions.slice(0, limite);
 }

@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import { getPharmacyCatalog, searchCatalog, CatalogItem, normalizeText, termMatches } from './product_catalog';
+import { getPharmacyCatalog, searchCatalog, CatalogItem, normalizeText, termMatches, getSmartCrossSelling } from './product_catalog';
 
 export interface CampaignAxis {
   nome: string;
@@ -2537,7 +2537,17 @@ export async function analyzeProductMarketingAndCrossSell360(
       apenas_com_stock: true,
       segmento: 'SEM_RECEITA',
     })
-      .filter((it) => !seenParceiros.has(it.cnp) && it.pvp > it.custo && it.margem >= 20)
+      .filter((it) => {
+        if (seenParceiros.has(it.cnp)) return false;
+        if (it.pvp <= it.custo || it.margem < 20) return false;
+        // Guard-rail clínico 1: Nunca duplicar o mesmo DCI
+        if (target.dci && it.dci && normalizeText(target.dci) === normalizeText(it.dci)) return false;
+        // Guard-rail clínico 2: Nunca associar dois AINEs orais
+        const isTargetNsaid = (target.dci || '').match(/ibuprofeno|cetoprofeno|diclofenac|naproxeno|acetilsalicilico/i);
+        const isItNsaid = (it.dci || '').match(/ibuprofeno|cetoprofeno|diclofenac|naproxeno|acetilsalicilico/i);
+        if (isTargetNsaid && isItNsaid) return false;
+        return true;
+      })
       .map((it) => {
         const risco = isItemExpiryRisk(it);
         const mono = it.vendasQtd <= 2 && it.stock >= 2;
@@ -2569,6 +2579,27 @@ export async function analyzeProductMarketingAndCrossSell360(
     for (const m of matches.slice(0, 2)) {
       seenParceiros.add(m.cnp);
       parceirosCrossSelling.push(m);
+    }
+  }
+
+  // Complementar com o motor clínico inteligente (getSmartCrossSelling)
+  const smart = getSmartCrossSelling(target.cnp, catalog, 5);
+  for (const s of smart) {
+    if (!seenParceiros.has(s.produto.cnp) && parceirosCrossSelling.length < 6) {
+      seenParceiros.add(s.produto.cnp);
+      const simP = computeSafeAntiDumpingDiscount(s.produto.custo, s.produto.pvp, 10);
+      parceirosCrossSelling.push({
+        cnp: s.produto.cnp,
+        designacao: s.produto.designacao,
+        categoria: s.produto.categoria,
+        tipoVenda: s.produto.tipoVenda,
+        stock: s.produto.stock,
+        pvp: s.produto.pvp,
+        margemPct: Number(s.produto.margem.toFixed(1)),
+        criterioUrgencia: s.seguranca,
+        pvpPromoSugerido: simP.pvpPromo,
+        sinergiaClinica: `${s.papel}: ${s.motivoClinico}`,
+      });
     }
   }
 
