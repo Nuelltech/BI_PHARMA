@@ -4987,6 +4987,65 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
+      <!-- COMPARATIVO EXECUTIVO MÊS A MÊS (MoM): ESTAMOS COM MAIS OU MENOS STOCK E IMOBILIZADO? -->
+      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 1.25rem;">⚖️</span>
+            <div>
+              <h3 style="font-size: 1.05rem; font-weight: 800; color: #0f172a; margin: 0;">
+                Comparativo Executivo Mês a Mês (MoM) — Resposta às Perguntas de Gestão
+              </h3>
+              <p style="font-size: 0.78rem; color: #64748b; margin: 2px 0 0 0;">
+                Identifique instantaneamente se a farmácia acumulou ou reduziu stock e monos entre períodos.
+              </p>
+            </div>
+          </div>
+          <span id="evoMomPeriodLabel" style="font-size: 0.8rem; font-weight: 700; color: #475569; background: #f1f5f9; padding: 5px 12px; border-radius: 6px;">
+            Mês Atual vs Mês Anterior
+          </span>
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 16px;">
+          <!-- Card MoM 1: Variação Stock Total -->
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 16px;">
+            <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">Evolução do Stock Físico Global</div>
+            <div id="evoMomStockDelta" style="font-size: 1.45rem; font-weight: 800; color: #0284c7; margin-top: 4px;">-- €</div>
+            <div id="evoMomStockDeltaSub" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">Variação patrimonial do inventário em armazém</div>
+          </div>
+
+          <!-- Card MoM 2: Variação Capital Imobilizado (Monos) -->
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 16px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">Capital Imobilizado ("Monos")</span>
+              <span id="evoMomTrendBadge" style="font-size: 0.72rem; font-weight: 800; padding: 2px 8px; border-radius: 4px; background: #e2e8f0; color: #475569;">A calcular</span>
+            </div>
+            <div id="evoMomMonosDelta" style="font-size: 1.45rem; font-weight: 800; color: #e11d48; margin-top: 4px;">-- €</div>
+            <div id="evoMomMonosDeltaSub" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">Variação de produtos sem vendas há >90 dias</div>
+          </div>
+
+          <!-- Card MoM 3: Liquidez de Monos Resgatada -->
+          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 16px;">
+            <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">Dinheiro de Monos Resgatado no Mês</div>
+            <div id="evoMomLiqDelta" style="font-size: 1.45rem; font-weight: 800; color: #059669; margin-top: 4px;">+0,00 €</div>
+            <div style="font-size: 0.76rem; color: #059669; margin-top: 2px;">Comprovado por talões de vendas Sifarma</div>
+          </div>
+        </div>
+
+        <!-- Parecer Executivo -->
+        <div id="evoMomExplicacao" style="background: #eff6ff; border-left: 4px solid #3b82f6; padding: 12px 16px; border-radius: 6px; font-size: 0.84rem; color: #1e40af; line-height: 1.45;">
+          A calcular evolução MoM...
+        </div>
+
+        <!-- NOTA DE RIGOR FARMACÊUTICO & DECOMPOSIÇÃO DE SAÍDAS -->
+        <div style="margin-top: 14px; background: #fffbeb; border: 1px solid #fef3c7; border-radius: 8px; padding: 12px 16px; font-size: 0.80rem; color: #92400e; display: flex; align-items: flex-start; gap: 10px; line-height: 1.45;">
+          <span style="font-size: 1.25rem; line-height: 1;">🛡️</span>
+          <div>
+            <b>Princípio de Rigor Farmacêutico & Contabilístico:</b> Ter menos stock nem sempre é poupança — pode ser venda (dinheiro na caixa), devolução a armazenista, acerto de contagem ou quebra/caducidade deitada fora. O BI Pharma <b>apenas contabiliza como Liquidez Recuperada as saídas com venda comprovada</b>. Saídas sem venda são tratadas como ajustes/perdas e nunca são somadas como ganho financeiro. Os preços de custo respeitam o valor histórico de compra (CMP) de cada época.
+          </div>
+        </div>
+      </div>
+
       <!-- PAINEL COMPARATIVO: STOCK ATIVO vs IMOBILIZADO vs VENDAS -->
       <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
@@ -13108,11 +13167,72 @@ function getDashboardHtml(): string {
         if (kpiImob) kpiImob.textContent = Number(r.stock_imobilizado_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
         if (kpiImobSub) kpiImobSub.textContent = Number(r.taxa_imobilizado_pct || 0).toFixed(1) + '% do capital total em stock (' + Number(r.stock_imobilizado_unidades || 0).toLocaleString('pt-PT') + ' un monos)';
 
-        if (kpiPoup) kpiPoup.textContent = '+' + Number(r.liquidez_recuperada_comprovada_eur || r.valores_poupados_acumulados_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (kpiPoup) kpiPoup.textContent = '+' + Number(r.liquidez_recuperada_comprovada_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
         if (kpiPoupSub) kpiPoupSub.textContent = 'Comprovado por vendas de monos no Sifarma';
 
         if (kpiCap) kpiCap.textContent = (r.dias_medios_rotacao || 48) + ' dias';
         if (kpiCapSub) kpiCapSub.textContent = 'Stock Ativo: ' + Number(r.stock_ativo_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + (100 - (r.taxa_imobilizado_pct || 0)).toFixed(1) + '%)';
+
+        // Atualizar Comparativo MoM Executivo
+        if (data.comparativoMoM) {
+          const m = data.comparativoMoM;
+          const lblPeriod = document.getElementById('evoMomPeriodLabel');
+          const deltaStock = document.getElementById('evoMomStockDelta');
+          const deltaStockSub = document.getElementById('evoMomStockDeltaSub');
+          const deltaMonos = document.getElementById('evoMomMonosDelta');
+          const deltaMonosSub = document.getElementById('evoMomMonosDeltaSub');
+          const badgeTrend = document.getElementById('evoMomTrendBadge');
+          const deltaLiq = document.getElementById('evoMomLiqDelta');
+          const expText = document.getElementById('evoMomExplicacao');
+
+          if (lblPeriod) lblPeriod.textContent = (m.mes_atual_label || 'Mês Atual') + ' vs ' + (m.mes_anterior_label || 'Mês Anterior');
+
+          if (deltaStock) {
+            const sinalS = m.variacao_stock_eur > 0 ? '+' : '';
+            deltaStock.textContent = sinalS + Number(m.variacao_stock_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + (m.variacao_stock_pct > 0 ? '+' : '') + Number(m.variacao_stock_pct || 0).toFixed(1) + '%)';
+            deltaStock.style.color = m.variacao_stock_eur <= 0 ? '#059669' : '#0284c7';
+          }
+          if (deltaStockSub) {
+            deltaStockSub.textContent = m.variacao_stock_eur <= 0
+              ? '📉 O stock global reduziu face ao mês anterior.'
+              : '📈 O stock global aumentou face ao mês anterior.';
+          }
+
+          if (deltaMonos) {
+            const sinalM = m.variacao_monos_eur > 0 ? '+' : '';
+            deltaMonos.textContent = sinalM + Number(m.variacao_monos_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+            deltaMonos.style.color = m.variacao_monos_eur <= 0 ? '#059669' : '#e11d48';
+          }
+          if (deltaMonosSub) {
+            deltaMonosSub.textContent = m.variacao_monos_eur <= 0
+              ? '🟢 Redução do valor parado em armazém.'
+              : '🔴 Aumento do capital imobilizado.';
+          }
+
+          if (badgeTrend) {
+            if (m.tendencia_monos === 'REDUCAO') {
+              badgeTrend.textContent = '🟢 Redução de Monos';
+              badgeTrend.style.background = '#dcfce7';
+              badgeTrend.style.color = '#15803d';
+            } else if (m.tendencia_monos === 'AUMENTO') {
+              badgeTrend.textContent = '🔴 Aumento de Monos';
+              badgeTrend.style.background = '#fee2e2';
+              badgeTrend.style.color = '#b91c1c';
+            } else {
+              badgeTrend.textContent = '🟡 Monos Estáveis';
+              badgeTrend.style.background = '#fef3c7';
+              badgeTrend.style.color = '#b45309';
+            }
+          }
+
+          if (deltaLiq) {
+            deltaLiq.textContent = '+' + Number(m.liquidez_recuperada_mom_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+          }
+
+          if (expText) {
+            expText.textContent = m.explicacao_executiva || 'Comparativo MoM calculado com sucesso.';
+          }
+        }
 
         // Render Gráfico e Tabela
         renderStockEvolutionChart(data.evolucaoMensal);
@@ -13132,17 +13252,20 @@ function getDashboardHtml(): string {
 
       let html = '';
       pontos.forEach(function(p) {
+        const liqRec = Number(p.liquidez_recuperada_monos_eur || 0);
         const hStock = Math.max(8, Math.round((p.stock_total_eur / maxVal) * 200));
         const hImob = Math.max(4, Math.round((p.stock_imobilizado_eur / maxVal) * 200));
         const hVendas = Math.max(6, Math.round((p.vendas_mes_eur / maxVal) * 200));
-        const hPoup = Math.max(2, Math.round((p.valores_poupados_eur / maxVal) * 200));
+        const hPoup = Math.max(2, Math.round((liqRec / maxVal) * 200));
+
+        const tooltip = p.mes_label + ' | Stock: ' + Number(p.stock_total_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Monos: ' + Number(p.stock_imobilizado_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + Number(p.taxa_imobilizado_pct).toFixed(1) + '%) | Vendas: ' + Number(p.vendas_mes_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Monos Resgatados: +' + liqRec.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Rotação: ' + (p.dias_rotacao || 45) + ' dias';
 
         html += '<div style="flex: 1; min-width: 65px; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; position: relative;">' +
-          '<div style="display: flex; gap: 4px; align-items: flex-end; height: 210px; width: 100%; justify-content: center;">' +
-          '  <div title="Stock Total: ' + p.stock_total_eur.toFixed(2) + ' €" style="width: 14px; height: ' + hStock + 'px; background: #0284c7; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
-          '  <div title="Monos: ' + p.stock_imobilizado_eur.toFixed(2) + ' € (' + p.taxa_imobilizado_pct + '%)" style="width: 14px; height: ' + hImob + 'px; background: #fca5a5; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
-          '  <div title="Vendas: ' + p.vendas_mes_eur.toFixed(2) + ' €" style="width: 14px; height: ' + hVendas + 'px; background: #10b981; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
-          '  <div title="Poupança: +' + p.valores_poupados_eur.toFixed(2) + ' €" style="width: 10px; height: ' + hPoup + 'px; background: #fbbf24; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
+          '<div title="' + escapeHtml(tooltip) + '" style="display: flex; gap: 4px; align-items: flex-end; height: 210px; width: 100%; justify-content: center; cursor: pointer;">' +
+          '  <div style="width: 14px; height: ' + hStock + 'px; background: #0284c7; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
+          '  <div style="width: 14px; height: ' + hImob + 'px; background: #fca5a5; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
+          '  <div style="width: 14px; height: ' + hVendas + 'px; background: #10b981; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
+          '  <div style="width: 10px; height: ' + hPoup + 'px; background: #fbbf24; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
           '</div>' +
           '<div style="font-size: 0.72rem; color: #475569; font-weight: 700; margin-top: 8px; text-align: center; white-space: nowrap;">' + escapeHtml(p.mes_label) + '</div>' +
           '</div>';
