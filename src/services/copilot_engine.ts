@@ -472,6 +472,122 @@ const COPILOT_TOOLS = [
   },
 ];
 
+
+// ============================================================================
+// MODOS ESPECIALIZADOS DO COPILOT (FASE 3: GUIÕES ASSERTIVOS & TOOL SCOPING)
+// ============================================================================
+export type CopilotMode = 'STOCKS' | 'FINANCE' | 'MARKETING' | 'CLINICAL' | 'GENERAL';
+
+// 1. MODO STOCKS & RUPTURAS
+const TOOLS_STOCKS_NAMES = new Set([
+  'calcular_stock_minimo_e_cobertura',
+  'filtrar_validade_e_margem',
+  'identificar_produtos_sem_vendas_e_escoamento',
+  'gerar_proposta_encomenda_reposicao',
+  'consultar_produtos_por_nome_ou_categoria',
+  'calcular_niveis_sazonais_dinamicos',
+  'consultar_progresso_tarefas_equipa',
+  'criar_tarefa_equipa'
+]);
+
+// 2. MODO FINANCEIRO & LABORATÓRIOS
+const TOOLS_FINANCE_NAMES = new Set([
+  'analisar_curva_abc_faturacao_e_margem',
+  'auditar_anomalias_margem_e_precos',
+  'analisar_evolucao_mensal_financeira',
+  'comparar_performance_periodos',
+  'comparar_similares_e_rentabilidade',
+  'avaliar_acordo_anual_compras_escalonadas',
+  'calcular_perdas_financeiras_e_custo_oportunidade',
+  'consultar_vendas_diarias',
+  'consultar_produtos_por_nome_ou_categoria'
+]);
+
+// 3. MODO MARKETING & ESCOAMENTO
+const TOOLS_MARKETING_NAMES = new Set([
+  'sugerir_packs_promocionais',
+  'consultar_campanhas_ativas_e_historico',
+  'ativar_campanha_farmacia',
+  'planear_compras_sazonais_laboratorio',
+  'filtrar_validade_e_margem',
+  'identificar_produtos_sem_vendas_e_escoamento',
+  'consultar_produtos_por_nome_ou_categoria',
+  'criar_tarefa_equipa'
+]);
+
+// 4. MODO BALCÃO CLÍNICO & SINTOMAS
+const TOOLS_CLINICAL_NAMES = new Set([
+  'consultar_produtos_por_nome_ou_categoria',
+  'sugerir_vendas_cruzadas_receita',
+  'analisar_consolidacao_genericos_dci',
+  'filtrar_validade_e_margem',
+  'comparar_similares_e_rentabilidade',
+  'criar_tarefa_equipa'
+]);
+
+export function getScopedToolsForMode(mode: CopilotMode): any[] {
+  if (mode === 'STOCKS') return COPILOT_TOOLS.filter(t => TOOLS_STOCKS_NAMES.has(t.name));
+  if (mode === 'FINANCE') return COPILOT_TOOLS.filter(t => TOOLS_FINANCE_NAMES.has(t.name));
+  if (mode === 'MARKETING') return COPILOT_TOOLS.filter(t => TOOLS_MARKETING_NAMES.has(t.name));
+  if (mode === 'CLINICAL') return COPILOT_TOOLS.filter(t => TOOLS_CLINICAL_NAMES.has(t.name));
+  return COPILOT_TOOLS;
+}
+
+// ============================================================================
+// GUIÕES DE RESPOSTA ASSERTIVOS & PROMPTS DE SISTEMA ESPECIALIZADOS
+// ============================================================================
+const PROMPT_STOCKS = `És o Especialista em Gestão de Stocks, Rupturas e Validades da Farmácia.
+A tua missão é proteger a farmácia de quebras por caducidade e evitar rupturas de medicamentos de alta rotação.
+
+DIRETRIZES RÍGIDAS DE COMUNICAÇÃO:
+1. PROIBIDO texto corrido introdutório ou despedidas longas. Sê métrico, cirúrgico e direto.
+2. ESTRUTURA OBRIGATÓRIA DA RESPOSTA:
+   - Resumo em 1 linha com métrica-chave (ex: "X produtos em risco identificados totalizando Y € de stock").
+   - Cartões / Linhas de Produto no seguinte formato estrito:
+     • **[CNP] Designação** | Stock: X un (Y dias cobertura) | Validade: MM/AAAA | Margem: Z%
+       ↳ *Ação Imediata:* [Travar Encomenda / Devolver Fornecedor / Colocar no Balcão / Encomendar X un]
+3. Se o utilizador perguntar por validades ou produtos a escoar, lista prioritariamente os que têm data de caducidade mais curta e maior valor financeiro empatado.`;
+
+const PROMPT_FINANCE = `És o Diretor Financeiro e Auditor Comercial da Farmácia.
+A tua missão é auditar compras a laboratórios, rentabilidade por molécula/marca e desvios de margem comercial.
+
+DIRETRIZES RÍGIDAS DE COMUNICAÇÃO:
+1. Foco absoluto em Euros (€), percentagens de margem (%) e volume de vendas reais.
+2. ESTRUTURA OBRIGATÓRIA DA RESPOSTA:
+   a) **KPIs Globais**: Faturação total, Margem média real vs alvo e dependência de laboratórios.
+   b) **Tabela Comparativa Markdown**:
+      | Categoria / Produto | Vendas Laboratório | Principal Concorrente | Vendas Concorrente | Comparativo de Margem |
+   c) **Oportunidades de Negociação & Troca**: Aponta com clareza onde a farmácia está a perder margem (ex: marca vs genérico GH com ganho unitário) e que ações tomar com os delegados comerciais.`;
+
+const PROMPT_MARKETING = `És o Consultor de Marketing Farmacêutico, Campanhas e Escoamento Ativo.
+A tua missão é criar montras sazonais, packs promocionais e argumentos comerciais éticos para acelerar a rotação de stock.
+
+DIRETRIZES RÍGIDAS DE COMUNICAÇÃO:
+1. NUNCA respondas apenas com uma lista solta de produtos. Transforma SEMPRE o pedido numa **Mini-Campanha Estruturada**:
+   a) **Nome Comercial da Campanha** (ex: "Semana do Conforto Articular" ou "Inverno Sem Constipações").
+   b) **Cesto de Produtos Sugerido**: CNP, Designação, PVP Normal, PVP Promo sugerido, Margem final e Stock a libertar.
+   c) **Argumento de 1 Frase para a Equipa dizer ao Balcão** (pitch de recomendação ética ao utente).
+   d) **Proposta de Ação**: Sugere a criação de uma missão semanal para a equipa colocar o cesto no balcão.`;
+
+const PROMPT_CLINICAL = `És o Especialista em Atendimento Farmacêutico, Despiste de Sintomas e Venda Cruzada Responsável.
+A tua missão é apoiar a equipa de atendimento ao utente com rigor farmacológico, contraindicações e escoamento ético do stock em gaveta.
+
+DIRETRIZES RÍGIDAS DE COMUNICAÇÃO:
+1. SISTEMA DE CLARIFICAÇÃO ATIVA: Se a queixa for ampla (ex: "tosse", "diarreia", "dor"), pergunta sucintamente antes de debitar se é adulto/pediátrico ou se existem sintomas de alarme (febre alta, sangue).
+2. ESTRUTURA OBRIGATÓRIA DA RECOMENDAÇÃO:
+   • **1. Tratamento Principal (Com Stock Disponível)**: Aponta a molécula/produto com stock real em gaveta, priorizando lotes de validade mais curta.
+   • **2. Coadjuvante / Venda Cruzada Responsável**: Recomendação complementar ética (ex: pastilhas antissépticas, probióticos, hidratação).
+   • **3. Alerta Clínico & Contraindicações**: Advertência de segurança indispensável (ex: hipertensão, duplicado de AINEs, gravidez).
+   • **4. Alternativa de Maior Rentabilidade**: Aponta o genérico de Grupo Homogéneo que gera mais margem à farmácia mantendo a eficácia.`;
+
+export function getSystemPromptForMode(mode: CopilotMode): string {
+  if (mode === 'STOCKS') return PROMPT_STOCKS;
+  if (mode === 'FINANCE') return PROMPT_FINANCE;
+  if (mode === 'MARKETING') return PROMPT_MARKETING;
+  if (mode === 'CLINICAL') return PROMPT_CLINICAL;
+  return SYSTEM_PROMPT;
+}
+
 const SYSTEM_PROMPT = `És o Consultor Farmacêutico & Copilot Analítico da Farmácia.
 A tua missão é apoiar o Diretor Técnico e o Gestor da Farmácia a tomar decisões financeiras, operacionais e clínicas inteligentes com base EXCLUSIVAMENTE nos dados reais da farmácia.
 
@@ -669,8 +785,9 @@ export async function askConversationalCopilot(
   prisma: PrismaClient,
   secContext: ToolSecurityContext,
   question: string,
-  sessionId = 'default'
-): Promise<CopilotChatResponse> {
+  sessionId = 'default',
+  mode: CopilotMode = 'GENERAL'
+): Promise<CopilotChatResponse & { mode: CopilotMode; suggestions?: string[] }> {
   pruneOldSessions();
   sessionTimestamps.set(sessionId, Date.now());
 
@@ -699,6 +816,7 @@ export async function askConversationalCopilot(
       text: `⚠️ **Modo Offline:** Configure a chave \`ANTHROPIC_API_KEY\` para ativar o raciocínio conversacional livre com Claude.`,
       toolsUsed: [],
       sessionId,
+      mode,
     };
   }
 
@@ -734,11 +852,11 @@ export async function askConversationalCopilot(
           system: [
             {
               type: 'text',
-              text: `${SYSTEM_PROMPT}\n\nAmbiente: Farmácia Comunitária (Tenant Isolado)`,
+              text: `${getSystemPromptForMode(mode)}\n\nModo Operacional Ativo: ${mode}\nAmbiente: Farmácia Comunitária (Tenant Isolado)`,
               cache_control: { type: 'ephemeral' },
             },
           ],
-          tools: COPILOT_TOOLS,
+          tools: getScopedToolsForMode(mode),
           tool_choice: { type: 'auto' },
           messages: currentMessages,
         }),
@@ -801,6 +919,7 @@ export async function askConversationalCopilot(
           text: finalText,
           toolsUsed,
           sessionId,
+          mode,
           shoppingList: capturedShoppingList || undefined,
           usage: {
             inputTokens: totalInputTokens,
@@ -970,6 +1089,7 @@ case 'auditar_anomalias_margem_e_precos':
       text: 'Foram analisados os dados da farmácia, mas a resposta excedeu o limite de passos. Por favor tente especificar mais a sua pergunta.',
       toolsUsed,
       sessionId,
+      mode,
       usage: {
         inputTokens: totalInputTokens,
         outputTokens: totalOutputTokens,
@@ -985,6 +1105,7 @@ case 'auditar_anomalias_margem_e_precos':
       text: `❌ Ocorreu um erro ao comunicar com a inteligência analítica: ${err.message}`,
       toolsUsed,
       sessionId,
+      mode,
     };
   }
 }

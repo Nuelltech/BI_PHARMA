@@ -2226,7 +2226,7 @@ async function startServer() {
       if (pathname === '/api/ask' && req.method === 'POST') {
         try {
           const rawBody = await readRequestBody(req, 256 * 1024);
-          const { question, farmaciaId, sessionId } = JSON.parse(rawBody || '{}');
+          const { question, farmaciaId, sessionId, mode } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
           const q = String(question || '').trim();
 
@@ -2246,7 +2246,7 @@ async function startServer() {
           // Isola estritamente o sessionId por farmácia para impedir leitura cruzada de conversas em RAM
           const cleanSid = String(sessionId || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
           const scopedSid = `${activeFarmacia.id}:${cleanSid}`;
-          const copilotRes = await askConversationalCopilot(prisma, secContext, q, scopedSid);
+          const copilotRes = await askConversationalCopilot(prisma, secContext, q, scopedSid, (mode || 'GENERAL'));
 
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({
@@ -2263,6 +2263,23 @@ async function startServer() {
         } catch (e: any) {
           const status = e.statusCode || 500;
           console.error('[API /api/ask Error]:', e);
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+        return;
+      }
+
+      
+      // 3.2. Endpoint para Feedback de Auditoria da Resposta do Copilot
+      if (pathname === '/api/copilot/feedback' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 32 * 1024);
+          const { sessionId, feedback, question, comment, farmaciaId } = JSON.parse(rawBody || '{}');
+          console.log(`[Copilot Feedback] Farmácia: ${farmaciaId} | Sessão: ${sessionId} | Voto: ${feedback} | Questão: ${question}`);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: true, message: 'Feedback registado para melhoria contínua do modelo.' }));
+        } catch (e: any) {
+          const status = e.statusCode || 400;
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ success: false, error: e.message }));
         }
@@ -4043,6 +4060,83 @@ function getDashboardHtml(): string {
       font-size: 0.82rem;
     }
 
+  
+    /* ========================================================================
+       MODOS ESPECIALIZADOS DO COPILOT (FASE 3: UI & QUICK REPLIES)
+       ======================================================================== */
+    .copilot-mode-selector {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 14px 0 10px 0;
+    }
+    .copilot-mode-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 14px;
+      border-radius: 9px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      border: 1.5px solid #cbd5e1;
+      background: #ffffff;
+      color: #334155;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .copilot-mode-btn:hover {
+      border-color: #0284c7;
+      color: #0284c7;
+      background: #f0f9ff;
+    }
+    .copilot-mode-btn.active {
+      background: #0284c7;
+      color: #ffffff;
+      border-color: #0284c7;
+      box-shadow: 0 2px 6px rgba(2, 132, 199, 0.3);
+    }
+    .copilot-mode-banner {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-left: 4px solid #0284c7;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 0.82rem;
+      color: #334155;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .chat-feedback-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      padding-top: 6px;
+      border-top: 1px dashed #e2e8f0;
+      font-size: 0.74rem;
+      color: #64748b;
+    }
+    .chat-feedback-btn {
+      background: #f1f5f9;
+      border: 1px solid #cbd5e1;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      cursor: pointer;
+      color: #475569;
+      transition: background 0.15s;
+    }
+    .chat-feedback-btn:hover {
+      background: #e2e8f0;
+    }
+    .chat-feedback-btn.voted {
+      background: #dcfce7;
+      color: #15803d;
+      border-color: #86efac;
+    }
+
   </style>
 </head>
 <body>
@@ -4515,6 +4609,34 @@ function getDashboardHtml(): string {
               🔄 Nova Conversa
             </button>
           </div>
+        </div>
+
+        
+        <!-- SELETOR DE 4 MODOS ESPECIALIZADOS DO COPILOT (FASE 3) -->
+        <div class="copilot-mode-selector">
+          <button class="copilot-mode-btn" id="modeBtn-CLINICAL" onclick="setCopilotMode('CLINICAL')">
+            <span>🩺</span> Balcão Clínico & Sintomas
+          </button>
+          <button class="copilot-mode-btn" id="modeBtn-FINANCE" onclick="setCopilotMode('FINANCE')">
+            <span>💰</span> Finanças, Margens & Labs
+          </button>
+          <button class="copilot-mode-btn" id="modeBtn-STOCKS" onclick="setCopilotMode('STOCKS')">
+            <span>📦</span> Stocks, Rupturas & Validades
+          </button>
+          <button class="copilot-mode-btn" id="modeBtn-MARKETING" onclick="setCopilotMode('MARKETING')">
+            <span>🎯</span> Marketing & Escoamento
+          </button>
+          <button class="copilot-mode-btn active" id="modeBtn-GENERAL" onclick="setCopilotMode('GENERAL')">
+            <span>🌐</span> Raciocínio Livre (Geral)
+          </button>
+        </div>
+
+        <!-- BANNER DO MODO ATIVO -->
+        <div class="copilot-mode-banner" id="copilotModeBanner">
+          <div id="copilotModeDesc">
+            💡 <b>Modo Geral:</b> Pergunte qualquer questão ou selecione um modo especializado acima para obter respostas assertivas em cartões e tabelas compactas.
+          </div>
+          <span id="copilotModeTag" style="font-weight: 800; font-size: 0.72rem; text-transform: uppercase; background: #e0f2fe; color: #0369a1; padding: 2px 8px; border-radius: 6px;">GERAL</span>
         </div>
 
         <!-- PAINEL DE PERGUNTAS ESTRATÉGICAS DA DIREÇÃO TÉCNICA -->
