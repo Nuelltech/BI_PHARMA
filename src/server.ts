@@ -1,3 +1,18 @@
+import {
+  getPharmacyTeam,
+  addPharmacyTeamMember,
+  updatePharmacyTeamMember,
+  deletePharmacyTeamMember,
+  getActivePharmacySessions,
+  revokeUserSession,
+  recordUserSession,
+  createPasswordResetToken,
+  verifyPasswordResetToken,
+  consumePasswordResetToken,
+  getPermissionsForRole,
+  UserRole
+} from './services/rbac_settings';
+
 import { getMobileStaffHtml } from './views/mobile_staff_view';
 import {
   getPharmacyWeeklyTasks,
@@ -2530,6 +2545,167 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
+      
+      // ======================================================================
+      // FASE 4: ENDPOINTS DE CONFIGURAÇÕES, EQUIPA (RBAC) E RECUPERAÇÃO
+      // ======================================================================
+
+      // 4.1. Listar Equipa da Farmácia
+      if (pathname === '/api/settings/team' && req.method === 'GET') {
+        try {
+          const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          const team = getPharmacyTeam(activeFarmacia.id);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, farmaciaId: activeFarmacia.id, team }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 4.2. Convidar / Adicionar Membro da Equipa
+      if (pathname === '/api/settings/team/invite' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const { farmaciaId, nome, email, role, pin } = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          if (!nome || !email) {
+            throw new Error('Nome e email são de preenchimento obrigatório.');
+          }
+          const member = addPharmacyTeamMember(activeFarmacia.id, { nome, email, role, pin });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, member }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 4.3. Atualizar Membro da Equipa
+      if (pathname === '/api/settings/team/update' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const { farmaciaId, userId, updates } = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          const updated = updatePharmacyTeamMember(activeFarmacia.id, userId, updates || {});
+          if (!updated) throw new Error('Utilizador não encontrado.');
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, member: updated }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 4.4. Remover Membro da Equipa
+      if (pathname === '/api/settings/team/delete' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const { farmaciaId, userId } = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          const deleted = deletePharmacyTeamMember(activeFarmacia.id, userId);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: deleted }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 4.5. Listar Sessões Ativas da Farmácia
+      if (pathname === '/api/settings/sessions' && req.method === 'GET') {
+        try {
+          const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          // Regista a sessão atual de navegação se ainda não existir
+          const ip = getClientIp(req);
+          const userAgent = String(req.headers['user-agent'] || 'Desktop Browser');
+          const sessions = getActivePharmacySessions(activeFarmacia.id);
+          if (sessions.length === 0) {
+            recordUserSession({
+              farmaciaId: activeFarmacia.id,
+              userName: 'Diretor / Gestão',
+              role: 'GESTOR',
+              ip,
+              device: userAgent.includes('Mobile') ? 'Dispositivo Móvel' : 'Computador Desktop',
+            });
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, sessions: getActivePharmacySessions(activeFarmacia.id) }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 4.6. Revogar Sessão Ativa Remotamente
+      if (pathname === '/api/settings/sessions/revoke' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 32 * 1024);
+          const { sessionId } = JSON.parse(rawBody || '{}');
+          const revoked = revokeUserSession(sessionId);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: revoked, message: 'Sessão revogada com sucesso.' }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 4.7. Recuperação de Password (Esqueci-me da Senha)
+      if (pathname === '/api/auth/forgot-password' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 32 * 1024);
+          const { email, farmaciaId } = JSON.parse(rawBody || '{}');
+          const cleanEmail = String(email || '').trim().toLowerCase();
+          if (!cleanEmail || !cleanEmail.includes('@')) {
+            throw new Error('Por favor introduza um endereço de email válido.');
+          }
+          const token = createPasswordResetToken(cleanEmail, farmaciaId);
+          const resetLink = `${getBaseIssuerUrl(req)}/?resetToken=${token}`;
+          console.log(`📧 [Simulação de Envio de Email]: Link de recuperação gerado para ${cleanEmail}: ${resetLink} (válido por 15 min)`);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({
+            ok: true,
+            message: 'Se o email constar no sistema, enviámos as instruções de recuperação com validade de 15 minutos.',
+            resetLinkPreview: !IS_PROD ? resetLink : undefined,
+          }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 4.8. Validação e Redefinição de Nova Senha
+      if (pathname === '/api/auth/reset-password' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 32 * 1024);
+          const { token, newPassword } = JSON.parse(rawBody || '{}');
+          const tokenRecord = verifyPasswordResetToken(token);
+          if (!tokenRecord) {
+            throw new Error('O token de recuperação é inválido ou já expirou.');
+          }
+          if (!newPassword || newPassword.length < 6) {
+            throw new Error('A nova palavra-passe deve ter pelo menos 6 caracteres.');
+          }
+          consumePasswordResetToken(token);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, message: 'Palavra-passe redefinida com sucesso. Pode agora iniciar sessão.' }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
       // 2.5L. Rota da Interface Mobile da Equipa
       if (
         pathname === '/mobile' ||
@@ -4244,10 +4420,13 @@ function getDashboardHtml(): string {
       </div>
       <div class="top-nav-right">
         <button class="top-btn top-btn-qr" onclick="openMobileStaffModal()" title="Abrir QR Code e link direto para o telemóvel da equipa de balcão">
-          📱 Acesso Balcão (QR Code)
+          📱 Acesso Balcão (QR)
+        </button>
+        <button class="top-btn" onclick="openSettingsModal()" style="background:#f1f5f9;border:1px solid #cbd5e1;color:#1e293b;" title="Configurações da Farmácia, Equipa (RBAC) e Sessões">
+          ⚙️ Configurações
         </button>
         <button class="top-btn top-btn-logout" onclick="logoutApp()" title="Encerrar sessão de forma segura">
-          🚪 Terminar Sessão
+          🚪 Sair
         </button>
       </div>
     </header>
@@ -5944,6 +6123,157 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
+  
+  <!-- MODAL DE CONFIGURAÇÕES GLOBAIS DA FARMÁCIA (FASE 4: RBAC, SETTINGS & SESSÕES) -->
+  <div id="settingsModal" style="display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.75); backdrop-filter: blur(4px); z-index: 99999; align-items: center; justify-content: center; padding: 20px;">
+    <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 16px; max-width: 760px; width: 100%; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35); overflow: hidden;">
+      
+      <!-- Cabeçalho do Modal -->
+      <div style="padding: 18px 24px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; background: #f8fafc;">
+        <div>
+          <h3 style="font-size: 1.2rem; font-weight: 800; color: #0f172a; margin: 0; display: flex; align-items: center; gap: 8px;">
+            ⚙️ Configurações da Farmácia & Controlo de Acessos
+          </h3>
+          <p style="font-size: 0.8rem; color: #64748b; margin: 2px 0 0 0;">Gestão da equipa, níveis de acesso (RBAC), sessões ativas e dados da farmácia.</p>
+        </div>
+        <button onclick="closeSettingsModal()" style="background: none; border: none; font-size: 1.4rem; cursor: pointer; color: #94a3b8;">&times;</button>
+      </div>
+
+      <!-- Barra de Abas do Modal -->
+      <div style="display: flex; gap: 4px; padding: 10px 24px; background: #f1f5f9; border-bottom: 1px solid #e2e8f0;">
+        <button class="settings-tab-btn active" id="settingsTabBtn-team" onclick="switchSettingsTab('team')" style="padding: 7px 14px; border-radius: 8px; border: none; background: #ffffff; font-weight: 700; font-size: 0.82rem; cursor: pointer; color: #0284c7; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+          👥 Equipa & Níveis (RBAC)
+        </button>
+        <button class="settings-tab-btn" id="settingsTabBtn-sessions" onclick="switchSettingsTab('sessions')" style="padding: 7px 14px; border-radius: 8px; border: none; background: transparent; font-weight: 700; font-size: 0.82rem; cursor: pointer; color: #475569;">
+          🟢 Sessões Ativas
+        </button>
+        <button class="settings-tab-btn" id="settingsTabBtn-pharmacy" onclick="switchSettingsTab('pharmacy')" style="padding: 7px 14px; border-radius: 8px; border: none; background: transparent; font-weight: 700; font-size: 0.82rem; cursor: pointer; color: #475569;">
+          🏥 Dados da Farmácia
+        </button>
+        <button class="settings-tab-btn" id="settingsTabBtn-reset" onclick="switchSettingsTab('reset')" style="padding: 7px 14px; border-radius: 8px; border: none; background: transparent; font-weight: 700; font-size: 0.82rem; cursor: pointer; color: #475569;">
+          🔑 Recuperação de Conta
+        </button>
+      </div>
+
+      <!-- Corpo do Modal com Scroll -->
+      <div style="padding: 24px; overflow-y: auto; flex: 1;">
+        
+        <!-- ABA 1: GESTÃO DE EQUIPA (RBAC) -->
+        <div id="settingsView-team" style="display: block;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+            <div>
+              <div style="font-size: 0.95rem; font-weight: 800; color: #0f172a;">Colaboradores da Farmácia</div>
+              <div style="font-size: 0.78rem; color: #64748b;">Defina quem tem acesso à Direção, Gestão ou apenas ao Balcão Operacional.</div>
+            </div>
+            <button class="btn" onclick="toggleInviteForm()" style="background: #0284c7; color: #fff; font-size: 0.8rem; padding: 7px 14px; font-weight: 700; border: none; border-radius: 8px; cursor: pointer;">
+              + Convidar Colaborador
+            </button>
+          </div>
+
+          <!-- Formulário Ocultável de Convite -->
+          <div id="inviteMemberForm" style="display: none; background: #f8fafc; border: 1.5px solid #bae6fd; border-radius: 12px; padding: 16px; margin-bottom: 16px;">
+            <div style="font-weight: 800; font-size: 0.85rem; color: #0369a1; margin-bottom: 10px;">Novo Acesso de Colaborador</div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 10px;">
+              <div>
+                <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">Nome:</label>
+                <input type="text" id="inviteName" placeholder="Ex: Dr. João Pedro" style="width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem;" />
+              </div>
+              <div>
+                <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">Email:</label>
+                <input type="email" id="inviteEmail" placeholder="joao@farmacia.pt" style="width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem;" />
+              </div>
+              <div>
+                <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">Nível de Acesso (RBAC):</label>
+                <select id="inviteRole" style="width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem; font-weight: 600;">
+                  <option value="AUXILIAR">Auxiliar (Só Balcão/Tarefas)</option>
+                  <option value="DIRETOR" selected>Diretor (Clínico & Campanhas)</option>
+                  <option value="GESTOR">Gestor (Financeiro & Equipa)</option>
+                  <option value="SUPORTE">Suporte TI (Auditoria Técnica)</option>
+                </select>
+              </div>
+              <div>
+                <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">PIN Rápido (4 dígitos):</label>
+                <input type="text" id="invitePin" maxlength="6" placeholder="Ex: 4321" style="width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem; font-family: monospace;" />
+              </div>
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+              <button onclick="toggleInviteForm()" type="button" class="btn btn-secondary" style="font-size: 0.78rem; padding: 6px 12px;">Cancelar</button>
+              <button onclick="submitInviteMember()" type="button" class="btn" style="background: #10b981; color: #fff; font-size: 0.78rem; padding: 6px 16px; font-weight: 700; border: none; border-radius: 6px;">Guardar Acesso</button>
+            </div>
+          </div>
+
+          <div id="settingsTeamTableContainer">
+            <div style="text-align: center; color: #94a3b8; padding: 20px;">A carregar lista da equipa...</div>
+          </div>
+        </div>
+
+        <!-- ABA 2: SESSÕES ATIVAS -->
+        <div id="settingsView-sessions" style="display: none;">
+          <div style="margin-bottom: 14px;">
+            <div style="font-size: 0.95rem; font-weight: 800; color: #0f172a;">Sessões Ativas no Momento</div>
+            <div style="font-size: 0.78rem; color: #64748b;">Monitorização em tempo real de quem está ligado à plataforma. Pode revogar acessos suspeitos imediatamente.</div>
+          </div>
+          <div id="settingsSessionsContainer">
+            <div style="text-align: center; color: #94a3b8; padding: 20px;">A carregar sessões ativas...</div>
+          </div>
+        </div>
+
+        <!-- ABA 3: DADOS DA FARMÁCIA -->
+        <div id="settingsView-pharmacy" style="display: none;">
+          <div style="margin-bottom: 14px;">
+            <div style="font-size: 0.95rem; font-weight: 800; color: #0f172a;">Perfil e Parâmetros da Farmácia</div>
+            <div style="font-size: 0.78rem; color: #64748b;">Informações da entidade e valores de referência comercial.</div>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+            <div>
+              <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">Nome da Farmácia:</label>
+              <input type="text" id="settingsFarmName" readonly style="width: 100%; padding: 8px 12px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem;" />
+            </div>
+            <div>
+              <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">NIF:</label>
+              <input type="text" id="settingsFarmNif" readonly style="width: 100%; padding: 8px 12px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem;" />
+            </div>
+            <div>
+              <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">Código de Acesso Unificado:</label>
+              <input type="text" id="settingsFarmAccessCode" readonly style="width: 100%; padding: 8px 12px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem; font-family: monospace; font-weight: 700; color: #0284c7;" />
+            </div>
+            <div>
+              <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">Margem Média Objetivo (%):</label>
+              <input type="text" value="30.0%" readonly style="width: 100%; padding: 8px 12px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem; font-weight: 700; color: #059669;" />
+            </div>
+          </div>
+        </div>
+
+        <!-- ABA 4: RECUPERAÇÃO DE PALAVRA-PASSE -->
+        <div id="settingsView-reset" style="display: none;">
+          <div style="margin-bottom: 14px;">
+            <div style="font-size: 0.95rem; font-weight: 800; color: #0f172a;">Recuperação de Palavra-Passe & Acesso</div>
+            <div style="font-size: 0.78rem; color: #64748b;">Fluxo de emergência para recuperação de credenciais via email com token temporário de 15 minutos.</div>
+          </div>
+          <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; padding: 18px; max-width: 480px;">
+            <label style="font-size: 0.75rem; font-weight: 700; color: #334155; display: block; margin-bottom: 6px;">Email do Utilizador:</label>
+            <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+              <input type="email" id="forgotPassEmail" placeholder="exemplo@farmacia.pt" style="flex: 1; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem;" />
+              <button onclick="submitForgotPassword()" type="button" class="btn" style="background: #0284c7; color: #fff; font-size: 0.82rem; padding: 8px 16px; font-weight: 700; border: none; border-radius: 6px;">
+                Enviar Link
+              </button>
+            </div>
+            <div id="forgotPassFeedback" style="display: none; padding: 10px; border-radius: 6px; font-size: 0.8rem;"></div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Rodapé do Modal -->
+      <div style="padding: 14px 24px; border-top: 1px solid #e2e8f0; background: #f8fafc; display: flex; justify-content: flex-end;">
+        <button class="btn btn-secondary" onclick="closeSettingsModal()" style="font-size: 0.85rem; padding: 8px 18px;">
+          Fechar
+        </button>
+      </div>
+
+    </div>
+  </div>
+
   <!-- MODAL ABRIR NO TELEMÓVEL DA EQUIPA -->
   <div id="mobileStaffModal" style="display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 99999; align-items: center; justify-content: center;">
     <div style="background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 24px; max-width: 440px; width: 90%; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35); text-align: center;">
@@ -7566,6 +7896,214 @@ function getDashboardHtml(): string {
       if (!inp || !inp.value) return;
       const text = encodeURIComponent('Olá equipa! Aqui está o link de acesso direto ao BI Pharma (Modo Balcão da Farmácia):\n' + inp.value);
       window.open('https://api.whatsapp.com/send?text=' + text, '_blank');
+    }
+
+    
+    function openSettingsModal() {
+      const modal = document.getElementById('settingsModal');
+      if (modal) modal.style.display = 'flex';
+
+      // Preenche os dados da farmácia
+      if (currentReport && currentReport.farmacia) {
+        const fn = document.getElementById('settingsFarmName');
+        if (fn) fn.value = currentReport.farmacia.nome || '';
+        const fNif = document.getElementById('settingsFarmNif');
+        if (fNif) fNif.value = currentReport.farmacia.nif || '';
+        const fCode = document.getElementById('settingsFarmAccessCode');
+        if (fCode) fCode.value = currentReport.farmacia.codigo_acesso || activeFarmaciaId || '';
+      }
+
+      loadSettingsTeam();
+      loadSettingsSessions();
+    }
+
+    function closeSettingsModal() {
+      const modal = document.getElementById('settingsModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    function switchSettingsTab(tabName) {
+      ['team', 'sessions', 'pharmacy', 'reset'].forEach(t => {
+        const btn = document.getElementById('settingsTabBtn-' + t);
+        const view = document.getElementById('settingsView-' + t);
+        if (btn) {
+          const isAct = t === tabName;
+          btn.style.background = isAct ? '#ffffff' : 'transparent';
+          btn.style.color = isAct ? '#0284c7' : '#475569';
+          btn.style.boxShadow = isAct ? '0 1px 2px rgba(0,0,0,0.05)' : 'none';
+        }
+        if (view) view.style.display = (t === tabName ? 'block' : 'none');
+      });
+    }
+
+    function toggleInviteForm() {
+      const f = document.getElementById('inviteMemberForm');
+      if (f) f.style.display = (f.style.display === 'none' ? 'block' : 'none');
+    }
+
+    async function loadSettingsTeam() {
+      const container = document.getElementById('settingsTeamTableContainer');
+      if (!container || !activeFarmaciaId) return;
+
+      try {
+        const res = await fetch('/api/settings/team?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        const data = await res.json();
+        if (data.ok && Array.isArray(data.team)) {
+          if (data.team.length === 0) {
+            container.innerHTML = '<div style="text-align: center; color: #64748b; padding: 20px;">Nenhum colaborador adicionado ainda.</div>';
+            return;
+          }
+
+          let html = '<div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden;"><table style="width: 100%; border-collapse: collapse; font-size: 0.82rem; text-align: left;">';
+          html += '<thead style="background: #f8fafc; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700;">' +
+            '<tr><th style="padding: 10px 14px;">Colaborador</th><th style="padding: 10px 14px;">Email</th><th style="padding: 10px 14px;">Perfil (RBAC)</th><th style="padding: 10px 14px;">PIN</th><th style="padding: 10px 14px; text-align: right;">Ações</th></tr></thead><tbody>';
+
+          data.team.forEach(m => {
+            let roleBadge = '<span style="background: #e0f2fe; color: #0369a1; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem;">AUXILIAR</span>';
+            if (m.role === 'DIRETOR') roleBadge = '<span style="background: #dcfce7; color: #15803d; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem;">DIRETOR TÉCNICO</span>';
+            if (m.role === 'GESTOR') roleBadge = '<span style="background: #fef9c3; color: #854d0e; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem;">GESTOR GLOBAL</span>';
+            if (m.role === 'SUPORTE') roleBadge = '<span style="background: #f3e8ff; color: #7e22ce; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem;">SUPORTE TI</span>';
+
+            html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+              '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(m.nome) + '</td>' +
+              '<td style="padding: 10px 14px; color: #475569;">' + escapeHtml(m.email) + '</td>' +
+              '<td style="padding: 10px 14px;">' + roleBadge + '</td>' +
+              '<td style="padding: 10px 14px; font-family: monospace; font-weight: 700; color: #64748b;">' + escapeHtml(m.pin || '••••') + '</td>' +
+              '<td style="padding: 10px 14px; text-align: right;">' +
+              '<button onclick="deleteTeamMember(\'' + m.id + '\')" style="background: none; border: none; color: #e11d48; cursor: pointer; font-size: 0.8rem; font-weight: 700;">Remover</button>' +
+              '</td></tr>';
+          });
+
+          html += '</tbody></table></div>';
+          container.innerHTML = html;
+        }
+      } catch (err) {
+        container.innerHTML = '<div style="color: #e11d48; padding: 10px;">Erro ao carregar equipa.</div>';
+      }
+    }
+
+    async function submitInviteMember() {
+      const nome = document.getElementById('inviteName').value.trim();
+      const email = document.getElementById('inviteEmail').value.trim();
+      const role = document.getElementById('inviteRole').value;
+      const pin = document.getElementById('invitePin').value.trim();
+
+      if (!nome || !email) {
+        alert('Por favor introduza o nome e o email do colaborador.');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/settings/team/invite', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ farmaciaId: activeFarmaciaId, nome, email, role, pin })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          toggleInviteForm();
+          document.getElementById('inviteName').value = '';
+          document.getElementById('inviteEmail').value = '';
+          document.getElementById('invitePin').value = '';
+          loadSettingsTeam();
+        } else {
+          alert('Erro: ' + (data.error || 'Não foi possível adicionar colaborador.'));
+        }
+      } catch (err) {
+        alert('Erro ao enviar pedido.');
+      }
+    }
+
+    async function deleteTeamMember(userId) {
+      if (!confirm('Deseja realmente revogar o acesso deste colaborador?')) return;
+      try {
+        await fetch('/api/settings/team/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ farmaciaId: activeFarmaciaId, userId })
+        });
+        loadSettingsTeam();
+      } catch (e) {}
+    }
+
+    async function loadSettingsSessions() {
+      const container = document.getElementById('settingsSessionsContainer');
+      if (!container || !activeFarmaciaId) return;
+
+      try {
+        const res = await fetch('/api/settings/sessions?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        const data = await res.json();
+        if (data.ok && Array.isArray(data.sessions)) {
+          if (data.sessions.length === 0) {
+            container.innerHTML = '<div style="text-align: center; color: #64748b; padding: 20px;">Nenhuma sessão ativa registada.</div>';
+            return;
+          }
+
+          let html = '<div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden;"><table style="width: 100%; border-collapse: collapse; font-size: 0.82rem; text-align: left;">';
+          html += '<thead style="background: #f8fafc; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700;">' +
+            '<tr><th style="padding: 10px 14px;">Utilizador</th><th style="padding: 10px 14px;">Dispositivo / IP</th><th style="padding: 10px 14px;">Perfil</th><th style="padding: 10px 14px;">Última Atividade</th><th style="padding: 10px 14px; text-align: right;">Ação</th></tr></thead><tbody>';
+
+          data.sessions.forEach(s => {
+            const timeStr = new Date(s.lastSeenAt).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+              '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(s.userName) + '</td>' +
+              '<td style="padding: 10px 14px; color: #475569;">' + escapeHtml(s.device) + ' (' + escapeHtml(s.ip) + ')</td>' +
+              '<td style="padding: 10px 14px; font-weight: 700; color: #0284c7;">' + escapeHtml(s.role) + '</td>' +
+              '<td style="padding: 10px 14px; color: #059669; font-weight: 600;">' + timeStr + '</td>' +
+              '<td style="padding: 10px 14px; text-align: right;">' +
+              '<button onclick="revokeSession(\'' + s.sessionId + '\')" style="background: #fee2e2; border: 1px solid #fca5a5; color: #dc2626; border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 0.74rem; font-weight: 700;">Terminar Sessão</button>' +
+              '</td></tr>';
+          });
+
+          html += '</tbody></table></div>';
+          container.innerHTML = html;
+        }
+      } catch (err) {
+        container.innerHTML = '<div style="color: #e11d48; padding: 10px;">Erro ao carregar sessões.</div>';
+      }
+    }
+
+    async function revokeSession(sessionId) {
+      if (!confirm('Deseja realmente terminar esta sessão ativa imediatamente?')) return;
+      try {
+        await fetch('/api/settings/sessions/revoke', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId })
+        });
+        loadSettingsSessions();
+      } catch (e) {}
+    }
+
+    async function submitForgotPassword() {
+      const email = document.getElementById('forgotPassEmail').value.trim();
+      const fb = document.getElementById('forgotPassFeedback');
+      if (!email) {
+        alert('Por favor introduza o seu email.');
+        return;
+      }
+      try {
+        const res = await fetch('/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, farmaciaId: activeFarmaciaId })
+        });
+        const data = await res.json();
+        if (fb) {
+          fb.style.display = 'block';
+          if (data.ok) {
+            fb.style.background = '#dcfce7';
+            fb.style.color = '#15803d';
+            fb.innerHTML = '✓ ' + escapeHtml(data.message) + (data.resetLinkPreview ? '<br><small><b>Link de teste:</b> <a href="' + data.resetLinkPreview + '" target="_blank">' + data.resetLinkPreview + '</a></small>' : '');
+          } else {
+            fb.style.background = '#fee2e2';
+            fb.style.color = '#dc2626';
+            fb.textContent = '❌ ' + (data.error || 'Erro ao processar pedido.');
+          }
+        }
+      } catch (e) {
+        alert('Erro ao enviar pedido de recuperação.');
+      }
     }
 
     function openMobileStaffModal() {
