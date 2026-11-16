@@ -5745,22 +5745,40 @@ function getDashboardHtml(): string {
   </div>
 
   <div class="modal-backdrop" id="productModal" style="display: none;" onclick="if(event.target===this) closeModal()">
-    <div class="modal">
-      <div class="modal-header">
-        <div>
-          <h2 id="modalTitle" style="font-size: 1.15rem; color: var(--primary);"></h2>
-          <p id="modalSub" style="font-size: 0.85rem; color: var(--muted); margin-top: 4px;"></p>
+    <div class="modal" id="productModalBox" style="max-width: 1440px; width: 96vw; height: 92vh; display: flex; flex-direction: column; padding: 20px 24px; overflow: hidden;">
+      
+      <!-- HEADER DO PRODUTO & AÇÕES -->
+      <div class="modal-header" style="margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border);">
+        <div style="flex: 1; min-width: 300px;">
+          <h2 id="modalTitle" style="font-size: 1.18rem; color: var(--primary); margin: 0; line-height: 1.35;"></h2>
+          <p id="modalSub" style="font-size: 0.82rem; color: var(--muted); margin: 3px 0 0 0;"></p>
         </div>
-        <button class="btn btn-secondary" onclick="closeModal()">✕ Fechar</button>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <button class="btn btn-secondary" onclick="closeModal()" style="font-weight: 700; padding: 6px 14px;">✕ Fechar</button>
+        </div>
       </div>
-      <div id="modalRuleBox" style="background:rgba(56,189,248,0.1);border:1px solid rgba(56,189,248,0.3);padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:0.86rem;"></div>
-      <div id="modalMetrics" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px;"></div>
-      <div id="modalChartHeader" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;">
-        <h4 id="modalChartTitle" style="font-size: 0.85rem; color: var(--muted); text-transform: uppercase;">Evolução de Vendas Mensais (Unidades Vendidas por Mês)</h4>
-        <div id="modalLabSwitcher" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+
+      <!-- CORPO COM SCROLL CONTROLADO -->
+      <div id="productModalScrollBody" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-right: 4px;">
+        
+        <!-- REGRA DE BALCÃO E CROSS-SELLING -->
+        <div id="modalRuleBox" style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.25); padding: 8px 14px; border-radius: 8px; font-size: 0.84rem;"></div>
+
+        <!-- 4 KPIS DO LABORATÓRIO SELECIONADO -->
+        <div id="modalMetrics" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;"></div>
+
+        <!-- SECÇÃO DO GRÁFICO DE VENDAS -->
+        <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 12px 18px;">
+          <div id="modalChartHeader" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 6px;">
+            <h4 id="modalChartTitle" style="font-size: 0.84rem; color: var(--muted); text-transform: uppercase; margin: 0;">Evolução de Vendas Mensais (Unidades Vendidas por Mês)</h4>
+            <div id="modalLabSwitcher" style="display: flex; gap: 6px; flex-wrap: wrap;"></div>
+          </div>
+          <div class="chart-bars" id="modalChart" style="height: 110px;"></div>
+        </div>
+
+        <!-- SECÇÃO DE LABORATÓRIOS POR MOLÉCULA (AMPLA, ESPAÇOSA E COM SCROLL FIXO) -->
+        <div id="modalDciPeers" style="display: none; background: #ffffff; border: 1.5px solid #e9d5ff; border-radius: 12px; padding: 16px; margin-top: 4px; flex: 1;"></div>
       </div>
-      <div class="chart-bars" id="modalChart"></div>
-      <div id="modalDciPeers" style="margin-top: 18px; display: none;"></div>
     </div>
   </div>
 
@@ -10786,154 +10804,240 @@ function getDashboardHtml(): string {
       }
     }
 
-    async function openProductModal(cnp) {
-      const res = await fetch('/api/product/' + cnp + '?farmaciaId=' + activeFarmaciaId);
-      if (!res.ok) return;
-      const p = await res.json();
+    let productClientCache = {};
+    let activeDciGroup = null;
 
+    function updateModalProductView(p) {
       const inv = p.inventario[0] || { quantidade: 0, custo_unitario: 0, data_validade: null };
-      const totalVendido = p.vendas.reduce((s, v) => s + v.quantidade, 0);
+      const totalVendido = (p.vendas || []).reduce((s, v) => s + v.quantidade, 0);
       const vmm = (totalVendido / 12).toFixed(2);
 
-      document.getElementById('modalTitle').innerHTML = \`[\${p.cnp_codigo}] \${p.designacao} \${formatSegmentoBadge(p)}\`;
-      document.getElementById('modalSub').textContent = \`Categoria: \${p.categoria} | \${p.grupo_equivalencia_dci ? 'Grupo DCI: ' + p.grupo_equivalencia_dci + ' | ' : ''}IVA: \${p.taxa_iva ?? '-'}%\`;
+      const titleEl = document.getElementById('modalTitle');
+      if (titleEl) titleEl.innerHTML = '[' + p.cnp_codigo + '] ' + escapeHtml(p.designacao) + ' ' + formatSegmentoBadge(p);
 
-      const ruleBox = document.getElementById('modalRuleBox');
-      let ruleHtml = '';
-      if (p.eh_generico) {
-        ruleHtml = \`🧬 <b>Medicamento Genérico (MG) — Grupo DCI: \${p.grupo_equivalencia_dci}:</b> Substituível no balcão perante receita médica por DCI. Priorizar o escoamento de laboratórios com 1-2 caixas soltas ("restos de gaveta") ou validade mais curta, e concentrar futuras encomendas no laboratório com menor preço de custo.\`;
-      } else if (p.tipo_venda === 'MSRM') {
-        ruleHtml = \`🏷️ <b>Medicamento de Marca Sujeito a Receita (MSRM):</b> Vedado a cross-selling comercial e sem substituição direta por outra marca se prescrito nominalmente. Gerir por ajuste de stock mínimo ou devolução ao armazenista.\`;
-      } else {
-        ruleHtml = \`🟢 <b>Elegível para Cross-Selling e Campanhas (\${p.tipo_venda}):</b> \${p.sugestao_cross_sell}\`;
+      const subEl = document.getElementById('modalSub');
+      if (subEl) {
+        subEl.textContent = 'Categoria: ' + (p.categoria || 'Geral') + (p.grupo_equivalencia_dci ? ' | Grupo DCI: ' + p.grupo_equivalencia_dci : '') + ' | IVA: ' + (p.taxa_iva ?? '-') + '%';
       }
-      ruleBox.innerHTML = \`
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
-          <div style="flex:1;min-width:260px;">\${ruleHtml}</div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <button class="btn btn-secondary" onclick="jumpToProductCrossSell360('\${p.cnp_codigo}')" style="font-size:0.78rem;padding:6px 12px;border-color:#38bdf8;color:#38bdf8;">
-              🤝 Ver Cross-Selling & Escoamento 360º
-            </button>
-            \${p.tipo_venda !== 'MSRM' ? \`
-              <button class="btn" onclick="jumpToSingleProductCampaign('\${p.cnp_codigo}')" style="font-size:0.78rem;padding:6px 12px;background:linear-gradient(135deg,#f43f5e,#a855f7);">
-                📣 Criar Campanha p/ Este Produto
-              </button>
-            \` : ''}
-          </div>
-        </div>
-      \`;
 
-      const peersBox = document.getElementById('modalDciPeers');
-      const dciGroup = currentReport && p.grupo_equivalencia_dci
-        ? currentReport.consolidacao_genericos_dci.find(g => g.grupo_equivalencia_dci === p.grupo_equivalencia_dci)
-        : null;
+      // 4 KPIs
+      const metricsEl = document.getElementById('modalMetrics');
+      if (metricsEl) {
+        metricsEl.innerHTML =
+          '<div style="background:#f8fafc;padding:10px 14px;border-radius:8px;border:1px solid #e2e8f0">' +
+            '<div style="font-size:0.72rem;font-weight:700;color:#64748b;text-transform:uppercase;">' + (activeDciGroup ? 'STOCK DESTE LAB' : 'STOCK ATUAL') + '</div>' +
+            '<div style="font-size:1.3rem;font-weight:800;color:#0f172a;margin-top:2px;">' + inv.quantidade + ' un</div>' +
+            '<div style="font-size:0.76rem;color:#64748b;">Custo: ' + Number(inv.custo_unitario).toFixed(2) + ' €' + (activeDciGroup ? ' | Molécula: <b style="color:#7e22ce;">' + activeDciGroup.stock_total_unidades + ' un</b> (' + activeDciGroup.num_laboratorios_abertos + ' labs)' : '') + '</div>' +
+          '</div>' +
+          '<div style="background:#f8fafc;padding:10px 14px;border-radius:8px;border:1px solid #e2e8f0">' +
+            '<div style="font-size:0.72rem;font-weight:700;color:#64748b;text-transform:uppercase;">PVP & MARGEM</div>' +
+            '<div style="font-size:1.3rem;font-weight:800;color:#0f172a;margin-top:2px;">' + (p.pvp ? Number(p.pvp).toFixed(2) + ' €' : '-') + '</div>' +
+            '<div style="font-size:0.76rem;color:#059669;font-weight:700;">Margem: ' + (p.margem_padrao ? p.margem_padrao + '%' : '-') + '</div>' +
+          '</div>' +
+          '<div style="background:#f8fafc;padding:10px 14px;border-radius:8px;border:1px solid #e2e8f0">' +
+            '<div style="font-size:0.72rem;font-weight:700;color:#64748b;text-transform:uppercase;">RITMO (VMM 12M)</div>' +
+            '<div style="font-size:1.3rem;font-weight:800;color:#0f172a;margin-top:2px;">' + vmm + ' /mês</div>' +
+            '<div style="font-size:0.76rem;color:#64748b;">Total 12M: ' + totalVendido + ' un vendidas</div>' +
+          '</div>' +
+          '<div style="background:#f8fafc;padding:10px 14px;border-radius:8px;border:1px solid #e2e8f0">' +
+            '<div style="font-size:0.72rem;font-weight:700;color:#64748b;text-transform:uppercase;">VALIDADE REGISTADA</div>' +
+            '<div style="font-size:1.3rem;font-weight:800;color:' + (inv.data_validade ? '#e11d48' : '#0f172a') + ';margin-top:2px;">' + (inv.data_validade || 'S/ Registo') + '</div>' +
+            '<div style="font-size:0.76rem;color:#64748b;">Controlo Sifarma / Winphar</div>' +
+          '</div>';
+      }
 
-      document.getElementById('modalMetrics').innerHTML = \`
-        <div style="background:var(--bg);padding:12px;border-radius:8px;border:1px solid var(--border)">
-          <div style="font-size:0.75rem;color:var(--muted)">\${dciGroup ? 'STOCK DESTE LABORATÓRIO' : 'STOCK ATUAL'}</div>
-          <div style="font-size:1.25rem;font-weight:700">\${inv.quantidade} un</div>
-          <div style="font-size:0.78rem;color:var(--muted)">Custo: \${inv.custo_unitario.toFixed(2)} € \${dciGroup ? \` | Gaveta: <b style="color:#c084fc">\${dciGroup.stock_total_unidades} un</b> (\${dciGroup.num_laboratorios_abertos} labs)\` : ''}</div>
-        </div>
-        <div style="background:var(--bg);padding:12px;border-radius:8px;border:1px solid var(--border)">
-          <div style="font-size:0.75rem;color:var(--muted)">PVP & MARGEM</div>
-          <div style="font-size:1.25rem;font-weight:700">\${p.pvp ? p.pvp.toFixed(2) + ' €' : '-'}</div>
-          <div style="font-size:0.78rem;color:var(--success)">Margem: \${p.margem_padrao ? p.margem_padrao + '%' : '-'}</div>
-        </div>
-        <div style="background:var(--bg);padding:12px;border-radius:8px;border:1px solid var(--border)">
-          <div style="font-size:0.75rem;color:var(--muted)">RITMO (VMM 12M)</div>
-          <div style="font-size:1.25rem;font-weight:700">\${vmm} /mês</div>
-          <div style="font-size:0.78rem;color:var(--muted)">Total vendido: \${totalVendido} un</div>
-        </div>
-        <div style="background:var(--bg);padding:12px;border-radius:8px;border:1px solid var(--border)">
-          <div style="font-size:0.75rem;color:var(--muted)">VALIDADE REGISTADA</div>
-          <div style="font-size:1.25rem;font-weight:700;color:\${inv.data_validade ? '#fb7185' : 'var(--text)'}">\${inv.data_validade || 'S/ Registo'}</div>
-          <div style="font-size:0.78rem;color:var(--muted)">Controlo Sifarma / Winphar</div>
-        </div>
-      \`;
-
-      const salesMap = new Map(p.vendas.map(v => [v.mes, v.quantidade]));
+      // Gráfico
+      const salesMap = new Map((p.vendas || []).map(v => [v.mes, v.quantidade]));
       const maxQtd = Math.max(1, ...MONTHS_ORDER.map(m => salesMap.get(m.key) || 0));
 
       const chartTitleEl = document.getElementById('modalChartTitle');
       if (chartTitleEl) {
-        chartTitleEl.innerHTML = dciGroup
-          ? \`📊 Evolução de Vendas Mensais — <span style="color:#38bdf8;">[\${p.cnp_codigo}] \${p.designacao.split(',')[0]}</span> (Total: \${totalVendido} un)\`
-          : 'Evolução de Vendas Mensais (Unidades Vendidas por Mês)';
+        chartTitleEl.innerHTML = '📊 Evolução de Vendas Mensais — <span style="color:#0284c7;font-weight:800;">[' + p.cnp_codigo + '] ' + escapeHtml((p.designacao || '').split(',')[0]) + '</span> (Total: ' + totalVendido + ' un)';
       }
 
-      document.getElementById('modalChart').innerHTML = MONTHS_ORDER.map(m => {
-        const qtd = salesMap.get(m.key) || 0;
-        const heightPct = Math.round((qtd / maxQtd) * 110) + 4;
-        return \`
-          <div class="bar-col">
-            <span class="bar-val">\${qtd}</span>
-            <div class="bar" style="height:\${heightPct}px;background:\${qtd > 0 ? 'var(--primary)' : '#334155'}"></div>
-            <span class="bar-lbl">\${m.label}</span>
-          </div>
-        \`;
-      }).join('');
+      const chartEl = document.getElementById('modalChart');
+      if (chartEl) {
+        chartEl.innerHTML = MONTHS_ORDER.map(m => {
+          const qtd = salesMap.get(m.key) || 0;
+          const heightPct = Math.round((qtd / maxQtd) * 85) + 4;
+          return '<div class="bar-col">' +
+            '<span class="bar-val">' + qtd + '</span>' +
+            '<div class="bar" style="height:' + heightPct + 'px;background:' + (qtd > 0 ? '#0284c7' : '#cbd5e1') + '"></div>' +
+            '<span class="bar-lbl">' + m.label + '</span>' +
+            '</div>';
+        }).join('');
+      }
+    }
 
+    async function switchLabInModal(cnp, clickedTr) {
+      // 1. Atualizar imediatamente o destaque visual da linha clicada
+      const tbody = document.getElementById('dciPeersTableBody');
+      if (tbody) {
+        const rows = tbody.querySelectorAll('tr');
+        rows.forEach(function(r) {
+          r.style.background = '';
+          r.style.borderLeft = '';
+          const b = r.querySelector('.lab-status-btn');
+          if (b) {
+            b.innerHTML = '📊 Ver Gráfico';
+            b.style.background = '#f0f9ff';
+            b.style.color = '#0284c7';
+            b.style.borderColor = '#bae6fd';
+          }
+        });
+      }
+
+      if (clickedTr) {
+        clickedTr.style.background = '#faf5ff';
+        clickedTr.style.borderLeft = '4px solid #a855f7';
+        const b = clickedTr.querySelector('.lab-status-btn');
+        if (b) {
+          b.innerHTML = '👁️ No Gráfico';
+          b.style.background = '#f3e8ff';
+          b.style.color = '#7e22ce';
+          b.style.borderColor = '#d8b4fe';
+        }
+      }
+
+      // 2. Verificar se está em cache ou descarregar
+      let p = productClientCache[cnp];
+      if (!p) {
+        const chartTitleEl = document.getElementById('modalChartTitle');
+        if (chartTitleEl) chartTitleEl.textContent = '⏳ A carregar vendas do laboratório [' + cnp + ']...';
+        try {
+          const res = await fetch('/api/product/' + cnp + '?farmaciaId=' + encodeURIComponent(activeFarmaciaId || ''));
+          if (!res.ok) return;
+          p = await res.json();
+          productClientCache[cnp] = p;
+        } catch (err) {
+          console.error('Falha ao carregar laboratório:', err);
+          return;
+        }
+      }
+
+      // 3. Atualizar gráfico e métricas SEM mexer no scroll nem na tabela
+      updateModalProductView(p);
+    }
+
+    async function openProductModal(cnp) {
+      // Verificar se já temos o produto em cache para abertura instantânea
+      let p = productClientCache[cnp];
+      if (!p) {
+        try {
+          const res = await fetch('/api/product/' + cnp + '?farmaciaId=' + encodeURIComponent(activeFarmaciaId || ''));
+          if (!res.ok) return;
+          p = await res.json();
+          productClientCache[cnp] = p;
+        } catch (err) {
+          console.error(err);
+          return;
+        }
+      }
+
+      const dciGroup = currentReport && p.grupo_equivalencia_dci
+        ? currentReport.consolidacao_genericos_dci.find(g => g.grupo_equivalencia_dci === p.grupo_equivalencia_dci)
+        : null;
+      activeDciGroup = dciGroup;
+
+      // Atualizar view do produto
+      updateModalProductView(p);
+
+      // Regra de Balcão e Cross-Selling
+      const ruleBox = document.getElementById('modalRuleBox');
+      let ruleHtml = '';
+      if (p.eh_generico) {
+        ruleHtml = '🧬 <b>Medicamento Genérico (MG) — Grupo DCI: ' + escapeHtml(p.grupo_equivalencia_dci || p.designacao) + ':</b> Substituível no balcão perante receita médica por DCI. Priorizar o escoamento de laboratórios com 1-2 caixas soltas ("restos de gaveta") ou validade mais curta, e concentrar futuras encomendas no laboratório com menor preço de custo.';
+      } else if (p.tipo_venda === 'MSRM') {
+        ruleHtml = '🏷️ <b>Medicamento de Marca Sujeito a Receita (MSRM):</b> Vedado a cross-selling comercial e sem substituição direta por outra marca se prescrito nominalmente.';
+      } else {
+        ruleHtml = '🟢 <b>Elegível para Cross-Selling e Campanhas (' + escapeHtml(p.tipo_venda || '') + '):</b> ' + escapeHtml(p.sugestao_cross_sell || '');
+      }
+      if (ruleBox) {
+        ruleBox.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">' +
+          '<div style="flex:1;min-width:260px;">' + ruleHtml + '</div>' +
+          '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+            '<button class="btn btn-secondary" onclick="jumpToProductCrossSell360(&quot;' + p.cnp_codigo + '&quot;)" style="font-size:0.78rem;padding:6px 12px;border-color:#0284c7;color:#0284c7;">🤝 Cross-Selling 360º</button>' +
+          '</div></div>';
+      }
+
+      const peersBox = document.getElementById('modalDciPeers');
       const switcherEl = document.getElementById('modalLabSwitcher');
 
-      // Se for Genérico MG e pertencer a um grupo DCI com múltiplos laboratórios, mostra a tabela comparativa clicável + seletor rápido!
-      if (dciGroup) {
+      if (dciGroup && dciGroup.todos_laboratorios && dciGroup.todos_laboratorios.length > 0) {
         if (switcherEl) {
           const allCnps = dciGroup.todos_laboratorios.map(l => l.cnp_codigo).join(',');
-          switcherEl.innerHTML = \`
-            <button class="btn btn-secondary" onclick="renderDciCombinedChart('\${allCnps}', '\${escapeJsString(dciGroup.grupo_equivalencia_dci)}')" style="font-size:0.74rem;padding:4px 10px;border-color:#c084fc;color:#c084fc;">
-              🧬 Ver Soma da Molécula (\${dciGroup.num_laboratorios_abertos} Labs)
-            </button>
-          \`;
+          switcherEl.innerHTML = '<button class="btn btn-secondary" onclick="renderDciCombinedChart(&quot;' + allCnps + '&quot;, &quot;' + escapeJsString(dciGroup.grupo_equivalencia_dci) + '&quot;)" style="font-size:0.75rem;padding:5px 12px;border-color:#c084fc;color:#7e22ce;font-weight:700;background:#faf5ff;">' +
+            '🧬 Ver Soma da Molécula (' + dciGroup.num_laboratorios_abertos + ' Labs)' +
+          '</button>';
         }
 
+        // Pré-carregar em background os outros laboratórios do grupo DCI para cliques instantâneos a 0ms
+        dciGroup.todos_laboratorios.forEach(function(l) {
+          if (!productClientCache[l.cnp_codigo]) {
+            fetch('/api/product/' + l.cnp_codigo + '?farmaciaId=' + encodeURIComponent(activeFarmaciaId || ''))
+              .then(function(r) { return r.ok ? r.json() : null; })
+              .then(function(data) { if (data) productClientCache[l.cnp_codigo] = data; })
+              .catch(function() {});
+          }
+        });
+
         peersBox.style.display = 'block';
-        peersBox.innerHTML = \`
-          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
-            <h4 style="font-size: 0.85rem; color: #c084fc; text-transform: uppercase; margin: 0;">
-              🧬 Outros Laboratórios em Stock para \${dciGroup.grupo_equivalencia_dci} (\${dciGroup.num_laboratorios_abertos} marcas abertas)
-            </h4>
-            <span style="font-size:0.78rem;color:#38bdf8;font-weight:600;">
-              👆 Clique em qualquer laboratório para ver o seu gráfico de vendas e stock
-            </span>
-          </div>
-          <div class="table-wrap" style="max-height: 220px;">
-            <table>
-              <thead>
-                <tr>
-                  <th>Código</th>
-                  <th>Laboratório / Designação</th>
-                  <th>Stock</th>
-                  <th>Custo Unit.</th>
-                  <th>VMM</th>
-                  <th>Validade</th>
-                  <th>Prioridade de Escoamento</th>
-                  <th>Desempenho Vendas</th>
-                </tr>
-              </thead>
-              <tbody>
-                \${dciGroup.todos_laboratorios.map(lab => {
+        peersBox.innerHTML =
+          '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">' +
+            '<div>' +
+              '<h4 style="font-size: 0.94rem; font-weight: 800; color: #7e22ce; text-transform: uppercase; margin: 0; display: flex; align-items: center; gap: 6px;">' +
+                '🧬 Laboratórios Disponíveis em Stock para ' + escapeHtml(dciGroup.grupo_equivalencia_dci) + ' (' + dciGroup.num_laboratorios_abertos + ' marcas em gaveta)' +
+              '</h4>' +
+              '<p style="font-size: 0.8rem; color: #64748b; margin: 3px 0 0 0;">' +
+                'Clique em qualquer linha ou no botão "Ver Gráfico" para ver a rotação desse laboratório <b>sem perder a posição da tabela</b>.' +
+              '</p>' +
+            '</div>' +
+            '<span style="font-size:0.78rem;background:#f3e8ff;color:#6b21a8;font-weight:800;padding:5px 12px;border-radius:8px;border:1px solid #d8b4fe;">' +
+              'Stock Molécula: ' + dciGroup.stock_total_unidades + ' un | VMM Grupo: ' + dciGroup.vmm_total_grupo + '/mês' +
+            '</span>' +
+          '</div>' +
+          '<div class="table-wrap" style="height: 380px; max-height: 480px; overflow-y: auto; border: 1.5px solid #e2e8f0; border-radius: 10px; background: #ffffff;">' +
+            '<table style="width: 100%; border-collapse: collapse; font-size: 0.86rem; text-align: left;">' +
+              '<thead style="position: sticky; top: 0; z-index: 3; background: #f8fafc; border-bottom: 2px solid #cbd5e1;">' +
+                '<tr>' +
+                  '<th style="padding: 11px 14px; width: 100px; color: #475569;">Código</th>' +
+                  '<th style="padding: 11px 14px; color: #475569;">Laboratório / Designação</th>' +
+                  '<th style="padding: 11px 14px; text-align: center; width: 110px; color: #475569;">Stock Gaveta</th>' +
+                  '<th style="padding: 11px 14px; text-align: right; width: 110px; color: #475569;">Custo Unit.</th>' +
+                  '<th style="padding: 11px 14px; text-align: center; width: 100px; color: #475569;">Ritmo VMM</th>' +
+                  '<th style="padding: 11px 14px; text-align: center; width: 110px; color: #475569;">Validade</th>' +
+                  '<th style="padding: 11px 14px; text-align: center; width: 180px; color: #475569;">Prioridade de Escoamento</th>' +
+                  '<th style="padding: 11px 14px; text-align: right; width: 140px; color: #475569;">Ação Gráfico</th>' +
+                '</tr>' +
+              '</thead>' +
+              '<tbody id="dciPeersTableBody">' +
+                dciGroup.todos_laboratorios.map(function(lab) {
                   const isCurrent = lab.cnp_codigo === p.cnp_codigo;
-                  return \`
-                    <tr class="clickable-row" onclick="openProductModal('\${lab.cnp_codigo}')" style="\${isCurrent ? 'background:rgba(168,85,247,0.22);border-left:3px solid #c084fc;' : ''}">
-                      <td><b>\${lab.cnp_codigo}</b></td>
-                      <td><b>\${lab.designacao}</b></td>
-                      <td><b>\${lab.stock_atual} un</b></td>
-                      <td>\${lab.custo_unitario.toFixed(2)} €</td>
-                      <td><b>\${lab.vmm}/mês</b></td>
-                      <td>\${lab.data_validade || '-'}</td>
-                      <td>\${lab.stock_atual <= 2 ? '<span class="badge badge-danger">🧹 Resto Gaveta (Escoar 1º)</span>' : lab.custo_unitario === dciGroup.custo_minimo ? '<span class="badge badge-success">⭐ Lab Mais Barato</span>' : 'Stock Principal'}</td>
-                      <td>
-                        \${isCurrent
-                          ? '<span class="badge badge-purple">👁️ Em Visualização</span>'
-                          : '<span class="badge badge-info" style="cursor:pointer;">📊 Ver Gráfico</span>'}
-                      </td>
-                    </tr>
-                  \`;
-                }).join('')}
-              </tbody>
-            </table>
-          </div>
-        \`;
+                  const rowStyle = isCurrent ? 'background:#faf5ff;border-left:4px solid #a855f7;' : '';
+                  const statusBadge = isCurrent
+                    ? '<span class="badge badge-purple lab-status-btn" style="background:#f3e8ff;color:#7e22ce;border-color:#d8b4fe;padding:4px 10px;">👁️ No Gráfico</span>'
+                    : '<button class="btn btn-secondary lab-status-btn" style="font-size:0.75rem;padding:4px 10px;background:#f0f9ff;color:#0284c7;border-color:#bae6fd;font-weight:700;">📊 Ver Gráfico</button>';
+
+                  const priorityBadge = lab.stock_atual <= 2
+                    ? '<span class="badge badge-danger" style="background:#fee2e2;color:#b91c1c;padding:3px 8px;font-weight:700;">🧹 Resto Gaveta (Escoar 1º)</span>'
+                    : lab.custo_unitario === dciGroup.custo_minimo
+                      ? '<span class="badge badge-success" style="background:#dcfce7;color:#15803d;padding:3px 8px;font-weight:700;">⭐ Mais Barato</span>'
+                      : '<span style="color:#64748b;font-size:0.78rem;">Stock Principal</span>';
+
+                  return '<tr class="clickable-row lab-row-' + lab.cnp_codigo + '" onclick="switchLabInModal(&quot;' + lab.cnp_codigo + '&quot;, this)" style="' + rowStyle + 'border-bottom: 1px solid #f1f5f9; cursor: pointer;">' +
+                    '<td style="padding: 10px 14px; font-family: monospace; font-weight: 700; color: #0284c7;">' + escapeHtml(lab.cnp_codigo) + '</td>' +
+                    '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(lab.designacao) + '</td>' +
+                    '<td style="padding: 10px 14px; text-align: center; font-weight: 800; color: #0f172a;">' + lab.stock_atual + ' un</td>' +
+                    '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #334155;">' + Number(lab.custo_unitario).toFixed(2) + ' €</td>' +
+                    '<td style="padding: 10px 14px; text-align: center; font-weight: 700; color: #0f172a;">' + lab.vmm + ' /mês</td>' +
+                    '<td style="padding: 10px 14px; text-align: center; color: #64748b;">' + escapeHtml(lab.data_validade || '—') + '</td>' +
+                    '<td style="padding: 10px 14px; text-align: center;">' + priorityBadge + '</td>' +
+                    '<td style="padding: 10px 14px; text-align: right;">' + statusBadge + '</td>' +
+                    '</tr>';
+                }).join('') +
+              '</tbody>' +
+            '</table>' +
+          '</div>';
       } else {
         if (switcherEl) switcherEl.innerHTML = '';
         peersBox.style.display = 'none';
