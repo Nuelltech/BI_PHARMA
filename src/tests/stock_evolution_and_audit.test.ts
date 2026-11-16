@@ -18,7 +18,9 @@ describe('Evolução de Stock, Imobilizado, Valores Poupados e Auditoria de Tare
     expect(report.resumoAtual.stock_total_unidades).toBeGreaterThan(0);
     expect(report.resumoAtual.stock_imobilizado_eur).toBeGreaterThanOrEqual(0);
     expect(report.resumoAtual.taxa_imobilizado_pct).toBeGreaterThanOrEqual(0);
-    expect(report.resumoAtual.valores_poupados_acumulados_eur).toBeGreaterThanOrEqual(0);
+    expect(report.resumoAtual.liquidez_recuperada_comprovada_eur).toBeGreaterThanOrEqual(0);
+    expect(report.resumoAtual.stock_ativo_eur).toBeGreaterThan(0);
+    expect(report.resumoAtual.dias_medios_rotacao).toBeGreaterThan(0);
 
     // Deve conter evolução mensal com pontos históricos
     expect(Array.isArray(report.evolucaoMensal)).toBe(true);
@@ -29,7 +31,7 @@ describe('Evolução de Stock, Imobilizado, Valores Poupados e Auditoria de Tare
     expect(firstPoint).toHaveProperty('mes_label');
     expect(firstPoint).toHaveProperty('stock_total_eur');
     expect(firstPoint).toHaveProperty('stock_imobilizado_eur');
-    expect(firstPoint).toHaveProperty('valores_poupados_eur');
+    expect(firstPoint).toHaveProperty('liquidez_recuperada_monos_eur');
 
     // Comparativo MoM
     expect(report.comparativoMoM).toBeDefined();

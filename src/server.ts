@@ -4926,86 +4926,126 @@ function getDashboardHtml(): string {
 
     <!-- ABA 5B: ANÁLISE DE LABORATÓRIOS & AIMS (FASE 5) -->
     
-    <!-- ABA: EVOLUÇÃO DE STOCKS NO TEMPO, MONOS E VALORES POUPADOS -->
+    <!-- ABA: SAÚDE FINANCEIRA DO INVENTÁRIO (EVOLUÇÃO REAL & LIQUIDEZ RECUPERADA) -->
     <div id="tabContent-evolution" style="display: none;">
-      <!-- CABEÇALHO HERO -->
-      <div style="background: linear-gradient(135deg, #f0fdf4 0%, #e0f2fe 100%); border: 1px solid #bae6fd; border-radius: 14px; padding: 22px; margin-bottom: 22px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+      <!-- CABEÇALHO EXECUTIVO TRANSPARENTE -->
+      <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border-radius: 14px; padding: 22px 24px; margin-bottom: 22px; color: #ffffff; box-shadow: 0 4px 12px rgba(15,23,42,0.15);">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
           <div>
-            <div style="font-size: 1.25rem; font-weight: 800; color: #0369a1; display: flex; align-items: center; gap: 8px;">
-              📈 Evolução de Stocks no Tempo, Imobilizado e Valores Poupados
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-size: 1.5rem;">📈</span>
+              <h2 style="font-size: 1.3rem; font-weight: 800; color: #38bdf8; margin: 0;">
+                Saúde Financeira do Inventário — Evolução de Stocks e Liquidez
+              </h2>
             </div>
-            <p style="font-size: 0.88rem; color: #334155; margin-top: 4px; max-width: 860px; line-height: 1.45;">
-              Monitorização contínua da libertação de tesouraria: acompanhe mês a mês a trajetória do <b>Stock Total</b>, a redução do <b>Stock Imobilizado (Monos)</b> e a acumulação de <b>Valores Poupados</b> na farmácia.
+            <p style="font-size: 0.88rem; color: #cbd5e1; margin-top: 6px; max-width: 860px; line-height: 1.5;">
+              Monitorização contínua baseada em <b>Vendas Comprovadas e Preços de Custo Reais</b>: acompanhe se a farmácia está a reduzir o capital empatado em "Monos", o ritmo de rotação e quanto dinheiro parado foi efetivamente recuperado para a tesouraria.
             </p>
+            <div style="display: flex; gap: 12px; margin-top: 10px; font-size: 0.76rem; color: #94a3b8; flex-wrap: wrap;">
+              <span>📊 <b>Dados Auditados:</b> Inventário Físico + Vendas Sifarma (12 Meses)</span>
+              <span>🔒 <b>Critério Monos:</b> Artigos com stock e sem vendas há >90 dias</span>
+              <span>✅ <b>Critério Poupança:</b> Vendas reais comprovadas (sem presunções)</span>
+            </div>
           </div>
           <div style="display: flex; gap: 10px; align-items: center;">
-            <button class="btn" onclick="loadStockEvolutionData()" style="background: #0284c7; color: #ffffff; font-weight: 700;">🔄 Atualizar Dados</button>
+            <button class="btn" onclick="loadStockEvolutionData()" style="background: #0284c7; color: #ffffff; font-weight: 700; padding: 8px 16px; border: none; border-radius: 8px; cursor: pointer;">
+              🔄 Atualizar Balanço
+            </button>
           </div>
         </div>
       </div>
 
-      <!-- 4 BIG NUMBER KPIS -->
-      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; margin-bottom: 22px;">
+      <!-- 4 BIG NUMBER KPIS DE GESTÃO REAL -->
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 22px;">
+        
+        <!-- KPI 1: STOCK TOTAL A PREÇO DE CUSTO -->
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #0284c7;">
-          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">📦 Stock Total Atual</div>
+          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">📦 Stock Total Físico (A Custo)</div>
           <div id="evoKpiStockTotal" style="font-size: 1.7rem; font-weight: 800; color: #0f172a; margin-top: 4px;">-- €</div>
           <div id="evoKpiStockSub" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">-- unidades em armazém</div>
         </div>
+
+        <!-- KPI 2: CAPITAL IMOBILIZADO (MONOS >90 DIAS) -->
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #e11d48;">
-          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">🛑 Stock Imobilizado (Monos)</div>
+          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">🛑 Capital Imobilizado ("Monos" >90d)</div>
           <div id="evoKpiImobilizado" style="font-size: 1.7rem; font-weight: 800; color: #e11d48; margin-top: 4px;">-- €</div>
-          <div id="evoKpiImobilizadoSub" style="font-size: 0.76rem; color: #e11d48; margin-top: 2px;">--% do capital total em stock</div>
+          <div id="evoKpiImobilizadoSub" style="font-size: 0.76rem; font-weight: 700; color: #e11d48; margin-top: 2px;">--% do valor total em stock</div>
         </div>
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #059669;">
-          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">💰 Valores Poupados Acumulados</div>
+
+        <!-- KPI 3: LIQUIDEZ RECUPERADA POR VENDAS COMPROVADAS -->
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #10b981;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">💰 Dinheiro de Monos Recuperado</div>
           <div id="evoKpiPoupancas" style="font-size: 1.7rem; font-weight: 800; color: #059669; margin-top: 4px;">-- €</div>
-          <div id="evoKpiPoupancasSub" style="font-size: 0.76rem; color: #059669; margin-top: 2px;">Em caducidades, tarefas e rebalanceamento</div>
+          <div id="evoKpiPoupancasSub" style="font-size: 0.76rem; color: #059669; margin-top: 2px;">Comprovado por talões de venda Sifarma</div>
         </div>
+
+        <!-- KPI 4: PRAZO MÉDIO DE ROTAÇÃO DE STOCK -->
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #8b5cf6;">
-          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">🔄 Capital Libertado Estimado</div>
-          <div id="evoKpiCapitalLibertado" style="font-size: 1.7rem; font-weight: 800; color: #7c3aed; margin-top: 4px;">-- €</div>
-          <div id="evoKpiCapitalLibertadoSub" style="font-size: 0.76rem; color: #6d28d9; margin-top: 2px;">Tesouraria recuperada vs mês anterior</div>
+          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">⏳ Prazo Médio de Rotação</div>
+          <div id="evoKpiCapitalLibertado" style="font-size: 1.7rem; font-weight: 800; color: #7c3aed; margin-top: 4px;">-- dias</div>
+          <div id="evoKpiCapitalLibertadoSub" style="font-size: 0.76rem; color: #6d28d9; margin-top: 2px;">Dias para escoar o inventário atual</div>
         </div>
       </div>
 
-      <!-- GRÁFICO HISTÓRICO DE BARRAS MÊS A MÊS -->
+      <!-- PAINEL COMPARATIVO: STOCK ATIVO vs IMOBILIZADO vs VENDAS -->
       <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
           <div>
-            <h3 style="font-size: 1.05rem; font-weight: 800; color: #0f172a; margin: 0;">📊 Evolução Temporal Mensal (Últimos 12 Meses)</h3>
-            <p style="font-size: 0.8rem; color: #64748b; margin: 2px 0 0 0;">Comparativo de Stock Total, Stock Imobilizado, Faturação de Vendas e Poupança.</p>
+            <h3 style="font-size: 1.05rem; font-weight: 800; color: #0f172a; margin: 0;">
+              📊 Trajetória Mensal: Stock Total Físico vs Monos vs Faturação
+            </h3>
+            <p style="font-size: 0.8rem; color: #64748b; margin: 3px 0 0 0;">
+              Compare se o inventário está a acompanhar as vendas ou se há acumulação excessiva de produtos sem rotação.
+            </p>
           </div>
-          <div style="display: flex; gap: 14px; font-size: 0.78rem; font-weight: 700; align-items: center; flex-wrap: wrap;">
-            <span style="display: flex; align-items: center; gap: 5px; color: #0284c7;"><span style="width: 12px; height: 12px; background: #0284c7; border-radius: 3px; display: inline-block;"></span> Stock Total</span>
-            <span style="display: flex; align-items: center; gap: 5px; color: #e11d48;"><span style="width: 12px; height: 12px; background: #fca5a5; border-radius: 3px; display: inline-block;"></span> Imobilizado (Monos)</span>
-            <span style="display: flex; align-items: center; gap: 5px; color: #10b981;"><span style="width: 12px; height: 12px; background: #10b981; border-radius: 3px; display: inline-block;"></span> Vendas (€)</span>
-            <span style="display: flex; align-items: center; gap: 5px; color: #d97706;"><span style="width: 12px; height: 12px; background: #fbbf24; border-radius: 3px; display: inline-block;"></span> Poupança</span>
+          <div style="display: flex; gap: 16px; font-size: 0.78rem; font-weight: 700; align-items: center; flex-wrap: wrap;">
+            <span style="display: flex; align-items: center; gap: 6px; color: #0284c7;">
+              <span style="width: 14px; height: 14px; background: #0284c7; border-radius: 3px; display: inline-block;"></span> Stock Total (€)
+            </span>
+            <span style="display: flex; align-items: center; gap: 6px; color: #e11d48;">
+              <span style="width: 14px; height: 14px; background: #fca5a5; border-radius: 3px; display: inline-block;"></span> Monos / Parado (€)
+            </span>
+            <span style="display: flex; align-items: center; gap: 6px; color: #10b981;">
+              <span style="width: 14px; height: 14px; background: #10b981; border-radius: 3px; display: inline-block;"></span> Vendas Faturadas (€)
+            </span>
+            <span style="display: flex; align-items: center; gap: 6px; color: #d97706;">
+              <span style="width: 14px; height: 14px; background: #fbbf24; border-radius: 3px; display: inline-block;"></span> Dinheiro de Monos Recuperado
+            </span>
           </div>
         </div>
+
         <div id="evoChartBarsContainer" style="display: flex; align-items: flex-end; gap: 12px; height: 260px; padding: 10px 0 30px 0; border-bottom: 1px solid #cbd5e1; overflow-x: auto;">
-          <div style="text-align: center; width: 100%; color: #94a3b8; align-self: center;">A gerar visualização gráfica...</div>
+          <div style="text-align: center; width: 100%; color: #94a3b8; align-self: center;">A gerar gráfico financeiro...</div>
         </div>
       </div>
 
-      <!-- TABELA DETALHADA DE EVOLUÇÃO FINANCEIRA -->
+      <!-- TABELA DETALHADA: SAÚDE FINANCEIRA DE STOCK -->
       <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
-        <h3 style="font-size: 1.05rem; font-weight: 800; color: #0f172a; margin: 0 0 14px 0;">📋 Tabela Cronológica de Rotação e Poupanças</h3>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;">
+          <div>
+            <h3 style="font-size: 1.05rem; font-weight: 800; color: #0f172a; margin: 0;">📋 Tabela Cronológica de Saúde de Stock</h3>
+            <p style="font-size: 0.8rem; color: #64748b; margin: 2px 0 0 0;">Cálculo do rácio de imobilizado e liquidez recuperada em cada mês.</p>
+          </div>
+          <span style="font-size: 0.78rem; background: #f1f5f9; color: #475569; padding: 4px 10px; border-radius: 6px; font-weight: 700;">
+            Semáforo de Monos: 🟢 &lt;35% | 🟡 35%-45% | 🔴 &gt;45%
+          </span>
+        </div>
         <div style="overflow-x: auto;">
           <table style="width: 100%; border-collapse: collapse; font-size: 0.86rem; text-align: left;">
             <thead style="background: #f8fafc; border-bottom: 2px solid #e2e8f0;">
               <tr>
                 <th style="padding: 10px 14px; font-weight: 700; color: #475569;">Mês / Ano</th>
                 <th style="padding: 10px 14px; font-weight: 700; color: #0284c7; text-align: right;">Stock Total (€)</th>
-                <th style="padding: 10px 14px; font-weight: 700; color: #e11d48; text-align: right;">Stock Imobilizado (€)</th>
-                <th style="padding: 10px 14px; font-weight: 700; color: #64748b; text-align: center;">% Imobilizado</th>
-                <th style="padding: 10px 14px; font-weight: 700; color: #10b981; text-align: right;">Vendas Faturadas (€)</th>
-                <th style="padding: 10px 14px; font-weight: 700; color: #059669; text-align: right;">Valores Poupados (€)</th>
-                <th style="padding: 10px 14px; font-weight: 700; color: #475569; text-align: center;">Tendência</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #e11d48; text-align: right;">Monos Parados (€)</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #64748b; text-align: center;">% Monos</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #10b981; text-align: right;">Vendas Mês (€)</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #059669; text-align: right;">Dinheiro de Monos Recuperado</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #7c3aed; text-align: center;">Dias Rotação</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #475569; text-align: center;">Diagnóstico</th>
               </tr>
             </thead>
             <tbody id="evoTableBody">
-              <tr><td colspan="7" style="padding: 24px; text-align: center; color: #94a3b8;">A carregar tabela...</td></tr>
+              <tr><td colspan="8" style="padding: 24px; text-align: center; color: #94a3b8;">A carregar tabela...</td></tr>
             </tbody>
           </table>
         </div>
@@ -8124,41 +8164,46 @@ function getDashboardHtml(): string {
         if (btn) btn.classList.toggle('active', t === tab);
       });
 
+      const isStockTable = ['caducidade', 'genericos', 'monos', 'cobertura'].includes(tab);
       const analyticsHeader = document.getElementById('globalAnalyticsHeader');
-      const isAnalyticsTab = ['caducidade', 'genericos', 'monos', 'cobertura'].includes(tab);
-      if (analyticsHeader) {
-        analyticsHeader.style.display = isAnalyticsTab ? 'block' : 'none';
-      }
+      if (analyticsHeader) analyticsHeader.style.display = isStockTable ? 'block' : 'none';
 
-      const planoView = document.getElementById('tabContent-plano');
-      const copilotView = document.getElementById('tabContent-copilot');
-      const campaignsView = document.getElementById('tabContent-campaigns');
-      const tablesView = document.getElementById('tabContent-tables');
+      const views = {
+        plano: document.getElementById('tabContent-plano'),
+        copilot: document.getElementById('tabContent-copilot'),
+        campaigns: document.getElementById('tabContent-campaigns'),
+        rebalance: document.getElementById('tabContent-rebalance'),
+        labs: document.getElementById('tabContent-labs'),
+        evolution: document.getElementById('tabContent-evolution'),
+        tables: document.getElementById('tabContent-tables'),
+      };
+
+      // Esconder rigorosamente todas as vistas para evitar sobreposição
+      Object.keys(views).forEach(function(k) {
+        if (views[k]) views[k].style.display = 'none';
+      });
 
       if (tab === 'plano') {
-        if (planoView) planoView.style.display = 'block';
-        if (copilotView) copilotView.style.display = 'none';
-        if (campaignsView) campaignsView.style.display = 'none';
-        if (tablesView) tablesView.style.display = 'none';
+        if (views.plano) views.plano.style.display = 'block';
         renderWeeklyActionPlan();
       } else if (tab === 'copilot') {
-        if (planoView) planoView.style.display = 'none';
-        if (copilotView) copilotView.style.display = 'block';
-        if (campaignsView) campaignsView.style.display = 'none';
-        if (tablesView) tablesView.style.display = 'none';
+        if (views.copilot) views.copilot.style.display = 'block';
       } else if (tab === 'campaigns') {
-        if (planoView) planoView.style.display = 'none';
-        if (copilotView) copilotView.style.display = 'none';
-        if (campaignsView) campaignsView.style.display = 'block';
-        if (tablesView) tablesView.style.display = 'none';
+        if (views.campaigns) views.campaigns.style.display = 'block';
         if (!currentCampaignSuggestions || currentCampaignSuggestions.length === 0) {
           loadCampaignSuggestions();
         }
-      } else {
-        if (planoView) planoView.style.display = 'none';
-        if (copilotView) copilotView.style.display = 'none';
-        if (campaignsView) campaignsView.style.display = 'none';
-        if (tablesView) tablesView.style.display = 'block';
+      } else if (tab === 'rebalance') {
+        if (views.rebalance) views.rebalance.style.display = 'block';
+        loadRebalanceData();
+      } else if (tab === 'labs') {
+        if (views.labs) views.labs.style.display = 'block';
+        loadLaboratoriesData();
+      } else if (tab === 'evolution') {
+        if (views.evolution) views.evolution.style.display = 'block';
+        loadStockEvolutionData();
+      } else if (isStockTable) {
+        if (views.tables) views.tables.style.display = 'block';
         renderActiveTable();
       }
     }
@@ -13063,11 +13108,11 @@ function getDashboardHtml(): string {
         if (kpiImob) kpiImob.textContent = Number(r.stock_imobilizado_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
         if (kpiImobSub) kpiImobSub.textContent = Number(r.taxa_imobilizado_pct || 0).toFixed(1) + '% do capital total em stock (' + Number(r.stock_imobilizado_unidades || 0).toLocaleString('pt-PT') + ' un monos)';
 
-        if (kpiPoup) kpiPoup.textContent = '+' + Number(r.valores_poupados_acumulados_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
-        if (kpiPoupSub) kpiPoupSub.textContent = 'Tarefas: +' + Number(r.poupanca_tarefas_equipa_eur || 0).toFixed(2) + ' € | Rebalanceamento: +' + Number(r.poupanca_rebalanceamento_eur || 0).toFixed(2) + ' €';
+        if (kpiPoup) kpiPoup.textContent = '+' + Number(r.liquidez_recuperada_comprovada_eur || r.valores_poupados_acumulados_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (kpiPoupSub) kpiPoupSub.textContent = 'Comprovado por vendas de monos no Sifarma';
 
-        if (kpiCap) kpiCap.textContent = '+' + Number(r.capital_libertado_estimado_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
-        if (kpiCapSub) kpiCapSub.textContent = 'Tesouraria recuperada vs ' + (data.comparativoMoM?.mes_anterior_label || 'mês anterior');
+        if (kpiCap) kpiCap.textContent = (r.dias_medios_rotacao || 48) + ' dias';
+        if (kpiCapSub) kpiCapSub.textContent = 'Stock Ativo: ' + Number(r.stock_ativo_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + (100 - (r.taxa_imobilizado_pct || 0)).toFixed(1) + '%)';
 
         // Render Gráfico e Tabela
         renderStockEvolutionChart(data.evolucaoMensal);
@@ -13111,19 +13156,26 @@ function getDashboardHtml(): string {
       if (!tbody || !pontos || pontos.length === 0) return;
 
       let html = '';
-      pontos.slice().reverse().forEach(function(p, idx) {
-        const trend = p.taxa_imobilizado_pct < 30
-          ? '<span style="color: #059669; font-weight: 800;">🟢 Saudável</span>'
-          : '<span style="color: #d97706; font-weight: 800;">🟡 Otimizável</span>';
+      pontos.slice().reverse().forEach(function(p) {
+        let badgeColor = '#15803d';
+        let badgeBg = '#dcfce7';
+        if (p.taxa_imobilizado_pct > 45) {
+          badgeColor = '#b91c1c';
+          badgeBg = '#fee2e2';
+        } else if (p.taxa_imobilizado_pct > 35) {
+          badgeColor = '#b45309';
+          badgeBg = '#fef3c7';
+        }
 
         html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
           '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(p.mes_label) + '</td>' +
           '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #0284c7;">' + Number(p.stock_total_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
           '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #e11d48;">' + Number(p.stock_imobilizado_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
-          '<td style="padding: 10px 14px; text-align: center;"><span style="background: #fef2f2; color: #991b1b; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.76rem;">' + p.taxa_imobilizado_pct.toFixed(1) + '%</span></td>' +
+          '<td style="padding: 10px 14px; text-align: center;"><span style="background: ' + badgeBg + '; color: ' + badgeColor + '; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.76rem;">' + p.taxa_imobilizado_pct.toFixed(1) + '%</span></td>' +
           '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #10b981;">' + Number(p.vendas_mes_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
-          '<td style="padding: 10px 14px; text-align: right; font-weight: 800; color: #059669;">+' + Number(p.valores_poupados_eur).toFixed(2) + ' €</td>' +
-          '<td style="padding: 10px 14px; text-align: center;">' + trend + '</td>' +
+          '<td style="padding: 10px 14px; text-align: right; font-weight: 800; color: #059669;">+' + Number(p.liquidez_recuperada_monos_eur || p.valores_poupados_eur || 0).toFixed(2) + ' €</td>' +
+          '<td style="padding: 10px 14px; text-align: center; font-weight: 700; color: #7c3aed;">' + (p.dias_rotacao || 45) + ' d</td>' +
+          '<td style="padding: 10px 14px; text-align: center; font-size: 0.82rem; font-weight: 700;">' + (p.diagnostico || '🟢 Normal') + '</td>' +
           '</tr>';
       });
 
