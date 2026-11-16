@@ -8044,7 +8044,7 @@ function getDashboardHtml(): string {
     function shareMobileWhatsApp() {
       const inp = document.getElementById('mobileDirectUrl');
       if (!inp || !inp.value) return;
-      const text = encodeURIComponent('Olá equipa! Aqui está o link de acesso direto ao BI Pharma (Modo Balcão da Farmácia):\n' + inp.value);
+      const text = encodeURIComponent('Olá equipa! Aqui está o link de acesso direto ao BI Pharma (Modo Balcão da Farmácia): ' + inp.value);
       window.open('https://api.whatsapp.com/send?text=' + text, '_blank');
     }
 
@@ -8262,7 +8262,7 @@ function getDashboardHtml(): string {
               '<td style="padding: 10px 14px;">' + roleBadge + '</td>' +
               '<td style="padding: 10px 14px; font-family: monospace; font-weight: 700; color: #64748b;">' + escapeHtml(m.pin || '••••') + '</td>' +
               '<td style="padding: 10px 14px; text-align: right;">' +
-              '<button onclick="deleteTeamMember(\'' + m.id + '\')" style="background: none; border: none; color: #e11d48; cursor: pointer; font-size: 0.8rem; font-weight: 700;">Remover</button>' +
+              '<button data-id="' + m.id + '" onclick="deleteTeamMember(this.dataset.id)" style="background: none; border: none; color: #e11d48; cursor: pointer; font-size: 0.8rem; font-weight: 700;">Remover</button>' +
               '</td></tr>';
           });
 
@@ -8343,7 +8343,7 @@ function getDashboardHtml(): string {
               '<td style="padding: 10px 14px; font-weight: 700; color: #0284c7;">' + escapeHtml(s.role) + '</td>' +
               '<td style="padding: 10px 14px; color: #059669; font-weight: 600;">' + timeStr + '</td>' +
               '<td style="padding: 10px 14px; text-align: right;">' +
-              '<button onclick="revokeSession(\'' + s.sessionId + '\')" style="background: #fee2e2; border: 1px solid #fca5a5; color: #dc2626; border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 0.74rem; font-weight: 700;">Terminar Sessão</button>' +
+              '<button data-id="' + s.sessionId + '" onclick="revokeSession(this.dataset.id)" style="background: #fee2e2; border: 1px solid #fca5a5; color: #dc2626; border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 0.74rem; font-weight: 700;">Terminar Sessão</button>' +
               '</td></tr>';
           });
 
