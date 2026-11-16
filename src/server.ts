@@ -10561,6 +10561,102 @@ function getDashboardHtml(): string {
     }
 
 
+    // ========================================================================
+    // MODOS ESPECIALIZADOS DO COPILOT (FASE 3)
+    // ========================================================================
+    let currentCopilotMode = 'GENERAL';
+
+    const COPILOT_MODES_INFO = {
+      CLINICAL: {
+        tag: 'CLÍNICO',
+        tagBg: '#dbeafe',
+        tagColor: '#1d4ed8',
+        desc: '🩺 <b>Modo Balcão Clínico & Sintomas:</b> Indicação terapêutica, alívio sintomático, posologia, verificação de contraindicações e alternativas sem interação.',
+        placeholder: 'Ex: Utente com tosse seca e hipertenso, o que indicar sem pseudoefedrina? Ou: Sintomas de dor articular...'
+      },
+      FINANCE: {
+        tag: 'FINANÇAS',
+        tagBg: '#fef9c3',
+        tagColor: '#854d0e',
+        desc: '💰 <b>Modo Finanças, Margens & Labs:</b> Análise de margem comercial, rentabilidade por fornecedor, negociação e impacto financeiro de vendas.',
+        placeholder: 'Ex: Quais os laboratórios com maior margem em genéricos? Qual a rentabilidade do paracetamol?...'
+      },
+      STOCKS: {
+        tag: 'STOCKS',
+        tagBg: '#ffedd5',
+        tagColor: '#c2410c',
+        desc: '📦 <b>Modo Stocks, Rupturas & Validades:</b> Alertas de caducidade próxima, cálculo de quebras de stock, cobertura e excesso de inventário.',
+        placeholder: 'Ex: Quais os produtos com validade a expirar nos próximos 3 meses? Artigos em risco de rutura?...'
+      },
+      MARKETING: {
+        tag: 'MARKETING',
+        tagBg: '#f3e8ff',
+        tagColor: '#7e22ce',
+        desc: '🎯 <b>Modo Marketing & Escoamento:</b> Campanhas sazonais, pacotes promocionais, escoamento de monos e gatilhos de cross-selling.',
+        placeholder: 'Ex: Sugestões de campanha para dermocosmética no inverno? Como escoar os 10 maiores monos?...'
+      },
+      GENERAL: {
+        tag: 'GERAL',
+        tagBg: '#e0f2fe',
+        tagColor: '#0369a1',
+        desc: '💡 <b>Modo Geral:</b> Pergunte qualquer questão ou selecione um modo especializado acima para obter respostas assertivas em cartões e tabelas compactas.',
+        placeholder: "Faça uma pergunta ou pedido de seguimento... (Ex: 'E desses, quais têm maior margem?')"
+      }
+    };
+
+    function setCopilotMode(mode) {
+      currentCopilotMode = mode || 'GENERAL';
+      const info = COPILOT_MODES_INFO[currentCopilotMode] || COPILOT_MODES_INFO.GENERAL;
+
+      // 1. Atualizar estilos visuais dos 5 botões de modo
+      ['CLINICAL', 'FINANCE', 'STOCKS', 'MARKETING', 'GENERAL'].forEach(function(m) {
+        const btn = document.getElementById('modeBtn-' + m);
+        if (btn) {
+          if (m === currentCopilotMode) {
+            btn.classList.add('active');
+          } else {
+            btn.classList.remove('active');
+          }
+        }
+      });
+
+      // 2. Atualizar Banner do Modo Ativo
+      const descEl = document.getElementById('copilotModeDesc');
+      const tagEl = document.getElementById('copilotModeTag');
+      if (descEl) descEl.innerHTML = info.desc;
+      if (tagEl) {
+        tagEl.textContent = info.tag;
+        tagEl.style.background = info.tagBg;
+        tagEl.style.color = info.tagColor;
+      }
+
+      // 3. Atualizar placeholder do input e dar foco
+      const inputEl = document.getElementById('askInput');
+      if (inputEl) {
+        inputEl.placeholder = info.placeholder;
+        inputEl.focus();
+      }
+    }
+
+    async function sendCopilotFeedback(vote, btn) {
+      if (!btn || btn.classList.contains('voted')) return;
+      try {
+        await fetch('/api/copilot/feedback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: getCopilotSessionId(),
+            feedback: vote,
+            farmaciaId: activeFarmaciaId,
+          }),
+        });
+        btn.classList.add('voted');
+        btn.textContent = vote === 'UP' ? '✓ Obrigado pelo feedback' : '✓ Feedback registado';
+      } catch (e) {
+        console.warn('Erro ao registar feedback:', e);
+      }
+    }
+
     async function askQuestion(forcedQuestion) {
       if (isCopilotThinking) return;
       const inputEl = document.getElementById('askInput');
@@ -10602,6 +10698,7 @@ function getDashboardHtml(): string {
             question,
             farmaciaId: activeFarmaciaId,
             sessionId: sid,
+            mode: currentCopilotMode || 'GENERAL',
           }),
         });
 
@@ -10649,9 +10746,16 @@ function getDashboardHtml(): string {
           '</div>';
         }
 
+        const feedbackActionsHtml = '<div class="chat-feedback-actions">' +
+          '<span>Esta resposta foi útil?</span>' +
+          '<button class="chat-feedback-btn" onclick="sendCopilotFeedback(&quot;UP&quot;, this)">👍 Sim, assertiva</button>' +
+          '<button class="chat-feedback-btn" onclick="sendCopilotFeedback(&quot;DOWN&quot;, this)">👎 Pouco clara</button>' +
+        '</div>';
+
         assistantBubble.innerHTML = badgeHtml +
           '<div>' + formattedHtml + '</div>' +
           actionButtonsHtml +
+          feedbackActionsHtml +
           telemetryHtml +
           '<div style="margin-top: 6px; font-size: 0.72rem; color: #94a3b8; text-align: right;">' +
           'Copilot • ' + new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) +
