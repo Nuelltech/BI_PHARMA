@@ -1,4 +1,13 @@
 import {
+  calculateCrossStoreRebalance,
+  getGroupSummary
+} from './services/cross_store_rebalance';
+import {
+  getLaboratoriesAnalytics,
+  getHistoricalAimAnalytics
+} from './services/lab_analytics';
+
+import {
   getPharmacyTeam,
   addPharmacyTeamMember,
   updatePharmacyTeamMember,
@@ -2706,6 +2715,66 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
+      
+      // ======================================================================
+      // FASE 5: ENDPOINTS MULTI-LOJA, BALANCEAMENTO & ANÁLISE DE LABORATÓRIOS/AIMS
+      // ======================================================================
+
+      // 5.1. Resumo Consolidado do Grupo de Farmácias
+      if (pathname === '/api/groups/summary' && req.method === 'GET') {
+        try {
+          const summary = await getGroupSummary(prisma);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, summary }));
+        } catch (e: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 5.2. Oportunidades de Balanceamento Cruzado de Stock (Multi-Loja)
+      if (pathname === '/api/groups/rebalance' && req.method === 'GET') {
+        try {
+          const rebalanceData = await calculateCrossStoreRebalance(prisma);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, ...rebalanceData }));
+        } catch (e: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 5.3. Análise de Fornecedores e Laboratórios Titulares
+      if (pathname === '/api/analytics/labs' && req.method === 'GET') {
+        try {
+          const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+          const labs = await getLaboratoriesAnalytics(prisma, farmIdQuery || undefined);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, laboratories: labs }));
+        } catch (e: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 5.4. Filtro Histórico Específico por Múltiplos AIMs
+      if (pathname === '/api/analytics/aims' && req.method === 'GET') {
+        try {
+          const aimsParam = String(parsedUrl.query.aims || parsedUrl.query.aim || '').trim();
+          const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+          const aimAnalytics = await getHistoricalAimAnalytics(prisma, aimsParam, farmIdQuery || undefined);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, ...aimAnalytics }));
+        } catch (e: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
       // 2.5L. Rota da Interface Mobile da Equipa
       if (
         pathname === '/mobile' ||
@@ -4763,6 +4832,87 @@ function getDashboardHtml(): string {
               Abrir Estúdio de Campanhas & Marketing 360º →
             </button>
           </div>
+        </div>
+      </div>
+    </div>
+
+    
+    <!-- ABA 5A: BALANCEAMENTO DE STOCK MULTI-LOJA (FASE 5) -->
+    <div id="tabContent-rebalance" style="display: none;">
+      <div style="background: linear-gradient(135deg, #f0f9ff 0%, #ffffff 100%); border: 1px solid #bae6fd; border-radius: 14px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
+          <div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: #0369a1; display: flex; align-items: center; gap: 8px;">
+              🔄 Balanceamento Cruzado de Stock entre Farmácias do Grupo
+            </div>
+            <p style="font-size: 0.88rem; color: #334155; margin-top: 4px; max-width: 820px; line-height: 1.45;">
+              O algoritmo cruzou os dados de inventário e vendas das farmácias do grupo e identificou produtos em <b>excesso numa loja que estão em carência ou ruptura iminente noutra</b>.
+            </p>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <button class="btn" onclick="loadRebalanceData()" style="background: #0284c7; color: #fff; font-weight: 700; font-size: 0.82rem; padding: 8px 16px; border: none; border-radius: 8px; cursor: pointer;">
+              🔄 Recalcular Oportunidades
+            </button>
+            <button class="btn" onclick="printTransferGuide()" style="background: #10b981; color: #fff; font-weight: 700; font-size: 0.82rem; padding: 8px 16px; border: none; border-radius: 8px; cursor: pointer;">
+              📄 Emitir Guia de Transferência
+            </button>
+          </div>
+        </div>
+
+        <!-- KPIS DO GRUPO -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 18px;">
+          <div class="executive-kpi-card" style="border-left: 4px solid #0284c7;">
+            <div style="font-size: 0.72rem; font-weight: 800; color: #64748b; text-transform: uppercase;">Poupança Total Estimada</div>
+            <div style="font-size: 1.45rem; font-weight: 800; color: #0369a1;" id="rebalanceSavingsTotal">0,00 €</div>
+            <div style="font-size: 0.78rem; color: #64748b;">Evitado em compras duplicadas a armazenistas</div>
+          </div>
+          <div class="executive-kpi-card" style="border-left: 4px solid #10b981;">
+            <div style="font-size: 0.72rem; font-weight: 800; color: #64748b; text-transform: uppercase;">Oportunidades de Troca</div>
+            <div style="font-size: 1.45rem; font-weight: 800; color: #065f46;" id="rebalanceOpportunitiesCount">0 artigos</div>
+            <div style="font-size: 0.78rem; color: #047857;">Transferências viáveis identificadas</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tabela de Sugestões de Transferência -->
+      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.02);">
+        <div style="font-size: 0.95rem; font-weight: 800; color: #0f172a; margin-bottom: 12px;">Propostas de Transferência Interna Sugeridas</div>
+        <div id="rebalanceTableContainer">
+          <div style="text-align: center; color: #94a3b8; padding: 30px;">A carregar sugestões de balanceamento...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ABA 5B: ANÁLISE DE LABORATÓRIOS & AIMS (FASE 5) -->
+    <div id="tabContent-labs" style="display: none;">
+      <div style="background: linear-gradient(135deg, #faf5ff 0%, #ffffff 100%); border: 1px solid #e9d5ff; border-radius: 14px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
+        <div style="font-size: 1.25rem; font-weight: 800; color: #7e22ce; margin-bottom: 6px;">
+          🏭 Inteligência Comercial de Laboratórios & Filtros por AIM
+        </div>
+        <p style="font-size: 0.88rem; color: #334155; max-width: 860px; line-height: 1.45;">
+          Analise o volume de compras vs vendas, margem média e quotas de fornecedores titulares. Utilize a barra abaixo para pesquisar múltiplos códigos AIM em simultâneo (ex: <b>AIM 320, 2121, 6581</b>).
+        </p>
+
+        <!-- Barra de Filtro de AIMs -->
+        <div style="background: #ffffff; border: 1.5px solid #d8b4fe; border-radius: 10px; padding: 14px; margin-top: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+          <div style="flex: 1; min-width: 260px;">
+            <label style="font-size: 0.74rem; font-weight: 800; color: #6b21a8; text-transform: uppercase; display: block; margin-bottom: 4px;">Pesquisar Códigos AIM Específicos:</label>
+            <input type="text" id="inputFilterAims" placeholder="Ex: 320, 2121, 6581 (separados por vírgula)" style="width: 100%; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem;" />
+          </div>
+          <button class="btn" onclick="executeAimSearch()" style="background: #7e22ce; color: #fff; font-weight: 700; font-size: 0.82rem; padding: 9px 18px; border: none; border-radius: 6px; cursor: pointer; align-self: flex-end;">
+            🔍 Filtrar Histórico de AIMs
+          </button>
+          <button class="btn btn-secondary" onclick="loadLabsData()" style="font-size: 0.82rem; padding: 9px 14px; align-self: flex-end;">
+            Ver Todos os Labs
+          </button>
+        </div>
+      </div>
+
+      <!-- Container Dinâmico de Laboratórios / AIMs -->
+      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.02);">
+        <div id="labsResultsTitle" style="font-size: 0.95rem; font-weight: 800; color: #0f172a; margin-bottom: 12px;">Ranking de Laboratórios Titulares</div>
+        <div id="labsTableContainer">
+          <div style="text-align: center; color: #94a3b8; padding: 30px;">A carregar dados de laboratórios...</div>
         </div>
       </div>
     </div>
@@ -7753,7 +7903,7 @@ function getDashboardHtml(): string {
 
     function switchTab(tab) {
       activeTab = tab;
-      ['plano', 'copilot', 'campaigns', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
+      ['plano', 'copilot', 'campaigns', 'rebalance', 'labs', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
         const btn = document.getElementById('tabBtn-' + t);
         if (btn) btn.classList.toggle('active', t === tab);
       });
@@ -7899,6 +8049,148 @@ function getDashboardHtml(): string {
     }
 
     
+    
+    let cachedRebalanceData = null;
+
+    async function loadRebalanceData() {
+      const container = document.getElementById('rebalanceTableContainer');
+      if (!container) return;
+      container.innerHTML = '<div style="text-align: center; color: #64748b; padding: 25px;">A cruzar inventários e vendas entre lojas...</div>';
+
+      try {
+        const res = await fetch('/api/groups/rebalance');
+        const data = await res.json();
+        cachedRebalanceData = data;
+
+        const savEl = document.getElementById('rebalanceSavingsTotal');
+        if (savEl) savEl.textContent = Number(data.totalPoupancaEstimadaEur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+
+        const oppEl = document.getElementById('rebalanceOpportunitiesCount');
+        if (oppEl) oppEl.textContent = (data.totalOportunidades || 0) + ' artigos';
+
+        if (!data.sugestoes || data.sugestoes.length === 0) {
+          container.innerHTML = '<div style="text-align: center; color: #10b981; font-weight: 700; padding: 30px;">✅ Os stocks entre as farmácias do grupo estão perfeitamente equilibrados no momento.</div>';
+          return;
+        }
+
+        let html = '<div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow-x: auto;"><table style="width: 100%; border-collapse: collapse; font-size: 0.82rem; text-align: left;">';
+        html += '<thead style="background: #f8fafc; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700;">' +
+          '<tr><th style="padding: 10px 14px;">Produto / CNP</th><th style="padding: 10px 14px;">Loja Origem (Excesso)</th><th style="padding: 10px 14px;">Loja Destino (Ruptura)</th><th style="padding: 10px 14px; text-align: center;">Qtd a Transferir</th><th style="padding: 10px 14px; text-align: right;">Poupança Gerada</th></tr></thead><tbody>';
+
+        data.sugestoes.forEach(s => {
+          html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+            '<td style="padding: 10px 14px;"><div style="font-weight: 700; color: #0f172a;">' + escapeHtml(s.designacao) + '</div><div style="font-size: 0.72rem; color: #64748b;">CNP: ' + escapeHtml(s.cnp_codigo) + (s.aim ? ' | AIM: ' + escapeHtml(s.aim) : '') + '</div></td>' +
+            '<td style="padding: 10px 14px;"><div style="font-weight: 700; color: #0369a1;">' + escapeHtml(s.origem.farmaciaNome) + '</div><div style="font-size: 0.72rem; color: #64748b;">Stock: ' + s.origem.stock_atual + ' un (' + s.origem.dias_cobertura + 'd cob.)</div></td>' +
+            '<td style="padding: 10px 14px;"><div style="font-weight: 700; color: #b91c1c;">' + escapeHtml(s.destino.farmaciaNome) + '</div><div style="font-size: 0.72rem; color: #64748b;">Stock: ' + s.destino.stock_atual + ' un (VMM: ' + s.destino.vmm + ' un)</div></td>' +
+            '<td style="padding: 10px 14px; text-align: center;"><span style="background: #e0f2fe; color: #0369a1; font-weight: 800; padding: 4px 10px; border-radius: 6px;">' + s.quantidade_sugerida + ' un</span></td>' +
+            '<td style="padding: 10px 14px; text-align: right; font-weight: 800; color: #059669;">+' + Number(s.valor_poupanca_eur).toFixed(2) + ' €</td>' +
+            '</tr>';
+        });
+
+        html += '</tbody></table></div>';
+        container.innerHTML = html;
+      } catch (err) {
+        container.innerHTML = '<div style="color: #e11d48; padding: 15px;">Erro ao carregar dados de balanceamento.</div>';
+      }
+    }
+
+    function printTransferGuide() {
+      if (!cachedRebalanceData || !cachedRebalanceData.sugestoes) {
+        alert('Carregue primeiro as oportunidades de transferência.');
+        return;
+      }
+      window.print();
+    }
+
+    async function loadLabsData() {
+      const container = document.getElementById('labsTableContainer');
+      const title = document.getElementById('labsResultsTitle');
+      if (!container) return;
+      if (title) title.textContent = 'Ranking de Laboratórios Titulares';
+      container.innerHTML = '<div style="text-align: center; color: #64748b; padding: 25px;">A analisar laboratórios...</div>';
+
+      try {
+        const res = await fetch('/api/analytics/labs?farmaciaId=' + encodeURIComponent(activeFarmaciaId || ''));
+        const data = await res.json();
+        if (!data.laboratories || data.laboratories.length === 0) {
+          container.innerHTML = '<div style="text-align: center; color: #64748b; padding: 20px;">Nenhum registo de laboratório disponível.</div>';
+          return;
+        }
+
+        let html = '<div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow-x: auto;"><table style="width: 100%; border-collapse: collapse; font-size: 0.82rem; text-align: left;">';
+        html += '<thead style="background: #f8fafc; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700;">' +
+          '<tr><th style="padding: 10px 14px;">Laboratório Titular</th><th style="padding: 10px 14px;">Artigos</th><th style="padding: 10px 14px; text-align: right;">Faturação Acumulada</th><th style="padding: 10px 14px; text-align: center;">Unidades Vendidas</th><th style="padding: 10px 14px; text-align: center;">Margem Média</th><th style="padding: 10px 14px; text-align: right;">Stock em Armazém</th></tr></thead><tbody>';
+
+        data.laboratories.slice(0, 50).forEach(l => {
+          html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+            '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(l.laboratorio) + '</td>' +
+            '<td style="padding: 10px 14px; color: #475569;">' + l.totalArtigos + '</td>' +
+            '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #0284c7;">' + Number(l.faturacaoAcumulada).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
+            '<td style="padding: 10px 14px; text-align: center;">' + l.unidadesVendidas.toLocaleString('pt-PT') + '</td>' +
+            '<td style="padding: 10px 14px; text-align: center;"><span style="background: #ecfdf5; color: #059669; font-weight: 700; padding: 3px 8px; border-radius: 6px;">' + l.margemMediaPct + '%</span></td>' +
+            '<td style="padding: 10px 14px; text-align: right; color: #64748b;">' + Number(l.valorStockAtual).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + l.unidadesStockAtual + ' un)</td>' +
+            '</tr>';
+        });
+
+        html += '</tbody></table></div>';
+        container.innerHTML = html;
+      } catch (err) {
+        container.innerHTML = '<div style="color: #e11d48; padding: 15px;">Erro ao carregar laboratórios.</div>';
+      }
+    }
+
+    async function executeAimSearch() {
+      const input = document.getElementById('inputFilterAims');
+      const val = input ? input.value.trim() : '';
+      if (!val) {
+        alert('Por favor introduza pelo menos um código AIM (ex: 320, 2121, 6581).');
+        return;
+      }
+
+      const container = document.getElementById('labsTableContainer');
+      const title = document.getElementById('labsResultsTitle');
+      if (title) title.textContent = 'Histórico Detalhado dos AIMs: ' + val;
+      if (container) container.innerHTML = '<div style="text-align: center; color: #64748b; padding: 25px;">A pesquisar histórico dos AIMs selecionados...</div>';
+
+      try {
+        const res = await fetch('/api/analytics/aims?aims=' + encodeURIComponent(val) + '&farmaciaId=' + encodeURIComponent(activeFarmaciaId || ''));
+        const data = await res.json();
+
+        if (!data.produtos || data.produtos.length === 0) {
+          container.innerHTML = '<div style="text-align: center; color: #64748b; padding: 25px;">Nenhum produto encontrado com os códigos AIM pesquisados na base de dados.</div>';
+          return;
+        }
+
+        let html = '<div style="margin-bottom: 12px; font-size: 0.82rem; color: #64748b;"><b>Total de Produtos:</b> ' + data.totalProdutos + ' | <b>Faturação Total AIM:</b> ' + Number(data.faturacaoTotalAimEur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | <b>Unidades Totais:</b> ' + data.unidadesTotaisAim + ' un</div>';
+        html += '<div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow-x: auto;"><table style="width: 100%; border-collapse: collapse; font-size: 0.82rem; text-align: left;">';
+        html += '<thead style="background: #f8fafc; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700;">' +
+          '<tr><th style="padding: 10px 14px;">AIM</th><th style="padding: 10px 14px;">Produto / CNP</th><th style="padding: 10px 14px;">Laboratório</th><th style="padding: 10px 14px; text-align: center;">Stock</th><th style="padding: 10px 14px; text-align: right;">Total Vendas (€)</th><th style="padding: 10px 14px;">Histórico Mensal</th></tr></thead><tbody>';
+
+        data.produtos.forEach(p => {
+          let histBadges = '';
+          if (p.historicoMensal && p.historicoMensal.length > 0) {
+            histBadges = p.historicoMensal.map(h => '<span style="background: #f1f5f9; padding: 2px 6px; border-radius: 4px; margin-right: 4px; font-size: 0.7rem; font-weight: 600;">' + h.mes.slice(5) + ': ' + h.quantidade + 'un</span>').join('');
+          } else {
+            histBadges = '<span style="color: #94a3b8; font-size: 0.72rem;">Sem vendas registadas</span>';
+          }
+
+          html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+            '<td style="padding: 10px 14px; font-weight: 800; color: #7e22ce;">' + escapeHtml(p.aim) + '</td>' +
+            '<td style="padding: 10px 14px;"><div style="font-weight: 700; color: #0f172a;">' + escapeHtml(p.designacao) + '</div><div style="font-size: 0.72rem; color: #64748b;">CNP: ' + escapeHtml(p.cnp_codigo) + '</div></td>' +
+            '<td style="padding: 10px 14px; color: #475569;">' + escapeHtml(p.laboratorio || 'N/D') + '</td>' +
+            '<td style="padding: 10px 14px; text-align: center; font-weight: 700;">' + p.stock_atual + ' un</td>' +
+            '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #0284c7;">' + Number(p.vendasTotaisEur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
+            '<td style="padding: 10px 14px;">' + histBadges + '</td>' +
+            '</tr>';
+        });
+
+        html += '</tbody></table></div>';
+        container.innerHTML = html;
+      } catch (err) {
+        container.innerHTML = '<div style="color: #e11d48; padding: 15px;">Erro ao consultar histórico dos AIMs.</div>';
+      }
+    }
+
     function openSettingsModal() {
       const modal = document.getElementById('settingsModal');
       if (modal) modal.style.display = 'flex';
