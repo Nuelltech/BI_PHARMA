@@ -222,3 +222,80 @@ function checkPinMatch(farm: any, cleanPin: string) {
     error: 'PIN incorreto. Utilize o PIN atribuído à farmácia ou os 4 dígitos do seu código de acesso.',
   };
 }
+
+export interface WeeklyTaskAuditItem {
+  id: string;
+  task_id: string;
+  categoria: string;
+  cnp_codigo: string | null;
+  designacao: string | null;
+  concluido_por: string;
+  concluido_em: string;
+  valor_impacto: number;
+}
+
+export interface WeeklyTasksAuditReport {
+  farmaciaId: string;
+  totalConcluidas: number;
+  valorProtegidoTotal: number;
+  operadoresResumo: Array<{ operador: string; total: number; valorTotal: number }>;
+  tarefas: WeeklyTaskAuditItem[];
+}
+
+export async function getWeeklyTasksAudit(
+  prisma: PrismaClient,
+  farmaciaId: string
+): Promise<WeeklyTasksAuditReport> {
+  const tasks = await (prisma as any).tarefaEquipa.findMany({
+    where: {
+      farmaciaId,
+      concluido: true,
+    },
+    orderBy: { concluido_em: 'desc' },
+  });
+
+  let totalConcluidas = 0;
+  let valorProtegidoTotal = 0;
+  const operadoresMap = new Map<string, { total: number; valorTotal: number }>();
+
+  const list: WeeklyTaskAuditItem[] = [];
+
+  for (const t of tasks) {
+    totalConcluidas++;
+    const val = t.valor_impacto !== null && t.valor_impacto !== undefined ? Number(t.valor_impacto) : 0;
+    valorProtegidoTotal += val;
+
+    const op = String(t.concluido_por || 'Equipa de Balcão').trim();
+    const currOp = operadoresMap.get(op) || { total: 0, valorTotal: 0 };
+    currOp.total += 1;
+    currOp.valorTotal += val;
+    operadoresMap.set(op, currOp);
+
+    list.push({
+      id: t.id,
+      task_id: t.task_id,
+      categoria: t.categoria || 'GERAL',
+      cnp_codigo: t.cnp_codigo || null,
+      designacao: t.designacao || null,
+      concluido_por: op,
+      concluido_em: t.concluido_em ? t.concluido_em.toISOString() : new Date().toISOString(),
+      valor_impacto: Math.round(val * 100) / 100,
+    });
+  }
+
+  const operadoresResumo = Array.from(operadoresMap.entries())
+    .map(([operador, stats]) => ({
+      operador,
+      total: stats.total,
+      valorTotal: Math.round(stats.valorTotal * 100) / 100,
+    }))
+    .sort((a, b) => b.total - a.total);
+
+  return {
+    farmaciaId,
+    totalConcluidas,
+    valorProtegidoTotal: Math.round(valorProtegidoTotal * 100) / 100,
+    operadoresResumo,
+    tarefas: list,
+  };
+}

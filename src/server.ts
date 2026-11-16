@@ -23,7 +23,9 @@ import {
 } from './services/rbac_settings';
 
 import { getMobileStaffHtml } from './views/mobile_staff_view';
+import { getStockEvolutionAnalytics } from './services/stock_evolution';
 import {
+  getWeeklyTasksAudit,
   getPharmacyWeeklyTasks,
   toggleWeeklyTaskInDb,
   resetWeeklyTasksInDb,
@@ -2397,7 +2399,40 @@ async function startServer() {
         return;
       }
 
-      // 2.5I. Endpoint Obter Tarefas Semanais da Farmácia
+      
+        // 2.5I-Audit. Endpoint Auditoria Detalhada de Tarefas Concluídas (O que foi feito, quando e quem fez)
+        if (pathname === '/api/weekly-tasks/audit' && req.method === 'GET') {
+          try {
+            const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+            const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+            const auditData = await getWeeklyTasksAudit(prisma, activeFarmacia.id);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, ...auditData }));
+          } catch (e: any) {
+            const status = e.statusCode || 500;
+            res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+          return;
+        }
+
+        // 2.5I-Evolution. Endpoint Análise de Evolução de Stock, Monos e Valores Poupados no Tempo
+        if (pathname === '/api/analytics/stock-evolution' && req.method === 'GET') {
+          try {
+            const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+            const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+            const evolutionData = await getStockEvolutionAnalytics(prisma, activeFarmacia.id);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, ...evolutionData }));
+          } catch (e: any) {
+            const status = e.statusCode || 500;
+            res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+          return;
+        }
+
+        // 2.5I. Endpoint Obter Tarefas Semanais da Farmácia
       if (pathname === '/api/weekly-tasks' && req.method === 'GET') {
         try {
           const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
@@ -3893,7 +3928,7 @@ function getDashboardHtml(): string {
       background: #ffffff;
       border: 1px solid #e2e8f0;
       border-radius: 14px;
-      max-width: 860px;
+      max-width: 1120px;
       width: 100%;
       padding: 24px;
       max-height: 90vh;
@@ -4423,6 +4458,12 @@ function getDashboardHtml(): string {
           <span class="badge badge-purple" style="font-size:0.7rem;">12M</span>
         </button>
 
+        
+        <button class="nav-item tab-btn" id="tabBtn-evolution" onclick="switchTab('evolution')">
+          <span class="nav-item-left">📈 Evolução & Valor de Stock</span>
+          <span class="badge" style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.68rem; font-weight: 800; border: 1px solid rgba(16, 185, 129, 0.3);">NOVO</span>
+        </button>
+
         <div class="nav-section-title" style="margin-top:14px;">GESTÃO DE STOCK & COMPRAS</div>
 
         <button class="nav-item tab-btn" id="tabBtn-caducidade" onclick="switchTab('caducidade')">
@@ -4613,7 +4654,7 @@ function getDashboardHtml(): string {
             </p>
           </div>
           <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-            <span id="planoProgressText" style="font-size: 0.86rem; color: #047857; font-weight: 700; background: #d1fae5; padding: 6px 12px; border-radius: 8px; border: 1px solid #a7f3d0;">
+            <span id="planoProgressText" onclick="openCompletedTasksModal()" title="Clique para abrir histórico de auditoria de quem picou cada tarefa" style="cursor: pointer; transition: all 0.2s; font-size: 0.86rem; color: #047857; font-weight: 700; background: #d1fae5; padding: 6px 12px; border-radius: 8px; border: 1px solid #a7f3d0;">
               ✅ 0 de 0 tarefas concluídas
             </span>
             <button class="btn" onclick="printWeeklyActionPlan()" style="background: linear-gradient(135deg, #10b981, #059669); color: #042f2e; font-weight: 700;">
@@ -4622,8 +4663,8 @@ function getDashboardHtml(): string {
             <button class="btn btn-secondary" onclick="resetWeeklyTasksProgress()" style="font-size: 0.8rem; padding: 7px 12px;" title="Limpar vistos marcados">
               🔄 Limpar Vistos
             </button>
-            <button class="btn" onclick="openMobileStaffModal()" style="background: linear-gradient(135deg, #0284c7, #0369a1); color: #ffffff; font-weight: 700; box-shadow: 0 2px 4px rgba(2, 132, 199, 0.3);">
-              📱 Abrir no Telemóvel da Equipa
+            <button class="btn" onclick="openCompletedTasksModal()" style="background: linear-gradient(135deg, #059669, #047857); color: #ffffff; font-weight: 700; box-shadow: 0 2px 4px rgba(5, 150, 105, 0.25); display: flex; align-items: center; gap: 6px;" title="Ver histórico de auditoria: o que foi feito, quando e quem fez">
+              <span style="font-size: 1rem;">📋</span> Auditoria & Tarefas Concluídas
             </button>
           </div>
         </div>
@@ -4884,6 +4925,93 @@ function getDashboardHtml(): string {
     </div>
 
     <!-- ABA 5B: ANÁLISE DE LABORATÓRIOS & AIMS (FASE 5) -->
+    
+    <!-- ABA: EVOLUÇÃO DE STOCKS NO TEMPO, MONOS E VALORES POUPADOS -->
+    <div id="tabContent-evolution" style="display: none;">
+      <!-- CABEÇALHO HERO -->
+      <div style="background: linear-gradient(135deg, #f0fdf4 0%, #e0f2fe 100%); border: 1px solid #bae6fd; border-radius: 14px; padding: 22px; margin-bottom: 22px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+          <div>
+            <div style="font-size: 1.25rem; font-weight: 800; color: #0369a1; display: flex; align-items: center; gap: 8px;">
+              📈 Evolução de Stocks no Tempo, Imobilizado e Valores Poupados
+            </div>
+            <p style="font-size: 0.88rem; color: #334155; margin-top: 4px; max-width: 860px; line-height: 1.45;">
+              Monitorização contínua da libertação de tesouraria: acompanhe mês a mês a trajetória do <b>Stock Total</b>, a redução do <b>Stock Imobilizado (Monos)</b> e a acumulação de <b>Valores Poupados</b> na farmácia.
+            </p>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <button class="btn" onclick="loadStockEvolutionData()" style="background: #0284c7; color: #ffffff; font-weight: 700;">🔄 Atualizar Dados</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4 BIG NUMBER KPIS -->
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; margin-bottom: 22px;">
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #0284c7;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">📦 Stock Total Atual</div>
+          <div id="evoKpiStockTotal" style="font-size: 1.7rem; font-weight: 800; color: #0f172a; margin-top: 4px;">-- €</div>
+          <div id="evoKpiStockSub" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">-- unidades em armazém</div>
+        </div>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #e11d48;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">🛑 Stock Imobilizado (Monos)</div>
+          <div id="evoKpiImobilizado" style="font-size: 1.7rem; font-weight: 800; color: #e11d48; margin-top: 4px;">-- €</div>
+          <div id="evoKpiImobilizadoSub" style="font-size: 0.76rem; color: #e11d48; margin-top: 2px;">--% do capital total em stock</div>
+        </div>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #059669;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">💰 Valores Poupados Acumulados</div>
+          <div id="evoKpiPoupancas" style="font-size: 1.7rem; font-weight: 800; color: #059669; margin-top: 4px;">-- €</div>
+          <div id="evoKpiPoupancasSub" style="font-size: 0.76rem; color: #059669; margin-top: 2px;">Em caducidades, tarefas e rebalanceamento</div>
+        </div>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #8b5cf6;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">🔄 Capital Libertado Estimado</div>
+          <div id="evoKpiCapitalLibertado" style="font-size: 1.7rem; font-weight: 800; color: #7c3aed; margin-top: 4px;">-- €</div>
+          <div id="evoKpiCapitalLibertadoSub" style="font-size: 0.76rem; color: #6d28d9; margin-top: 2px;">Tesouraria recuperada vs mês anterior</div>
+        </div>
+      </div>
+
+      <!-- GRÁFICO HISTÓRICO DE BARRAS MÊS A MÊS -->
+      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
+          <div>
+            <h3 style="font-size: 1.05rem; font-weight: 800; color: #0f172a; margin: 0;">📊 Evolução Temporal Mensal (Últimos 12 Meses)</h3>
+            <p style="font-size: 0.8rem; color: #64748b; margin: 2px 0 0 0;">Comparativo de Stock Total, Stock Imobilizado, Faturação de Vendas e Poupança.</p>
+          </div>
+          <div style="display: flex; gap: 14px; font-size: 0.78rem; font-weight: 700; align-items: center; flex-wrap: wrap;">
+            <span style="display: flex; align-items: center; gap: 5px; color: #0284c7;"><span style="width: 12px; height: 12px; background: #0284c7; border-radius: 3px; display: inline-block;"></span> Stock Total</span>
+            <span style="display: flex; align-items: center; gap: 5px; color: #e11d48;"><span style="width: 12px; height: 12px; background: #fca5a5; border-radius: 3px; display: inline-block;"></span> Imobilizado (Monos)</span>
+            <span style="display: flex; align-items: center; gap: 5px; color: #10b981;"><span style="width: 12px; height: 12px; background: #10b981; border-radius: 3px; display: inline-block;"></span> Vendas (€)</span>
+            <span style="display: flex; align-items: center; gap: 5px; color: #d97706;"><span style="width: 12px; height: 12px; background: #fbbf24; border-radius: 3px; display: inline-block;"></span> Poupança</span>
+          </div>
+        </div>
+        <div id="evoChartBarsContainer" style="display: flex; align-items: flex-end; gap: 12px; height: 260px; padding: 10px 0 30px 0; border-bottom: 1px solid #cbd5e1; overflow-x: auto;">
+          <div style="text-align: center; width: 100%; color: #94a3b8; align-self: center;">A gerar visualização gráfica...</div>
+        </div>
+      </div>
+
+      <!-- TABELA DETALHADA DE EVOLUÇÃO FINANCEIRA -->
+      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+        <h3 style="font-size: 1.05rem; font-weight: 800; color: #0f172a; margin: 0 0 14px 0;">📋 Tabela Cronológica de Rotação e Poupanças</h3>
+        <div style="overflow-x: auto;">
+          <table style="width: 100%; border-collapse: collapse; font-size: 0.86rem; text-align: left;">
+            <thead style="background: #f8fafc; border-bottom: 2px solid #e2e8f0;">
+              <tr>
+                <th style="padding: 10px 14px; font-weight: 700; color: #475569;">Mês / Ano</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #0284c7; text-align: right;">Stock Total (€)</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #e11d48; text-align: right;">Stock Imobilizado (€)</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #64748b; text-align: center;">% Imobilizado</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #10b981; text-align: right;">Vendas Faturadas (€)</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #059669; text-align: right;">Valores Poupados (€)</th>
+                <th style="padding: 10px 14px; font-weight: 700; color: #475569; text-align: center;">Tendência</th>
+              </tr>
+            </thead>
+            <tbody id="evoTableBody">
+              <tr><td colspan="7" style="padding: 24px; text-align: center; color: #94a3b8;">A carregar tabela...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <div id="tabContent-labs" style="display: none;">
       <div style="background: linear-gradient(135deg, #faf5ff 0%, #ffffff 100%); border: 1px solid #e9d5ff; border-radius: 14px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
         <div style="font-size: 1.25rem; font-weight: 800; color: #7e22ce; margin-bottom: 6px;">
@@ -5545,6 +5673,76 @@ function getDashboardHtml(): string {
       </div> <!-- /main-content -->
     </div> <!-- /main-wrapper -->
   </div> <!-- /app-layout -->
+
+  
+  <!-- MODAL DE AUDITORIA DE TAREFAS CONCLUÍDAS (O QUE FOI FEITO, QUANDO E QUEM FEZ) -->
+  <div class="modal-backdrop" id="completedTasksModal" style="display: none; z-index: 1000;" onclick="if(event.target===this) closeCompletedTasksModal()">
+    <div class="modal" style="max-width: 1180px; width: 95vw; max-height: 92vh; display: flex; flex-direction: column;">
+      <div class="modal-header" style="border-bottom: 1px solid #e2e8f0; padding-bottom: 14px; margin-bottom: 16px;">
+        <div>
+          <h2 style="font-size: 1.25rem; color: #047857; display: flex; align-items: center; gap: 8px;">
+            📋 Auditoria de Tarefas da Equipa — O Que Foi Feito, Quando e Quem Fez
+          </h2>
+          <p style="font-size: 0.85rem; color: #64748b; margin-top: 3px;">
+            Registo em tempo real das ações e picagens concluídas pela equipa de balcão e gaveta.
+          </p>
+        </div>
+        <button class="btn btn-secondary" onclick="closeCompletedTasksModal()">✕ Fechar</button>
+      </div>
+
+      <!-- CARDS DE RESUMO DE AUDITORIA -->
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 18px;">
+        <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 14px;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: #166534; text-transform: uppercase;">✅ Total de Tarefas Realizadas</div>
+          <div id="auditTotalTasks" style="font-size: 1.6rem; font-weight: 800; color: #14532d; margin-top: 2px;">0</div>
+          <div style="font-size: 0.74rem; color: #15803d;">Picadas e sincronizadas</div>
+        </div>
+        <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 10px; padding: 14px;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: #065f46; text-transform: uppercase;">🛡️ Valor Protegido Acumulado</div>
+          <div id="auditTotalSaved" style="font-size: 1.6rem; font-weight: 800; color: #047857; margin-top: 2px;">0.00 €</div>
+          <div style="font-size: 0.74rem; color: #059669;">Em caducidades e restos escoados</div>
+        </div>
+        <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 10px; padding: 14px;">
+          <div style="font-size: 0.74rem; font-weight: 700; color: #1e40af; text-transform: uppercase;">👥 Operador Mais Ativo</div>
+          <div id="auditTopOperator" style="font-size: 1.25rem; font-weight: 800; color: #1d4ed8; margin-top: 4px;">--</div>
+          <div id="auditTopOperatorSub" style="font-size: 0.74rem; color: #2563eb;">-- picagens</div>
+        </div>
+      </div>
+
+      <!-- BARRA DE FILTROS E PESQUISA -->
+      <div style="display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; align-items: center;">
+        <input type="text" id="auditSearchInput" oninput="filterAuditTasks()" placeholder="🔍 Pesquisar por produto, CNP ou operador..." style="flex: 1; min-width: 260px; padding: 9px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 0.86rem;" />
+        <select id="auditCategoryFilter" onchange="filterAuditTasks()" style="padding: 9px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 0.86rem; background: #ffffff;">
+          <option value="ALL">Todas as Categorias</option>
+          <option value="VALIDADE">⏳ Validades na Gaveta</option>
+          <option value="RESTO_GAVETA">🧹 Restos de Gaveta</option>
+          <option value="TRAVAR_SIFARMA">🛑 Travar Compras</option>
+          <option value="CAMPANHA">🎯 Missões de Campanhas</option>
+        </select>
+        <button class="btn btn-secondary" onclick="loadCompletedTasksAudit()" style="padding: 9px 14px;">🔄 Atualizar</button>
+      </div>
+
+      <!-- TABELA DE AUDITORIA CRONOLÓGICA -->
+      <div style="flex: 1; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; max-height: 52vh;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 0.86rem; text-align: left;">
+          <thead style="background: #f8fafc; position: sticky; top: 0; z-index: 2; border-bottom: 2px solid #e2e8f0;">
+            <tr>
+              <th style="padding: 10px 14px; color: #475569; font-weight: 700; width: 160px;">Data & Hora</th>
+              <th style="padding: 10px 14px; color: #475569; font-weight: 700; width: 180px;">Quem Fez</th>
+              <th style="padding: 10px 14px; color: #475569; font-weight: 700; width: 140px;">Categoria</th>
+              <th style="padding: 10px 14px; color: #475569; font-weight: 700;">O Que Foi Feito (Produto / Ação)</th>
+              <th style="padding: 10px 14px; color: #475569; font-weight: 700; text-align: right; width: 130px;">Impacto / Poupança</th>
+            </tr>
+          </thead>
+          <tbody id="auditTasksTableBody">
+            <tr>
+              <td colspan="5" style="padding: 30px; text-align: center; color: #94a3b8;">A carregar registo de auditoria...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 
   <div class="modal-backdrop" id="productModal" style="display: none;" onclick="if(event.target===this) closeModal()">
     <div class="modal">
@@ -7903,7 +8101,7 @@ function getDashboardHtml(): string {
 
     function switchTab(tab) {
       activeTab = tab;
-      ['plano', 'copilot', 'campaigns', 'rebalance', 'labs', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
+      ['plano', 'copilot', 'campaigns', 'rebalance', 'labs', 'evolution', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
         const btn = document.getElementById('tabBtn-' + t);
         if (btn) btn.classList.toggle('active', t === tab);
       });
@@ -12517,6 +12715,211 @@ function getDashboardHtml(): string {
       a.href = URL.createObjectURL(blob);
       a.download = 'campanha_ativa_' + camp.campanhaId + '_' + new Date().toISOString().slice(0, 10) + '.csv';
       a.click();
+    }
+
+    
+    // ==========================================
+    // AUDITORIA DE TAREFAS CONCLUÍDAS (O QUE, QUANDO, QUEM)
+    // ==========================================
+    let cachedAuditTasks = [];
+
+    async function openCompletedTasksModal() {
+      const modal = document.getElementById('completedTasksModal');
+      if (!modal) return;
+      modal.style.display = 'flex';
+      await loadCompletedTasksAudit();
+    }
+
+    function closeCompletedTasksModal() {
+      const modal = document.getElementById('completedTasksModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    async function loadCompletedTasksAudit() {
+      const tbody = document.getElementById('auditTasksTableBody');
+      if (!tbody) return;
+      tbody.innerHTML = '<tr><td colspan="5" style="padding: 24px; text-align: center; color: #64748b;">A carregar registo de auditoria...</td></tr>';
+
+      try {
+        const res = await fetch('/api/weekly-tasks/audit?farmaciaId=' + encodeURIComponent(activeFarmaciaId || ''));
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Erro ao carregar auditoria');
+
+        cachedAuditTasks = data.tarefas || [];
+
+        // Atualizar contadores
+        const totalEl = document.getElementById('auditTotalTasks');
+        const savedEl = document.getElementById('auditTotalSaved');
+        const topOpEl = document.getElementById('auditTopOperator');
+        const topOpSub = document.getElementById('auditTopOperatorSub');
+
+        if (totalEl) totalEl.textContent = data.totalConcluidas || 0;
+        if (savedEl) savedEl.textContent = Number(data.valorProtegidoTotal || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+
+        if (data.operadoresResumo && data.operadoresResumo.length > 0) {
+          const top = data.operadoresResumo[0];
+          if (topOpEl) topOpEl.textContent = top.operador;
+          if (topOpSub) topOpSub.textContent = top.total + ' picagens (' + Number(top.valorTotal || 0).toFixed(2) + ' € protegidos)';
+        } else {
+          if (topOpEl) topOpEl.textContent = 'Sem registos';
+          if (topOpSub) topOpSub.textContent = '0 picagens';
+        }
+
+        renderAuditTasksTable(cachedAuditTasks);
+      } catch (err) {
+        tbody.innerHTML = '<tr><td colspan="5" style="padding: 20px; text-align: center; color: #e11d48;">Falha ao carregar auditoria: ' + escapeHtml(err.message) + '</td></tr>';
+      }
+    }
+
+    function filterAuditTasks() {
+      const query = (document.getElementById('auditSearchInput')?.value || '').toLowerCase().trim();
+      const cat = document.getElementById('auditCategoryFilter')?.value || 'ALL';
+
+      const filtered = cachedAuditTasks.filter(function(t) {
+        const matchCat = (cat === 'ALL' || t.categoria === cat);
+        const matchQuery = !query ||
+          (t.designacao && t.designacao.toLowerCase().includes(query)) ||
+          (t.cnp_codigo && t.cnp_codigo.includes(query)) ||
+          (t.concluido_por && t.concluido_por.toLowerCase().includes(query)) ||
+          (t.task_id && t.task_id.toLowerCase().includes(query));
+        return matchCat && matchQuery;
+      });
+
+      renderAuditTasksTable(filtered);
+    }
+
+    function renderAuditTasksTable(list) {
+      const tbody = document.getElementById('auditTasksTableBody');
+      if (!tbody) return;
+
+      if (!list || list.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="padding: 28px; text-align: center; color: #94a3b8;">Nenhuma tarefa encontrada com os filtros selecionados.</td></tr>';
+        return;
+      }
+
+      let html = '';
+      list.forEach(function(t) {
+        const d = new Date(t.concluido_em);
+        const dateStr = d.toLocaleDateString('pt-PT') + ' às ' + d.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+        let catBadge = '<span style="background: #f1f5f9; color: #475569; padding: 3px 8px; border-radius: 6px; font-weight: 700; font-size: 0.74rem;">' + escapeHtml(t.categoria) + '</span>';
+        if (t.categoria === 'VALIDADE') catBadge = '<span style="background: #fee2e2; color: #b91c1c; padding: 3px 8px; border-radius: 6px; font-weight: 700; font-size: 0.74rem;">⏳ Validades</span>';
+        if (t.categoria === 'RESTO_GAVETA') catBadge = '<span style="background: #fef3c7; color: #b45309; padding: 3px 8px; border-radius: 6px; font-weight: 700; font-size: 0.74rem;">🧹 Resto Gaveta</span>';
+        if (t.categoria === 'TRAVAR_SIFARMA') catBadge = '<span style="background: #e0e7ff; color: #4338ca; padding: 3px 8px; border-radius: 6px; font-weight: 700; font-size: 0.74rem;">🛑 Travar Compras</span>';
+        if (t.categoria === 'CAMPANHA') catBadge = '<span style="background: #f3e8ff; color: #7e22ce; padding: 3px 8px; border-radius: 6px; font-weight: 700; font-size: 0.74rem;">🎯 Campanha</span>';
+
+        const cnpBadge = t.cnp_codigo ? '<b style="color: #0284c7; cursor: pointer;" onclick="openProductModal(&quot;' + t.cnp_codigo + '&quot;)">[' + escapeHtml(t.cnp_codigo) + ']</b> ' : '';
+        const impactBadge = t.valor_impacto && t.valor_impacto > 0
+          ? '<span style="color: #059669; font-weight: 800;">+' + Number(t.valor_impacto).toFixed(2) + ' €</span>'
+          : '<span style="color: #94a3b8;">--</span>';
+
+        html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+          '<td style="padding: 10px 14px; color: #64748b; font-size: 0.82rem; font-family: monospace;">' + dateStr + '</td>' +
+          '<td style="padding: 10px 14px;"><span style="background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; padding: 3px 9px; border-radius: 6px; font-weight: 700; font-size: 0.78rem;">👤 ' + escapeHtml(t.concluido_por) + '</span></td>' +
+          '<td style="padding: 10px 14px;">' + catBadge + '</td>' +
+          '<td style="padding: 10px 14px; font-weight: 600; color: #0f172a;">' + cnpBadge + escapeHtml(t.designacao || t.task_id) + '</td>' +
+          '<td style="padding: 10px 14px; text-align: right;">' + impactBadge + '</td>' +
+          '</tr>';
+      });
+
+      tbody.innerHTML = html;
+    }
+
+    // ==========================================
+    // EVOLUÇÃO DE STOCK NO TEMPO & POUPANÇAS
+    // ==========================================
+    let cachedEvolutionData = null;
+
+    async function loadStockEvolutionData() {
+      try {
+        const res = await fetch('/api/analytics/stock-evolution?farmaciaId=' + encodeURIComponent(activeFarmaciaId || ''));
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'Erro ao obter evolução');
+
+        cachedEvolutionData = data;
+
+        // Atualizar 4 Big Numbers
+        const r = data.resumoAtual;
+        const kpiStock = document.getElementById('evoKpiStockTotal');
+        const kpiStockSub = document.getElementById('evoKpiStockSub');
+        const kpiImob = document.getElementById('evoKpiImobilizado');
+        const kpiImobSub = document.getElementById('evoKpiImobilizadoSub');
+        const kpiPoup = document.getElementById('evoKpiPoupancas');
+        const kpiPoupSub = document.getElementById('evoKpiPoupancasSub');
+        const kpiCap = document.getElementById('evoKpiCapitalLibertado');
+        const kpiCapSub = document.getElementById('evoKpiCapitalLibertadoSub');
+
+        if (kpiStock) kpiStock.textContent = Number(r.stock_total_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (kpiStockSub) kpiStockSub.textContent = Number(r.stock_total_unidades || 0).toLocaleString('pt-PT') + ' un em armazém (' + (r.total_artigos || 0) + ' artigos)';
+
+        if (kpiImob) kpiImob.textContent = Number(r.stock_imobilizado_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (kpiImobSub) kpiImobSub.textContent = Number(r.taxa_imobilizado_pct || 0).toFixed(1) + '% do capital total em stock (' + Number(r.stock_imobilizado_unidades || 0).toLocaleString('pt-PT') + ' un monos)';
+
+        if (kpiPoup) kpiPoup.textContent = '+' + Number(r.valores_poupados_acumulados_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (kpiPoupSub) kpiPoupSub.textContent = 'Tarefas: +' + Number(r.poupanca_tarefas_equipa_eur || 0).toFixed(2) + ' € | Rebalanceamento: +' + Number(r.poupanca_rebalanceamento_eur || 0).toFixed(2) + ' €';
+
+        if (kpiCap) kpiCap.textContent = '+' + Number(r.capital_libertado_estimado_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (kpiCapSub) kpiCapSub.textContent = 'Tesouraria recuperada vs ' + (data.comparativoMoM?.mes_anterior_label || 'mês anterior');
+
+        // Render Gráfico e Tabela
+        renderStockEvolutionChart(data.evolucaoMensal);
+        renderStockEvolutionTable(data.evolucaoMensal);
+      } catch (err) {
+        console.error('Falha ao carregar evolução de stock:', err);
+      }
+    }
+
+    function renderStockEvolutionChart(pontos) {
+      const container = document.getElementById('evoChartBarsContainer');
+      if (!container || !pontos || pontos.length === 0) return;
+
+      const maxVal = Math.max.apply(Math, pontos.map(function(p) {
+        return Math.max(p.stock_total_eur, p.vendas_mes_eur);
+      })) || 1;
+
+      let html = '';
+      pontos.forEach(function(p) {
+        const hStock = Math.max(8, Math.round((p.stock_total_eur / maxVal) * 200));
+        const hImob = Math.max(4, Math.round((p.stock_imobilizado_eur / maxVal) * 200));
+        const hVendas = Math.max(6, Math.round((p.vendas_mes_eur / maxVal) * 200));
+        const hPoup = Math.max(2, Math.round((p.valores_poupados_eur / maxVal) * 200));
+
+        html += '<div style="flex: 1; min-width: 65px; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; position: relative;">' +
+          '<div style="display: flex; gap: 4px; align-items: flex-end; height: 210px; width: 100%; justify-content: center;">' +
+          '  <div title="Stock Total: ' + p.stock_total_eur.toFixed(2) + ' €" style="width: 14px; height: ' + hStock + 'px; background: #0284c7; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
+          '  <div title="Monos: ' + p.stock_imobilizado_eur.toFixed(2) + ' € (' + p.taxa_imobilizado_pct + '%)" style="width: 14px; height: ' + hImob + 'px; background: #fca5a5; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
+          '  <div title="Vendas: ' + p.vendas_mes_eur.toFixed(2) + ' €" style="width: 14px; height: ' + hVendas + 'px; background: #10b981; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
+          '  <div title="Poupança: +' + p.valores_poupados_eur.toFixed(2) + ' €" style="width: 10px; height: ' + hPoup + 'px; background: #fbbf24; border-radius: 4px 4px 0 0; transition: height 0.3s;"></div>' +
+          '</div>' +
+          '<div style="font-size: 0.72rem; color: #475569; font-weight: 700; margin-top: 8px; text-align: center; white-space: nowrap;">' + escapeHtml(p.mes_label) + '</div>' +
+          '</div>';
+      });
+
+      container.innerHTML = html;
+    }
+
+    function renderStockEvolutionTable(pontos) {
+      const tbody = document.getElementById('evoTableBody');
+      if (!tbody || !pontos || pontos.length === 0) return;
+
+      let html = '';
+      pontos.slice().reverse().forEach(function(p, idx) {
+        const trend = p.taxa_imobilizado_pct < 30
+          ? '<span style="color: #059669; font-weight: 800;">🟢 Saudável</span>'
+          : '<span style="color: #d97706; font-weight: 800;">🟡 Otimizável</span>';
+
+        html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+          '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(p.mes_label) + '</td>' +
+          '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #0284c7;">' + Number(p.stock_total_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
+          '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #e11d48;">' + Number(p.stock_imobilizado_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
+          '<td style="padding: 10px 14px; text-align: center;"><span style="background: #fef2f2; color: #991b1b; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.76rem;">' + p.taxa_imobilizado_pct.toFixed(1) + '%</span></td>' +
+          '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #10b981;">' + Number(p.vendas_mes_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
+          '<td style="padding: 10px 14px; text-align: right; font-weight: 800; color: #059669;">+' + Number(p.valores_poupados_eur).toFixed(2) + ' €</td>' +
+          '<td style="padding: 10px 14px; text-align: center;">' + trend + '</td>' +
+          '</tr>';
+      });
+
+      tbody.innerHTML = html;
     }
 
     initPharmacies();
