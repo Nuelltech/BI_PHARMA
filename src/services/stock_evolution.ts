@@ -3,7 +3,8 @@ import { analyzePharmacyInventory } from './analysis';
 
 export interface MonthlyStockPoint {
   mes_ano: string; // ex: "2026-10"
-  mes_label: string; // ex: "Out 2026"
+  mes_label: string; // ex: "Out 2026 (Marco Zero)"
+  data_snapshot?: string;
   stock_total_eur: number;
   stock_imobilizado_eur: number;
   taxa_imobilizado_pct: number;
@@ -11,15 +12,17 @@ export interface MonthlyStockPoint {
   vendas_mes_eur: number;
   unidades_vendidas: number;
   liquidez_recuperada_monos_eur: number;
-  caducidades_salvas_eur: number;
   dias_rotacao: number;
   diagnostico: string;
-  origem_dados?: 'SNAPSHOT_REAL' | 'INVENTARIO_FISICO';
+  is_marco_zero: boolean;
+  origem_dados: 'SNAPSHOT_REAL' | 'INVENTARIO_FISICO';
 }
 
 export interface StockEvolutionReport {
   farmaciaId: string;
   farmaciaNome: string;
+  is_marco_zero: boolean;
+  total_posicoes_stock: number;
   resumoAtual: {
     stock_total_eur: number;
     stock_total_unidades: number;
@@ -29,12 +32,11 @@ export interface StockEvolutionReport {
     stock_ativo_eur: number;
     taxa_imobilizado_pct: number;
     liquidez_recuperada_comprovada_eur: number;
-    caducidades_salvas_venda_eur: number;
-    otimizacao_genericos_margem_eur: number;
     dias_medios_rotacao: number;
   };
   evolucaoMensal: MonthlyStockPoint[];
   comparativoMoM: {
+    has_comparison: boolean;
     variacao_stock_pct: number;
     variacao_stock_eur: number;
     variacao_monos_eur: number;
@@ -49,10 +51,11 @@ export interface StockEvolutionReport {
 
 /**
  * Análise Rigorosa da Saúde Financeira do Inventário e Liquidez Recuperada
- * Respeita:
- * 1. Preço de Custo Flutuante (por snapshot histórico ou CMP do inventário)
- * 2. Menos Stock ≠ Poupança: Apenas vendas comprovadas de monos contam como liquidez recuperada
- * 3. Sem presunção de encomendas evitadas sem dados do Sifarma
+ * Regras Inegociáveis de Negócio:
+ * 1. O 1º ficheiro de existências é o MARCO ZERO (Baseline).
+ * 2. Sem ficheiros anteriores, NÃO se assumem nem calculam valores fictícios para trás.
+ * 3. A recuperação de liquidez e a evolução só começam a ser medidas após o Marco Zero (a partir do 2º fecho).
+ * 4. Sem metas arbitrárias: foco em factos auditados.
  */
 export async function getStockEvolutionAnalytics(
   prisma: PrismaClient,
@@ -112,7 +115,32 @@ export async function getStockEvolutionAnalytics(
     ? Math.round((currentImobilizadoEur / currentStockTotalEur) * 1000) / 10
     : 0;
 
-  // 3. Verificar se existem Snapshots Mensais Históricos de Inventário (com custo real por época)
+  // 3. Vendas do mês mais recente (para o ponto atual)
+  const vendasMesAtualRaw = (await prisma.$queryRaw`
+    SELECT 
+      COALESCE(SUM("valor_total"), 0) as val_tot,
+      COALESCE(SUM("quantidade"), 0) as qtd_tot
+    FROM "Venda"
+    WHERE "farmaciaId" = ${farmaciaId}
+      AND "data_venda" >= DATE_TRUNC('month', (SELECT MAX("data_venda") FROM "Venda" WHERE "farmaciaId" = ${farmaciaId}))
+  `) as Array<{ val_tot: number | string; qtd_tot: number | string | bigint }>;
+
+  const vendasMesAtualEur = vendasMesAtualRaw.length > 0 ? Math.round(Number(vendasMesAtualRaw[0].val_tot) * 100) / 100 : 0;
+  const vendasMesAtualQtd = vendasMesAtualRaw.length > 0 ? Number(vendasMesAtualRaw[0].qtd_tot) : 0;
+
+  // Média de vendas diárias nos últimos 12 meses para cálculo de rotação atual
+  const vendasAnuaisRaw = (await prisma.$queryRaw`
+    SELECT COALESCE(SUM("valor_total"), 0) as total_ano
+    FROM "Venda"
+    WHERE "farmaciaId" = ${farmaciaId}
+      AND "data_venda" >= NOW() - INTERVAL '365 days'
+  `) as Array<{ total_ano: number | string }>;
+
+  const totalVendasAnoEur = vendasAnuaisRaw.length > 0 ? Number(vendasAnuaisRaw[0].total_ano) : 600000;
+  const vendasDiariasCusto = (totalVendasAnoEur * 0.65) / 365;
+  const diasMediosRotacao = vendasDiariasCusto > 0 ? Math.round(currentStockTotalEur / vendasDiariasCusto) : 55;
+
+  // 4. Verificar existência de Snapshots Históricos Reais de Inventário
   const snapshotsAgrupados = (await prisma.$queryRaw`
     SELECT 
       DATE_TRUNC('month', "data_snapshot") as mes,
@@ -124,181 +152,156 @@ export async function getStockEvolutionAnalytics(
     ORDER BY mes ASC
   `) as Array<{ mes: Date; val_tot: number | string; qtd_tot: number | string | bigint }>;
 
-  const snapshotsMap = new Map<string, { val: number; qtd: number }>();
-  for (const s of snapshotsAgrupados) {
-    const d = new Date(s.mes);
-    const k = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
-    snapshotsMap.set(k, {
-      val: Math.round(Number(s.val_tot) * 100) / 100,
-      qtd: Number(s.qtd_tot),
-    });
-  }
-
-  // 4. Vendas Mensais Agregadas (Série Temporal Real dos últimos 12 meses)
-  const vendasMensais = (await prisma.$queryRaw`
-    SELECT 
-      DATE_TRUNC('month', "data_venda") as mes,
-      COALESCE(SUM("valor_total"), 0) as val_tot,
-      COALESCE(SUM("quantidade"), 0) as qtd_tot
-    FROM "Venda"
-    WHERE "farmaciaId" = ${farmaciaId}
-    GROUP BY DATE_TRUNC('month', "data_venda")
-    ORDER BY mes ASC
-  `) as Array<{ mes: Date; val_tot: number | string; qtd_tot: number | string | bigint }>;
-
-  // Vendas de produtos que eram monos (Liquidez comprovada recuperada por talão de venda)
-  const vendasMonos = (await prisma.$queryRaw`
-    SELECT 
-      DATE_TRUNC('month', "data_venda") as mes,
-      "cnp_codigo",
-      SUM("quantidade") as qtd_mono,
-      SUM("valor_total") as val_mono
-    FROM "Venda"
-    WHERE "farmaciaId" = ${farmaciaId}
-    GROUP BY DATE_TRUNC('month', "data_venda"), "cnp_codigo"
-  `) as Array<{ mes: Date; cnp_codigo: string; qtd_mono: number | string | bigint; val_mono: number | string }>;
-
-  const monosVendasPorMes = new Map<string, number>();
-  let totalLiquidezMonosRecuperada = 0;
-
-  for (const vm of vendasMonos) {
-    if (monosCnpSet.has(vm.cnp_codigo)) {
-      const d = new Date(vm.mes);
-      const k = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
-      const custoUnit = costMap.get(vm.cnp_codigo) || 2.5;
-      const recuperadoEur = Math.max(0, Number(vm.qtd_mono) * custoUnit);
-      monosVendasPorMes.set(k, (monosVendasPorMes.get(k) || 0) + recuperadoEur);
-      totalLiquidezMonosRecuperada += recuperadoEur;
-    }
-  }
-  totalLiquidezMonosRecuperada = Math.round(totalLiquidezMonosRecuperada * 100) / 100;
-
-  // Tarefas concluídas com impacto auditado
-  const tarefasConcluidas = await prisma.tarefaEquipa.findMany({
-    where: { farmaciaId, concluido: true },
-    select: { valor_impacto: true },
-  });
-  let caducidadesSalvasTotal = 0;
-  for (const t of tarefasConcluidas) {
-    if (t.valor_impacto) caducidadesSalvasTotal += Number(t.valor_impacto);
-  }
-  caducidadesSalvasTotal = Math.round(caducidadesSalvasTotal * 100) / 100;
-
   const mesesNomes = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
+  const totalSnapshots = snapshotsAgrupados.length;
+  const isMarcoZero = totalSnapshots <= 1;
+
   const evolucaoMensal: MonthlyStockPoint[] = [];
 
-  const ultimosMeses = (vendasMensais && vendasMensais.length > 0)
-    ? vendasMensais.slice(-12)
-    : [];
+  // =========================================================================
+  // CENÁRIO A: MARCO ZERO (Apenas 1 ficheiro de inventário conhecido)
+  // Rigor: Não se inventam meses anteriores. A recuperação de dinheiro começa em 0.
+  // =========================================================================
+  if (isMarcoZero) {
+    let diag = 'Fotografia Inicial (Marco Zero)';
+    if (taxaImobilizado > 45) diag = 'Alerta de Imobilizado Inicial';
+    else if (taxaImobilizado > 35) diag = 'Diagnóstico Inicial';
 
-  const mediaVendasEur = ultimosMeses.length > 0
-    ? ultimosMeses.reduce((s, m) => s + Number(m.val_tot), 0) / ultimosMeses.length
-    : 45000;
+    evolucaoMensal.push({
+      mes_ano: '2026-10',
+      mes_label: 'Out 2026 (Marco Zero)',
+      stock_total_eur: currentStockTotalEur,
+      stock_imobilizado_eur: currentImobilizadoEur,
+      taxa_imobilizado_pct: taxaImobilizado,
+      stock_ativo_eur: stockAtivoEur,
+      vendas_mes_eur: vendasMesAtualEur,
+      unidades_vendidas: vendasMesAtualQtd,
+      liquidez_recuperada_monos_eur: 0, // Inicia a 0 no Marco Zero
+      dias_rotacao: diasMediosRotacao,
+      diagnostico: diag,
+      is_marco_zero: true,
+      origem_dados: 'INVENTARIO_FISICO',
+    });
 
-  ultimosMeses.forEach((m, idx) => {
-    const d = new Date(m.mes);
+    return {
+      farmaciaId,
+      farmaciaNome: farmacia.nome,
+      is_marco_zero: true,
+      total_posicoes_stock: 1,
+      resumoAtual: {
+        stock_total_eur: currentStockTotalEur,
+        stock_total_unidades: currentStockUnits,
+        total_artigos: inventarios.length,
+        stock_imobilizado_eur: currentImobilizadoEur,
+        stock_imobilizado_unidades: currentImobilizadoUnits,
+        stock_ativo_eur: stockAtivoEur,
+        taxa_imobilizado_pct: taxaImobilizado,
+        liquidez_recuperada_comprovada_eur: 0, // Medição inicia com o 2º fecho
+        dias_medios_rotacao: diasMediosRotacao,
+      },
+      evolucaoMensal,
+      comparativoMoM: {
+        has_comparison: false,
+        variacao_stock_pct: 0,
+        variacao_stock_eur: 0,
+        variacao_monos_eur: 0,
+        variacao_monos_pct: 0,
+        liquidez_recuperada_mom_eur: 0,
+        mes_anterior_label: 'N/A',
+        mes_atual_label: 'Out 2026 (Marco Zero)',
+        tendencia_monos: 'ESTAVEL',
+        explicacao_executiva: 'A farmácia encontra-se no Marco Zero (ponto de partida). A medição de evolução patrimonial, redução de monos e liquidez recuperada será ativada com a importação do fecho do próximo mês.',
+      },
+    };
+  }
+
+  // =========================================================================
+  // CENÁRIO B: MÚLTIPLOS SNAPSHOTS REAIS DE INVENTÁRIO
+  // Cada ponto corresponde estritamente a um fecho mensal físico comprovado.
+  // =========================================================================
+  let totalLiquidezMonosRecuperada = 0;
+
+  for (let i = 0; i < snapshotsAgrupados.length; i++) {
+    const s = snapshotsAgrupados[i];
+    const d = new Date(s.mes);
     const mesKey = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
-    const mesLabel = `${mesesNomes[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+    const mesLabel = `${mesesNomes[d.getUTCMonth()]} ${d.getUTCFullYear()}${i === 0 ? ' (Marco Zero)' : ''}`;
+    const stockVal = Math.round(Number(s.val_tot) * 100) / 100;
+    const isFirst = i === 0;
 
-    const vendasVal = Math.round(Number(m.val_tot) * 100) / 100;
-    const vendasQtd = Number(m.qtd_tot);
+    // Se é o primeiro fecho da série, é o Marco Zero desse histórico
+    let liqRecuperadaMes = 0;
 
-    let stockMesEur: number;
-    let origemDados: 'SNAPSHOT_REAL' | 'INVENTARIO_FISICO' = 'INVENTARIO_FISICO';
+    // Para meses subsequentes ao Marco Zero, calcula vendas reais de artigos que eram monos
+    if (!isFirst) {
+      const mesAnteriorDate = new Date(snapshotsAgrupados[i - 1].mes);
+      const vendasMonosIntervalo = (await prisma.$queryRaw`
+        SELECT COALESCE(SUM("valor_total"), 0) as val_tot, COALESCE(SUM("quantidade"), 0) as qtd_tot
+        FROM "Venda"
+        WHERE "farmaciaId" = ${farmaciaId}
+          AND "data_venda" >= ${mesAnteriorDate}
+          AND "data_venda" < ${d}
+          AND "cnp_codigo" IN (${monosCnpSet.size > 0 ? Array.from(monosCnpSet) : ['']})
+      `) as Array<{ val_tot: number | string; qtd_tot: number | string | bigint }>;
 
-    // Se temos snapshot físico com custos históricos para este mês, usamos os valores reais
-    if (snapshotsMap.has(mesKey)) {
-      const snap = snapshotsMap.get(mesKey)!;
-      stockMesEur = snap.val > 0 ? snap.val : currentStockTotalEur;
-      origemDados = 'SNAPSHOT_REAL';
-    } else {
-      // Reconstrução rigorosa com base no inventário físico e rotação de vendas
-      const rVendas = mediaVendasEur > 0 ? vendasVal / mediaVendasEur : 1;
-      stockMesEur = Math.round((currentStockTotalEur * (0.94 + 0.12 * rVendas)) * 100) / 100;
+      if (vendasMonosIntervalo.length > 0) {
+        liqRecuperadaMes = Math.max(0, Math.round(Number(vendasMonosIntervalo[0].val_tot) * 0.65 * 100) / 100);
+        totalLiquidezMonosRecuperada += liqRecuperadaMes;
+      }
     }
 
-    const progressFromPast = (ultimosMeses.length - 1 - idx) / (ultimosMeses.length || 1);
-    const taxaMonosMes = Math.min(55, Math.max(30, 44.5 + progressFromPast * 4.2 - (1 - (vendasVal / (mediaVendasEur || 1))) * 2));
-    const monosMesEur = Math.round((stockMesEur * (taxaMonosMes / 100)) * 100) / 100;
-    const ativoMesEur = Math.round((stockMesEur - monosMesEur) * 100) / 100;
-
-    // Liquidez recuperada de monos comprovada por vendas
-    const liqRecuperadaMes = Math.max(0, Math.round((monosVendasPorMes.get(mesKey) || 0) * 100) / 100);
-    const caducidadesSalvasMes = Math.max(0, Math.round((liqRecuperadaMes * 0.35) * 100) / 100);
-
-    // Dias de rotação = (Stock / Vendas diárias aproximadas a custo)
-    const custoVendasEstimado = vendasVal * 0.65;
-    const vendasDiariasCusto = custoVendasEstimado / 30;
-    const diasRotacao = vendasDiariasCusto > 0 ? Math.round(stockMesEur / vendasDiariasCusto) : 45;
-
-    let diagnostico = '🟢 Rotação Saudável';
-    if (taxaMonosMes > 45) diagnostico = '🔴 Excesso de Monos';
-    else if (taxaMonosMes > 35) diagnostico = '🟡 Alerta de Imobilizado';
+    const monosMesEur = Math.round((stockVal * (taxaImobilizado / 100)) * 100) / 100;
+    const ativoMesEur = Math.max(0, Math.round((stockVal - monosMesEur) * 100) / 100);
 
     evolucaoMensal.push({
       mes_ano: mesKey,
       mes_label: mesLabel,
-      stock_total_eur: stockMesEur,
+      data_snapshot: d.toISOString().split('T')[0],
+      stock_total_eur: stockVal,
       stock_imobilizado_eur: monosMesEur,
-      taxa_imobilizado_pct: Math.round(taxaMonosMes * 10) / 10,
+      taxa_imobilizado_pct: taxaImobilizado,
       stock_ativo_eur: ativoMesEur,
-      vendas_mes_eur: vendasVal,
-      unidades_vendidas: vendasQtd,
+      vendas_mes_eur: vendasMesAtualEur,
+      unidades_vendidas: vendasMesAtualQtd,
       liquidez_recuperada_monos_eur: liqRecuperadaMes,
-      caducidades_salvas_eur: caducidadesSalvasMes,
-      dias_rotacao: diasRotacao,
-      diagnostico,
-      origem_dados: origemDados,
+      dias_rotacao: diasMediosRotacao,
+      diagnostico: isFirst ? 'Marco Zero' : 'Fecho Mensal Auditado',
+      is_marco_zero: isFirst,
+      origem_dados: 'SNAPSHOT_REAL',
     });
-  });
-
-  // Comparativo MoM (Último mês vs Penúltimo)
-  let variacaoStockPct = 0;
-  let variacaoStockEur = 0;
-  let variacaoMonosEur = 0;
-  let variacaoMonosPct = 0;
-  let liquidezRecuperadaMoMEur = 0;
-  let mesAnteriorLabel = 'Mês Anterior';
-  let mesAtualLabel = 'Mês Atual';
-  let tendenciaMonos: 'REDUCAO' | 'AUMENTO' | 'ESTAVEL' = 'ESTAVEL';
-  let explicacaoExecutiva = 'Dados estáveis entre períodos.';
-
-  if (evolucaoMensal.length >= 2) {
-    const ultimo = evolucaoMensal[evolucaoMensal.length - 1];
-    const penultimo = evolucaoMensal[evolucaoMensal.length - 2];
-    mesAtualLabel = ultimo.mes_label;
-    mesAnteriorLabel = penultimo.mes_label;
-    liquidezRecuperadaMoMEur = ultimo.liquidez_recuperada_monos_eur;
-
-    variacaoStockEur = Math.round((ultimo.stock_total_eur - penultimo.stock_total_eur) * 100) / 100;
-    if (penultimo.stock_total_eur > 0) {
-      variacaoStockPct = Math.round((variacaoStockEur / penultimo.stock_total_eur) * 1000) / 10;
-    }
-
-    variacaoMonosEur = Math.round((ultimo.stock_imobilizado_eur - penultimo.stock_imobilizado_eur) * 100) / 100;
-    if (penultimo.stock_imobilizado_eur > 0) {
-      variacaoMonosPct = Math.round((variacaoMonosEur / penultimo.stock_imobilizado_eur) * 1000) / 10;
-    }
-
-    if (variacaoMonosEur < -50) {
-      tendenciaMonos = 'REDUCAO';
-      explicacaoExecutiva = `Excelente: O capital imobilizado em monos reduziu ${Math.abs(variacaoMonosEur).toFixed(2)} € (${Math.abs(variacaoMonosPct).toFixed(1)}%) vs ${mesAnteriorLabel}, impulsionado por ${liquidezRecuperadaMoMEur.toFixed(2)} € em vendas reais de artigos parados.`;
-    } else if (variacaoMonosEur > 50) {
-      tendenciaMonos = 'AUMENTO';
-      explicacaoExecutiva = `Atenção: O capital imobilizado em monos aumentou ${variacaoMonosEur.toFixed(2)} € (+${variacaoMonosPct.toFixed(1)}%) vs ${mesAnteriorLabel}. Recomenda-se travar compras nos produtos sem rotação e focar a equipa no balcão.`;
-    } else {
-      tendenciaMonos = 'ESTAVEL';
-      explicacaoExecutiva = `O capital imobilizado permaneceu estável em relação a ${mesAnteriorLabel}. Foram recuperados ${liquidezRecuperadaMoMEur.toFixed(2)} € através de vendas comprovadas de monos.`;
-    }
   }
 
-  // Dias médios de rotação globais
-  const vendasDiariasTotal = (mediaVendasEur * 0.65) / 30;
-  const diasMediosRotacao = vendasDiariasTotal > 0 ? Math.round(currentStockTotalEur / vendasDiariasTotal) : 48;
+  // Comparativo MoM dos 2 últimos snapshots
+  const ultimo = evolucaoMensal[evolucaoMensal.length - 1];
+  const penultimo = evolucaoMensal[evolucaoMensal.length - 2];
+  const variacaoStockEur = Math.round((ultimo.stock_total_eur - penultimo.stock_total_eur) * 100) / 100;
+  const variacaoStockPct = penultimo.stock_total_eur > 0
+    ? Math.round((variacaoStockEur / penultimo.stock_total_eur) * 1000) / 10
+    : 0;
+
+  const variacaoMonosEur = Math.round((ultimo.stock_imobilizado_eur - penultimo.stock_imobilizado_eur) * 100) / 100;
+  const variacaoMonosPct = penultimo.stock_imobilizado_eur > 0
+    ? Math.round((variacaoMonosEur / penultimo.stock_imobilizado_eur) * 1000) / 10
+    : 0;
+
+  let tendenciaMonos: 'REDUCAO' | 'AUMENTO' | 'ESTAVEL' = 'ESTAVEL';
+  if (variacaoMonosEur < -50) tendenciaMonos = 'REDUCAO';
+  else if (variacaoMonosEur > 50) tendenciaMonos = 'AUMENTO';
+
+  let explicacaoExecutiva = '';
+  if (tendenciaMonos === 'REDUCAO') {
+    explicacaoExecutiva = `O capital imobilizado reduziu ${Math.abs(variacaoMonosEur).toFixed(2)} € (${Math.abs(variacaoMonosPct).toFixed(1)}%) vs ${penultimo.mes_label}. Foram recuperados ${ultimo.liquidez_recuperada_monos_eur.toFixed(2)} € em liquidez comprovada por vendas.`;
+  } else if (tendenciaMonos === 'AUMENTO') {
+    explicacaoExecutiva = `O capital imobilizado aumentou ${variacaoMonosEur.toFixed(2)} € (+${variacaoMonosPct.toFixed(1)}%) vs ${penultimo.mes_label}. Recomenda-se travar novas compras e escoar no balcão.`;
+  } else {
+    explicacaoExecutiva = `O valor de stock e monos permaneceu estável entre fechos mensais.`;
+  }
 
   return {
     farmaciaId,
     farmaciaNome: farmacia.nome,
+    is_marco_zero: false,
+    total_posicoes_stock: totalSnapshots,
     resumoAtual: {
       stock_total_eur: currentStockTotalEur,
       stock_total_unidades: currentStockUnits,
@@ -307,20 +310,19 @@ export async function getStockEvolutionAnalytics(
       stock_imobilizado_unidades: currentImobilizadoUnits,
       stock_ativo_eur: stockAtivoEur,
       taxa_imobilizado_pct: taxaImobilizado,
-      liquidez_recuperada_comprovada_eur: totalLiquidezMonosRecuperada,
-      caducidades_salvas_venda_eur: caducidadesSalvasTotal,
-      otimizacao_genericos_margem_eur: Math.round(currentStockTotalEur * 0.024 * 100) / 100,
+      liquidez_recuperada_comprovada_eur: Math.round(totalLiquidezMonosRecuperada * 100) / 100,
       dias_medios_rotacao: diasMediosRotacao,
     },
     evolucaoMensal,
     comparativoMoM: {
+      has_comparison: true,
       variacao_stock_pct: variacaoStockPct,
       variacao_stock_eur: variacaoStockEur,
       variacao_monos_eur: variacaoMonosEur,
       variacao_monos_pct: variacaoMonosPct,
-      liquidez_recuperada_mom_eur: liquidezRecuperadaMoMEur,
-      mes_anterior_label: mesAnteriorLabel,
-      mes_atual_label: mesAtualLabel,
+      liquidez_recuperada_mom_eur: ultimo.liquidez_recuperada_monos_eur,
+      mes_anterior_label: penultimo.mes_label,
+      mes_atual_label: ultimo.mes_label,
       tendencia_monos: tendenciaMonos,
       explicacao_executiva: explicacaoExecutiva,
     },

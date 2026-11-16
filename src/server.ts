@@ -4928,23 +4928,23 @@ function getDashboardHtml(): string {
     
     <!-- ABA: SAÚDE FINANCEIRA DO INVENTÁRIO (EVOLUÇÃO REAL & LIQUIDEZ RECUPERADA) -->
     <div id="tabContent-evolution" style="display: none;">
-      <!-- CABEÇALHO EXECUTIVO TRANSPARENTE -->
+      <!-- CABEÇALHO EXECUTIVO TRANSPARENTE (MARCO ZERO OU SÉRIE MULTI-MÊS) -->
       <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border-radius: 14px; padding: 22px 24px; margin-bottom: 22px; color: #ffffff; box-shadow: 0 4px 12px rgba(15,23,42,0.15);">
         <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
           <div>
             <div style="display: flex; align-items: center; gap: 10px;">
-              <span style="font-size: 1.5rem;">📈</span>
-              <h2 style="font-size: 1.3rem; font-weight: 800; color: #38bdf8; margin: 0;">
-                Saúde Financeira do Inventário — Evolução de Stocks e Liquidez
+              <span id="evoHeaderIcon" style="font-size: 1.5rem;">📍</span>
+              <h2 id="evoHeaderTitle" style="font-size: 1.3rem; font-weight: 800; color: #38bdf8; margin: 0;">
+                Marco Zero — Diagnóstico Inicial & Linha de Partida
               </h2>
             </div>
-            <p style="font-size: 0.88rem; color: #cbd5e1; margin-top: 6px; max-width: 860px; line-height: 1.5;">
-              Monitorização contínua baseada em <b>Vendas Comprovadas e Preços de Custo Reais</b>: acompanhe se a farmácia está a reduzir o capital empatado em "Monos", o ritmo de rotação e quanto dinheiro parado foi efetivamente recuperado para a tesouraria.
+            <p id="evoHeaderDesc" style="font-size: 0.88rem; color: #cbd5e1; margin-top: 6px; max-width: 860px; line-height: 1.5;">
+              Esta é a fotografia patrimonial inicial da farmácia. Por rigor contabilístico, <b>não se simulam dados passados</b>. A evolução de stock, a redução do imobilizado e a liquidez recuperada serão medidas a partir da importação do fecho do próximo mês.
             </p>
             <div style="display: flex; gap: 12px; margin-top: 10px; font-size: 0.76rem; color: #94a3b8; flex-wrap: wrap;">
-              <span>📊 <b>Dados Auditados:</b> Inventário Físico + Vendas Sifarma (12 Meses)</span>
+              <span>📊 <b>Dados Auditados:</b> Inventário Físico Inicial Sifarma</span>
               <span>🔒 <b>Critério Monos:</b> Artigos com stock e sem vendas há >90 dias</span>
-              <span>✅ <b>Critério Poupança:</b> Vendas reais comprovadas (sem presunções)</span>
+              <span>✅ <b>Critério Poupança:</b> Vendas comprovadas após o Marco Zero</span>
             </div>
           </div>
           <div style="display: flex; gap: 10px; align-items: center;">
@@ -4955,7 +4955,7 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
-      <!-- 4 BIG NUMBER KPIS DE GESTÃO REAL -->
+      <!-- 4 BIG NUMBER KPIS DE GESTÃO REAL (SEM METAS ARBITRÁRIAS) -->
       <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 22px;">
         
         <!-- KPI 1: STOCK TOTAL A PREÇO DE CUSTO -->
@@ -4975,8 +4975,8 @@ function getDashboardHtml(): string {
         <!-- KPI 3: LIQUIDEZ RECUPERADA POR VENDAS COMPROVADAS -->
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #10b981;">
           <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">💰 Dinheiro de Monos Recuperado</div>
-          <div id="evoKpiPoupancas" style="font-size: 1.7rem; font-weight: 800; color: #059669; margin-top: 4px;">-- €</div>
-          <div id="evoKpiPoupancasSub" style="font-size: 0.76rem; color: #059669; margin-top: 2px;">Comprovado por talões de venda Sifarma</div>
+          <div id="evoKpiPoupancas" style="font-size: 1.7rem; font-weight: 800; color: #059669; margin-top: 4px;">0,00 €</div>
+          <div id="evoKpiPoupancasSub" style="font-size: 0.76rem; color: #059669; margin-top: 2px;">Medição inicia pós-Marco Zero</div>
         </div>
 
         <!-- KPI 4: PRAZO MÉDIO DE ROTAÇÃO DE STOCK -->
@@ -4987,8 +4987,28 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
-      <!-- COMPARATIVO EXECUTIVO MÊS A MÊS (MoM): ESTAMOS COM MAIS OU MENOS STOCK E IMOBILIZADO? -->
-      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+      <!-- PAINEL MARCO ZERO: AVISO E CARREGAMENTO DO 2º MÊS -->
+      <div id="evoMarcoZeroBoxContainer" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
+          <div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 1.25rem;">⏳</span>
+              <h3 style="font-size: 1.05rem; font-weight: 800; color: #0f172a; margin: 0;">
+                Medição de Evolução Patrimonial: Aguarda 2º Fecho de Existências
+              </h3>
+            </div>
+            <p style="font-size: 0.84rem; color: #475569; margin: 6px 0 0 0; max-width: 820px; line-height: 1.5;">
+              O BI Pharma opera com <b>rigor contabilístico integral</b>: o primeiro ficheiro importado representa a sua <b>Linha de Partida (Marco Zero)</b>. Não inventamos nem estimamos o que estava antes. Assim que carregar o fecho de inventário do mês seguinte, o sistema apresentará o gráfico de variação real de stock, a redução da gaveta de monos e o dinheiro resgatado por vendas comprovadas.
+            </p>
+          </div>
+          <button class="btn" onclick="openInteractiveImportModal()" style="background: #0284c7; color: #ffffff; font-weight: 700; padding: 11px 20px; border-radius: 8px; border: none; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 0.9rem; box-shadow: 0 2px 6px rgba(2,132,199,0.25);">
+            📥 Carregar Fecho de Mês Seguinte (Sifarma)
+          </button>
+        </div>
+      </div>
+
+      <!-- COMPARATIVO EXECUTIVO MÊS A MÊS (MoM) — VISÍVEL QUANDO EXISTEM >= 2 SNAPSHOTS -->
+      <div id="evoMomBoxContainer" style="display: none; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px 22px; margin-bottom: 22px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;">
           <div style="display: flex; align-items: center; gap: 8px;">
             <span style="font-size: 1.25rem;">⚖️</span>
@@ -5086,7 +5106,7 @@ function getDashboardHtml(): string {
             <p style="font-size: 0.8rem; color: #64748b; margin: 2px 0 0 0;">Cálculo do rácio de imobilizado e liquidez recuperada em cada mês.</p>
           </div>
           <span style="font-size: 0.78rem; background: #f1f5f9; color: #475569; padding: 4px 10px; border-radius: 6px; font-weight: 700;">
-            Semáforo de Monos: 🟢 &lt;35% | 🟡 35%-45% | 🔴 &gt;45%
+            Classificação de Monos: 🟢 Baixo (&lt;35%) | 🟡 Moderado (35%-45%) | 🔴 Elevado (&gt;45%)
           </span>
         </div>
         <div style="overflow-x: auto;">
@@ -13149,6 +13169,25 @@ function getDashboardHtml(): string {
         if (!data.ok) throw new Error(data.error || 'Erro ao obter evolução');
 
         cachedEvolutionData = data;
+        const isMarcoZero = !!data.is_marco_zero;
+
+        // Atualizar Cabeçalho Dinâmico
+        const iconEl = document.getElementById('evoHeaderIcon');
+        const titleEl = document.getElementById('evoHeaderTitle');
+        const descEl = document.getElementById('evoHeaderDesc');
+        if (iconEl) iconEl.textContent = isMarcoZero ? '📍' : '📈';
+        if (titleEl) titleEl.textContent = isMarcoZero
+          ? 'Marco Zero — Diagnóstico Inicial & Linha de Partida'
+          : 'Saúde Financeira do Inventário — Evolução de Stocks e Liquidez';
+        if (descEl) descEl.innerHTML = isMarcoZero
+          ? 'Esta é a fotografia patrimonial da farmácia no momento da 1ª importação de existências. Por rigor contabilístico, <b>não se simulam dados passados</b>. A evolução do stock, a redução do imobilizado e a liquidez recuperada serão medidas assim que for importado o fecho do próximo mês.'
+          : 'Monitorização contínua baseada em <b>Vendas Comprovadas e Preços de Custo Reais</b> entre fechos mensais do Sifarma.';
+
+        // Alternar Caixa de Marco Zero vs Caixa MoM
+        const boxZero = document.getElementById('evoMarcoZeroBoxContainer');
+        const boxMom = document.getElementById('evoMomBoxContainer');
+        if (boxZero) boxZero.style.display = isMarcoZero ? 'block' : 'none';
+        if (boxMom) boxMom.style.display = isMarcoZero ? 'none' : 'block';
 
         // Atualizar 4 Big Numbers
         const r = data.resumoAtual;
@@ -13167,14 +13206,14 @@ function getDashboardHtml(): string {
         if (kpiImob) kpiImob.textContent = Number(r.stock_imobilizado_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
         if (kpiImobSub) kpiImobSub.textContent = Number(r.taxa_imobilizado_pct || 0).toFixed(1) + '% do capital total em stock (' + Number(r.stock_imobilizado_unidades || 0).toLocaleString('pt-PT') + ' un monos)';
 
-        if (kpiPoup) kpiPoup.textContent = '+' + Number(r.liquidez_recuperada_comprovada_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
-        if (kpiPoupSub) kpiPoupSub.textContent = 'Comprovado por vendas de monos no Sifarma';
+        if (kpiPoup) kpiPoup.textContent = isMarcoZero ? '0,00 €' : '+' + Number(r.liquidez_recuperada_comprovada_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (kpiPoupSub) kpiPoupSub.textContent = isMarcoZero ? 'Medição inicia pós-Marco Zero (comprovado por vendas)' : 'Comprovado por vendas de monos no Sifarma';
 
-        if (kpiCap) kpiCap.textContent = (r.dias_medios_rotacao || 48) + ' dias';
+        if (kpiCap) kpiCap.textContent = (r.dias_medios_rotacao || 55) + ' dias';
         if (kpiCapSub) kpiCapSub.textContent = 'Stock Ativo: ' + Number(r.stock_ativo_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + (100 - (r.taxa_imobilizado_pct || 0)).toFixed(1) + '%)';
 
-        // Atualizar Comparativo MoM Executivo
-        if (data.comparativoMoM) {
+        // Atualizar Comparativo MoM (quando aplicável)
+        if (!isMarcoZero && data.comparativoMoM && data.comparativoMoM.has_comparison) {
           const m = data.comparativoMoM;
           const lblPeriod = document.getElementById('evoMomPeriodLabel');
           const deltaStock = document.getElementById('evoMomStockDelta');
@@ -13234,17 +13273,32 @@ function getDashboardHtml(): string {
           }
         }
 
-        // Render Gráfico e Tabela
-        renderStockEvolutionChart(data.evolucaoMensal);
-        renderStockEvolutionTable(data.evolucaoMensal);
+        // Render Gráfico e Tabela apenas com pontos reais existentes
+        renderStockEvolutionChart(data.evolucaoMensal, isMarcoZero);
+        renderStockEvolutionTable(data.evolucaoMensal, isMarcoZero);
       } catch (err) {
         console.error('Falha ao carregar evolução de stock:', err);
       }
     }
 
-    function renderStockEvolutionChart(pontos) {
+    function renderStockEvolutionChart(pontos, isMarcoZero) {
       const container = document.getElementById('evoChartBarsContainer');
       if (!container || !pontos || pontos.length === 0) return;
+
+      if (isMarcoZero && pontos.length === 1) {
+        const p = pontos[0];
+        const tooltip = p.mes_label + ' | Stock: ' + Number(p.stock_total_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Monos: ' + Number(p.stock_imobilizado_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + Number(p.taxa_imobilizado_pct).toFixed(1) + '%) | Rotação: ' + (p.dias_rotacao || 55) + ' dias';
+
+        container.innerHTML = '<div style="display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; height: 100%; gap: 12px; padding: 20px 0;">' +
+          '<div title="' + escapeHtml(tooltip) + '" style="display: flex; gap: 8px; align-items: flex-end; height: 180px; justify-content: center; cursor: pointer;">' +
+          '  <div style="width: 28px; height: 160px; background: #0284c7; border-radius: 6px 6px 0 0;" title="Stock Total Físico: ' + p.stock_total_eur.toFixed(2) + ' €"></div>' +
+          '  <div style="width: 28px; height: ' + Math.round(160 * (p.taxa_imobilizado_pct / 100)) + 'px; background: #fca5a5; border-radius: 6px 6px 0 0;" title="Monos no Marco Zero: ' + p.stock_imobilizado_eur.toFixed(2) + ' €"></div>' +
+          '</div>' +
+          '<div style="font-size: 0.88rem; font-weight: 800; color: #0f172a;">' + escapeHtml(p.mes_label) + '</div>' +
+          '<div style="font-size: 0.76rem; color: #64748b; background: #f8fafc; padding: 4px 12px; border-radius: 6px; border: 1px solid #e2e8f0;">📍 Fotografia Inicial Auditada — As barras comparativas serão criadas com a importação do próximo mês</div>' +
+          '</div>';
+        return;
+      }
 
       const maxVal = Math.max.apply(Math, pontos.map(function(p) {
         return Math.max(p.stock_total_eur, p.vendas_mes_eur);
@@ -13258,7 +13312,7 @@ function getDashboardHtml(): string {
         const hVendas = Math.max(6, Math.round((p.vendas_mes_eur / maxVal) * 200));
         const hPoup = Math.max(2, Math.round((liqRec / maxVal) * 200));
 
-        const tooltip = p.mes_label + ' | Stock: ' + Number(p.stock_total_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Monos: ' + Number(p.stock_imobilizado_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + Number(p.taxa_imobilizado_pct).toFixed(1) + '%) | Vendas: ' + Number(p.vendas_mes_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Monos Resgatados: +' + liqRec.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Rotação: ' + (p.dias_rotacao || 45) + ' dias';
+        const tooltip = p.mes_label + ' | Stock: ' + Number(p.stock_total_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Monos: ' + Number(p.stock_imobilizado_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + Number(p.taxa_imobilizado_pct).toFixed(1) + '%) | Vendas: ' + Number(p.vendas_mes_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Monos Resgatados: +' + liqRec.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € | Rotação: ' + (p.dias_rotacao || 55) + ' dias';
 
         html += '<div style="flex: 1; min-width: 65px; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; position: relative;">' +
           '<div title="' + escapeHtml(tooltip) + '" style="display: flex; gap: 4px; align-items: flex-end; height: 210px; width: 100%; justify-content: center; cursor: pointer;">' +
@@ -13274,7 +13328,7 @@ function getDashboardHtml(): string {
       container.innerHTML = html;
     }
 
-    function renderStockEvolutionTable(pontos) {
+    function renderStockEvolutionTable(pontos, isMarcoZero) {
       const tbody = document.getElementById('evoTableBody');
       if (!tbody || !pontos || pontos.length === 0) return;
 
@@ -13290,15 +13344,19 @@ function getDashboardHtml(): string {
           badgeBg = '#fef3c7';
         }
 
+        const liqDisplay = p.is_marco_zero 
+          ? '<span style="color:#64748b;font-size:0.78rem;">Ponto de Partida (0,00 €)</span>' 
+          : ('+' + Number(p.liquidez_recuperada_monos_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €');
+
         html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
           '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(p.mes_label) + '</td>' +
           '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #0284c7;">' + Number(p.stock_total_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
           '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #e11d48;">' + Number(p.stock_imobilizado_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
           '<td style="padding: 10px 14px; text-align: center;"><span style="background: ' + badgeBg + '; color: ' + badgeColor + '; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.76rem;">' + p.taxa_imobilizado_pct.toFixed(1) + '%</span></td>' +
           '<td style="padding: 10px 14px; text-align: right; font-weight: 700; color: #10b981;">' + Number(p.vendas_mes_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' +
-          '<td style="padding: 10px 14px; text-align: right; font-weight: 800; color: #059669;">+' + Number(p.liquidez_recuperada_monos_eur || p.valores_poupados_eur || 0).toFixed(2) + ' €</td>' +
-          '<td style="padding: 10px 14px; text-align: center; font-weight: 700; color: #7c3aed;">' + (p.dias_rotacao || 45) + ' d</td>' +
-          '<td style="padding: 10px 14px; text-align: center; font-size: 0.82rem; font-weight: 700;">' + (p.diagnostico || '🟢 Normal') + '</td>' +
+          '<td style="padding: 10px 14px; text-align: right; font-weight: 800; color: #059669;">' + liqDisplay + '</td>' +
+          '<td style="padding: 10px 14px; text-align: center; font-weight: 700; color: #7c3aed;">' + (p.dias_rotacao || 55) + ' d</td>' +
+          '<td style="padding: 10px 14px; text-align: center; font-size: 0.82rem; font-weight: 700;">' + (p.is_marco_zero ? '📍 Marco Zero' : escapeHtml(p.diagnostico || 'Auditado')) + '</td>' +
           '</tr>';
       });
 

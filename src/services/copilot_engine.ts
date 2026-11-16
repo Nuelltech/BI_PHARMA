@@ -33,6 +33,7 @@ import {
   toolCompararPerformancePeriodos,
   toolCalcularPerdasFinanceirasECustoOportunidade,
 } from './mcp_pharma_tools.js';
+import { getStockEvolutionAnalytics } from './stock_evolution';
 
 // ============================================================================
 // MOTOR CONVERSACIONAL COPILOT C/ MEMÓRIA E TOOL-CALLING MULTI-TENANT
@@ -476,6 +477,15 @@ const COPILOT_TOOLS = [
       },
     },
   },
+  {
+    name: 'consultar_evolucao_e_saude_stock',
+    description:
+      'Consulta a evolução de stock, valor total de inventário a preço de custo, capital imobilizado em monos (>90 dias sem vendas), prazo de rotação e dinheiro recuperado. Informa rigorosamente se a farmácia está no Marco Zero (1º e único ficheiro de existências importado, sem estimativas fictícias do passado) ou se já possui comparativos reais entre múltiplos fechos de mês.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+    },
+  },
 ];
 
 
@@ -493,7 +503,8 @@ const TOOLS_STOCKS_NAMES = new Set([
   'consultar_produtos_por_nome_ou_categoria',
   'calcular_niveis_sazonais_dinamicos',
   'consultar_progresso_tarefas_equipa',
-  'criar_tarefa_equipa'
+  'criar_tarefa_equipa',
+  'consultar_evolucao_e_saude_stock'
 ]);
 
 // 2. MODO FINANCEIRO & LABORATÓRIOS
@@ -506,7 +517,8 @@ const TOOLS_FINANCE_NAMES = new Set([
   'avaliar_acordo_anual_compras_escalonadas',
   'calcular_perdas_financeiras_e_custo_oportunidade',
   'consultar_vendas_diarias',
-  'consultar_produtos_por_nome_ou_categoria'
+  'consultar_produtos_por_nome_ou_categoria',
+  'consultar_evolucao_e_saude_stock'
 ]);
 
 // 3. MODO MARKETING & ESCOAMENTO
@@ -731,7 +743,20 @@ DIRETRIZES DE COMUNICAÇÃO:
     - RESTOS DE GAVETA: São ESTRITAMENTE produtos com STOCK <= 2 UNIDADES (órfãos de balcão/gaveta).
     - Quando o utilizador perguntar especificamente por "restos de gaveta", deves OBRIGATORIAMENTE passar 'apenas_restos_gaveta: true' para a ferramenta 'identificar_produtos_sem_vendas_e_escoamento', garantindo que apenas lista produtos com stock <= 2 unidades e apresenta o valor correspondente (ex: ~11.071 € em 1.011 produtos).
     - NUNCA apresentes produtos com dezenas de unidades (ex: 49 caixas de Ben-u-gripe, 36 termómetros) como "restos de gaveta"! Se o utilizador perguntar por restos de gaveta, foca nos artigos de 1-2 unidades e, se relevante, menciona em separado: "Adicionalmente, existem X monos com stock profundo (>= 3 un) totalizando € Y".
-    - NOTA DE TRANSPARÊNCIA: Menciona sempre de forma elegante a data de referência em Tempo Real (hoje) e a data da última venda registada na base de dados (devolvida no campo 'dataUltimaVendaRegistada').`;
+    - NOTA DE TRANSPARÊNCIA: Menciona sempre de forma elegante a data de referência em Tempo Real (hoje) e a data da última venda registada na base de dados (devolvida no campo 'dataUltimaVendaRegistada').
+
+16. EVOLUÇÃO DE STOCK, MONOS E MARCO ZERO (RIGOR CONTABILÍSTICO E SEM METAS ARBITRÁRIAS):
+    - Para qualquer pergunta sobre "evolução do stock", "como variou o stock", "se estamos com mais ou menos stock que antes", "quanto dinheiro recuperámos de monos" ou "histórico de stock":
+    - Chama OBRIGATORIAMENTE a ferramenta 'consultar_evolucao_e_saude_stock'.
+    - REGRAS INEGOCIÁVEIS DE RIGOR E TRANSPARÊNCIA:
+      * Se a farmácia estiver no MARCO ZERO (is_marco_zero: true):
+        1. Explica com total clareza que a farmácia se encontra no MARCO ZERO (Baseline / Ponto de Partida) com o seu 1º ficheiro de existências importado.
+        2. Apresenta os números reais e auditados de partida: Stock Total Físico (a custo), Capital Imobilizado em Monos (>90d) e Prazo de Rotação.
+        3. Esclarece que NÃO existem nem se assumem dados fictícios do passado: a evolução patrimonial e a medição de liquidez recuperada só começarão a ser calculadas a partir da importação do fecho de mês seguinte (2º ficheiro).
+        4. O dinheiro recuperado de monos é atualmente 0,00 € porque a medição só inicia pós-Marco Zero.
+        5. É ESTRITAMENTE PROIBIDO inventar, assumir ou indicar METAS (ex: 'meta de 45 dias' ou 'meta de 20%'), pois a farmácia não indicou nem configurou nenhuma meta.
+      * Se a farmácia tiver múltiplos fechos de mês (is_marco_zero: false):
+        1. Apresenta o comparativo MoM real comprovado entre os fechos mensais registados.`;
 
 // ============================================================================
 // CÁLCULO DE CUSTOS FINOPS & TELEMETRIA DE TOKENS (CLAUDE / ANTHROPIC)
@@ -1037,6 +1062,10 @@ export async function askConversationalCopilot(
 
             case 'consultar_vendas_diarias':
               resultData = await toolConsultarVendasDiarias(prisma, secContext, args);
+              break;
+
+            case 'consultar_evolucao_e_saude_stock':
+              resultData = await getStockEvolutionAnalytics(prisma, secContext.farmaciaId);
               break;
 
 case 'auditar_anomalias_margem_e_precos':
