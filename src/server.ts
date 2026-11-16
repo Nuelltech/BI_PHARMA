@@ -4522,9 +4522,6 @@ function getDashboardHtml(): string {
     <header class="top-nav-bar">
       <div class="top-nav-left">
         <div class="top-breadcrumb">
-          <div class="active-pharmacy-pill" id="topActivePharmacyPill">
-            <span>🏥</span> <span id="topActivePharmacyName">A carregar farmácia...</span>
-          </div>
           <span class="active-role-pill" id="topActiveRolePill">Direção & Gestão</span>
         </div>
       </div>
