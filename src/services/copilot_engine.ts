@@ -1,3 +1,9 @@
+import {
+  validateCopilotInputGuardrails,
+  sanitizeCopilotOutput,
+  COPILOT_SECURITY_GUARDRAILS_PROMPT,
+} from './copilot_guardrails';
+
 import { PrismaClient } from '@prisma/client';
 import dotenv from 'dotenv';
 dotenv.config();
@@ -581,11 +587,13 @@ DIRETRIZES RÍGIDAS DE COMUNICAÇÃO:
    • **4. Alternativa de Maior Rentabilidade**: Aponta o genérico de Grupo Homogéneo que gera mais margem à farmácia mantendo a eficácia.`;
 
 export function getSystemPromptForMode(mode: CopilotMode): string {
-  if (mode === 'STOCKS') return PROMPT_STOCKS;
-  if (mode === 'FINANCE') return PROMPT_FINANCE;
-  if (mode === 'MARKETING') return PROMPT_MARKETING;
-  if (mode === 'CLINICAL') return PROMPT_CLINICAL;
-  return SYSTEM_PROMPT;
+  let basePrompt = SYSTEM_PROMPT;
+  if (mode === 'STOCKS') basePrompt = PROMPT_STOCKS;
+  else if (mode === 'FINANCE') basePrompt = PROMPT_FINANCE;
+  else if (mode === 'MARKETING') basePrompt = PROMPT_MARKETING;
+  else if (mode === 'CLINICAL') basePrompt = PROMPT_CLINICAL;
+
+  return `${basePrompt}\n\n${COPILOT_SECURITY_GUARDRAILS_PROMPT}`;
 }
 
 const SYSTEM_PROMPT = `És o Consultor Farmacêutico & Copilot Analítico da Farmácia.
@@ -788,6 +796,19 @@ export async function askConversationalCopilot(
   sessionId = 'default',
   mode: CopilotMode = 'GENERAL'
 ): Promise<CopilotChatResponse & { mode: CopilotMode; suggestions?: string[] }> {
+  // ========================================================================
+  // GUARDRAILS DE SEGURANÇA: VALIDAÇÃO DE ENTRADA (0ms / ZERO TOKENS)
+  // ========================================================================
+  const guardrailCheck = validateCopilotInputGuardrails(question, secContext.farmaciaNome);
+  if (guardrailCheck.blocked) {
+    return {
+      text: guardrailCheck.publicResponse || '🛡️ [Bloqueio de Segurança]: Pedido não autorizado pelas políticas da plataforma.',
+      toolsUsed: [],
+      sessionId,
+      mode,
+    };
+  }
+
   pruneOldSessions();
   sessionTimestamps.set(sessionId, Date.now());
 
@@ -883,7 +904,7 @@ export async function askConversationalCopilot(
       if (toolUseCalls.length === 0) {
         // Resposta final de texto
         const textBlocks = content.filter((c: any) => c.type === 'text');
-        const finalText = textBlocks.map((b: any) => b.text).join('\n\n');
+        const finalText = sanitizeCopilotOutput(textBlocks.map((b: any) => b.text).join('\n\n'));
 
         // Guarda a resposta final no histórico
         history.push({ role: 'assistant', content: finalText });
