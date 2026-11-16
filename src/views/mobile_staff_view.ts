@@ -8,6 +8,11 @@ export function getMobileStaffHtml(): string {
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
+  <link rel="apple-touch-icon" href="/icons/icon.svg" />
+  <meta name="apple-mobile-web-app-title" content="BI Pharma" />
+  <meta name="application-name" content="BI Pharma" />
   <title>BI Pharma — Modo Equipa (Mobile)</title>
   <style>
     * {
@@ -852,6 +857,19 @@ export function getMobileStaffHtml(): string {
       </div>
     </header>
 
+        <!-- Banner de Instalação PWA -->
+    <div id="pwaInstallBanner" style="display:none; background: linear-gradient(135deg, #0284c7, #0369a1); padding: 10px 14px; border-radius: 12px; margin: 10px 14px 4px 14px; box-shadow: 0 4px 12px rgba(2,132,199,0.3); align-items: center; justify-content: space-between; gap: 8px;">
+      <div style="font-size: 0.82rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 6px;">
+        <span>📲</span> <span>Adicionar BI Pharma ao ecrã inicial</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:6px;">
+        <button id="pwaInstallBtn" type="button" style="background: #fff; color: #0369a1; border: none; padding: 5px 12px; border-radius: 8px; font-weight: 800; font-size: 0.78rem; cursor: pointer;">
+          Instalar
+        </button>
+        <button onclick="document.getElementById('pwaInstallBanner').style.display='none'" type="button" style="background: transparent; border: none; color: #bae6fd; font-size: 0.9rem; cursor: pointer; padding: 2px 4px;">✕</button>
+      </div>
+    </div>
+
     <!-- Barra de Separadores / Tabs (4 Secções) -->
     <div class="tabs-bar">
       <button class="tab-btn tab-1 active" onclick="goToSection(0)">
@@ -1033,7 +1051,7 @@ export function getMobileStaffHtml(): string {
     let allFarmacias = [];
     let statusFilters = ['all', 'all', 'all', 'all'];
     let balcaoSubtab = 'restos'; // 'restos' | 'winter' | 'all'
-    let syncInterval = null;
+    let syncInterval = null; if (taskEventSource) { try { taskEventSource.close(); } catch(e) {} taskEventSource = null; }
 
     // Gestos de Touch / Swipe
     let touchStartX = 0;
@@ -1194,7 +1212,7 @@ export function getMobileStaffHtml(): string {
       const nomeFarm = currentFarmacia?.nome || 'esta farmácia';
       if (confirm('Deseja terminar a sessão na ' + nomeFarm + ' e mudar de farmácia?')) {
         if (syncInterval) clearInterval(syncInterval);
-        syncInterval = null;
+        syncInterval = null; if (taskEventSource) { try { taskEventSource.close(); } catch(e) {} taskEventSource = null; }
         localStorage.removeItem('bi_pharma_mobile_session');
         currentFarmacia = null;
         rawReport = null;
@@ -1339,21 +1357,178 @@ export function getMobileStaffHtml(): string {
       }
     }
 
-    function startLiveSync() {
-      if (syncInterval) clearInterval(syncInterval);
-      syncInterval = setInterval(async () => {
-        if (!currentFarmacia) return;
+    // ========================================================================
+    // SINCRONIZAÇÃO EM TEMPO REAL VIA SSE (SEM REDESENHAR O ECRÃ) + OFFLINE
+    // ========================================================================
+    let taskEventSource = null;
+    const OFFLINE_QUEUE_KEY = 'bi_pharma_offline_tasks_queue';
+
+    function getOfflineQueue() {
+      try {
+        return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || '[]');
+      } catch { return []; }
+    }
+
+    function saveOfflineQueue(queue) {
+      try {
+        localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
+      } catch {}
+    }
+
+    async function flushOfflineQueue() {
+      if (!navigator.onLine || !currentFarmacia) return;
+      const queue = getOfflineQueue();
+      if (!queue.length) return;
+
+      const remaining = [];
+      let syncedCount = 0;
+
+      for (const item of queue) {
         try {
-          const res = await fetchMobileAuth('/api/weekly-tasks?farmaciaId=' + currentFarmacia.id);
-          const tData = await res.json();
-          tasksMap = tData.tasksMap || {};
-          renderSection1(true);
-          renderSection2(true);
-          renderSection3(true);
-          renderSection4(true);
-          updateOverallProgress();
-        } catch {}
-      }, 4000);
+          await fetchMobileAuth('/api/weekly-tasks/toggle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(item),
+          });
+          syncedCount++;
+        } catch {
+          remaining.push(item);
+        }
+      }
+
+      saveOfflineQueue(remaining);
+      if (syncedCount > 0) {
+        showToast('📡 ' + syncedCount + ' tarefa(s) sincronizada(s) após recuperar rede!', '#10b981', 3000);
+      }
+    }
+
+    window.addEventListener('online', flushOfflineQueue);
+
+    function startLiveSync() {
+      // Fecha qualquer polling anterior
+      if (syncInterval) {
+        clearInterval(syncInterval);
+        syncInterval = null; if (taskEventSource) { try { taskEventSource.close(); } catch(e) {} taskEventSource = null; }
+      }
+
+      if (!currentFarmacia) return;
+      if (taskEventSource) {
+        try { taskEventSource.close(); } catch(e) {}
+        taskEventSource = null;
+      }
+
+      const streamUrl = '/api/weekly-tasks/stream?farmaciaId=' + encodeURIComponent(currentFarmacia.id);
+      try {
+        taskEventSource = new EventSource(streamUrl);
+
+        taskEventSource.addEventListener('task_update', (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.type === 'RESET') {
+              tasksMap = {};
+              filterSection(currentSectionIndex);
+              updateOverallProgress();
+              showToast('🔄 As tarefas foram reiniciadas pelo Diretor', '#0284c7');
+              return;
+            }
+
+            if (data.type === 'TOGGLE' && data.taskId) {
+              if (data.concluido) {
+                tasksMap[data.taskId] = {
+                  concluido: true,
+                  concluido_por: data.concluido_por,
+                  concluido_em: data.concluido_em,
+                  valor_impacto: data.valor_impacto,
+                  categoria: data.categoria
+                };
+              } else {
+                delete tasksMap[data.taskId];
+              }
+
+              // Atualização CIRÚRGICA do DOM sem tocar no scroll nem inputs
+              applyLiveTaskPatch(data);
+              updateOverallProgress();
+
+              // Se outro colega concluiu a tarefa, avisa suavemente
+              if (data.concluido && data.concluido_por && data.concluido_por !== currentOperator) {
+                showToast('✓ ' + escapeHtml(data.concluido_por) + ' picou: ' + escapeHtml(data.designacao || 'produto'), '#059669', 2400);
+              }
+            }
+          } catch(err) {
+            console.warn('[SSE] Erro ao processar:', err);
+          }
+        });
+
+        taskEventSource.onerror = () => {
+          // EventSource nativo reconecta automaticamente
+        };
+      } catch (err) {
+        console.warn('SSE não suportado ou erro de ligação, a usar fallback leve');
+      }
+
+      // Verificação pontual silenciosa apenas quando a app volta a estar visível (após desbloquear telemóvel)
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && currentFarmacia) {
+          fetchMobileAuth('/api/weekly-tasks?farmaciaId=' + currentFarmacia.id)
+            .then(r => r.json())
+            .then(tData => {
+              if (tData.ok && tData.tasksMap) {
+                tasksMap = tData.tasksMap;
+                updateOverallProgress();
+                for (const taskId in tasksMap) {
+                  applyLiveTaskPatch({ taskId, ...tasksMap[taskId] });
+                }
+              }
+            })
+            .catch(() => {});
+          flushOfflineQueue();
+        }
+      });
+    }
+
+    function applyLiveTaskPatch(data) {
+      const card = document.getElementById('card_' + data.taskId);
+      if (!card) return;
+
+      const checkBtn = card.querySelector('.task-check-btn');
+      const body = card.querySelector('.task-body');
+
+      if (data.concluido) {
+        card.classList.add('completed');
+        if (checkBtn) checkBtn.textContent = '✓';
+
+        let stamp = card.querySelector('.task-completion-stamp');
+        if (!stamp && body) {
+          stamp = document.createElement('div');
+          stamp.className = 'task-completion-stamp';
+          body.appendChild(stamp);
+        }
+        if (stamp) {
+          const time = formatTime(data.concluido_em || new Date().toISOString());
+          stamp.innerHTML = '✓ Concluído por ' + escapeHtml(data.concluido_por || 'Equipa') + (time ? ' · ' + time : '');
+        }
+
+        // Se o utilizador estiver no filtro "Pendentes", aplica fade-out suave ao item
+        const statusF = statusFilters[currentSectionIndex];
+        if (statusF === 'pending') {
+          setTimeout(() => {
+            if (tasksMap[data.taskId]?.concluido && statusFilters[currentSectionIndex] === 'pending') {
+              card.style.transition = 'opacity 0.4s ease, transform 0.4s ease';
+              card.style.opacity = '0';
+              card.style.transform = 'scale(0.95)';
+              setTimeout(() => { if (card.parentNode) card.style.display = 'none'; }, 400);
+            }
+          }, 600);
+        }
+      } else {
+        card.classList.remove('completed');
+        card.style.display = '';
+        card.style.opacity = '1';
+        card.style.transform = '';
+        if (checkBtn) checkBtn.textContent = '';
+        const stamp = card.querySelector('.task-completion-stamp');
+        if (stamp) stamp.remove();
+      }
     }
 
     // ========================================================================
@@ -1786,29 +1961,46 @@ export function getMobileStaffHtml(): string {
         showToast('↩️ Tarefa reaberta', '#64748b');
       }
 
-      if (currentSectionIndex === 0) renderSection1();
-      else if (currentSectionIndex === 1) renderSection2();
-      else if (currentSectionIndex === 2) renderSection3();
-      else renderSection4();
+      // Feedback háptico suave no telemóvel
+      if (typeof navigator !== 'undefined' && navigator.vibrate) {
+        try { navigator.vibrate(40); } catch(e) {}
+      }
+
+      // Atualização cirúrgica instantânea (0ms) do nó no DOM sem saltar o ecrã
+      applyLiveTaskPatch({
+        taskId: taskId,
+        concluido: nextDoneState,
+        concluido_por: currentOperator,
+        concluido_em: new Date().toISOString(),
+        designacao: designacao,
+        valor_impacto: valor,
+        categoria: categoria
+      });
       updateOverallProgress();
+
+      const payload = {
+        farmaciaId: currentFarmacia.id,
+        taskId: taskId,
+        concluido: nextDoneState,
+        concluido_por: currentOperator,
+        categoria: categoria,
+        cnp_codigo: cnp,
+        designacao: designacao,
+        valor_impacto: valor,
+      };
 
       try {
         await fetchMobileAuth('/api/weekly-tasks/toggle', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            farmaciaId: currentFarmacia.id,
-            taskId: taskId,
-            concluido: nextDoneState,
-            concluido_por: currentOperator,
-            categoria: categoria,
-            cnp_codigo: cnp,
-            designacao: designacao,
-            valor_impacto: valor,
-          }),
+          body: JSON.stringify(payload),
         });
       } catch (e) {
-        console.error('Erro ao guardar no Supabase:', e);
+        console.warn('Falha de rede ao enviar tarefa, a colocar em fila offline:', e);
+        const queue = getOfflineQueue();
+        queue.push(payload);
+        saveOfflineQueue(queue);
+        showToast('📶 Guardado no dispositivo. Sincroniza ao recuperar rede.', '#f59e0b', 3000);
       }
     }
 
@@ -1881,6 +2073,47 @@ export function getMobileStaffHtml(): string {
       }
     }
   </script>
+<script>
+    // ========================================================================
+    // GESTÃO DO PWA (SERVICE WORKER & INSTALAÇÃO NO ECRÃ INICIAL)
+    // ========================================================================
+    let deferredPrompt = null;
+
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      });
+    }
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      const banner = document.getElementById('pwaInstallBanner');
+      if (banner && !window.matchMedia('(display-mode: standalone)').matches) {
+        banner.style.display = 'flex';
+      }
+    });
+
+    document.addEventListener('DOMContentLoaded', () => {
+      const installBtn = document.getElementById('pwaInstallBtn');
+      if (installBtn) {
+        installBtn.addEventListener('click', async () => {
+          if (deferredPrompt) {
+            deferredPrompt.prompt();
+            const { outcome } = await deferredPrompt.userChoice;
+            if (outcome === 'accepted') {
+              showToast('🎉 Aplicação adicionada com sucesso!', '#10b981');
+            }
+            deferredPrompt = null;
+            document.getElementById('pwaInstallBanner').style.display = 'none';
+          } else {
+            // Instruções amigáveis para Safari / iOS
+            showToast('💡 No iPhone: toque no botão Partilhar ⎋ e escolha "Adicionar ao Ecrã Principal"', '#0284c7', 5000);
+          }
+        });
+      }
+    });
+</script>
 </body>
 </html>`;
 }

@@ -42,6 +42,7 @@ async function runAudit() {
   const portOpen = await isPortOpen(5433);
   if (!portOpen) {
     console.log('💻 A iniciar PostgreSQL local embebido (localhost:5433) para auditoria...');
+    // @ts-ignore
     const { default: EmbeddedPostgres } = await import('embedded-postgres');
     const dataDir = path.resolve(process.cwd(), '.pgdata_utf8');
     embeddedPg = new EmbeddedPostgres({
@@ -146,7 +147,6 @@ async function runAudit() {
               custo_unitario: inv.custo_unitario,
               data_validade: inv.data_validade,
               data_extracao: inv.data_extracao,
-              atualizadoEm: inv.atualizadoEm,
             })),
             skipDuplicates: true,
           }),

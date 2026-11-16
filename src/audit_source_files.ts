@@ -102,6 +102,7 @@ function parseCsvIndependent(): CsvRow[] {
 async function main() {
   let embedded: any = null;
   if (!useSupabase && !(await isPortOpen(5433))) {
+    // @ts-ignore
     const { default: EmbeddedPostgres } = await import('embedded-postgres');
     embedded = new EmbeddedPostgres({
       databaseDir: path.resolve(process.cwd(), '.pgdata_utf8'),

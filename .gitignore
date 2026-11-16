@@ -21,6 +21,8 @@ output/
 # Logs e Sistema
 *.log
 *.mp4
+*.jpg
 .DS_Store
 Thumbs.db
 scratch/
+backup_pre_fase3/

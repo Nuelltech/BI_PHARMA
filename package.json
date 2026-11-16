@@ -4,7 +4,8 @@
   "description": "Motor de ETL e Inteligência de Inventário Farmacêutico (Fase 1 - Backend e Base de Dados)",
   "main": "dist/index.js",
   "scripts": {
-    "start": "tsx src/server.ts",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
     "build": "tsc",
     "db:push": "prisma db push",
     "db:generate": "prisma generate",

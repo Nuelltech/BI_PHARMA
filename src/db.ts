@@ -83,6 +83,7 @@ export async function ensureDatabaseReady(): Promise<{
     const alreadyRunning = await isPortOpen(port, '127.0.0.1');
     if (!alreadyRunning) {
       console.log(`[DB] Nenhum PostgreSQL detetado em ${host}:${port}. A iniciar PostgreSQL local embebido (UTF-8)...`);
+      // @ts-ignore
       const { default: EmbeddedPostgres } = await import('embedded-postgres');
       const pgDataDir = path.resolve(process.cwd(), '.pgdata_utf8');
       embeddedPgInstance = new EmbeddedPostgres({

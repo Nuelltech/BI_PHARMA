@@ -39,6 +39,7 @@ async function reconcile() {
   let embedded: any = null;
   if (!(await isPortOpen(5433))) {
     console.log('💻 A iniciar PostgreSQL local embebido (localhost:5433)...');
+    // @ts-ignore
     const { default: EmbeddedPostgres } = await import('embedded-postgres');
     embedded = new EmbeddedPostgres({
       databaseDir: path.resolve(process.cwd(), '.pgdata_utf8'),

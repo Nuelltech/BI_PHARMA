@@ -96,6 +96,43 @@ import {
 
 const customWeeklyTasksStore = new Map<string, any[]>();
 const customPacksStore = new Map<string, any[]>();
+// ============================================================================
+// SINCRONIZAÇÃO EM TEMPO REAL MULTI-DISPOSITIVO (SSE PUBSUB POR FARMÁCIA)
+// ============================================================================
+interface TaskStreamClient {
+  id: string;
+  farmaciaId: string;
+  res: http.ServerResponse;
+  clientIp: string;
+}
+const taskStreamClients = new Set<TaskStreamClient>();
+
+export function broadcastTaskUpdate(farmaciaId: string, eventData: any): void {
+  if (!farmaciaId) return;
+  const payload = `event: task_update\ndata: ${JSON.stringify(eventData)}\n\n`;
+  for (const client of Array.from(taskStreamClients)) {
+    if (client.farmaciaId === farmaciaId) {
+      try {
+        client.res.write(payload);
+      } catch (err) {
+        taskStreamClients.delete(client);
+      }
+    }
+  }
+}
+
+// Keep-alive heartbeat a cada 20s para manter conexões ativas através de proxies/Cloudflare
+setInterval(() => {
+  const comment = `: keepalive ${Date.now()}\n\n`;
+  for (const client of Array.from(taskStreamClients)) {
+    try {
+      client.res.write(comment);
+    } catch {
+      taskStreamClients.delete(client);
+    }
+  }
+}, 20000);
+
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const IS_PROD = process.env.NODE_ENV === 'production';
@@ -2283,6 +2320,42 @@ async function startServer() {
         return;
       }
 
+      
+      // 2.5H2. Endpoint SSE para Sincronização em Tempo Real de Tarefas
+      if (pathname === '/api/weekly-tasks/stream' && req.method === 'GET') {
+        try {
+          const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+            'X-Accel-Buffering': 'no',
+          });
+          res.write(': connected\n\n');
+
+          const clientId = 'sse_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+          const clientObj: TaskStreamClient = {
+            id: clientId,
+            farmaciaId: activeFarmacia.id,
+            res,
+            clientIp: getClientIp(req),
+          };
+          taskStreamClients.add(clientObj);
+
+          req.on('close', () => {
+            taskStreamClients.delete(clientObj);
+          });
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
       // 2.5I. Endpoint Obter Tarefas Semanais da Farmácia
       if (pathname === '/api/weekly-tasks' && req.method === 'GET') {
         try {
@@ -2317,6 +2390,17 @@ async function startServer() {
             designacao,
             valor_impacto: valor_impacto !== undefined ? Number(valor_impacto) : undefined,
           });
+          broadcastTaskUpdate(activeFarmacia.id, {
+            type: 'TOGGLE',
+            taskId,
+            concluido: !!concluido,
+            concluido_por: cleanConcluidoPor,
+            concluido_em: saved?.concluido_em ? saved.concluido_em.toISOString() : new Date().toISOString(),
+            categoria,
+            cnp_codigo,
+            designacao,
+            valor_impacto: valor_impacto !== undefined ? Number(valor_impacto) : undefined,
+          });
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true, task: saved }));
         } catch (e: any) {
@@ -2335,6 +2419,10 @@ async function startServer() {
           const farmIdQuery = String(farmaciaId || '').trim();
           const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
           const resetRes = await resetWeeklyTasksInDb(prisma, activeFarmacia.id);
+          broadcastTaskUpdate(activeFarmacia.id, {
+            type: 'RESET',
+            farmaciaId: activeFarmacia.id,
+          });
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(resetRes));
         } catch (e: any) {
@@ -2342,6 +2430,86 @@ async function startServer() {
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
         }
+        return;
+      }
+
+      
+      // ======================================================================
+      // RECURSOS PWA (PROGRESSIVE WEB APP)
+      // ======================================================================
+      if (pathname === '/manifest.webmanifest' || pathname === '/manifest.json') {
+        const manifest = {
+          name: 'BI Pharma — Modo Equipa',
+          short_name: 'BI Pharma',
+          description: 'Gestão Inteligente de Validades, Stocks e Vendas de Farmácia',
+          start_url: '/mobile',
+          display: 'standalone',
+          orientation: 'portrait',
+          background_color: '#0b1120',
+          theme_color: '#0f172a',
+          icons: [
+            {
+              src: '/icons/icon.svg',
+              sizes: '192x192 512x512',
+              type: 'image/svg+xml',
+              purpose: 'any maskable'
+            }
+          ]
+        };
+        res.writeHead(200, {
+          'Content-Type': 'application/manifest+json; charset=utf-8',
+          'Cache-Control': 'public, max-age=86400',
+        });
+        res.end(JSON.stringify(manifest, null, 2));
+        return;
+      }
+
+      if (pathname === '/sw.js') {
+        const swScript = `
+const CACHE_NAME = 'bi-pharma-pwa-v1';
+self.addEventListener('install', (e) => { self.skipWaiting(); });
+self.addEventListener('activate', (e) => {
+  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.map(k => k !== CACHE_NAME && caches.delete(k)))));
+  self.clients.claim();
+});
+self.addEventListener('fetch', (e) => {
+  if (e.request.method !== 'GET') return;
+  const url = new URL(e.request.url);
+  if (url.pathname.startsWith('/api/')) return;
+  e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+});
+`;
+        res.writeHead(200, {
+          'Content-Type': 'application/javascript; charset=utf-8',
+          'Cache-Control': 'no-cache',
+        });
+        res.end(swScript);
+        return;
+      }
+
+      if (pathname === '/icons/icon.svg' || pathname === '/icons/icon-192.png' || pathname === '/icons/icon-512.png') {
+        const svgIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#0284c7" />
+    </linearGradient>
+    <linearGradient id="crossGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#34d399" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)" />
+  <circle cx="256" cy="256" r="180" fill="rgba(255,255,255,0.06)" />
+  <rect x="216" y="116" width="80" height="280" rx="24" fill="url(#crossGrad)" />
+  <rect x="116" y="216" width="280" height="80" rx="24" fill="url(#crossGrad)" />
+  <circle cx="256" cy="256" r="32" fill="#ffffff" opacity="0.9" />
+</svg>`;
+        res.writeHead(200, {
+          'Content-Type': 'image/svg+xml; charset=utf-8',
+          'Cache-Control': 'public, max-age=604800',
+        });
+        res.end(svgIcon);
         return;
       }
 
@@ -3769,6 +3937,112 @@ function getDashboardHtml(): string {
       gap: 10px;
     }
 
+  
+    /* ========================================================================
+       TOP NAVIGATION BAR GLOBAL (FASE 2: ACESSO QR, LOGOUT & PERFIL)
+       ======================================================================== */
+    .top-nav-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 24px;
+      background: #ffffff;
+      border-bottom: 1px solid #e2e8f0;
+      position: sticky;
+      top: 0;
+      z-index: 990;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+    }
+    .top-nav-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .top-breadcrumb {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .active-pharmacy-pill {
+      font-size: 0.88rem;
+      font-weight: 800;
+      color: #0f172a;
+      background: #f8fafc;
+      padding: 6px 14px;
+      border-radius: 9px;
+      border: 1.5px solid #cbd5e1;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .active-role-pill {
+      font-size: 0.72rem;
+      font-weight: 800;
+      color: #0284c7;
+      background: #e0f2fe;
+      border: 1px solid #bae6fd;
+      padding: 4px 10px;
+      border-radius: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .top-nav-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .top-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 15px;
+      border-radius: 8px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      cursor: pointer;
+      border: none;
+      transition: all 0.15s ease;
+    }
+    .top-btn-qr {
+      background: linear-gradient(135deg, #0284c7, #0369a1);
+      color: #ffffff;
+      box-shadow: 0 2px 4px rgba(2, 132, 199, 0.25);
+    }
+    .top-btn-qr:hover {
+      background: linear-gradient(135deg, #0369a1, #075985);
+      transform: translateY(-1px);
+    }
+    .top-btn-logout {
+      background: #f1f5f9;
+      color: #475569;
+      border: 1px solid #cbd5e1;
+    }
+    .top-btn-logout:hover {
+      background: #fee2e2;
+      color: #dc2626;
+      border-color: #fca5a5;
+    }
+    .executive-kpi-card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+    }
+    .live-activity-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      font-size: 0.82rem;
+    }
+
   </style>
 </head>
 <body>
@@ -3864,6 +4138,25 @@ function getDashboardHtml(): string {
 
     <!-- ÁREA PRINCIPAL COM CONTEÚDO DINÂMICO -->
     <div class="main-wrapper">
+    <!-- BARRA DE NAVEGAÇÃO DE TOPO GLOBAL (ACESSO RÁPIDO AO BALCÃO, QR & LOGOUT) -->
+    <header class="top-nav-bar">
+      <div class="top-nav-left">
+        <div class="top-breadcrumb">
+          <div class="active-pharmacy-pill" id="topActivePharmacyPill">
+            <span>🏥</span> <span id="topActivePharmacyName">A carregar farmácia...</span>
+          </div>
+          <span class="active-role-pill" id="topActiveRolePill">Direção & Gestão</span>
+        </div>
+      </div>
+      <div class="top-nav-right">
+        <button class="top-btn top-btn-qr" onclick="openMobileStaffModal()" title="Abrir QR Code e link direto para o telemóvel da equipa de balcão">
+          📱 Acesso Balcão (QR Code)
+        </button>
+        <button class="top-btn top-btn-logout" onclick="logoutApp()" title="Encerrar sessão de forma segura">
+          🚪 Terminar Sessão
+        </button>
+      </div>
+    </header>
       <div class="main-content">
         <!-- CABEÇALHO CONTEXTUAL DE GESTÃO DE STOCK (FILTROS GLOBAIS + 5 KPIS PRINCIPAIS - SÓ APARECE NAS TABELAS DE STOCK) -->
         <div id="globalAnalyticsHeader" style="display: none;">
@@ -7134,6 +7427,25 @@ function getDashboardHtml(): string {
       }
     }
 
+    
+    async function logoutApp() {
+      if (!confirm('Deseja realmente terminar a sua sessão com segurança?')) return;
+      try {
+        await fetch('/api/auth/logout', { method: 'POST' });
+      } catch(e) {}
+      document.cookie = 'admin_session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+      document.cookie = 'farmacia_access_code=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+      localStorage.removeItem('bi_pharma_admin_authenticated');
+      window.location.href = '/?logout=1';
+    }
+
+    function shareMobileWhatsApp() {
+      const inp = document.getElementById('mobileDirectUrl');
+      if (!inp || !inp.value) return;
+      const text = encodeURIComponent('Olá equipa! Aqui está o link de acesso direto ao BI Pharma (Modo Balcão da Farmácia):\n' + inp.value);
+      window.open('https://api.whatsapp.com/send?text=' + text, '_blank');
+    }
+
     function openMobileStaffModal() {
       const farmsList = (typeof cachedAdminPharmacies !== 'undefined' && Array.isArray(cachedAdminPharmacies))
         ? cachedAdminPharmacies
@@ -7234,6 +7546,42 @@ function getDashboardHtml(): string {
 
     function onDesktopRuturaFilterChange() {
       renderDesktopCard4(false);
+    }
+
+    
+    function initDesktopTasksRealtime() {
+      if (!activeFarmaciaId || typeof EventSource === 'undefined') return;
+      try {
+        const es = new EventSource('/api/weekly-tasks/stream?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        es.addEventListener('task_update', function(e) {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.type === 'RESET') {
+              remoteDoneTasksMap = {};
+              localStorage.removeItem('bi_pharma_weekly_done_' + activeFarmaciaId);
+              updateWeeklyTasksCounter();
+              return;
+            }
+            if (data.type === 'TOGGLE' && data.taskId) {
+              if (data.concluido) {
+                remoteDoneTasksMap[data.taskId] = {
+                  concluido: true,
+                  concluido_por: data.concluido_por,
+                  concluido_em: data.concluido_em,
+                  valor_impacto: data.valor_impacto,
+                  categoria: data.categoria
+                };
+              } else {
+                delete remoteDoneTasksMap[data.taskId];
+              }
+              localStorage.setItem('bi_pharma_weekly_done_' + activeFarmaciaId, JSON.stringify(remoteDoneTasksMap));
+              updateWeeklyTasksCounter();
+              const chk = document.querySelector('.weekly-task-checkbox[data-task-id="' + data.taskId + '"]');
+              if (chk) chk.checked = !!data.concluido;
+            }
+          } catch(err) {}
+        });
+      } catch(err) {}
     }
 
     function updateWeeklyTasksCounter() {
@@ -7744,6 +8092,7 @@ function getDashboardHtml(): string {
 
     function renderWeeklyActionPlan() {
       fetchWeeklyTasksFromDb();
+    initDesktopTasksRealtime();
       if (!currentReport) return;
 
       renderDesktopCard1(false);
