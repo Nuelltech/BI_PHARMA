@@ -16,7 +16,10 @@
     "audit:supabase": "tsx src/audit_db_parity.ts",
     "dashboard": "tsx src/server.ts",
     "benchmark": "tsx scripts/load_test_harness.ts",
-    "test": "vitest run --fileParallelism=false"
+    "test": "vitest run --fileParallelism=false",
+    "test:cits": "tsx --test test/*.test.ts",
+    "cits:import": "tsx scripts/import-cits.ts",
+    "rcm:process": "tsx scripts/process-rcm.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.3.0",

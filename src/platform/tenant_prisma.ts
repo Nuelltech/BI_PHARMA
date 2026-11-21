@@ -16,7 +16,19 @@ export const TENANT_MODELS = new Set<string>([
   'MartDciGrupo', 'MembroEquipa', 'MembroFarmacia', 'DispositivoBalcao', 'CodigoEmparelhamento',
 ]);
 
-export const GLOBAL_MODELS = new Set<string>(['ProdutoMestre']);
+export const GLOBAL_MODELS = new Set<string>([
+  'ProdutoMestre',
+  'EnriquecimentoFila',
+  'ProdutoEnriquecimento',
+  'EnriquecimentoFonte',
+  'CitsCarga',
+  'CitsRaw',
+  'ProdutoCits',
+  'ProdutoCitsHistorico',
+  'DocumentoMedicamento',
+  'DocumentoCnp',
+  'DocumentoSeccao',
+]);
 
 export const SYSTEM_MODELS = new Set<string>([
   'Organizacao', 'Farmacia', 'Utilizador', 'SessaoUtilizador', 'TokenRecuperacao', 'SessaoAdmin',

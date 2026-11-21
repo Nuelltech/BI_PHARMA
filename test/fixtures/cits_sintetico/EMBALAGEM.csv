@@ -1,0 +1,21 @@
+EMB_ID,PROD_ID,NR_REGISTO,DESCR,GRUPO_HOM_COD,QUANT_TOT,UNID_QUANT_TOT_ID,QUANTIDADE,UNID_QUANT_ID,TIPO_EMB_ID,ACOND_PRIMARIO_ID,TIPO_TRATAMENTO_ID,ESTADO_EMB_ID,IND_EMB_UNITARIA,IND_EMB_HOSPITALAR,IND_DISP_SEGURANCA,PEM_AMB,PEM_AMB_MS,PEM_AMB_BIO,PEM_AMB_BIO_MS,CNPEM,CHNM_COD,CDM,REFERENCIA,CARACT_ESPECIFICAS,SUBSTITUICAO_FARMACIA,DATA_PREVISTA_REPOSICAO,LNP,EXPORT_TEMP_SUSP
+101,1,5000001,Blister - 20 unidades,GH0001,,,,,,,,1,N,N,N,S,S,N,N,50000010,,,,,S,,N,N
+102,2,5000002,Blister - 20 unidades,GH0001,,,,,,,,1,N,N,N,S,S,N,N,50000010,,,,,S,,N,N
+103,3,5000003,Blister - 28 unidades,GH0002,,,,,,,,1,N,N,N,S,S,N,N,50000030,,,,,S,,N,N
+104,3,5000004,Blister - 56 unidades,GH0002,,,,,,,,1,N,N,N,S,S,N,N,50000031,,,,,S,,N,N
+105,4,5000005,Blister - 28 unidades,GH0002,,,,,,,,1,N,N,N,S,S,N,N,50000030,,,,,S,,N,N
+106,5,5000006,Blister - 20 unidades,,,,,,,,,1,N,N,N,S,S,N,N,,,,,,N,,N,N
+107,6,5000007,Frasco - 30 unidades,,,,,,,,,1,N,N,N,S,S,N,N,50000070,,,,,N,,N,N
+108,7,5000008,Seringa pré-cheia - 2 unidades,,,,,,,,,1,N,N,N,S,S,N,N,50000080,,,,,N,,N,N
+109,8,5000009,Frasco - 14 unidades,GH0003,,,,,,,,1,N,N,N,S,S,N,N,50000090,,,,,S,2026-12-15,N,N
+110,9,5000010,Frasco - 100 ml,,,,,,,,,1,N,N,N,S,S,N,N,50000100,,,,,S,,N,N
+111,10,5000011,Frasco para injetáveis - 1 unidade,,,,,,,,,1,N,N,N,N,N,N,N,50000110,,,,,N,,N,N
+112,11,5000012,Frasco - 85 ml,,,,,,,,,1,N,N,N,S,S,N,N,50000120,,,,,S,,N,N
+113,12,5000013,Bisnaga - 100 g,,,,,,,,,1,N,N,N,S,S,N,N,,,,,,N,,N,N
+114,13,5000014,Caixa - 50 tiras,,,,,,,,,1,N,N,N,S,S,N,N,,,,,,N,,N,N
+115,14,5000015,Frasco - 200 ml,,,,,,,,,1,N,N,N,N,N,N,N,,,,,,N,,N,N
+116,15,5000016,Lata - 800 g,,,,,,,,,1,N,N,N,N,N,N,N,,,,,,N,,N,N
+117,16,5000017,Blister - 20 unidades,,,,,,,,,1,N,N,N,S,S,N,N,,,,,,N,,N,N
+118,17,5000018,Frasco - 28 unidades,GH0003,,,,,,,,1,N,N,N,S,S,N,N,50000090,,,,,S,,N,N
+119,18,123456,Blister - 20 unidades,,,,,,,,,1,N,N,N,S,S,N,N,,,,,,S,,N,N
+120,18,,Embalagem sem registo,,,,,,,,,1,N,N,N,S,S,N,N,,,,,,S,,N,N

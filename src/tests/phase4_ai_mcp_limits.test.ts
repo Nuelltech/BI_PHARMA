@@ -176,9 +176,9 @@ describe('Fase 4: Copilot AI & MCP Isolados com Quotas e Hashing', () => {
     const lastClinical = toolsClinical[toolsClinical.length - 1];
     expect(lastClinical.cache_control?.type).toBe('ephemeral');
 
-    // A ferramenta consultar_evolucao_e_saude_stock deve estar disponível nos modos STOCKS e FINANCE
-    expect(toolsStocks.some((t) => t.name === 'consultar_evolucao_e_saude_stock')).toBe(true);
+    // A ferramenta consultar_patrimonio_stock deve estar disponível nos modos STOCKS e FINANCE
+    expect(toolsStocks.some((t) => t.name === 'consultar_patrimonio_stock')).toBe(true);
     const toolsFinance = getScopedToolsForMode('FINANCE');
-    expect(toolsFinance.some((t) => t.name === 'consultar_evolucao_e_saude_stock')).toBe(true);
+    expect(toolsFinance.some((t) => t.name === 'consultar_patrimonio_stock')).toBe(true);
   });
 });
