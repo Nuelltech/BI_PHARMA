@@ -2715,10 +2715,21 @@ async function startServer() {
           const { farmaciaId, pin, memberId } = JSON.parse(rawBody || '{}');
           const resAuth = await verifyMobileStaffPin(prisma, farmaciaId, pin, memberId);
 
-          if (!resAuth.valid) {
-            recordFailedAttempt(clientIp);
-          } else {
+          if (resAuth.valid) {
             resetFailedAttempts(clientIp);
+            // Regista a sessão ativa para monitorização em tempo real (Sessões Ativas)
+            const userAgent = String(req.headers['user-agent'] || 'Mobile Device');
+            const opName = (resAuth as any).member ? (resAuth as any).member.nome : 'Operador Balcão';
+            const opRole = (resAuth as any).member ? (resAuth as any).member.role : 'AUXILIAR';
+            const targetFarmId = (resAuth as any).farmacia ? (resAuth as any).farmacia.id : farmaciaId;
+            recordUserSession(prisma, {
+              farmaciaId: targetFarmId,
+              userId: (resAuth as any).member ? (resAuth as any).member.id : undefined,
+              userName: opName,
+              role: opRole,
+              ip: clientIp,
+              device: userAgent.includes('Mobile') ? 'Dispositivo Móvel' : 'Terminal Balcão',
+            }).catch(() => {});
           }
 
           if (resAuth.valid && (resAuth as any).farmacia && (resAuth as any).farmacia.codigo_acesso) {
