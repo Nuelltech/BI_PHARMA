@@ -45,6 +45,10 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
   console.error('[Server] Unhandled Rejection at:', promise, 'reason:', reason);
 });
+if (process.stdin && process.stdin.resume) {
+  try { process.stdin.resume(); } catch (_) {}
+}
+setInterval(() => {}, 60000); // Keepalive timer para manter o processo ativo em background
 import { analyzePharmacyInventory, PharmacyAnalysisReport } from './services/analysis';
 import { classifyAllExistingProducts, classifyProduct } from './services/classifier';
 import { getPharmacyCatalog, invalidateCatalog } from './services/product_catalog';
