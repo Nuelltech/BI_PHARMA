@@ -126,11 +126,14 @@ export function getMobileStaffHtml(): string {
       font-size: 0.75rem;
       font-weight: 600;
       cursor: pointer;
+      transition: all 0.15s ease;
     }
 
-    .operator-chip:active {
-      background: #38bdf8;
-      color: #0f172a;
+    .operator-chip:active, .operator-chip.active {
+      background: #38bdf8 !important;
+      color: #0f172a !important;
+      border-color: #38bdf8 !important;
+      font-weight: 700;
     }
 
     .pin-dots {
@@ -778,20 +781,16 @@ export function getMobileStaffHtml(): string {
 
       <div class="form-group">
         <label>Farmácia Ativa</label>
-        <select id="pinFarmSelect" class="select-farmacia">
+        <select id="pinFarmSelect" class="select-farmacia" onchange="loadPharmacyTeamChips(this.value)">
           <option value="">A carregar farmácias...</option>
         </select>
       </div>
 
       <div class="form-group">
         <label>O Teu Nome / Operador</label>
-        <input type="text" id="pinOperatorInput" class="input-operator" placeholder="Ex: Ana, Rui, Balcão 1" />
-        <div class="operator-chips">
-          <span class="operator-chip" onclick="setOperator('Ana')">Ana</span>
-          <span class="operator-chip" onclick="setOperator('Marta')">Marta</span>
-          <span class="operator-chip" onclick="setOperator('Rui')">Rui</span>
-          <span class="operator-chip" onclick="setOperator('Balcão 1')">Balcão 1</span>
-          <span class="operator-chip" onclick="setOperator('Armazém')">Armazém</span>
+        <input type="text" id="pinOperatorInput" class="input-operator" placeholder="Ex: Nome do colaborador" />
+        <div class="operator-chips" id="operatorChipsContainer">
+          <span style="font-size: 0.72rem; color: #94a3b8;">A carregar equipa...</span>
         </div>
       </div>
 
@@ -1045,7 +1044,8 @@ export function getMobileStaffHtml(): string {
     let currentSectionIndex = 0;
     let enteredPin = '';
     let currentFarmacia = null;
-    let currentOperator = localStorage.getItem('bi_pharma_operator') || 'Ana';
+    let currentOperator = localStorage.getItem('bi_pharma_operator') || '';
+    let selectedMemberId = null;
     let rawReport = null;
     let tasksMap = {};
     let allFarmacias = [];
@@ -1166,6 +1166,10 @@ export function getMobileStaffHtml(): string {
           }
         }
 
+        if (sel.value) {
+          loadPharmacyTeamChips(sel.value);
+        }
+
         const saved = JSON.parse(localStorage.getItem('bi_pharma_mobile_session') || '{}');
 
         // Se o utilizador abriu um link específico da Farmácia:
@@ -1229,8 +1233,45 @@ export function getMobileStaffHtml(): string {
       }
     }
 
-    function setOperator(name) {
-      document.getElementById('pinOperatorInput').value = name;
+    function setOperator(name, memberId) {
+      const input = document.getElementById('pinOperatorInput');
+      if (input) input.value = name;
+      currentOperator = name;
+      selectedMemberId = memberId || null;
+      document.querySelectorAll('.operator-chip').forEach(c => {
+        c.classList.toggle('active', c.textContent.trim() === name.trim());
+      });
+    }
+
+    async function loadPharmacyTeamChips(farmId) {
+      const container = document.getElementById('operatorChipsContainer');
+      if (!container || !farmId) return;
+      container.innerHTML = '<span style="font-size: 0.72rem; color: #94a3b8;">A carregar colaboradores...</span>';
+      try {
+        const res = await fetch('/api/mobile/team-members?farmaciaId=' + encodeURIComponent(farmId));
+        const data = await res.json();
+        if (data.ok && Array.isArray(data.members) && data.members.length > 0) {
+          container.innerHTML = data.members.map(function(m) {
+            return '<span class="operator-chip" onclick="setOperator(\'' + escapeHtml(m.nome) + '\', \'' + m.id + '\')">' + escapeHtml(m.nome) + '</span>';
+          }).join('') + 
+          '<span class="operator-chip" onclick="setOperator(\'Balcão 1\', null)">Balcão 1</span>' + 
+          '<span class="operator-chip" onclick="setOperator(\'Armazém\', null)">Armazém</span>';
+
+          const input = document.getElementById('pinOperatorInput');
+          if (input && (!input.value || input.value === 'Ana')) {
+            setOperator(data.members[0].nome, data.members[0].id);
+          }
+        } else {
+          container.innerHTML = 
+            '<span class="operator-chip" onclick="setOperator(\'Balcão 1\', null)">Balcão 1</span>' +
+            '<span class="operator-chip" onclick="setOperator(\'Balcão 2\', null)">Balcão 2</span>' +
+            '<span class="operator-chip" onclick="setOperator(\'Armazém\', null)">Armazém</span>';
+        }
+      } catch (err) {
+        container.innerHTML = 
+          '<span class="operator-chip" onclick="setOperator(\'Balcão 1\', null)">Balcão 1</span>' +
+          '<span class="operator-chip" onclick="setOperator(\'Armazém\', null)">Armazém</span>';
+      }
     }
 
     function pressPin(digit) {
@@ -1270,7 +1311,7 @@ export function getMobileStaffHtml(): string {
         const res = await fetch('/api/mobile/auth-pin', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ farmaciaId: farmId, pin: enteredPin }),
+          body: JSON.stringify({ farmaciaId: farmId, pin: enteredPin, memberId: selectedMemberId }),
         });
         const data = await res.json();
 

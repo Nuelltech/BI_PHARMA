@@ -38,6 +38,13 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import { ensureDatabaseReady } from './db';
+
+process.on('uncaughtException', (err) => {
+  console.error('[Server] Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Server] Unhandled Rejection at:', promise, 'reason:', reason);
+});
 import { analyzePharmacyInventory, PharmacyAnalysisReport } from './services/analysis';
 import { classifyAllExistingProducts, classifyProduct } from './services/classifier';
 import { getPharmacyCatalog, invalidateCatalog } from './services/product_catalog';
@@ -191,8 +198,12 @@ interface AdminSession {
   expiresAt: number;
 }
 const activeAdminSessions = new Map<string, AdminSession>();
-const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 horas de validade
+const ADMIN_SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas de validade
 const MAX_ACTIVE_SESSIONS = 1000;
+
+function getSessionSigningKey(): string {
+  return (process.env.SESSION_SECRET || ADMIN_PASSWORD || 'BI_PHARMA_SECURE_HMAC_KEY_2026').trim();
+}
 
 function createAdminSession(): string {
   const now = Date.now();
@@ -205,11 +216,14 @@ function createAdminSession(): string {
       if (oldestKey) activeAdminSessions.delete(oldestKey);
     }
   }
-  const token = 'ADM_' + crypto.randomBytes(24).toString('hex').toUpperCase();
+  const expiresAt = now + ADMIN_SESSION_TTL_MS;
+  const payload = `${expiresAt}`;
+  const sig = crypto.createHmac('sha256', getSessionSigningKey()).update(payload).digest('hex').toUpperCase();
+  const token = `ADM_${expiresAt}_${sig}`;
   activeAdminSessions.set(token, {
     token,
     createdAt: now,
-    expiresAt: now + ADMIN_SESSION_TTL_MS,
+    expiresAt,
   });
   return token;
 }
@@ -217,13 +231,39 @@ function createAdminSession(): string {
 function isValidAdminSession(token: string): boolean {
   if (!token || typeof token !== 'string') return false;
   const cleanToken = token.trim().toUpperCase();
+
+  // 1. Checa memória RAM primeiro
   const session = activeAdminSessions.get(cleanToken);
-  if (!session) return false;
-  if (Date.now() > session.expiresAt) {
-    activeAdminSessions.delete(cleanToken);
-    return false;
+  if (session) {
+    if (Date.now() > session.expiresAt) {
+      activeAdminSessions.delete(cleanToken);
+      return false;
+    }
+    return true;
   }
-  return true;
+
+  // 2. Validação stateless criptográfica HMAC (resiste a reinício de processos no Render/PaaS)
+  if (cleanToken.startsWith('ADM_')) {
+    const parts = cleanToken.split('_');
+    if (parts.length === 3 && parts[0] === 'ADM') {
+      const expiresAt = parseInt(parts[1], 10);
+      const providedSig = parts[2];
+      if (!isNaN(expiresAt) && Date.now() <= expiresAt) {
+        const expectedSig = crypto.createHmac('sha256', getSessionSigningKey()).update(String(expiresAt)).digest('hex').toUpperCase();
+        if (safeCompareStrings(providedSig, expectedSig)) {
+          // Re-insere na cache em memória
+          activeAdminSessions.set(cleanToken, {
+            token: cleanToken,
+            createdAt: expiresAt - ADMIN_SESSION_TTL_MS,
+            expiresAt,
+          });
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 function invalidateAdminSession(token: string): void {
@@ -589,8 +629,12 @@ async function startServer() {
         }
         const candidateToken = headerToken || authBearer || adminCookieToken || (explicitCode ? explicitCode.trim() : '');
 
-        // O Modo Admin SÓ é aceite através do Token Efémero Assinado e Ativo
-        if (candidateToken && isValidAdminSession(candidateToken)) {
+        // O Modo Admin SÓ é aceite através do Token Efémero Assinado e Ativo (ou password direta de admin)
+        if (
+          candidateToken &&
+          (isValidAdminSession(candidateToken) ||
+            (ADMIN_PASSWORD.length >= 6 && safeCompareStrings(candidateToken, ADMIN_PASSWORD)))
+        ) {
           return {
             authenticated: true,
             role: 'ADMIN' as const,
@@ -2668,8 +2712,8 @@ async function startServer() {
           }
 
           const rawBody = await readRequestBody(req, 64 * 1024);
-          const { farmaciaId, pin } = JSON.parse(rawBody || '{}');
-          const resAuth = await verifyMobileStaffPin(prisma, farmaciaId, pin);
+          const { farmaciaId, pin, memberId } = JSON.parse(rawBody || '{}');
+          const resAuth = await verifyMobileStaffPin(prisma, farmaciaId, pin, memberId);
 
           if (!resAuth.valid) {
             recordFailedAttempt(clientIp);
@@ -2685,6 +2729,43 @@ async function startServer() {
         } catch (e: any) {
           const status = e.statusCode || 500;
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 2.5H1. Endpoint Mobile: Listar Nomes dos Colaboradores da Farmácia para Chips
+      if (pathname === '/api/mobile/team-members' && req.method === 'GET') {
+        try {
+          const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+          if (!farmIdQuery) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'farmaciaId obrigatório' }));
+            return;
+          }
+          const farm = await prisma.farmacia.findFirst({
+            where: {
+              OR: [
+                { id: farmIdQuery },
+                { codigo_acesso: { equals: farmIdQuery, mode: 'insensitive' } },
+              ],
+            },
+            select: { id: true, nome: true },
+          });
+          if (!farm) {
+            res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Farmácia não encontrada' }));
+            return;
+          }
+          const members = await prisma.membroEquipa.findMany({
+            where: { farmaciaId: farm.id, ativo: true },
+            select: { id: true, nome: true, role: true },
+            orderBy: { criadoEm: 'asc' },
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, farmaciaId: farm.id, members }));
+        } catch (e: any) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
         }
         return;
@@ -2940,7 +3021,8 @@ self.addEventListener('fetch', (e) => {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true, farmaciaId: activeFarmacia.id, team }));
         } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
         }
         return;
@@ -2959,7 +3041,8 @@ self.addEventListener('fetch', (e) => {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true, member }));
         } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
         }
         return;
@@ -2976,7 +3059,8 @@ self.addEventListener('fetch', (e) => {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true, member: updated }));
         } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
         }
         return;
@@ -2992,7 +3076,8 @@ self.addEventListener('fetch', (e) => {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: deleted }));
         } catch (e: any) {
-          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
         }
         return;
@@ -6979,8 +7064,9 @@ function getDashboardHtml(): string {
                 </select>
               </div>
               <div>
-                <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">PIN Rápido (4 dígitos):</label>
-                <input type="text" id="invitePin" maxlength="6" placeholder="Ex: 4321" style="width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem; font-family: monospace;" />
+                <label style="font-size: 0.72rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">PIN Rápido (4 a 6 dígitos):</label>
+                <input type="text" id="invitePin" maxlength="6" placeholder="Ex: 6294" style="width: 100%; padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem; font-family: monospace;" />
+                <small style="color: #64748b; font-size: 0.68rem; display: block; margin-top: 3px;">Evite repetições (ex: 6666) ou sequências (ex: 1234).</small>
               </div>
             </div>
             <div style="display: flex; justify-content: flex-end; gap: 8px;">
@@ -8969,8 +9055,14 @@ function getDashboardHtml(): string {
       if (!container || !activeFarmaciaId) return;
 
       try {
-        const res = await fetch('/api/settings/team?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        const res = await fetch('/api/settings/team?farmaciaId=' + encodeURIComponent(activeFarmaciaId), {
+          headers: { 'x-access-code': activeAccessCode }
+        });
         const data = await res.json();
+        if (res.status === 401 || (data && !data.ok && data.error && (data.error.includes('não autorizado') || data.error.includes('indique o código')))) {
+          container.innerHTML = '<div style="color: #e11d48; padding: 14px; text-align: center;">Sessão expirada ou não autorizada. <button onclick="openAuthGateModal()" class="btn btn-sm" style="margin-left: 8px;">Reautenticar</button></div>';
+          return;
+        }
         if (data.ok && Array.isArray(data.team)) {
           if (data.team.length === 0) {
             container.innerHTML = '<div style="text-align: center; color: #64748b; padding: 20px;">Nenhum colaborador adicionado ainda.</div>';
@@ -9016,18 +9108,44 @@ function getDashboardHtml(): string {
         return;
       }
 
+      if (pin) {
+        const isDigits = pin.length >= 4 && pin.length <= 6 && !isNaN(Number(pin)) && !pin.includes('.');
+        if (!isDigits) {
+          alert('O PIN deve ter entre 4 e 6 dígitos numéricos.');
+          return;
+        }
+        const isRepeated = pin.split('').every(ch => ch === pin[0]);
+        if (isRepeated) {
+          alert('PIN rejeitado por segurança: evite todos os dígitos repetidos (ex: 6666, 1111). Por favor escolha um PIN seguro como 6294 ou 8421.');
+          return;
+        }
+        if (['1234', '4321', '123456', '654321', '0123', '9876'].includes(pin)) {
+          alert('PIN rejeitado por segurança: evite sequências numéricas óbvias (ex: 1234, 4321). Por favor escolha um PIN seguro como 6294 ou 8421.');
+          return;
+        }
+      }
+
       try {
         const res = await fetch('/api/settings/team/invite', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'x-access-code': activeAccessCode
+          },
           body: JSON.stringify({ farmaciaId: activeFarmaciaId, nome, email, role, pin })
         });
         const data = await res.json();
+        if (res.status === 401 || (data && !data.ok && data.error && (data.error.includes('não autorizado') || data.error.includes('indique o código')))) {
+          alert('A sua sessão expirou ou não está autorizada. Por favor volte a introduzir o código da farmácia ou a password de administrador.');
+          openAuthGateModal('Sessão expirada. Por favor autentique-se novamente.', activeAuthRole === 'ADMIN' ? 'ADMIN' : 'PHARMACY');
+          return;
+        }
         if (data.ok) {
           toggleInviteForm();
           document.getElementById('inviteName').value = '';
           document.getElementById('inviteEmail').value = '';
           document.getElementById('invitePin').value = '';
+          alert('Colaborador adicionado com sucesso!');
           loadSettingsTeam();
         } else {
           alert('Erro: ' + (data.error || 'Não foi possível adicionar colaborador.'));
@@ -9040,11 +9158,20 @@ function getDashboardHtml(): string {
     async function deleteTeamMember(userId) {
       if (!confirm('Deseja realmente revogar o acesso deste colaborador?')) return;
       try {
-        await fetch('/api/settings/team/delete', {
+        const res = await fetch('/api/settings/team/delete', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'x-access-code': activeAccessCode
+          },
           body: JSON.stringify({ farmaciaId: activeFarmaciaId, userId })
         });
+        const data = await res.json();
+        if (res.status === 401 || (data && !data.ok && data.error && (data.error.includes('não autorizado') || data.error.includes('indique o código')))) {
+          alert('A sua sessão expirou ou não está autorizada.');
+          openAuthGateModal('Sessão expirada. Por favor autentique-se novamente.', activeAuthRole === 'ADMIN' ? 'ADMIN' : 'PHARMACY');
+          return;
+        }
         loadSettingsTeam();
       } catch (e) {}
     }
@@ -9054,8 +9181,14 @@ function getDashboardHtml(): string {
       if (!container || !activeFarmaciaId) return;
 
       try {
-        const res = await fetch('/api/settings/sessions?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        const res = await fetch('/api/settings/sessions?farmaciaId=' + encodeURIComponent(activeFarmaciaId), {
+          headers: { 'x-access-code': activeAccessCode }
+        });
         const data = await res.json();
+        if (res.status === 401 || (data && !data.ok && data.error && (data.error.includes('não autorizado') || data.error.includes('indique o código')))) {
+          container.innerHTML = '<div style="color: #e11d48; padding: 14px; text-align: center;">Sessão expirada ou não autorizada. <button onclick="openAuthGateModal()" class="btn btn-sm" style="margin-left: 8px;">Reautenticar</button></div>';
+          return;
+        }
         if (data.ok && Array.isArray(data.sessions)) {
           if (data.sessions.length === 0) {
             container.innerHTML = '<div style="text-align: center; color: #64748b; padding: 20px;">Nenhuma sessão ativa registada.</div>';
