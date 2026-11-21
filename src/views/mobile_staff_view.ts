@@ -1243,6 +1243,13 @@ export function getMobileStaffHtml(): string {
       });
     }
 
+    function handleOperatorChipClick(el) {
+      if (!el) return;
+      const name = el.getAttribute('data-name') || el.textContent.trim();
+      const id = el.getAttribute('data-id') || null;
+      setOperator(name, id);
+    }
+
     async function loadPharmacyTeamChips(farmId) {
       const container = document.getElementById('operatorChipsContainer');
       if (!container || !farmId) return;
@@ -1250,27 +1257,24 @@ export function getMobileStaffHtml(): string {
       try {
         const res = await fetch('/api/mobile/team-members?farmaciaId=' + encodeURIComponent(farmId));
         const data = await res.json();
+        let chipsHtml = '';
         if (data.ok && Array.isArray(data.members) && data.members.length > 0) {
-          container.innerHTML = data.members.map(function(m) {
-            return '<span class="operator-chip" onclick="setOperator(\'' + escapeHtml(m.nome) + '\', \'' + m.id + '\')">' + escapeHtml(m.nome) + '</span>';
-          }).join('') + 
-          '<span class="operator-chip" onclick="setOperator(\'Balcão 1\', null)">Balcão 1</span>' + 
-          '<span class="operator-chip" onclick="setOperator(\'Armazém\', null)">Armazém</span>';
+          chipsHtml = data.members.map(function(m) {
+            return '<span class="operator-chip" data-name="' + escapeHtml(m.nome) + '" data-id="' + escapeHtml(m.id) + '" onclick="handleOperatorChipClick(this)">' + escapeHtml(m.nome) + '</span>';
+          }).join('');
 
           const input = document.getElementById('pinOperatorInput');
-          if (input && (!input.value || input.value === 'Ana')) {
+          if (input && (!input.value || input.value === 'Ana' || input.value === 'Balcão 1')) {
             setOperator(data.members[0].nome, data.members[0].id);
           }
-        } else {
-          container.innerHTML = 
-            '<span class="operator-chip" onclick="setOperator(\'Balcão 1\', null)">Balcão 1</span>' +
-            '<span class="operator-chip" onclick="setOperator(\'Balcão 2\', null)">Balcão 2</span>' +
-            '<span class="operator-chip" onclick="setOperator(\'Armazém\', null)">Armazém</span>';
         }
+        chipsHtml += '<span class="operator-chip" data-name="Balcão 1" data-id="" onclick="handleOperatorChipClick(this)">Balcão 1</span>';
+        chipsHtml += '<span class="operator-chip" data-name="Armazém" data-id="" onclick="handleOperatorChipClick(this)">Armazém</span>';
+        container.innerHTML = chipsHtml;
       } catch (err) {
         container.innerHTML = 
-          '<span class="operator-chip" onclick="setOperator(\'Balcão 1\', null)">Balcão 1</span>' +
-          '<span class="operator-chip" onclick="setOperator(\'Armazém\', null)">Armazém</span>';
+          '<span class="operator-chip" data-name="Balcão 1" data-id="" onclick="handleOperatorChipClick(this)">Balcão 1</span>' +
+          '<span class="operator-chip" data-name="Armazém" data-id="" onclick="handleOperatorChipClick(this)">Armazém</span>';
       }
     }
 
