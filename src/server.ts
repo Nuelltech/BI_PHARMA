@@ -9172,8 +9172,15 @@ function getDashboardHtml(): string {
           openAuthGateModal('Sessão expirada. Por favor autentique-se novamente.', activeAuthRole === 'ADMIN' ? 'ADMIN' : 'PHARMACY');
           return;
         }
-        loadSettingsTeam();
-      } catch (e) {}
+        if (data.ok) {
+          alert('Colaborador removido com sucesso!');
+          loadSettingsTeam();
+        } else {
+          alert('Erro ao remover colaborador: ' + (data.error || 'Não foi possível concluir a remoção.'));
+        }
+      } catch (e) {
+        alert('Erro de comunicação ao remover colaborador.');
+      }
     }
 
     async function loadSettingsSessions() {
