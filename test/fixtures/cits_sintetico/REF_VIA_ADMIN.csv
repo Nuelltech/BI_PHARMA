@@ -1,0 +1,5 @@
+VIA_ADMIN_ID,DESCR,ABREV_CHNM,IND_ATIVO
+1,Via oral,oral,S
+2,Via subcutânea,sc,S
+3,Via intramuscular,im,S
+4,Via cutânea,cut,S

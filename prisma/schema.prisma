@@ -910,3 +910,167 @@ model EnriquecimentoFonte {
   @@index([cnp_codigo])
   @@map("EnriquecimentoFonte")
 }
+// Modelos CITS a acrescentar ao schema.prisma do Bi-Pharma.
+// Correspondem a supabase/migrations/20261120_cits_import.sql.
+// A vista v_produto_catalogo é lida com $queryRaw (ou como `view` com previewFeatures = ["views"]).
+
+model CitsCarga {
+  id                 BigInt    @id @default(autoincrement())
+  ficheiro           String
+  ficheiro_sha256    String
+  iniciada_em        DateTime  @default(now()) @db.Timestamptz(6)
+  terminada_em       DateTime? @db.Timestamptz(6)
+  estado             String    @default("EM_CURSO") // EM_CURSO | CONCLUIDA | FALHADA | REJEITADA
+  linhas_por_tabela  Json      @default("{}")
+  avisos             Json      @default("[]")
+  erro               String?
+  produtos_inseridos Int       @default(0)
+  produtos_alterados Int       @default(0)
+  produtos_removidos Int       @default(0)
+
+  raw       CitsRaw[]
+  produtos  ProdutoCits[]
+  historico ProdutoCitsHistorico[]
+}
+
+model CitsRaw {
+  tabela   String
+  linha    Int
+  dados    Json
+  carga_id BigInt
+  carga    CitsCarga @relation(fields: [carga_id], references: [id])
+
+  @@id([tabela, linha])
+}
+
+model ProdutoCits {
+  cnp_codigo                  String   @id
+  emb_id                      BigInt
+  prod_id                     BigInt
+  ativo_no_cits               Boolean  @default(true)
+
+  nome                        String?
+  descricao_embalagem         String?
+  marca                       String?
+  tipo_produto                String?  // MUH | DM | COSMETICO | ALIM_ESPECIAL | NUTRICAO | OUTRO
+  nr_processo                 String?
+  titular_aim                 String?
+
+  dci                         String?
+  substancias                 Json     @default("[]")
+  dosagem                     String?
+  dosagem_completa            String?
+  forma_farmaceutica          String?
+  forma_farmaceutica_agrupada String?
+  vias_administracao          String[] @default([])
+  atc_codigos                 String[] @default([])
+  atc_descricoes              String[] @default([])
+  cft_codigos                 String[] @default([])
+  cft_descricoes              String[] @default([])
+  gh_codigo                   String?
+  gh_descricao                String?
+  cnpem                       String?
+
+  classificacoes_dispensa     Int[]    @default([])
+  regime_dispensa             String
+  precisa_receita             Boolean
+  tipo_venda_derivado         String   // MSRM | MNSRM | VENDA_LIVRE
+  eh_generico                 Boolean  @default(false)
+  eh_marca                    Boolean  @default(false)
+  eh_biossimilar              Boolean  @default(false)
+  eh_biologico                Boolean  @default(false)
+  publico                     String   @default("DESCONHECIDO")
+  publico_fonte               String?
+  grupos_produto              Int[]    @default([])
+
+  pvp_oficial                 Decimal? @db.Decimal(15, 2)
+  pvp_max                     Decimal? @db.Decimal(15, 2)
+  preco_referencia            Decimal? @db.Decimal(15, 2)
+  pvp_notificado              Decimal? @db.Decimal(15, 2)
+
+  comparticipacoes            Json     @default("[]")
+  estado_comercializacao      String?
+  data_prevista_reposicao     DateTime? @db.Date
+  estado_aim                  String?
+  fim_escoamento              DateTime? @db.Date
+  pem_amb                     Boolean?
+
+  margem_terapeutica_estreita Boolean?
+  monitorizacao_adicional     Boolean?
+  substituicao_farmacia       Boolean?
+  conservacao                 String?
+  alertas                     Json     @default("[]")
+
+  cits_data_alteracao         DateTime? @db.Date
+  hash_conteudo               String
+  carga_id                    BigInt
+  carga                       CitsCarga @relation(fields: [carga_id], references: [id])
+  atualizado_em               DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@index([gh_codigo])
+  @@index([dci])
+  @@index([prod_id])
+}
+
+model ProdutoCitsHistorico {
+  id             BigInt    @id @default(autoincrement())
+  cnp_codigo     String
+  campo          String
+  valor_anterior Json?
+  valor_novo     Json?
+  carga_id       BigInt
+  carga          CitsCarga @relation(fields: [carga_id], references: [id])
+  criado_em      DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@index([cnp_codigo, criado_em(sort: Desc)])
+}
+
+// ---------- Documentos de medicamento (20261121_documentos_medicamento.sql) ----------
+
+model DocumentoMedicamento {
+  id                BigInt    @id @default(autoincrement())
+  sha256            String    @unique
+  tipo              String    // RCM | FI | MMR | DESCONHECIDO
+  estado            String    // IDENTIFICADO | POR_REVER | ERRO
+  motivo            String?
+  ficheiro_original String
+  ficheiro_final    String?
+  armazenamento     String?
+  paginas           Int?
+  nome_documento    String?
+  composicao        String?
+  data_revisao      DateTime? @db.Date
+  data_aprovacao    DateTime? @db.Date
+  nome_chave        String?
+  cnps_seccao8      String[]  @default([])
+  seccoes_em_falta  String[]  @default([])
+  revisto_por       String?
+  revisto_em        DateTime? @db.Timestamptz(6)
+  processado_em     DateTime  @default(now()) @db.Timestamptz(6)
+
+  cnps     DocumentoCnp[]
+  seccoes  DocumentoSeccao[]
+
+  @@index([estado, tipo])
+}
+
+model DocumentoCnp {
+  documento_id BigInt
+  cnp_codigo   String
+  documento    DocumentoMedicamento @relation(fields: [documento_id], references: [id], onDelete: Cascade)
+
+  @@id([documento_id, cnp_codigo])
+  @@index([cnp_codigo])
+}
+
+model DocumentoSeccao {
+  documento_id BigInt
+  numero       String
+  titulo       String
+  texto        String
+  texto_hash   String
+  documento    DocumentoMedicamento @relation(fields: [documento_id], references: [id], onDelete: Cascade)
+
+  @@id([documento_id, numero])
+  @@index([numero, texto_hash])
+}

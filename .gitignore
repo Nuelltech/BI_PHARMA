@@ -22,6 +22,7 @@ Avenida/
 output/
 *.pdf
 *.csv
+!test/fixtures/**
 
 # Logs e Sistema
 *.log
