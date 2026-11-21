@@ -35,6 +35,10 @@ function isPortOpen(port: number, host = '127.0.0.1'): Promise<boolean> {
  * Supabase (ex: faturas_processadas, resumos_lote, faturas_nuelltech) nunca são tocadas.
  */
 export async function ensureNonDestructiveSchema(prisma: PrismaClient): Promise<void> {
+  // Em arquitetura de produção, as alterações de schema são geridas via prisma migrate no CI/CD.
+  // Esta verificação manual em runtime só corre se expressamente forçada via AUTO_RUN_RAW_SCHEMA=true.
+  if (process.env.AUTO_RUN_RAW_SCHEMA !== 'true') return;
+
   const sqlPath = path.resolve(process.cwd(), 'supabase_bi_pharma_setup.sql');
   if (!fs.existsSync(sqlPath)) return;
 
@@ -120,15 +124,15 @@ export async function ensureDatabaseReady(): Promise<{
     const url6543 = dbUrl.replace(':5432/', ':6543/');
     const sep6543 = url6543.includes('?') ? '&' : '?';
     const clean6543 = url6543.includes('pgbouncer=')
-      ? url6543
-      : `${url6543}${sep6543}pgbouncer=true&connection_limit=3`;
+      ? (url6543.includes('connection_limit=') ? url6543 : `${url6543}${sep6543}connection_limit=15`)
+      : `${url6543}${sep6543}pgbouncer=true&connection_limit=15`;
     candidateUrls.push(clean6543);
 
     // 2. Porta 5432 (Modo Sessão com limite estrito de ligações)
     const sep5432 = dbUrl.includes('?') ? '&' : '?';
     const clean5432 = dbUrl.includes('connection_limit=')
       ? dbUrl
-      : `${dbUrl}${sep5432}connection_limit=2`;
+      : `${dbUrl}${sep5432}connection_limit=5`;
     candidateUrls.push(clean5432);
   } else {
     candidateUrls.push(dbUrl);

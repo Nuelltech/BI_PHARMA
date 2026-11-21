@@ -2,11 +2,15 @@ import { describe, it, expect } from 'vitest';
 import path from 'path';
 import fs from 'fs';
 import { verifyMobileStaffPin } from '../services/weekly_tasks';
+import { hashPinWithPepper } from '../services/security_phase0';
 import { generateMonthlyEmailDigest } from '../services/campaigns';
 import { clearCopilotSession } from '../services/copilot_engine';
 
 describe('Blindagem de Segurança - Testes de Regressão e Hardening', () => {
-  it('1. Deve rejeitar o PIN universal 1234 quando não é o PIN da farmácia', async () => {
+  it('1. Deve rejeitar o PIN universal 1234 e os dígitos do código da farmácia, aceitando apenas pinHash HMAC+pepper', async () => {
+    const memberId = 'mem-op-1';
+    const validPinHash = hashPinWithPepper('482917', memberId);
+
     const mockPrisma: any = {
       farmacia: {
         findFirst: async () => ({
@@ -15,16 +19,55 @@ describe('Blindagem de Segurança - Testes de Regressão e Hardening', () => {
           codigo_acesso: 'FARM-X-9876',
         }),
       },
+      limiteTaxa: {
+        findUnique: async () => null,
+        upsert: async () => ({}),
+        update: async () => ({}),
+        delete: async () => ({}),
+      },
+      membroEquipa: {
+        findMany: async () => [
+          {
+            id: memberId,
+            farmaciaId: 'farm-123',
+            nome: 'Operador Teste',
+            email: 'op@farmacia.pt',
+            role: 'AUXILIAR',
+            pin: null,
+            pinHash: validPinHash,
+            pinFalhas: 0,
+            pinBloqueadoAte: null,
+            pinTemporario: false,
+            ativo: true,
+            criadoEm: new Date(),
+          },
+        ],
+        update: async ({ data }: any) => ({
+          id: memberId,
+          farmaciaId: 'farm-123',
+          nome: 'Operador Teste',
+          email: 'op@farmacia.pt',
+          role: 'AUXILIAR',
+          pinHash: validPinHash,
+          ativo: true,
+          criadoEm: new Date(),
+          ...data,
+        }),
+      },
     };
 
     // Tentar autenticar com o antigo backdoor universal '1234'
-    const res = await verifyMobileStaffPin(mockPrisma, 'farm-123', '1234');
-    expect(res.valid).toBe(false);
-    expect(res.error).toContain('PIN incorreto');
+    const res1234 = await verifyMobileStaffPin(mockPrisma, 'farm-123', '1234');
+    expect(res1234.valid).toBe(false);
 
-    // Com os 4 dígitos corretos do código (9876), deve passar
-    const resCorreto = await verifyMobileStaffPin(mockPrisma, 'farm-123', '9876');
+    // Tentar autenticar com os 4 dígitos do codigo_acesso (9876) — agora BLOQUEADO na Fase 0
+    const resCodigo = await verifyMobileStaffPin(mockPrisma, 'farm-123', '9876');
+    expect(resCodigo.valid).toBe(false);
+
+    // Com o PIN real do membro (verificado via HMAC + pepper), deve passar
+    const resCorreto = await verifyMobileStaffPin(mockPrisma, 'farm-123', '482917');
     expect(resCorreto.valid).toBe(true);
+    expect(resCorreto.member?.nome).toBe('Operador Teste');
   });
 
   it('2. Anti-Path Traversal: Nomes de ficheiros devem ser limpos e confinados', () => {

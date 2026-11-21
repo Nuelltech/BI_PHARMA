@@ -1,4 +1,5 @@
 import { PrismaClient, Prisma } from '@prisma/client';
+import { logSecurityAudit } from './audit_service';
 import {
   parseWinpharVendasPdfFile,
   parseWinpharValidadesPdfFile,
@@ -385,15 +386,35 @@ export async function executeInteractiveImport(
         `${parsedVen.rows.length} produtos lidos no documento`
       );
 
-      // Decisão 1: NIF / Farmácia
-      let targetFarmaciaId = farmacia.id;
-      if (fileDecisions.nifAction === 'create_new' && parsedVen.farmaciaNif && parsedVen.farmaciaNif !== farmacia.nif) {
-        const newFarm = await prisma.farmacia.upsert({
+      // Decisão 1: NIF / Farmácia (Validação de fronteira estrita de Tenant)
+      const targetFarmaciaId = farmacia.id;
+      if (parsedVen.farmaciaNif && parsedVen.farmaciaNif !== farmacia.nif) {
+        // 1. Bloquear se o NIF pertencer a qualquer outra farmácia existente (sem vazar qual)
+        const outroTenant = await prisma.farmacia.findUnique({
           where: { nif: parsedVen.farmaciaNif },
-          update: { nome: parsedVen.farmaciaNome || `Farmácia ${parsedVen.farmaciaNif}` },
-          create: { nome: parsedVen.farmaciaNome || `Farmácia ${parsedVen.farmaciaNif}`, nif: parsedVen.farmaciaNif },
         });
-        targetFarmaciaId = newFarm.id;
+        if (outroTenant && outroTenant.id !== farmacia.id) {
+          throw new Error('O ficheiro contém um NIF que não corresponde à sua farmácia e não pode ser importado.');
+        }
+
+        // 2. "create_new" contornaria o provisionamento exclusivo do Superadmin
+        if (fileDecisions.nifAction === 'create_new') {
+          throw new Error('A criação de novas farmácias no sistema é reservada à superadministração.');
+        }
+
+        // 3. "link_to_current" exige confirmação explícita do proprietário e regista evento de auditoria
+        if (fileDecisions.nifAction === 'link_to_current') {
+          await logSecurityAudit(prisma, {
+            evento: 'IMPORT_COMPLETED',
+            farmaciaId: farmacia.id,
+            detalhes: {
+              stage: 'import_nif_divergence',
+              nifFicheiro: parsedVen.farmaciaNif,
+              nifFarmacia: farmacia.nif,
+              action: 'link_to_current_confirmed',
+            },
+          });
+        }
       }
 
       // Decisão 2: Conflito de Período Existente

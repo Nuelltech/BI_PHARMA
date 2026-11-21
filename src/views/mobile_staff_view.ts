@@ -881,7 +881,7 @@ export function getMobileStaffHtml(): string {
         <span class="badge-pill" id="tabCount2">0</span>
       </button>
       <button class="tab-btn tab-3" onclick="goToSection(2)">
-        <span>🟡 Sifarma</span>
+        <span>🟡 Encomendas</span>
         <span class="badge-pill" id="tabCount3">0</span>
       </button>
       <button class="tab-btn tab-4" onclick="goToSection(3)">
@@ -985,7 +985,7 @@ export function getMobileStaffHtml(): string {
       </div>
 
       <!-- ====================================================================
-           SECÇÃO 3: TRAVAR NO SIFARMA (O QUE NÃO ENCOMENDAR)
+           SECÇÃO 3: TRAVAR ENCOMENDAS (O QUE NÃO ENCOMENDAR)
            ==================================================================== -->
       <div class="section-page" id="page2">
         <div class="search-filter-bar">
@@ -1002,7 +1002,7 @@ export function getMobileStaffHtml(): string {
         <div class="task-list" id="list2">
           <div class="empty-state">
             <div class="empty-icon">⏳</div>
-            <p>A carregar artigos para travar no Sifarma...</p>
+            <p>A carregar artigos para travar no sistema de gestão...</p>
           </div>
         </div>
         <div class="swipe-hint">👈 Deslize para a direita ou esquerda 👉</div>
@@ -1051,7 +1051,8 @@ export function getMobileStaffHtml(): string {
     let allFarmacias = [];
     let statusFilters = ['all', 'all', 'all', 'all'];
     let balcaoSubtab = 'restos'; // 'restos' | 'winter' | 'all'
-    let syncInterval = null; if (taskEventSource) { try { taskEventSource.close(); } catch(e) {} taskEventSource = null; }
+    let syncInterval = null;
+    let taskEventSource = null;
 
     // Gestos de Touch / Swipe
     let touchStartX = 0;
@@ -1360,7 +1361,7 @@ export function getMobileStaffHtml(): string {
     // ========================================================================
     // SINCRONIZAÇÃO EM TEMPO REAL VIA SSE (SEM REDESENHAR O ECRÃ) + OFFLINE
     // ========================================================================
-    let taskEventSource = null;
+    // (taskEventSource já declarado no topo)
     const OFFLINE_QUEUE_KEY = 'bi_pharma_offline_tasks_queue';
 
     function getOfflineQueue() {
@@ -1807,7 +1808,7 @@ export function getMobileStaffHtml(): string {
       \`;
     }
 
-    // SECÇÃO 3: TRAVAR NO SIFARMA (O QUE NÃO ENCOMENDAR)
+    // SECÇÃO 3: TRAVAR ENCOMENDAS (O QUE NÃO ENCOMENDAR)
     function renderSection3(preserveScroll = false) {
       if (!rawReport) return;
       const container = document.getElementById('list2');
@@ -1834,7 +1835,7 @@ export function getMobileStaffHtml(): string {
         container.innerHTML = \`
           <div class="empty-state">
             <div class="empty-icon">✅</div>
-            <p>Nenhum artigo pendente para travar no Sifarma.</p>
+            <p>Nenhum artigo pendente para travar no sistema de gestão.</p>
           </div>
         \`;
         return;
@@ -1859,7 +1860,7 @@ export function getMobileStaffHtml(): string {
                 <span class="tag tag-cnp">CNP: \${escapeHtml(it.cnp_codigo)}</span>
               </div>
               <div class="task-instruction">
-                🛑 <b>Ação no Sifarma:</b> Alterar <b>Ponto de Encomenda / Stock Mínimo = 0</b> para travar novas compras.
+                🛑 <b>Ação no Sistema:</b> Alterar <b>Ponto de Encomenda / Stock Mínimo = 0</b> para travar novas compras.
               </div>
               \${isDone ? \`
                 <div class="task-completion-stamp">
@@ -1926,7 +1927,7 @@ export function getMobileStaffHtml(): string {
                 <span class="tag tag-cnp">CNP: \${escapeHtml(it.cnp_codigo)}</span>
               </div>
               <div class="task-instruction">
-                🟢 <b>Ajustar no Sifarma:</b> Subir Ponto de Encomenda para <b>\${sugestaoEnc} un</b> ou gerar encomenda imediata ao fornecedor habitual.
+                🟢 <b>Ajustar no Sistema:</b> Subir Ponto de Encomenda para <b>\${sugestaoEnc} un</b> ou gerar encomenda imediata ao fornecedor habitual.
               </div>
               \${isDone ? \`
                 <div class="task-completion-stamp">
@@ -2081,7 +2082,9 @@ export function getMobileStaffHtml(): string {
 
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js').catch(() => {});
+        navigator.serviceWorker.getRegistrations().then((regs) => {
+          for (const r of regs) r.unregister();
+        }).catch(() => {});
       });
     }
 

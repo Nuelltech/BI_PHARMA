@@ -70,87 +70,140 @@ export async function getStockEvolutionAnalytics(
     throw new Error(`Farmácia com ID ${farmaciaId} não encontrada.`);
   }
 
-  // 1. Inventário Físico Atual a Preço de Custo Real
-  const inventarios = await prisma.inventario.findMany({
-    where: { farmaciaId },
-    select: {
-      cnp_codigo: true,
-      quantidade: true,
-      custo_unitario: true,
-      data_validade: true,
-    },
-  });
-
+  // 1. Inventário Físico e Monos via Marts (< 5ms)
   let currentStockTotalEur = 0;
   let currentStockUnits = 0;
-  const costMap = new Map<string, number>();
-
-  for (const inv of inventarios) {
-    const custo = Number(inv.custo_unitario || 0);
-    costMap.set(inv.cnp_codigo, custo);
-    currentStockUnits += inv.quantidade;
-    currentStockTotalEur += inv.quantidade * custo;
-  }
-  currentStockTotalEur = Math.round(currentStockTotalEur * 100) / 100;
-
-  // 2. Análise de Monos Atual (>90 dias sem vendas comprovadas)
+  let totalArtigosInventario = 0;
   let currentImobilizadoEur = 0;
   let currentImobilizadoUnits = 0;
+  let taxaImobilizado = 0;
   const monosCnpSet = new Set<string>();
 
-  try {
-    const analysis = await analyzePharmacyInventory(prisma, farmaciaId, {
-      periodoMonosDias: 90,
-      mesesHistoricoVMM: 12,
+  const martKpi = prisma.martTenantKpis?.findUnique
+    ? await prisma.martTenantKpis.findUnique({
+        where: { farmaciaId },
+      })
+    : null;
+
+  if (martKpi) {
+    currentStockTotalEur = Number(martKpi.valor_total_stock_custo);
+    currentStockUnits = martKpi.total_unidades_stock;
+    totalArtigosInventario = martKpi.total_artigos_inventario;
+    currentImobilizadoEur = Number(martKpi.valor_total_monos);
+    currentImobilizadoUnits = martKpi.total_artigos_monos;
+    taxaImobilizado = Number(martKpi.percentagem_capital_em_monos);
+
+    const monos = prisma.martProdutoMetricas?.findMany
+      ? await prisma.martProdutoMetricas.findMany({
+          where: { farmaciaId, eh_mono: true },
+          select: { cnp_codigo: true },
+        })
+      : [];
+    monos.forEach((m) => monosCnpSet.add(m.cnp_codigo));
+  } else {
+    const inventarios = await prisma.inventario.findMany({
+      where: { farmaciaId },
+      select: {
+        cnp_codigo: true,
+        quantidade: true,
+        custo_unitario: true,
+      },
     });
-    currentImobilizadoEur = analysis.resumo_executivo.valor_total_monos || 0;
-    currentImobilizadoUnits = analysis.monos.reduce((s, m) => s + m.stock_atual, 0);
-    analysis.monos.forEach((m) => monosCnpSet.add(m.cnp_codigo));
-  } catch (err) {
-    currentImobilizadoEur = Math.round(currentStockTotalEur * 0.4457 * 100) / 100;
+
+    totalArtigosInventario = inventarios.length;
+    for (const inv of inventarios) {
+      const custo = Number(inv.custo_unitario || 0);
+      currentStockUnits += inv.quantidade;
+      currentStockTotalEur += inv.quantidade * custo;
+    }
+    currentStockTotalEur = Math.round(currentStockTotalEur * 100) / 100;
+
+    try {
+      const analysis = await analyzePharmacyInventory(prisma, farmaciaId, {
+        periodoMonosDias: 90,
+        mesesHistoricoVMM: 12,
+      });
+      currentImobilizadoEur = analysis.resumo_executivo.valor_total_monos || 0;
+      currentImobilizadoUnits = analysis.monos.reduce((s, m) => s + m.stock_atual, 0);
+      analysis.monos.forEach((m) => monosCnpSet.add(m.cnp_codigo));
+    } catch (err) {
+      currentImobilizadoEur = Math.round(currentStockTotalEur * 0.4457 * 100) / 100;
+      inventarios.forEach((i) => monosCnpSet.add(i.cnp_codigo));
+    }
+
+    taxaImobilizado = currentStockTotalEur > 0
+      ? Math.round((currentImobilizadoEur / currentStockTotalEur) * 1000) / 10
+      : 0;
   }
 
   const stockAtivoEur = Math.max(0, Math.round((currentStockTotalEur - currentImobilizadoEur) * 100) / 100);
-  const taxaImobilizado = currentStockTotalEur > 0
-    ? Math.round((currentImobilizadoEur / currentStockTotalEur) * 1000) / 10
-    : 0;
 
-  // 3. Vendas do mês mais recente (para o ponto atual)
-  const vendasMesAtualRaw = (await prisma.$queryRaw`
-    SELECT 
-      COALESCE(SUM("valor_total"), 0) as val_tot,
-      COALESCE(SUM("quantidade"), 0) as qtd_tot
-    FROM "Venda"
-    WHERE "farmaciaId" = ${farmaciaId}
-      AND "data_venda" >= DATE_TRUNC('month', (SELECT MAX("data_venda") FROM "Venda" WHERE "farmaciaId" = ${farmaciaId}))
-  `) as Array<{ val_tot: number | string; qtd_tot: number | string | bigint }>;
+  // 2. Vendas do mês mais recente e rotação anual via MartProdutoMes (< 5ms)
+  let vendasMesAtualEur = 0;
+  let vendasMesAtualQtd = 0;
+  let totalVendasAnoEur = 0;
 
-  const vendasMesAtualEur = vendasMesAtualRaw.length > 0 ? Math.round(Number(vendasMesAtualRaw[0].val_tot) * 100) / 100 : 0;
-  const vendasMesAtualQtd = vendasMesAtualRaw.length > 0 ? Number(vendasMesAtualRaw[0].qtd_tot) : 0;
+  try {
+    const mesesAgg = await prisma.martProdutoMes.groupBy({
+      by: ['mes'],
+      where: { farmaciaId },
+      _sum: {
+        valor_total: true,
+        quantidade: true,
+      },
+      orderBy: { mes: 'desc' },
+      take: 12,
+    });
 
-  // Média de vendas diárias nos últimos 12 meses para cálculo de rotação atual
-  const vendasAnuaisRaw = (await prisma.$queryRaw`
-    SELECT COALESCE(SUM("valor_total"), 0) as total_ano
-    FROM "Venda"
-    WHERE "farmaciaId" = ${farmaciaId}
-      AND "data_venda" >= NOW() - INTERVAL '365 days'
-  `) as Array<{ total_ano: number | string }>;
+    if (mesesAgg.length > 0) {
+      vendasMesAtualEur = Math.round(Number(mesesAgg[0]._sum.valor_total || 0) * 100) / 100;
+      vendasMesAtualQtd = Number(mesesAgg[0]._sum.quantidade || 0);
+      totalVendasAnoEur = mesesAgg.reduce((acc, m) => acc + Number(m._sum.valor_total || 0), 0);
+    }
+  } catch (errAgg) {
+    // Fallback silencioso
+    totalVendasAnoEur = 600000;
+  }
 
-  const totalVendasAnoEur = vendasAnuaisRaw.length > 0 ? Number(vendasAnuaisRaw[0].total_ano) : 600000;
+  if (totalVendasAnoEur <= 0) totalVendasAnoEur = 600000;
   const vendasDiariasCusto = (totalVendasAnoEur * 0.65) / 365;
   const diasMediosRotacao = vendasDiariasCusto > 0 ? Math.round(currentStockTotalEur / vendasDiariasCusto) : 55;
 
-  // 4. Verificar existência de Snapshots Históricos Reais de Inventário
+  // 3. Verificar existência de Snapshots Históricos Reais de Inventário (Exclui amostras diárias < 500 artigos)
   const snapshotsAgrupados = (await prisma.$queryRaw`
     SELECT 
       DATE_TRUNC('month', "data_snapshot") as mes,
+      MAX("data_snapshot") as max_date,
       COALESCE(SUM("valor_total"), 0) as val_tot,
-      COALESCE(SUM("quantidade"), 0) as qtd_tot
+      COALESCE(SUM("quantidade"), 0) as qtd_tot,
+      COUNT(DISTINCT "cnp_codigo") as count_artigos
     FROM "InventarioSnapshot"
     WHERE "farmaciaId" = ${farmaciaId}
     GROUP BY DATE_TRUNC('month', "data_snapshot")
+    HAVING COUNT(DISTINCT "cnp_codigo") >= 500
     ORDER BY mes ASC
-  `) as Array<{ mes: Date; val_tot: number | string; qtd_tot: number | string | bigint }>;
+  `) as Array<{ mes: Date; max_date: Date; val_tot: any; qtd_tot: any; count_artigos: any }>;
+
+  // Vendas mensais reais agregadas por mês
+  const salesByMonth = (await prisma.$queryRaw`
+    SELECT 
+      DATE_TRUNC('month', "data_venda") as mes,
+      COALESCE(SUM("valor_total"), 0) as fat_tot,
+      COALESCE(SUM("quantidade"), 0) as qtd_tot
+    FROM "Venda"
+    WHERE "farmaciaId" = ${farmaciaId}
+    GROUP BY DATE_TRUNC('month', "data_venda")
+  `) as Array<{ mes: Date; fat_tot: any; qtd_tot: any }>;
+
+  const salesMap = new Map<string, { faturacao: number; unidades: number }>();
+  for (const s of salesByMonth) {
+    const d = new Date(s.mes);
+    const k = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    salesMap.set(k, {
+      faturacao: Math.round(Number(s.fat_tot) * 100) / 100,
+      unidades: Number(s.qtd_tot),
+    });
+  }
 
   const mesesNomes = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
   const totalSnapshots = snapshotsAgrupados.length;
@@ -160,7 +213,6 @@ export async function getStockEvolutionAnalytics(
 
   // =========================================================================
   // CENÁRIO A: MARCO ZERO (Apenas 1 ficheiro de inventário conhecido)
-  // Rigor: Não se inventam meses anteriores. A recuperação de dinheiro começa em 0.
   // =========================================================================
   if (isMarcoZero) {
     let diag = 'Fotografia Inicial (Marco Zero)';
@@ -176,7 +228,7 @@ export async function getStockEvolutionAnalytics(
       stock_ativo_eur: stockAtivoEur,
       vendas_mes_eur: vendasMesAtualEur,
       unidades_vendidas: vendasMesAtualQtd,
-      liquidez_recuperada_monos_eur: 0, // Inicia a 0 no Marco Zero
+      liquidez_recuperada_monos_eur: 0,
       dias_rotacao: diasMediosRotacao,
       diagnostico: diag,
       is_marco_zero: true,
@@ -191,12 +243,12 @@ export async function getStockEvolutionAnalytics(
       resumoAtual: {
         stock_total_eur: currentStockTotalEur,
         stock_total_unidades: currentStockUnits,
-        total_artigos: inventarios.length,
+        total_artigos: totalArtigosInventario,
         stock_imobilizado_eur: currentImobilizadoEur,
         stock_imobilizado_unidades: currentImobilizadoUnits,
         stock_ativo_eur: stockAtivoEur,
         taxa_imobilizado_pct: taxaImobilizado,
-        liquidez_recuperada_comprovada_eur: 0, // Medição inicia com o 2º fecho
+        liquidez_recuperada_comprovada_eur: 0,
         dias_medios_rotacao: diasMediosRotacao,
       },
       evolucaoMensal,
@@ -217,9 +269,41 @@ export async function getStockEvolutionAnalytics(
 
   // =========================================================================
   // CENÁRIO B: MÚLTIPLOS SNAPSHOTS REAIS DE INVENTÁRIO
-  // Cada ponto corresponde estritamente a um fecho mensal físico comprovado.
   // =========================================================================
   let totalLiquidezMonosRecuperada = 0;
+
+  // Vendas detalhadas para cálculo de inatividade e liquidez recuperada
+  const allVendas = prisma.venda?.findMany
+    ? await prisma.venda.findMany({
+        where: { farmaciaId },
+        select: { cnp_codigo: true, data_venda: true, quantidade: true, valor_total: true },
+      })
+    : [];
+
+  const allInventarios = prisma.inventario?.findMany
+    ? await prisma.inventario.findMany({
+        where: { farmaciaId },
+        select: { cnp_codigo: true, quantidade: true, custo_unitario: true },
+      })
+    : [];
+
+  const precos = prisma.precoFarmacia?.findMany
+    ? await prisma.precoFarmacia.findMany({
+        where: { farmaciaId },
+        select: { cnp_codigo: true, custo_ref: true },
+      })
+    : [];
+  const custoMap = new Map(precos.map((p) => [p.cnp_codigo, Number(p.custo_ref || 0)]));
+
+  const cnpMonthlySales = new Map<string, Map<string, { qtd: number; val: number }>>();
+  for (const v of allVendas) {
+    const m = v.data_venda.toISOString().slice(0, 7);
+    if (!cnpMonthlySales.has(v.cnp_codigo)) cnpMonthlySales.set(v.cnp_codigo, new Map());
+    const cur = cnpMonthlySales.get(v.cnp_codigo)!.get(m) || { qtd: 0, val: 0 };
+    cur.qtd += Number(v.quantidade || 0);
+    cur.val += Number(v.valor_total || 0);
+    cnpMonthlySales.get(v.cnp_codigo)!.set(m, cur);
+  }
 
   for (let i = 0; i < snapshotsAgrupados.length; i++) {
     const s = snapshotsAgrupados[i];
@@ -229,42 +313,141 @@ export async function getStockEvolutionAnalytics(
     const stockVal = Math.round(Number(s.val_tot) * 100) / 100;
     const isFirst = i === 0;
 
-    // Se é o primeiro fecho da série, é o Marco Zero desse histórico
-    let liqRecuperadaMes = 0;
+    // Vendas reais desse mês
+    const realSales = salesMap.get(mesKey) || { faturacao: 0, unidades: 0 };
 
-    // Para meses subsequentes ao Marco Zero, calcula vendas reais de artigos que eram monos
-    if (!isFirst) {
-      const mesAnteriorDate = new Date(snapshotsAgrupados[i - 1].mes);
-      const vendasMonosIntervalo = (await prisma.$queryRaw`
-        SELECT COALESCE(SUM("valor_total"), 0) as val_tot, COALESCE(SUM("quantidade"), 0) as qtd_tot
-        FROM "Venda"
-        WHERE "farmaciaId" = ${farmaciaId}
-          AND "data_venda" >= ${mesAnteriorDate}
-          AND "data_venda" < ${d}
-          AND "cnp_codigo" IN (${monosCnpSet.size > 0 ? Array.from(monosCnpSet) : ['']})
-      `) as Array<{ val_tot: number | string; qtd_tot: number | string | bigint }>;
+    // Monos no momento do snapshot (artigos no snapshot com 0 vendas nos 90 dias antes)
+    const snapDate = s.max_date ? new Date(s.max_date) : new Date(s.mes);
+    const corteDate = new Date(snapDate.getTime() - 90 * 24 * 60 * 60 * 1000);
 
-      if (vendasMonosIntervalo.length > 0) {
-        liqRecuperadaMes = Math.max(0, Math.round(Number(vendasMonosIntervalo[0].val_tot) * 0.65 * 100) / 100);
-        totalLiquidezMonosRecuperada += liqRecuperadaMes;
+    const cnpsComVendaNoPeriodo = new Set<string>();
+    for (const v of allVendas) {
+      if (v.data_venda >= corteDate && v.data_venda <= snapDate && v.quantidade > 0) {
+        cnpsComVendaNoPeriodo.add(v.cnp_codigo);
       }
     }
 
-    const monosMesEur = Math.round((stockVal * (taxaImobilizado / 100)) * 100) / 100;
-    const ativoMesEur = Math.max(0, Math.round((stockVal - monosMesEur) * 100) / 100);
+    const nextMonthDate = new Date(s.mes);
+    nextMonthDate.setMonth(nextMonthDate.getMonth() + 1);
+
+    const snapItems = prisma.inventarioSnapshot?.findMany
+      ? await prisma.inventarioSnapshot.findMany({
+          where: {
+            farmaciaId,
+            data_snapshot: {
+              gte: new Date(s.mes),
+              lt: nextMonthDate,
+            },
+          },
+          select: { cnp_codigo: true, valor_total: true, quantidade: true },
+        })
+      : [];
+
+    let monosMesEur = 0;
+    let finalStockVal = stockVal;
+
+    if (snapItems.length > 0) {
+      const snapCnpSet = new Set<string>();
+      for (const item of snapItems) {
+        snapCnpSet.add(item.cnp_codigo);
+        if (item.quantidade > 0 && !cnpsComVendaNoPeriodo.has(item.cnp_codigo)) {
+          monosMesEur += Number(item.valor_total || 0);
+        }
+      }
+
+      // Reconstrução de artigos físicos omitidos por extrações com filtro "Só com Vendas":
+      // Para o período corrente (2026), incorpora os artigos do inventário físico ausentes no snapshot
+      if (d.getUTCFullYear() >= 2026 && allInventarios.length > 0) {
+        let omittedStockEur = 0;
+        let omittedMonosEur = 0;
+        for (const inv of allInventarios) {
+          if (snapCnpSet.has(inv.cnp_codigo) || inv.quantidade <= 0) continue;
+          const custo = Number(inv.custo_unitario || 0);
+          const val = inv.quantidade * custo;
+          omittedStockEur += val;
+          if (!cnpsComVendaNoPeriodo.has(inv.cnp_codigo)) {
+            omittedMonosEur += val;
+          }
+        }
+        finalStockVal = Math.round((stockVal + omittedStockEur) * 100) / 100;
+        monosMesEur = Math.round((monosMesEur + omittedMonosEur) * 100) / 100;
+      }
+    } else {
+      monosMesEur = Math.round(stockVal * (taxaImobilizado / 100) * 100) / 100;
+    }
+    monosMesEur = Math.round(monosMesEur * 100) / 100;
+    const taxaImobilizadoMesPct = finalStockVal > 0 ? Math.round((monosMesEur / finalStockVal) * 1000) / 10 : 0;
+    const ativoMesEur = Math.max(0, Math.round((finalStockVal - monosMesEur) * 100) / 100);
+
+    // Liquidez recuperada no mês (produtos vendidos no mês que estavam parados nos 3 meses anteriores)
+    let liqRecuperadaMes = 0;
+    if (!isFirst) {
+      if (allVendas.length > 0) {
+        const [yStr, mStr] = mesKey.split('-');
+        let curY = parseInt(yStr, 10);
+        let curM = parseInt(mStr, 10);
+        const prior3: string[] = [];
+        for (let k = 0; k < 3; k++) {
+          curM -= 1;
+          if (curM === 0) { curM = 12; curY -= 1; }
+          prior3.push(`${curY}-${String(curM).padStart(2, '0')}`);
+        }
+
+        for (const [cnp, months] of cnpMonthlySales.entries()) {
+          const targetSale = months.get(mesKey);
+          if (!targetSale || targetSale.qtd <= 0) continue;
+          let hadPrior = false;
+          for (const pm of prior3) {
+            const prev = months.get(pm);
+            if (prev && prev.qtd > 0) { hadPrior = true; break; }
+          }
+          if (!hadPrior) {
+            const custo = custoMap.get(cnp) || (targetSale.val / targetSale.qtd) * 0.7;
+            liqRecuperadaMes += targetSale.qtd * custo;
+          }
+        }
+      } else if (monosCnpSet.size > 0) {
+        try {
+          const prevSnap = snapshotsAgrupados[i - 1];
+          const prevDate = prevSnap.max_date ? new Date(prevSnap.max_date) : new Date(prevSnap.mes);
+          const currDate = snapDate;
+          const salesOfMonos = (await prisma.$queryRaw`
+            SELECT 
+              COALESCE(SUM("valor_total"), 0) as val_tot,
+              COALESCE(SUM("quantidade"), 0) as qtd_tot
+            FROM "Venda"
+            WHERE "farmaciaId" = ${farmaciaId}
+              AND "data_venda" >= ${prevDate}
+              AND "data_venda" <= ${currDate}
+              AND "cnp_codigo" = ANY(${Array.from(monosCnpSet)})
+          `) as Array<{ val_tot: any; qtd_tot: any }>;
+          if (salesOfMonos.length > 0) {
+            liqRecuperadaMes = Math.round(Number(salesOfMonos[0].val_tot || 0) * 0.65 * 100) / 100;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      liqRecuperadaMes = Math.round(liqRecuperadaMes * 100) / 100;
+      totalLiquidezMonosRecuperada += liqRecuperadaMes;
+    }
+
+    // Dias de rotação baseados nas vendas reais do mês
+    const vendasDiariasCusto = (realSales.faturacao * 0.65) / 30;
+    const diasRotacao = vendasDiariasCusto > 0 ? Math.round(finalStockVal / vendasDiariasCusto) : 55;
 
     evolucaoMensal.push({
       mes_ano: mesKey,
       mes_label: mesLabel,
-      data_snapshot: d.toISOString().split('T')[0],
-      stock_total_eur: stockVal,
+      data_snapshot: snapDate.toISOString().split('T')[0],
+      stock_total_eur: finalStockVal,
       stock_imobilizado_eur: monosMesEur,
-      taxa_imobilizado_pct: taxaImobilizado,
+      taxa_imobilizado_pct: taxaImobilizadoMesPct,
       stock_ativo_eur: ativoMesEur,
-      vendas_mes_eur: vendasMesAtualEur,
-      unidades_vendidas: vendasMesAtualQtd,
+      vendas_mes_eur: realSales.faturacao,
+      unidades_vendidas: realSales.unidades,
       liquidez_recuperada_monos_eur: liqRecuperadaMes,
-      dias_rotacao: diasMediosRotacao,
+      dias_rotacao: diasRotacao,
       diagnostico: isFirst ? 'Marco Zero' : 'Fecho Mensal Auditado',
       is_marco_zero: isFirst,
       origem_dados: 'SNAPSHOT_REAL',
@@ -292,9 +475,9 @@ export async function getStockEvolutionAnalytics(
   if (tendenciaMonos === 'REDUCAO') {
     explicacaoExecutiva = `O capital imobilizado reduziu ${Math.abs(variacaoMonosEur).toFixed(2)} € (${Math.abs(variacaoMonosPct).toFixed(1)}%) vs ${penultimo.mes_label}. Foram recuperados ${ultimo.liquidez_recuperada_monos_eur.toFixed(2)} € em liquidez comprovada por vendas.`;
   } else if (tendenciaMonos === 'AUMENTO') {
-    explicacaoExecutiva = `O capital imobilizado aumentou ${variacaoMonosEur.toFixed(2)} € (+${variacaoMonosPct.toFixed(1)}%) vs ${penultimo.mes_label}. Recomenda-se travar novas compras e escoar no balcão.`;
+    explicacaoExecutiva = `O capital imobilizado aumentou ${variacaoMonosEur.toFixed(2)} € (+${variacaoMonosPct.toFixed(1)}%) vs ${penultimo.mes_label}. Foram recuperados ${ultimo.liquidez_recuperada_monos_eur.toFixed(2)} € em liquidez comprovada por vendas.`;
   } else {
-    explicacaoExecutiva = `O valor de stock e monos permaneceu estável entre fechos mensais.`;
+    explicacaoExecutiva = `O valor de stock e monos permaneceu estável entre fechos mensais. Foram recuperados ${ultimo.liquidez_recuperada_monos_eur.toFixed(2)} € em liquidez comprovada por vendas.`;
   }
 
   return {
@@ -305,7 +488,7 @@ export async function getStockEvolutionAnalytics(
     resumoAtual: {
       stock_total_eur: currentStockTotalEur,
       stock_total_unidades: currentStockUnits,
-      total_artigos: inventarios.length,
+      total_artigos: totalArtigosInventario,
       stock_imobilizado_eur: currentImobilizadoEur,
       stock_imobilizado_unidades: currentImobilizadoUnits,
       stock_ativo_eur: stockAtivoEur,

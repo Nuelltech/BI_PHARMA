@@ -1,12 +1,5 @@
 import { PrismaClient, Prisma } from '@prisma/client';
-import crypto from 'crypto';
-
-function safeCompareStrings(a: string, b: string): boolean {
-  if (!a || !b) return false;
-  const hashA = crypto.createHash('sha256').update(a).digest();
-  const hashB = crypto.createHash('sha256').update(b).digest();
-  return crypto.timingSafeEqual(hashA, hashB);
-}
+import { verifyMemberPin } from './rbac_settings';
 
 export interface WeeklyTaskItem {
   id?: string;
@@ -156,70 +149,65 @@ export async function resetWeeklyTasksInDb(
 }
 
 /**
- * Validação do PIN da farmácia para ambiente mobile
+ * Validação segura do PIN da equipa de balcão (Fase 0):
+ * - Usa exclusivamente pinHash (HMAC-SHA256 com pepper + salt por vínculo) em MembroEquipa
+ * - Nunca aceita PINs em texto claro, STAFF_MOBILE_PIN nem dígitos de codigo_acesso
+ * - Aplica bloqueio progressivo após 5 tentativas falhadas em 15 minutos
  */
 export async function verifyMobileStaffPin(
   prisma: PrismaClient,
   farmaciaIdOrCode: string,
-  pin: string
+  pin: string,
+  memberId?: string
 ) {
   const cleanPin = (pin || '').trim();
   if (!cleanPin) {
     return { valid: false, error: 'PIN não introduzido.' };
   }
 
-  // 1. Procurar a farmácia por ID ou por Código de Acesso
+  const targetFarm = (farmaciaIdOrCode || '').trim();
+  if (!targetFarm) {
+    return { valid: false, error: 'Farmácia não identificada.' };
+  }
+
   const farm = await prisma.farmacia.findFirst({
     where: {
       OR: [
-        { id: farmaciaIdOrCode },
-        { codigo_acesso: { equals: farmaciaIdOrCode, mode: 'insensitive' } },
+        { id: targetFarm },
+        { codigo_acesso: { equals: targetFarm, mode: 'insensitive' } },
       ],
     },
   });
 
   if (!farm) {
-    // Se não forneceu farmácia específica, tentar a primeira
-    const firstFarm = await prisma.farmacia.findFirst({ orderBy: { criadoEm: 'asc' } });
-    if (!firstFarm) {
-      return { valid: false, error: 'Nenhuma farmácia configurada no sistema.' };
-    }
-    return checkPinMatch(firstFarm, cleanPin);
+    return { valid: false, error: 'Farmácia não encontrada.' };
   }
 
-  return checkPinMatch(farm, cleanPin);
-}
-
-function checkPinMatch(farm: any, cleanPin: string) {
-  const farmCode = (farm.codigo_acesso || '').toUpperCase();
-  // Extrair números do código da farmácia (ex: FARM-A-7842 -> 7842)
-  const codeNumbers = farmCode.replace(/[^0-9]/g, '');
-  const last4 = codeNumbers.length >= 4 ? codeNumbers.slice(-4) : '';
-  const configuredStaffPin = (process.env.STAFF_MOBILE_PIN || '').trim();
-
-  // Regras de validação do PIN de segurança da equipa:
-  // 1. PIN configurado em STAFF_MOBILE_PIN (se existir)
-  // 2. Os últimos 4 dígitos do código da farmácia (se existirem e tiverem pelo menos 4 dígitos)
-  // 3. O próprio código de acesso completo da farmácia (ex: FARM-A-7842)
-  const isMatch =
-    (configuredStaffPin.length > 0 && safeCompareStrings(cleanPin, configuredStaffPin)) ||
-    (last4.length >= 4 && safeCompareStrings(cleanPin, last4)) ||
-    (farmCode.length > 0 && safeCompareStrings(cleanPin.toUpperCase(), farmCode));
-
-  if (isMatch) {
+  const result = await verifyMemberPin(prisma, farm.id, cleanPin, memberId);
+  if (!result.valid) {
     return {
-      valid: true,
-      farmacia: {
-        id: farm.id,
-        nome: farm.nome,
-        codigo_acesso: farm.codigo_acesso,
-      },
+      valid: false,
+      error: result.error || 'PIN incorreto.',
+      lockedUntil: result.lockedUntil,
     };
   }
 
   return {
-    valid: false,
-    error: 'PIN incorreto. Utilize o PIN atribuído à farmácia ou os 4 dígitos do seu código de acesso.',
+    valid: true,
+    requiresPinChange: Boolean(result.requiresPinChange),
+    farmacia: {
+      id: farm.id,
+      nome: farm.nome,
+      codigo_acesso: farm.codigo_acesso,
+    },
+    member: result.member
+      ? {
+          id: result.member.id,
+          nome: result.member.nome,
+          role: result.member.role,
+          pinTemporario: result.member.pinTemporario,
+        }
+      : undefined,
   };
 }
 

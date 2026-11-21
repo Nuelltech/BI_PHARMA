@@ -60,6 +60,10 @@ export function checkToolPermission(perfil: string, toolName: string): { allowed
   return { allowed: true };
 }
 
+export function hashMcpToken(token: string): string {
+  return crypto.createHash('sha256').update(token.trim()).digest('hex');
+}
+
 export async function resolveMcpAuthentication(
   prisma: PrismaClient,
   rawToken: string,
@@ -70,13 +74,30 @@ export async function resolveMcpAuthentication(
     return { allowed: false, reason: 'INVALID_TOKEN', perfilPermissao: 'BALCAO_CLINICO' };
   }
 
-  // 1. Verificar se é um token de conector específico (McpConnector)
-  const connector = await prisma.mcpConnector.findUnique({
-    where: { token },
+  const hashedToken = hashMcpToken(token);
+
+  // 1. Verificar se é um token de conector específico (McpConnector) por Hash SHA-256 ou Token Legado
+  const connector = await prisma.mcpConnector.findFirst({
+    where: {
+      OR: [
+        { token: hashedToken },
+        { token: token },
+      ],
+    },
     include: { farmacia: true },
   });
 
   if (connector) {
+    // Se o token na BD ainda estava em texto limpo, faz upgrade automático e transparente para hash SHA-256
+    if (connector.token === token) {
+      prisma.mcpConnector
+        .update({
+          where: { id: connector.id },
+          data: { token: hashedToken },
+        })
+        .catch(() => {});
+    }
+
     if (!connector.farmacia.mcpPermitido) {
       return {
         allowed: false,
@@ -219,20 +240,26 @@ export async function createMcpConnector(
     criadoPor?: string;
   }
 ) {
-  const tokenSuffix = crypto.randomBytes(8).toString('hex');
-  const token = `mcp_live_${tokenSuffix}`;
+  const tokenSuffix = crypto.randomBytes(16).toString('hex');
+  const plainToken = `mcp_live_${tokenSuffix}`;
+  const hashedToken = hashMcpToken(plainToken);
 
-  return await prisma.mcpConnector.create({
+  const created = await prisma.mcpConnector.create({
     data: {
       farmaciaId,
       nome: params.nome.trim(),
-      token,
+      token: hashedToken,
       agenteTipo: params.agenteTipo || 'CLAUDE_WEB',
       perfilPermissao: params.perfilPermissao || 'COMPLETO',
       criadoPor: params.criadoPor || 'DIRETOR',
       ativo: true,
     },
   });
+
+  return {
+    ...created,
+    token: plainToken, // Devolve o token em texto limpo apenas uma vez para apresentação ao utilizador
+  };
 }
 
 export async function toggleMcpConnector(

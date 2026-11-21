@@ -7,8 +7,6 @@ import { PrismaClient } from '@prisma/client';
 import {
   ToolSecurityContext,
   toolCalcularStockMinimoECobertura,
-  toolFiltrarValidadeEMargem,
-  toolSugerirPacksPromocionais,
   toolIdentificarProdutosSemVenda,
   toolConsolidarGenericosDci,
   toolPlanearComprasSazonais,
@@ -22,11 +20,14 @@ import {
   toolAuditarAnomaliasMargemEPrecos,
   toolAnalisarEvolucaoMensalFinanceira,
   toolCompararPerformancePeriodos,
+  toolAuditarEscoamentoEDestraveStock,
   toolCalcularPerdasFinanceirasECustoOportunidade,
   toolConsultarVendasDiarias,
   toolConsultarCampanhasAtivasEHistorico,
   toolAtivarCampanhaFarmacia,
 } from './mcp_pharma_tools.js';
+import { sugerirPacksPromocionais } from './comercial.js';
+import { createPrismaComercialRepo, buildComercialCfg } from './comercial_repo.js';
 import { checkToolPermission } from './mcp_governance.js';
 
 export interface McpServerOptions {
@@ -86,6 +87,22 @@ export function createPharmaMcpServer(
               periodo_b: { type: 'string', description: 'Segundo período a comparar (ex: "2026-Q1", "2026-H1")' },
             },
             required: ['periodo_a', 'periodo_b'],
+          },
+        },
+        {
+          name: 'auditar_escoamento_e_destrave_stock',
+          description:
+            'Audita o escoamento, reativação de monos e destrave de capital num determinado mês (ex: produtos parados há 3 meses ou desde agosto que venderam).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              mes_venda: { type: 'string', description: 'Mês de venda no formato YYYY-MM (ex: "2026-10")' },
+              meses_parado_minimo: { type: 'number', description: 'Meses de inatividade anterior exigidos (padrão 3)' },
+              parado_desde: { type: 'string', description: 'Mês inicial de inatividade (ex: "2026-08")' },
+              apenas_eliminados_a_zero: { type: 'boolean', description: 'Se true, filtra apenas artigos com stock final = 0' },
+              excluir_sazonais: { type: 'boolean', description: 'Se true, exclui artigos sazonais' },
+            },
+            required: ['mes_venda'],
           },
         },
         {
@@ -325,6 +342,9 @@ export function createPharmaMcpServer(
         case 'comparar_performance_periodos':
           result = await toolCompararPerformancePeriodos(prisma, secContext, (args as any) || {});
           break;
+        case 'auditar_escoamento_e_destrave_stock':
+          result = await toolAuditarEscoamentoEDestraveStock(prisma, secContext, (args as any) || {});
+          break;
         case 'calcular_perdas_financeiras_e_custo_oportunidade':
           result = await toolCalcularPerdasFinanceirasECustoOportunidade(prisma, secContext, (args as any) || {});
           break;
@@ -356,11 +376,28 @@ export function createPharmaMcpServer(
           result = await toolCalcularStockMinimoECobertura(prisma, secContext, (args as any) || {});
           break;
         case 'filtrar_produtos_por_validade_e_margem':
-          result = await toolFiltrarValidadeEMargem(prisma, secContext, (args as any) || {});
+          result = await toolAuditarEscoamentoEDestraveStock(prisma, secContext, (args as any) || {});
           break;
-        case 'sugerir_packs_promocionais':
-          result = await toolSugerirPacksPromocionais(prisma, secContext, (args as any) || {});
+        case 'sugerir_packs_promocionais': {
+          const repo = createPrismaComercialRepo(prisma, secContext.farmaciaId, 'mcp', 1, args);
+          const modo = (args as any)?.modo === 'TEMAS' || (!(args as any)?.campanha_id && !(args as any)?.tema) ? 'TEMAS' : 'PACK';
+          result = await sugerirPacksPromocionais(
+            {
+              modo,
+              campanha_id: (args as any)?.campanha_id,
+              tema: (args as any)?.tema,
+              desconto_pct: (args as any)?.desconto_pct ?? (args as any)?.desconto_percentagem,
+              publico: (args as any)?.publico ?? null,
+              n_produtos_max: (args as any)?.n_produtos_max,
+              incluir_em_campanha: (args as any)?.incluir_em_campanha,
+              incluir_preco_fixo: (args as any)?.incluir_preco_fixo,
+              liquidacao: (args as any)?.liquidacao,
+              data_referencia: (args as any)?.data_referencia,
+            },
+            { repo, ref: new Date(), cfg: buildComercialCfg() }
+          );
           break;
+        }
         case 'identificar_produtos_sem_vendas_e_escoamento':
           result = await toolIdentificarProdutosSemVenda(prisma, secContext, (args as any) || {});
           break;

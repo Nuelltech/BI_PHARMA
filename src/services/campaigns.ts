@@ -1,5 +1,34 @@
 import { PrismaClient } from '@prisma/client';
 import { getPharmacyCatalog, searchCatalog, CatalogItem, normalizeText, termMatches, getSmartCrossSelling } from './product_catalog';
+import { loadEnrichedCatalogMap, CATEGORIA_LABELS, createPrismaComercialRepo, buildComercialCfg } from './comercial_repo';
+import { QUALIDADE_OK, sugerirPacksPromocionais, Ctx, computePackCompositionHash } from './comercial';
+
+async function getMarketingEligibleCatalog(
+  prisma: PrismaClient,
+  farmaciaId: string,
+  baseCatalog?: CatalogItem[]
+): Promise<CatalogItem[]> {
+  const [catalog, enrichedMap] = await Promise.all([
+    baseCatalog ? Promise.resolve(baseCatalog) : getPharmacyCatalog(prisma, farmaciaId),
+    loadEnrichedCatalogMap(prisma, farmaciaId),
+  ]);
+  return catalog
+    .filter((it) => {
+      const cand = enrichedMap.get(it.cnp);
+      if (!cand) return false;
+      if (cand.precisa_receita || !cand.permite_marketing || cand.uso_veterinario) return false;
+      if (!QUALIDADE_OK.has(cand.qualidade_classificacao)) return false;
+      return true;
+    })
+    .map((it) => {
+      const cand = enrichedMap.get(it.cnp)!;
+      return {
+        ...it,
+        tipoVenda: cand.permite_desconto_promo ? 'VENDA_LIVRE' : 'MNSRM',
+        categoria: CATEGORIA_LABELS[cand.categoria_id] || it.categoria,
+      };
+    });
+}
 
 export interface CampaignAxis {
   nome: string;
@@ -1095,7 +1124,7 @@ export async function getSeasonalCampaignSuggestions(
       );
 
 
-  const catalog = await getPharmacyCatalog(prisma, farmaciaId);
+  const catalog = await getMarketingEligibleCatalog(prisma, farmaciaId);
   const resultados: CampaignSuggestionResult[] = [];
 
   // 1. Campanhas Sazonais e Efemérides do Calendário Civil
@@ -1359,6 +1388,7 @@ export async function getMarketingAndCrossSellingIntelligence(
   crossSellingPlans: CrossSellProtocol[];
 }> {
   const catalog = await getPharmacyCatalog(prisma, farmaciaId);
+  const eligibleCatalog = await getMarketingEligibleCatalog(prisma, farmaciaId, catalog);
   const comStock = catalog.filter((i) => i.stock > 0);
 
   const overview: MarketingStockOverview = {
@@ -1492,8 +1522,8 @@ export async function getMarketingAndCrossSellingIntelligence(
         vmm: Number((l.vendasQtd / 12).toFixed(1)),
       }));
 
-    // 2. Encontrar produtos de Venda Livre / MNSRM em stock que precisam de escoamento (Validade, Mono, Resto de Gaveta ou Excesso)
-    const candidatosEscoar = searchCatalog(catalog, {
+    // 2. Encontrar produtos de Venda Livre / MNSRM em stock elegíveis pelo motor determinístico
+    const candidatosEscoar = searchCatalog(eligibleCatalog, {
       grupos_termos: [cfg.termosEscoar],
       excluir: cfg.excluirEscoar,
       apenas_com_stock: true,
@@ -2320,7 +2350,7 @@ export async function getSmartCampaignBaskets(
   prisma: PrismaClient,
   farmaciaId: string
 ): Promise<SmartCampaignBaskets> {
-  const catalog = await getPharmacyCatalog(prisma, farmaciaId);
+  const catalog = await getMarketingEligibleCatalog(prisma, farmaciaId);
   const comStock = catalog.filter((i) => i.stock > 0 && i.tipoVenda !== 'MSRM');
 
   // 1. Validades a Caducar (< 6 meses)
@@ -2684,228 +2714,243 @@ export interface ClinicalThemePack {
   margemPackPct: number;
   orientacaoBalcao: string;
   disposicaoFisica: string;
+  // Fase 4: Governação e Ciclo de Vida
+  estadoCiclo: 'PROPOSTO' | 'APROVADO_DT' | 'ATIVO' | 'ENCERRADO' | 'REJEITADO' | 'SUSPENSO_STOCK_BAIXO';
+  hashComposicao: string;
+  packsMontaveis: number;
+  validadoPor?: string | null;
+  validadoEm?: string | null;
+  campanhaAtivaId?: string | null;
 }
 
 export async function generateClinicalThemePacks(
   prisma: PrismaClient,
-  farmaciaId: string
+  farmaciaId: string,
+  refDate?: Date
 ): Promise<ClinicalThemePack[]> {
-  const catalog = await getPharmacyCatalog(prisma, farmaciaId);
-
-  const archetypes = [
-    {
-      id: 'pack_gripe_imunidade',
-      titulo: 'Pack Gripe, Tosse & Imunidade Total',
-      icone: '🧣',
-      sintomaOuQueixa: 'Febre, dores musculares no corpo, tosse e congestão nasal no inverno',
-      publicoAlvo: 'Adultos e famílias com sintomas gripais que procuram alívio rápido e reforço das defesas',
-      orientacaoBalcao: 'Ao aviar receitas de antibióticos ou analgésicos, perguntar pelos outros sintomas e sugerir a proteção conjunta da garganta e imunidade.',
-      disposicaoFisica: 'Cesto temático no balcão principal com o título «SOS Inverno: Alívio Sintomático + Imunidade».',
-      roles: [
-        {
-          nomePapel: 'Antigripal / Antipirético',
-          termos: ['ben-u-gripe', 'cegripe', 'antigrippine', 'aspirina c', 'paracetamol gripe', 'trioval', 'ilvico'],
-          proposito: 'Alívio rápido da febre, cefaleias e sensação de corpo dorido',
-          priorizarExcesso: true,
-        },
-        {
-          nomePapel: 'Garganta & Imunidade Celular',
-          termos: ['strepsils', 'propolis', 'mebocaina', 'cegripe c', 'vitamina c', 'pastilhas garganta', 'zinco'],
-          proposito: 'Desinfeção da orofaringe, proteção da mucosa e reforço das defesas celulares',
-          priorizarExcesso: false,
-        },
-      ],
-    },
-    {
-      id: 'pack_barreira_cutanea_frio',
-      titulo: 'Pack SOS Barreira Cutânea, Lábios & Frio',
-      icone: '❄️',
-      sintomaOuQueixa: 'Lábios gretados, cieiro, fissuras dolorosas nas mãos e pele ressequida pelo frio',
-      publicoAlvo: 'Utentes expostos ao vento/frio, trabalhadores exteriores ou com pele atópica e mãos secas',
-      orientacaoBalcao: 'Apresentar como complemento de conveniência no fecho de qualquer atendimento a utentes com mãos expostas ou cieiro.',
-      disposicaoFisica: 'Cesto de oportunidades junto ao terminal Multibanco para compra imediata por impulso.',
-      roles: [
-        {
-          nomePapel: 'Stick / Reparador Labial',
-          termos: ['letibalm', 'labello', 'cicalfate labios', 'balsamo labial', 'stick labial', 'batom cieiro'],
-          proposito: 'Cicatrização rápida de cieiro e criação de barreira protetora labial contra o vento',
-          priorizarExcesso: false,
-        },
-        {
-          nomePapel: 'Creme Reparador de Mãos & Emoliente',
-          termos: ['creme maos', 'dermaprotect', 'ureia', 'neutrogena maos', 'atoderm maos', 'cicalfate'],
-          proposito: 'Nutrição profunda e regeneração da pele gretada e áspera das mãos',
-          priorizarExcesso: true,
-        },
-      ],
-    },
-    {
-      id: 'pack_digestao_refluxo',
-      titulo: 'Pack Conforto Digestivo & Azia Pós-Refeições',
-      icone: '🍵',
-      sintomaOuQueixa: 'Azia, ardor de estômago, refluxo ácido e sensação de enfartamento abdominal',
-      publicoAlvo: 'Utentes com queixas dispépticas, refeições pesadas ou excessos de fim-de-semana',
-      orientacaoBalcao: 'Perguntar se o desconforto é azia imediata ou enfartamento pesado, oferecendo a solução combinada de alívio.',
-      disposicaoFisica: 'Expor na prateleira de venda livre na secção de bem-estar gástrico com sinalética de dupla ação.',
-      roles: [
-        {
-          nomePapel: 'Antiácido / Protetor da Mucosa',
-          termos: ['gaviscon', 'rennie', 'kompensan', 'pantoprazol', 'omeprazol'],
-          proposito: 'Ação imediata contra o ardor estomacal e neutralização do refluxo ácido',
-          priorizarExcesso: false,
-        },
-        {
-          nomePapel: 'Regulador Hepático & Digestivo',
-          termos: ['digest', 'cha digestivo', 'alcachofra', 'sollievo', 'cardo mariano', 'hepato'],
-          proposito: 'Estimulação da digestão leve e alívio do inchaço e peso abdominal',
-          priorizarExcesso: true,
-        },
-      ],
-    },
-    {
-      id: 'pack_sono_relaxamento',
-      titulo: 'Pack Noite Tranquila & Sono Reparador',
-      icone: '🌙',
-      sintomaOuQueixa: 'Dificuldade em adormecer, despertares noturnos frequentes e cansaço ao acordar',
-      publicoAlvo: 'Utentes com insónia inicial, stress de trabalho ou ritmos de sono alterados',
-      orientacaoBalcao: 'Explicar que a melatonina atua a induzir o sono e o magnésio/valeriana impedem o despertar a meio da noite.',
-      disposicaoFisica: 'Cesto temático na secção de suplementos e fitoterapia com foco em bem-estar noturno.',
-      roles: [
-        {
-          nomePapel: 'Indutor de Sono (Melatonina)',
-          termos: ['aquilea sono', 'melatonina', 'sono', 'dormir'],
-          proposito: 'Redução do tempo necessário para adormecer de forma suave e fisiológica',
-          priorizarExcesso: false,
-        },
-        {
-          nomePapel: 'Relaxante Muscular & Nervoso',
-          termos: ['valeriana', 'passiflora', 'magnesio', 'stress', 'ansiedade'],
-          proposito: 'Relaxamento das tensões musculares e diminuição dos despertares a meio da noite',
-          priorizarExcesso: true,
-        },
-      ],
-    },
-    {
-      id: 'pack_muscular_articular',
-      titulo: 'Pack Alívio Muscular & Articular (Dupla Ação)',
-      icone: '🦵',
-      sintomaOuQueixa: 'Rigidez matinal, dores articulares agravadas pelo frio e humidade e contraturas musculares',
-      publicoAlvo: 'Utentes com queixas osteoarticulares crónicas, idosos ou pessoas com tensão muscular',
-      orientacaoBalcao: 'Recomendar a aplicação local do gel para alívio imediato combinada com o suporte articular contínuo.',
-      disposicaoFisica: 'Dispor na secção de ortopedia e mobilidade com destaque para o pack de alívio duplo.',
-      roles: [
-        {
-          nomePapel: 'Gel / Creme Tópico de Ação Rápida',
-          termos: ['voltaren', 'biofreeze', 'arnica', 'gel dor', 'traumeel', 'flexagil'],
-          proposito: 'Efeito térmico e anti-inflamatório localizado para alívio rápido da dor',
-          priorizarExcesso: false,
-        },
-        {
-          nomePapel: 'Suporte Articular / Magnésio',
-          termos: ['cartilagem', 'colagenio', 'magnesio', 'articulacoes', 'glucosamina'],
-          proposito: 'Nutrição das cartilagens e relaxamento contínuo das fibras musculares',
-          priorizarExcesso: true,
-        },
-      ],
-    },
-  ];
-
   const packs: ClinicalThemePack[] = [];
+  const activePackIds = new Set<string>();
 
-  for (const arc of archetypes) {
-    const selectedItems: ClinicalThemePackItem[] = [];
-    const usedCnps = new Set<string>();
+  // 1. Carregar packs já assinados e ativos na farmácia (Persistidos na BD com carimbo do DT)
+  try {
+    const activeDb = await prisma.campanhaAtiva.findMany({
+      where: {
+        farmaciaId,
+        estado: 'ATIVA',
+        campanhaId: { startsWith: 'pack_' },
+      },
+      orderBy: { criadoEm: 'desc' },
+    });
 
-    for (const role of arc.roles) {
-      const matches = catalog.filter((item) => {
-        if (usedCnps.has(item.cnp)) return false;
-        const itemNorm = item.norm || normalizeText(item.designacao);
-        return role.termos.some((t) => {
-          const normT = normalizeText(t);
-          return itemNorm.includes(normT) || item.designacao.toLowerCase().includes(t.toLowerCase());
-        });
+    for (const c of activeDb) {
+      activePackIds.add(c.campanhaId);
+      const payload: any = c.produtosJson || {};
+      const prodsRaw: any[] = Array.isArray(payload) ? payload : (payload.produtos || []);
+
+      const cnps = prodsRaw.map((p: any) => String(p.cnp || p.cnp_codigo || '')).filter(Boolean);
+      const metrics = await prisma.martProdutoMetricas.findMany({
+        where: { farmaciaId, cnp_codigo: { in: cnps } },
+        select: { cnp_codigo: true, stock_total_unidades: true },
+      });
+      const stockMap = new Map(metrics.map((m) => [m.cnp_codigo, Number(m.stock_total_unidades || 0)]));
+
+      const produtos: ClinicalThemePackItem[] = prodsRaw.map((p: any) => {
+        const cnp = String(p.cnp || p.cnp_codigo || '');
+        const currentStock = stockMap.has(cnp) ? stockMap.get(cnp)! : Number(p.stockAtual || p.stock_atual || 0);
+        return {
+          cnp,
+          designacao: p.designacao,
+          propositoUtente: p.propositoUtente || p.proposito_utente || 'Cuidado complementar',
+          stockAtual: currentStock,
+          custoUnitario: Number(p.custoUnitario || p.custo_unitario || 0),
+          pvpUnitario: Number(p.pvpUnitario || p.pvp_atual || p.pvp || 0),
+          margemPct: Number((p.margemPct || p.margem_pct || 0).toFixed(1)),
+          tipoVenda: p.tipoVenda || 'VENDA_LIVRE',
+        };
       });
 
-      if (matches.length === 0) continue;
+      const currentMinStock = produtos.length > 0 ? Math.min(...produtos.map((p) => p.stockAtual)) : 0;
+      const estadoCiclo = currentMinStock < 3 ? 'SUSPENSO_STOCK_BAIXO' : 'ATIVO';
 
-      matches.sort((a, b) => {
-        const aHasStock = (a.stock || 0) > 0 ? 1 : 0;
-        const bHasStock = (b.stock || 0) > 0 ? 1 : 0;
-        if (aHasStock !== bHasStock) return bHasStock - aHasStock;
-
-        if (role.priorizarExcesso) {
-          return (b.stock || 0) - (a.stock || 0);
-        }
-        return (b.margem || 0) - (a.margem || 0);
-      });
-
-      const chosen = matches[0];
-      usedCnps.add(chosen.cnp);
-
-      selectedItems.push({
-        cnp: chosen.cnp,
-        designacao: chosen.designacao,
-        propositoUtente: role.proposito,
-        stockAtual: chosen.stock,
-        custoUnitario: chosen.custo,
-        pvpUnitario: chosen.pvp,
-        margemPct: Number(chosen.margem.toFixed(1)),
-        tipoVenda: chosen.tipoVenda,
-      });
-    }
-
-    if (selectedItems.length >= 2) {
-      const pvpTotalOriginal = Number(
-        selectedItems.reduce((acc, it) => acc + (it.pvpUnitario || 0), 0).toFixed(2)
-      );
-      const custoTotal = Number(
-        selectedItems.reduce((acc, it) => acc + (it.custoUnitario || 0), 0).toFixed(2)
-      );
-
-      let descontoPct = 12;
-      let pvpPackComDesconto = Number((pvpTotalOriginal * (1 - descontoPct / 100)).toFixed(2));
-      let margemPackPct =
-        pvpPackComDesconto > 0
-          ? Number((((pvpPackComDesconto - custoTotal) / pvpPackComDesconto) * 100).toFixed(1))
-          : 0;
-
-      if (margemPackPct < 5 && custoTotal > 0) {
-        const pvpMinimoSeguro = Number((custoTotal / 0.95).toFixed(2));
-        if (pvpMinimoSeguro < pvpTotalOriginal) {
-          pvpPackComDesconto = pvpMinimoSeguro;
-          descontoPct = Math.max(
-            0,
-            Math.round(((pvpTotalOriginal - pvpPackComDesconto) / pvpTotalOriginal) * 100)
-          );
-          margemPackPct = 5.0;
-        } else {
-          pvpPackComDesconto = pvpTotalOriginal;
-          descontoPct = 0;
-          margemPackPct =
-            pvpTotalOriginal > 0
-              ? Number((((pvpTotalOriginal - custoTotal) / pvpTotalOriginal) * 100).toFixed(1))
-              : 0;
-        }
-      }
-
+      const pvpTotalOriginal = Number(payload.pvpTotalOriginal || produtos.reduce((s, p) => s + p.pvpUnitario, 0).toFixed(2));
+      const pvpPackComDesconto = Number(payload.pvpPackComDesconto || (pvpTotalOriginal * (1 - c.descontoAplicadoPct / 100)).toFixed(2));
+      const custoTotal = Number(produtos.reduce((s, p) => s + p.custoUnitario, 0).toFixed(2));
       const poupancaUtente = Number(Math.max(0, pvpTotalOriginal - pvpPackComDesconto).toFixed(2));
+      const margemPackPct = Number(payload.margemPackPct || (pvpPackComDesconto > 0 ? (((pvpPackComDesconto - custoTotal) / pvpPackComDesconto) * 100).toFixed(1) : 0));
+
+      const hash = payload.hashComposicao || computePackCompositionHash(cnps, payload.publicoAlvo || 'Adultos e Famílias (Adulto)', c.descontoAplicadoPct);
 
       packs.push({
-        id: arc.id,
-        titulo: arc.titulo,
-        sintomaOuQueixa: arc.sintomaOuQueixa,
-        publicoAlvo: arc.publicoAlvo,
-        icone: arc.icone,
-        produtos: selectedItems,
+        id: c.campanhaId,
+        titulo: c.titulo,
+        sintomaOuQueixa: payload.sintomaOuQueixa || 'Campanha Ativa no Balcão',
+        publicoAlvo: payload.publicoAlvo || 'Adultos e Famílias (Adulto)',
+        icone: c.icone || '🎯',
+        produtos,
         pvpTotalOriginal,
         custoTotal,
-        descontoPct,
+        descontoPct: c.descontoAplicadoPct,
         pvpPackComDesconto,
         poupancaUtente,
         margemPackPct,
-        orientacaoBalcao: arc.orientacaoBalcao,
-        disposicaoFisica: arc.disposicaoFisica,
+        orientacaoBalcao: payload.orientacaoBalcao || 'Apresentar como recomendação integrada ao balcão.',
+        disposicaoFisica: payload.disposicaoFisica || 'Cesto temático no balcão.',
+        estadoCiclo,
+        hashComposicao: hash,
+        packsMontaveis: currentMinStock,
+        validadoPor: payload.validadoPor || c.criadoPor || 'Diretor Técnico',
+        validadoEm: payload.validadoEm || c.criadoEm.toISOString(),
+        campanhaAtivaId: c.id,
       });
+    }
+  } catch (err) {
+    console.warn('Aviso ao carregar packs ativos da BD:', err);
+  }
+
+  // 2. Obter campanhas / temas de época do motor determinístico
+  const repo = createPrismaComercialRepo(prisma, farmaciaId, 'mkt-studio');
+  const cfg = buildComercialCfg();
+  const ctx: Ctx = {
+    repo,
+    ref: refDate || new Date(),
+    cfg,
+  };
+
+  const temasRes = await sugerirPacksPromocionais({ modo: 'TEMAS' }, ctx);
+  if (!temasRes.ok) return packs;
+
+  const temasLinhas = (temasRes as any).dados?.linhas || (temasRes as any).linhas || [];
+
+  const THEME_METADATA: Record<string, { icone: string; sintoma: string; orientacao: string; disposicao: string }> = {
+    imunidade_inverno: {
+      icone: '🧣',
+      sintoma: 'Prevenção e alívio sintomático de gripes, tosse e reforço imunitário no inverno',
+      orientacao: 'Perguntar ao utente se tem sintomas associados (garganta/nariz) e propor a proteção integrada.',
+      disposicao: 'Cesto temático no balcão principal com o título «SOS Inverno: Imunidade & Alívio».',
+    },
+    pele_seca_frio: {
+      icone: '❄️',
+      sintoma: 'Lábios gretados, cieiro e mãos ressequidas pelo vento e baixas temperaturas',
+      orientacao: 'Apresentar como complemento de conveniência no fecho de qualquer atendimento a utentes com mãos expostas.',
+      disposicao: 'Cesto de oportunidades junto ao terminal Multibanco para conveniência e impulso.',
+    },
+    dia_diabetes: {
+      icone: '🩺',
+      sintoma: 'Cuidado especializado do pé diabético e prevenção de fissuras cutâneas',
+      orientacao: 'Ao dispensar tiras, lancetas ou antidiabéticos, reforçar a hidratação profilática dos pés.',
+      disposicao: 'Expositor da secção de diabetes e cuidados especializados.',
+    },
+    novembro_azul: {
+      icone: '💙',
+      sintoma: 'Saúde preventiva masculina, vitalidade e bem-estar urinário',
+      orientacao: 'Aconselhar na dispensa de suplementos e rotina de check-up masculino.',
+      disposicao: 'Gôndola de saúde masculina e suplementação ativa.',
+    },
+    outono_queda_capilar: {
+      icone: '🍂',
+      sintoma: 'Queda de cabelo sazonal, unhas quebradiças e perda de densidade capilar',
+      orientacao: 'Explicar a importância da suplementação oral com o cuidado tópico antiqueda continuado.',
+      disposicao: 'Mesa de dermocosmética capilar com destaque de outono.',
+    },
+    black_friday: {
+      icone: '🖤',
+      sintoma: 'Oportunidade de cuidado facial e corporal com rotina diária completa',
+      orientacao: 'Destacar a poupança direta de conjunto na rotina de higiene e hidratação.',
+      disposicao: 'Prateleira de campanhas promocionais de topo de loja.',
+    },
+    natal_coffrets: {
+      icone: '🎁',
+      sintoma: 'Ofertas festivas e cuidados corporais hidratantes de conveniência',
+      orientacao: 'Sugerir como presente de valor útil e cuidado diário familiar.',
+      disposicao: 'Cesto de época natalícia junto ao balcão de atendimento.',
+    },
+    liquidacao_validades_monos: {
+      icone: '🏷️',
+      sintoma: 'Oportunidades de escoamento rápido com desconto reforçado e validade garantida',
+      orientacao: 'Apresentar aos utentes habituais como vantagem económica imediata.',
+      disposicao: 'Cesto de escoamento e promoções junto à caixa.',
+    },
+  };
+
+  for (const row of temasLinhas) {
+    const campanhaId = String(row[0]);
+    const packId = `pack_${campanhaId}`;
+    if (activePackIds.has(packId)) continue; // Já ativo na farmácia com assinatura DT
+
+    const titulo = String(row[1]);
+    const meta = THEME_METADATA[campanhaId] || {
+      icone: '📦',
+      sintoma: `Campanha ativa: ${titulo}`,
+      orientacao: 'Aconselhamento personalizado de balcão de acordo com as necessidades do utente.',
+      disposicao: 'Cesto temático na secção de venda livre.',
+    };
+
+    // Pack físico determinístico com mínimo de 3 unidades por item e público adulto
+    const packRes = await sugerirPacksPromocionais(
+      {
+        modo: 'PACK',
+        campanha_id: campanhaId,
+        publico: 'ADULTO',
+        min_stock_por_item: 3,
+        tipo_oferta: 'PACK_FISICO',
+      },
+      ctx
+    );
+
+    if (packRes.ok) {
+      const envelope = packRes as any;
+      const itensRaw: any[] = envelope.itens || envelope.extra?.itens || [];
+      const totais = envelope.totais || envelope.extra?.totais || {};
+      const validacao = envelope.validacao_legal || envelope.extra?.validacao_legal || { ok: true };
+
+      if (itensRaw.length >= 2 && validacao.ok) {
+        const produtos: ClinicalThemePackItem[] = itensRaw.map((it: any) => ({
+          cnp: it.cnp_codigo,
+          designacao: it.designacao,
+          propositoUtente: it.finalidade_curta || it.subcategoria_id || 'Cuidado complementar',
+          stockAtual: it.stock_total_unidades,
+          custoUnitario: it.custo_unitario_medio,
+          pvpUnitario: it.pvp,
+          margemPct: Number((it.margem_pct_promo || it.margem_pct || 0).toFixed(1)),
+          tipoVenda: it.permite_desconto_promo ? 'VENDA_LIVRE' : 'MNSRM',
+        }));
+
+        const pvpTotalOriginal = Number(totais.pvp_cesto || produtos.reduce((s, p) => s + p.pvpUnitario, 0).toFixed(2));
+        const pvpPackComDesconto = Number(totais.preco_promo_cesto || pvpTotalOriginal);
+        const custoTotal = Number(produtos.reduce((s, p) => s + p.custoUnitario, 0).toFixed(2));
+        const poupancaUtente = Number(Math.max(0, pvpTotalOriginal - pvpPackComDesconto).toFixed(2));
+        const descontoPct = pvpTotalOriginal > 0 ? Math.round((poupancaUtente / pvpTotalOriginal) * 100) : 0;
+        const margemPackPct = Number(totais.margem_pct_cesto || (pvpPackComDesconto > 0 ? (((pvpPackComDesconto - custoTotal) / pvpPackComDesconto) * 100).toFixed(1) : 0));
+        const minStockMontavel = Math.min(...produtos.map((p) => p.stockAtual));
+        const hash = computePackCompositionHash(
+          produtos.map((p) => p.cnp),
+          'Adultos e Famílias (Adulto)',
+          descontoPct
+        );
+
+        packs.push({
+          id: packId,
+          titulo: `Pack ${titulo}`,
+          sintomaOuQueixa: meta.sintoma,
+          publicoAlvo: 'Adultos e Famílias (Adulto)',
+          icone: meta.icone,
+          produtos,
+          pvpTotalOriginal,
+          custoTotal,
+          descontoPct,
+          pvpPackComDesconto,
+          poupancaUtente,
+          margemPackPct,
+          orientacaoBalcao: meta.orientacao,
+          disposicaoFisica: meta.disposicao,
+          estadoCiclo: 'PROPOSTO',
+          hashComposicao: hash,
+          packsMontaveis: minStockMontavel,
+          validadoPor: null,
+          validadoEm: null,
+          campanhaAtivaId: null,
+        });
+      }
     }
   }
 

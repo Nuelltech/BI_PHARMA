@@ -25,8 +25,66 @@ export async function toolCalcularStockMinimoECobertura(
 ) {
   const dias = args.dias_cobertura_desejados || 7; // Default 1 semana
   const apenasAbaixo = args.apenas_abaixo_minimo ?? false;
-  const limite = args.limite || 25;
+  const limite = Math.min(args.limite || 20, 25); // Limite rígido para manter payload < 5KB
   const termo = (args.termo_pesquisa || '').trim().toLowerCase();
+
+  // 1. Otimização Fase 4: Leitura direta do Mart pré-agregado com latência < 5ms
+  const martCount = await prisma.martProdutoMetricas.count({ where: { farmaciaId: ctx.farmaciaId } });
+  if (martCount > 0) {
+    const whereClause: any = {
+      farmaciaId: ctx.farmaciaId,
+    };
+    if (termo) {
+      whereClause.OR = [
+        { cnp_codigo: { contains: termo } },
+        { designacao: { contains: termo, mode: 'insensitive' } },
+      ];
+    }
+    if (apenasAbaixo) {
+      whereClause.eh_risco_rutura = true;
+    }
+
+    const martItems = await prisma.martProdutoMetricas.findMany({
+      where: whereClause,
+      take: limite,
+      orderBy: { stock_total_valor_custo: 'desc' },
+    });
+
+    const itensMarts = martItems.map((m) => {
+      const vmm = Number(m.vmm);
+      const vendaDiaria = vmm / 30.0;
+      const stockMinimo = vmm > 0 ? Math.max(1, Math.ceil(vendaDiaria * dias * 1.2)) : 0;
+      const stockAtual = m.stock_total_unidades;
+      const diasCobertura = Number(m.cobertura_meses) * 30;
+
+      return {
+        cnp: m.cnp_codigo,
+        designacao: m.designacao,
+        segmento: m.tipo_venda || 'OUTRO',
+        stockAtual,
+        vendasAnoUnidades: m.total_unidades_vendidas,
+        vmm,
+        stockMinimoNecessarioParaDias: stockMinimo,
+        deficitUnidades: stockMinimo > stockAtual ? stockMinimo - stockAtual : 0,
+        diasCoberturaAtual: Math.round(diasCobertura),
+        situacao: stockAtual === 0 ? 'RUPTURA_TOTAL' : stockAtual < stockMinimo ? 'ABAIXO_DO_MINIMO' : 'NORMAL_OU_EXCESSO',
+        custoUnitario: Number(m.custo_unitario_medio),
+        valorTotalStock: Number(m.stock_total_valor_custo),
+      };
+    });
+
+    const criticos = itensMarts.filter((i) => i.situacao !== 'NORMAL_OU_EXCESSO');
+    return {
+      diasCoberturaSolicitados: dias,
+      totalArtigosAnalisados: itensMarts.length,
+      artigosAbaixoMinimoCount: criticos.length,
+      capitalNecessarioParaMinimosEur: Number(
+        criticos.reduce((s, i) => s + i.deficitUnidades * i.custoUnitario, 0).toFixed(2)
+      ),
+      itens: itensMarts,
+      fonteDados: 'MART_PRODUTO_METRICAS_PRE_COMPUTADO',
+    };
+  }
 
   const catalog = await getPharmacyCatalog(prisma, ctx.farmaciaId);
 
@@ -110,178 +168,34 @@ export async function toolCalcularStockMinimoECobertura(
   };
 }
 
-/**
- * 2. Filtrar Produtos por Validade e Margem (com simulação de PVP sem quebrar margem mínima)
- */
-export async function toolFiltrarValidadeEMargem(
-  prisma: PrismaClient,
-  ctx: ToolSecurityContext,
-  args: { ano_limite_validade?: number; margem_minima_pct?: number; apenas_venda_livre?: boolean; limite?: number }
-) {
-  const anoLimite = args.ano_limite_validade || 2027;
-  const margemMinima = args.margem_minima_pct != null ? args.margem_minima_pct : 10.0;
-  const apenasVendaLivre = args.apenas_venda_livre ?? true;
-  const limite = args.limite || 30;
+function parseReferenceMonth(input?: string): { date: Date; label: string } | null {
+  if (!input) return null;
+  const s = input.toLowerCase().trim();
+  const yearMatch = s.match(/20\d\d/);
+  const year = yearMatch ? parseInt(yearMatch[0], 10) : 2026;
 
-  // Busca lotes com validade da farmácia autenticada
-  const inventarios = await prisma.inventario.findMany({
-    where: {
-      farmaciaId: ctx.farmaciaId,
-      quantidade: { gt: 0 },
-      data_validade: {
-        not: null,
-        lte: new Date(`${anoLimite}-12-31T23:59:59.999Z`),
-      },
-    },
-    include: {
-      produto: true,
-    },
-    orderBy: {
-      data_validade: 'asc',
-    },
-  });
+  const monthNames = [
+    { key: 'jan', num: 1, label: 'Janeiro' },
+    { key: 'fev', num: 2, label: 'Fevereiro' },
+    { key: 'mar', num: 3, label: 'Março' },
+    { key: 'abr', num: 4, label: 'Abril' },
+    { key: 'mai', num: 5, label: 'Maio' },
+    { key: 'jun', num: 6, label: 'Junho' },
+    { key: 'jul', num: 7, label: 'Julho' },
+    { key: 'ago', num: 8, label: 'Agosto' },
+    { key: 'set', num: 9, label: 'Setembro' },
+    { key: 'out', num: 10, label: 'Outubro' },
+    { key: 'nov', num: 11, label: 'Novembro' },
+    { key: 'dez', num: 12, label: 'Dezembro' },
+  ];
 
-  const catalog = await getPharmacyCatalog(prisma, ctx.farmaciaId);
-  const catalogMap = new Map(catalog.map((c) => [c.cnp, c]));
-
-  const resultados = [];
-
-  for (const inv of inventarios) {
-    const prod = inv.produto;
-    const catItem = catalogMap.get(inv.cnp_codigo);
-
-    const isLivre = prod.tipo_venda === 'VENDA_LIVRE' || prod.tipo_venda === 'MNSRM' || prod.tipo_venda === 'PSBE';
-    if (apenasVendaLivre && !isLivre) continue;
-
-    const custo = Number(inv.custo_unitario || catItem?.custo || 1.0);
-    const taxaIva = prod.taxa_iva || 0.23;
-    const custoComIva = custo * (1 + taxaIva);
-    const pvpAtual = catItem?.pvp || custoComIva * 1.5;
-
-    // Margem Atual: (PVP - CustoComIva) / PVP
-    const margemAtualPct = pvpAtual > 0 ? ((pvpAtual - custoComIva) / pvpAtual) * 100 : 0;
-
-    // PVP Mínimo com a margem desejada: PVP_min = CustoComIva / (1 - MargemMinima/100)
-    const divisor = 1 - margemMinima / 100;
-    const pvpMinimoPromo = divisor > 0 ? custoComIva / divisor : custoComIva;
-
-    // Desconto máximo possível sem descer da margem mínima
-    const descontoMaximoPct = pvpAtual > pvpMinimoPromo ? ((pvpAtual - pvpMinimoPromo) / pvpAtual) * 100 : 0;
-
-    resultados.push({
-      cnp: inv.cnp_codigo,
-      designacao: prod.designacao,
-      lote: inv.lote,
-      validade: inv.data_validade ? inv.data_validade.toISOString().slice(0, 10) : 'N/D',
-      anoValidade: inv.data_validade ? inv.data_validade.getFullYear() : null,
-      stockAtual: inv.quantidade,
-      tipoVenda: prod.tipo_venda || 'VENDA_LIVRE',
-      custoSemIvaEur: Number(custo.toFixed(2)),
-      custoComIvaEur: Number(custoComIva.toFixed(2)),
-      pvpAtualEur: Number(pvpAtual.toFixed(2)),
-      margemAtualPct: Number(margemAtualPct.toFixed(1)),
-      pvpMinimoSugeridoEur: Number(pvpMinimoPromo.toFixed(2)),
-      descontoMaximoPermitidoPct: Number(descontoMaximoPct.toFixed(1)),
-      margemGarantidaPct: margemMinima,
-      cumpreAntiDumping: pvpMinimoPromo >= custoComIva,
-    });
+  for (const m of monthNames) {
+    if (s.includes(m.key) || s.includes(`-${String(m.num).padStart(2, '0')}`)) {
+      const d = new Date(Date.UTC(year, m.num, 0, 23, 59, 59));
+      return { date: d, label: `${m.label} ${year}` };
+    }
   }
-
-  // Ordena pela validade mais próxima
-  resultados.sort((a, b) => a.validade.localeCompare(b.validade));
-
-  return {
-    farmacia: 'Farmácia Comunitária',
-    criterios: {
-      anoLimite,
-      margemMinimaPct: margemMinima,
-      apenasVendaLivre,
-    },
-    totalLotesIdentificados: resultados.length,
-    capitalTotalEmRiscoCustoEur: Number(
-      resultados.reduce((s, i) => s + i.stockAtual * i.custoSemIvaEur, 0).toFixed(2)
-    ),
-    produtos: resultados.slice(0, limite),
-  };
-}
-
-/**
- * 3. Sugerir Packs Promocionais (2 a 3 produtos onde a margem de cada e do pack não fique abaixo de X%)
- */
-export async function toolSugerirPacksPromocionais(
-  prisma: PrismaClient,
-  ctx: ToolSecurityContext,
-  args: { margem_minima_pack_pct?: number; tamanho_pack?: number; ano_limite_validade?: number; limite?: number }
-) {
-  const margemMinima = args.margem_minima_pack_pct != null ? args.margem_minima_pack_pct : 5.0;
-  const tamanhoPack = args.tamanho_pack === 3 ? 3 : 2;
-  const anoLimite = args.ano_limite_validade || 2027;
-  const limite = args.limite || 10;
-
-  // Busca produtos candidatos com validade curta ou stock parado
-  const validadeResult = await toolFiltrarValidadeEMargem(prisma, ctx, {
-    ano_limite_validade: anoLimite,
-    margem_minima_pct: margemMinima,
-    apenas_venda_livre: true,
-    limite: 100,
-  });
-
-  const candidatos = validadeResult.produtos;
-  if (candidatos.length < tamanhoPack) {
-    return {
-      farmacia: 'Farmácia Comunitária',
-      mensagem: `Não existem produtos de venda livre suficientes com validade até ${anoLimite} para formar packs de ${tamanhoPack}.`,
-      packs: [],
-    };
-  }
-
-  const packs = [];
-
-  // Forma combinações inteligentes de 2 ou 3 produtos com sinergia
-  for (let i = 0; i < candidatos.length - (tamanhoPack - 1); i += tamanhoPack) {
-    const itens = candidatos.slice(i, i + tamanhoPack);
-    const somaCustoComIva = itens.reduce((s, it) => s + it.custoComIvaEur, 0);
-    const somaPvpNormal = itens.reduce((s, it) => s + it.pvpAtualEur, 0);
-
-    // Margem mínima do pack: PVP_pack >= somaCustoComIva / (1 - margemMinima / 100)
-    const divisor = 1 - margemMinima / 100;
-    const pvpPackMinimo = divisor > 0 ? somaCustoComIva / divisor : somaCustoComIva;
-
-    // Desconto sugerido equilibrado (ex: 15% a 20%, garantindo que não baixa do mínimo)
-    const pvpPromoSugerido = Math.max(pvpPackMinimo, somaPvpNormal * 0.82);
-    const margemRealPackPct = pvpPromoSugerido > 0 ? ((pvpPromoSugerido - somaCustoComIva) / pvpPromoSugerido) * 100 : 0;
-    const descontoPackPct = somaPvpNormal > 0 ? ((somaPvpNormal - pvpPromoSugerido) / somaPvpNormal) * 100 : 0;
-
-    packs.push({
-      packId: `PACK-${i / tamanhoPack + 1}`,
-      tituloSugerido: `Pack Oportunidade: ${itens.map((it) => it.designacao.split(' ')[0]).join(' + ')}`,
-      artigos: itens.map((it) => ({
-        cnp: it.cnp,
-        designacao: it.designacao,
-        validade: it.validade,
-        stockDisponivel: it.stockAtual,
-        pvpIndividualNormalEur: it.pvpAtualEur,
-        custoComIvaEur: it.custoComIvaEur,
-      })),
-      somaPvpNormalEur: Number(somaPvpNormal.toFixed(2)),
-      somaCustoComIvaEur: Number(somaCustoComIva.toFixed(2)),
-      pvpPackSugeridoEur: Number(pvpPromoSugerido.toFixed(2)),
-      poupancaClienteEur: Number((somaPvpNormal - pvpPromoSugerido).toFixed(2)),
-      descontoGlobalPct: Number(descontoPackPct.toFixed(1)),
-      margemFinalPackPct: Number(margemRealPackPct.toFixed(1)),
-      cumpreMargemMinima: margemRealPackPct >= margemMinima,
-      cumpreAntiDumping: pvpPromoSugerido >= somaCustoComIva,
-    });
-
-    if (packs.length >= limite) break;
-  }
-
-  return {
-    farmacia: 'Farmácia Comunitária',
-    totalPacksGerados: packs.length,
-    margemMinimaGarantidaPct: margemMinima,
-    packs,
-  };
+  return null;
 }
 
 /**
@@ -290,12 +204,150 @@ export async function toolSugerirPacksPromocionais(
 export async function toolIdentificarProdutosSemVenda(
   prisma: PrismaClient,
   ctx: ToolSecurityContext,
-  args: { meses_sem_venda?: number; apenas_com_stock?: boolean; limite?: number; apenas_restos_gaveta?: boolean }
+  args: {
+    meses_sem_venda?: number;
+    apenas_com_stock?: boolean;
+    limite?: number;
+    apenas_restos_gaveta?: boolean;
+    mes_referencia?: string;
+  }
 ) {
-  const meses = args.meses_sem_venda || 6;
+  const meses = args.meses_sem_venda || 3;
   const apenasComStock = args.apenas_com_stock ?? true;
   const apenasRestosGaveta = args.apenas_restos_gaveta ?? false;
-  const limite = args.limite || 30;
+  const limite = Math.min(args.limite || 20, 25); // Limite rígido para manter payload < 5KB
+
+  const parsedRef = parseReferenceMonth(args.mes_referencia);
+
+  // Se o utilizador pediu um mês histórico específico no passado (ex: Setembro 2026, Agosto 2026):
+  if (parsedRef && parsedRef.date < new Date('2026-10-25T00:00:00Z')) {
+    const dataReferencia = parsedRef.date;
+    const dias = meses * 30;
+    const dataCorte = new Date(dataReferencia.getTime() - dias * 24 * 60 * 60 * 1000);
+
+    const activeSales = await prisma.venda.groupBy({
+      by: ['cnp_codigo'],
+      where: {
+        farmaciaId: ctx.farmaciaId,
+        data_venda: { gte: dataCorte, lte: dataReferencia },
+        quantidade: { gt: 0 },
+      },
+    });
+    const activeSet = new Set(activeSales.map((s) => s.cnp_codigo));
+
+    const inventarios = await prisma.inventario.findMany({
+      where: {
+        farmaciaId: ctx.farmaciaId,
+        ...(apenasComStock ? { quantidade: { gt: 0 } } : {}),
+      },
+      include: { produto: true },
+    });
+
+    // Vendas posteriores (para saber se o produto foi reativado/vendido depois)
+    const salesAfter = await prisma.venda.groupBy({
+      by: ['cnp_codigo'],
+      where: {
+        farmaciaId: ctx.farmaciaId,
+        data_venda: { gt: dataReferencia },
+        quantidade: { gt: 0 },
+      },
+      _sum: { quantidade: true, valor_total: true },
+    });
+    const afterMap = new Map(salesAfter.map((s) => [s.cnp_codigo, { qtd: Number(s._sum.quantidade || 0), val: Number(s._sum.valor_total || 0) }]));
+
+    let monos = inventarios.filter((i) => !activeSet.has(i.cnp_codigo));
+    if (apenasRestosGaveta) {
+      monos = monos.filter((i) => i.quantidade <= 2);
+    }
+
+    const totalArtigosIdentificados = monos.length;
+    const totalUnidadesParadas = monos.reduce((s, i) => s + i.quantidade, 0);
+    const capitalTotalImobilizadoEur = Number(monos.reduce((s, i) => s + i.quantidade * Number(i.custo_unitario || 0), 0).toFixed(2));
+
+    monos.sort((a, b) => (b.quantidade * Number(b.custo_unitario || 0)) - (a.quantidade * Number(a.custo_unitario || 0)));
+
+    let reativadosCount = 0;
+    let liquidezRecuperadaPosteriormenteTotalEur = 0;
+
+    const itens = monos.slice(0, limite).map((m) => {
+      const custo = Number(m.custo_unitario || 0);
+      const post = afterMap.get(m.cnp_codigo);
+      const reativado = !!post && post.qtd > 0;
+      if (reativado) {
+        reativadosCount++;
+        liquidezRecuperadaPosteriormenteTotalEur += post.qtd * custo;
+      }
+      return {
+        cnp: m.cnp_codigo,
+        designacao: m.produto?.designacao || m.cnp_codigo,
+        segmento: m.produto?.tipo_venda || 'OUTRO',
+        stockNaData: m.quantidade,
+        custoUnitarioEur: custo,
+        capitalImobilizadoEur: Number((m.quantidade * custo).toFixed(2)),
+        mesesSemVendaEstimados: meses,
+        reativadoNoMesSeguinte: reativado,
+        unidadesVendidasPosteriormente: post ? post.qtd : 0,
+        liquidezRecuperadaPosteriormenteEur: post ? Number((post.qtd * custo).toFixed(2)) : 0,
+        estrategiaSugerida: m.quantidade <= 2 ? 'DEVOLUCAO_FORNECEDOR_OU_TRANSFERENCIA' : 'PACK_PROMOCIONAL_OU_CAMPANHA',
+      };
+    });
+
+    return {
+      periodoReferencia: parsedRef.label,
+      dataReferencia: dataReferencia.toISOString().slice(0, 10),
+      janelaInatividadeDias: dias,
+      criterioMesesSemVenda: meses,
+      totalArtigosIdentificados,
+      totalUnidadesParadas,
+      capitalTotalImobilizadoEur,
+      artigosReativadosPosteriormente: reativadosCount,
+      liquidezRecuperadaPosteriormenteTotalEur: Number(liquidezRecuperadaPosteriormenteTotalEur.toFixed(2)),
+      itens,
+      fonteDados: 'AUDITORIA_HISTORICA_RETROSPETIVA_VENDAS_STOCK',
+    };
+  }
+
+  // 1. Otimização Fase 4: Leitura direta do Mart analítico pré-agregado (< 5ms)
+  const martCount = await prisma.martProdutoMetricas.count({ where: { farmaciaId: ctx.farmaciaId } });
+  if (martCount > 0) {
+    const whereClause: any = {
+      farmaciaId: ctx.farmaciaId,
+      eh_mono: true,
+    };
+    if (apenasComStock) {
+      whereClause.stock_total_unidades = { gt: 0 };
+    }
+    if (apenasRestosGaveta) {
+      whereClause.stock_total_unidades = { in: [1, 2] };
+    }
+
+    const monosMarts = await prisma.martProdutoMetricas.findMany({
+      where: whereClause,
+      take: limite,
+      orderBy: { stock_total_valor_custo: 'desc' },
+    });
+
+    const itens = monosMarts.map((m) => ({
+      cnp: m.cnp_codigo,
+      designacao: m.designacao,
+      segmento: m.tipo_venda || 'OUTRO',
+      stockAtual: m.stock_total_unidades,
+      custoUnitarioEur: Number(m.custo_unitario_medio),
+      capitalImobilizadoEur: Number(m.stock_total_valor_custo),
+      dataUltimaVenda: m.data_ultima_venda ? m.data_ultima_venda.toISOString().slice(0, 10) : 'Sem vendas registadas',
+      mesesSemVendaEstimados: m.dias_sem_vendas ? Math.round(m.dias_sem_vendas / 30) : 12,
+      estrategiaSugerida: m.stock_total_unidades <= 2 ? 'DEVOLUCAO_FORNECEDOR_OU_TRANSFERENCIA' : 'PACK_PROMOCIONAL_OU_CAMPANHA',
+    }));
+
+    const capitalTotal = Number(itens.reduce((s, i) => s + i.capitalImobilizadoEur, 0).toFixed(2));
+    return {
+      criterioMesesSemVenda: meses,
+      totalArtigosIdentificados: itens.length,
+      capitalTotalImobilizadoEur: capitalTotal,
+      itens,
+      fonteDados: 'MART_PRODUTO_METRICAS_PRE_COMPUTADO',
+    };
+  }
 
   // Em Tempo Real: ancorado na data atual
   const dataReferencia = new Date();
@@ -365,7 +417,7 @@ export async function toolIdentificarProdutosSemVenda(
     if (ehRestoGaveta) {
       estrategiaSugerida = '🧺 RESTO DE GAVETA (≤2 un): Colocar no cesto de balcão ou dispensar prioritariamente na receita médica para eliminar o código e libertar espaço de gaveta.';
     } else if (isGenerico) {
-      estrategiaSugerida = '🧬 MONO PROFUNDO (GENÉRICO): Priorizar a dispensa deste laboratório na gaveta de genéricos ao balcão e colocar Ponto de Encomenda = 0 no Sifarma para outros laboratórios.';
+      estrategiaSugerida = '🧬 MONO PROFUNDO (GENÉRICO): Priorizar a dispensa deste laboratório na gaveta de genéricos ao balcão e colocar Ponto de Encomenda = 0 no sistema de gestão para outros laboratórios.';
     } else if (isMsrm) {
       estrategiaSugerida = '🏷️ MONO PROFUNDO (MSRM): Colocar etiqueta de destaque na gaveta física para dispensar na próxima receita médica ou avaliar devolução comercial ao armazenista.';
     } else {
@@ -427,7 +479,15 @@ export async function toolIdentificarProdutosSemVenda(
         ),
       },
     },
-    produtos: listaFiltrada.slice(0, limite),
+    produtos: listaFiltrada.slice(0, Math.min(limite, 10)).map((p) => ({
+      cnp: p.cnp,
+      designacao: p.designacao,
+      stockAtual: p.stockAtual,
+      capitalImobilizadoEur: p.capitalImobilizadoEur,
+      tipoVenda: p.tipoVenda,
+      classificacao: p.tipoClassificacao,
+      estrategia: p.ehRestoGaveta ? 'RESTO_GAVETA' : 'MONO_PROFUNDO',
+    })),
   };
 }
 
@@ -440,7 +500,52 @@ export async function toolConsolidarGenericosDci(
   args: { molecula_dci?: string; max_labs_desejados?: number; limite?: number }
 ) {
   const maxLabs = args.max_labs_desejados || 2;
-  const limite = args.limite || 15;
+  const limite = Math.min(args.limite || 5, 8); // Limite rígido para manter payload < 5KB
+
+  // 1. Otimização Fase 4: Leitura direta da tabela MartDciGrupo pré-agregada (< 5ms)
+  const dciCount = await prisma.martDciGrupo.count({ where: { farmaciaId: ctx.farmaciaId } });
+  if (dciCount > 0) {
+    const whereClause: any = { farmaciaId: ctx.farmaciaId };
+    if (args.molecula_dci) {
+      whereClause.grupo_equivalencia_dci = { contains: args.molecula_dci.trim(), mode: 'insensitive' };
+    }
+
+    const dciRows = await prisma.martDciGrupo.findMany({
+      where: whereClause,
+      take: limite,
+      orderBy: { poupanca_potencial_anual: 'desc' },
+    });
+
+    const grupos = dciRows.map((g) => ({
+      moleculaDci: g.grupo_equivalencia_dci,
+      laboratoriosAtuaisCount: g.num_laboratorios_abertos,
+      maxLaboratoriosPermitidos: maxLabs,
+      stockTotalUnidades: g.stock_total_unidades,
+      capitalTotalStockEur: Number(g.stock_total_valor_custo),
+      vmmTotalGrupo: Number(g.vmm_total_grupo),
+      custoMinimoEur: Number(g.custo_minimo),
+      custoMaximoEur: Number(g.custo_maximo),
+      poupancaPotencialAnualEur: Number(g.poupanca_potencial_anual),
+      laboratorios: Array.isArray(g.labsJson)
+        ? (g.labsJson as any[]).slice(0, 4).map((lab: any) => ({
+            nome: lab.laboratorio || lab.nome || 'Lab',
+            stock: lab.stockTotal || lab.stock || 0,
+            custo: Number((lab.custoMedio || lab.custo || 0).toFixed(2)),
+          }))
+        : [],
+    }));
+
+    return {
+      farmaciaId: ctx.farmaciaId,
+      totalGruposAnalisados: grupos.length,
+      gruposComDispersaoElevada: grupos.filter((g) => g.laboratoriosAtuaisCount > maxLabs).length,
+      poupancaTotalGrupoAnualEur: Number(
+        grupos.reduce((s, g) => s + g.poupancaPotencialAnualEur, 0).toFixed(2)
+      ),
+      grupos,
+      fonteDados: 'MART_DCI_GRUPO_PRE_COMPUTADO',
+    };
+  }
 
   const catalog = await getPharmacyCatalog(prisma, ctx.farmaciaId);
   const genericos = catalog.filter(
@@ -577,108 +682,32 @@ export async function toolPlanearComprasSazonais(
 export async function toolSugerirVendasCruzadasReceita(
   prisma: PrismaClient,
   ctx: ToolSecurityContext,
-  args: { top_n_moleculas?: number }
+  args: { top_n_moleculas?: number; medicamento?: string }
 ) {
-  const topN = args.top_n_moleculas || 5;
   const catalog = await getPharmacyCatalog(prisma, ctx.farmaciaId);
+  const alvo = stripAccents(args.medicamento || '');
 
-  // Filtra medicamentos MSRM
-  const msrmProds = catalog.filter((c) => c.tipoVenda === 'MSRM' || c.ehGenerico);
-  msrmProds.sort((a, b) => (b.vendasQtd || 0) - (a.vendasQtd || 0));
-
-  const topMsrm = msrmProds.slice(0, topN);
-
-  // Regras clínicas de sinergia entre MSRM e OTC / Dermocosmética
-  const sinergiasClinicas: Record<string, { necessidade: string; recomendacao: string; termosOtc: string[] }> = {
-    estatina: {
-      necessidade: 'Mialgias e redução de Coenzima Q10 endógena provocadas por estatinas.',
-      recomendacao: 'Coenzima Q10 (Ubiquinol 100mg) para proteção muscular e cardiovascular.',
-      termosOtc: ['coenzima', 'coq10', 'ubiquinona', 'cardio'],
-    },
-    atorvastatina: {
-      necessidade: 'Dores musculares e fadiga celular provocadas por inibição da síntese de CoQ10.',
-      recomendacao: 'Suplemento de Coenzima Q10 + Magnésio muscular.',
-      termosOtc: ['coenzima', 'magnesio', 'q10'],
-    },
-    sinvastatina: {
-      necessidade: 'Dores musculares e sensação de pernas pesadas.',
-      recomendacao: 'Coenzima Q10 e antioxidante mitocondrial.',
-      termosOtc: ['coenzima', 'q10'],
-    },
-    metformina: {
-      necessidade: 'Diminuição da absorção intestinal de Vitamina B12 e desconforto gástrico.',
-      recomendacao: 'Vitamina B12 sublingual + Protetor gástrico/enzimas digestivas.',
-      termosOtc: ['vitamina b12', 'complexo b', 'probiotico'],
-    },
-    omeprazol: {
-      necessidade: 'Diminuição da absorção de Cálcio, Magnésio e alteração da microbiota gástrica.',
-      recomendacao: 'Citrato de Cálcio + Probiótico gastro-resistente.',
-      termosOtc: ['calcio', 'magnesio', 'probiotico'],
-    },
-    pantoprazol: {
-      necessidade: 'Redução da acidez prolongada pode diminuir flora intestinal protetora.',
-      recomendacao: 'Probiótico com estirpes de Lactobacillus e Bifidobacterium.',
-      termosOtc: ['probiotico', 'gastro'],
-    },
-    losartan: {
-      necessidade: 'Controlo da retenção de líquidos e saúde vascular.',
-      recomendacao: 'Monitorização da tensão arterial de pulso/braço + suplemento de Potássio controlado.',
-      termosOtc: ['tensiómetro', 'tensiometro', 'omega 3'],
-    },
-    ibuprofeno: {
-      necessidade: 'Gastro-lesão provocada por anti-inflamatórios não esteroides.',
-      recomendacao: 'Protetor gástrico natural (ex: Alginato/Aloe vera) ou gel anti-inflamatório tópico.',
-      termosOtc: ['alginato', 'gaviscon', 'gel dor', 'voltaflex'],
-    },
-  };
-
-  const resultados = topMsrm.map((m) => {
-    const nomeLower = m.designacao.toLowerCase();
-    let matchSinergia = null;
-    for (const [chave, info] of Object.entries(sinergiasClinicas)) {
-      if (nomeLower.includes(chave) || (m.moleculaDci && m.moleculaDci.toLowerCase().includes(chave))) {
-        matchSinergia = info;
-        break;
-      }
-    }
-
-    if (!matchSinergia) {
-      matchSinergia = {
-        necessidade: 'Adesão à terapêutica crónica e saúde digestiva.',
-        recomendacao: 'Organizador semanal de medicação (Pilbox) e probiótico.',
-        termosOtc: ['caixa comprimidos', 'pilbox', 'probiotico'],
-      };
-    }
-
-    // Procura na farmácia produtos de venda livre que correspondam à sinergia
-    const otcDisponiveis = catalog.filter((c) => {
-      if (c.tipoVenda === 'MSRM') return false;
-      const cNome = c.designacao.toLowerCase();
-      return matchSinergia!.termosOtc.some((t) => cNome.includes(t)) && c.stock > 0;
-    });
-
-    return {
-      medicamentoReceita: {
-        cnp: m.cnp,
-        designacao: m.designacao,
-        vendasAnoUnidades: m.vendasQtd,
-        stockAtual: m.stock,
-      },
-      enquadramentoClinico: matchSinergia.necessidade,
-      aconselhamentoBalcao: matchSinergia.recomendacao,
-      produtosSugeridosEmStock: otcDisponiveis.slice(0, 3).map((p) => ({
-        cnp: p.cnp,
-        designacao: p.designacao,
-        stock: p.stock,
-        pvpEur: Number(p.pvp.toFixed(2)),
-        margemPct: Number(p.margem.toFixed(1)),
-      })),
-    };
-  });
+  const msrmProds = catalog
+    .filter((c) => {
+      if (alvo) return stripAccents(c.designacao + ' ' + (c.moleculaDci || '') + ' ' + (c.dci || '')).includes(alvo);
+      return c.tipoVenda === 'MSRM' || c.ehGenerico;
+    })
+    .sort((a, b) => (b.vendasQtd || 0) - (a.vendasQtd || 0))
+    .slice(0, args.top_n_moleculas || 5);
 
   return {
     farmacia: 'Farmácia Comunitária',
-    vendasCruzadasSugeridas: resultados,
+    avisoImportante:
+      'O sistema BI Pharma não dispõe de base científica ou farmacológica validada para efetuar aconselhamento clínico, posológico ou recomendações terapêuticas de venda cruzada. Qualquer associação clínica requer avaliação do Diretor Técnico da farmácia.',
+    medicamentosConsultados: msrmProds.map((m) => ({
+      cnp: m.cnp,
+      designacao: m.designacao,
+      dci: m.dci || m.moleculaDci || null,
+      stockAtual: m.stock,
+      vendasAnoUnidades: m.vendasQtd,
+    })),
+    notaOperacional:
+      'Se o Diretor Técnico indicar a categoria ou família de produtos de Venda Livre/MNSRM que pretende consultar (ex: vitaminas, probióticos, dermocosmética), utilize consultar_produtos_por_nome_ou_categoria ou identificar_produtos_sem_vendas_e_escoamento para verificar o stock e os monos dessa categoria.',
   };
 }
 
@@ -720,23 +749,36 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
     .map((s) => s.trim().replace(/[^a-z0-9-]/g, ''))
     .filter((s) => s.length >= 3 && !['que', 'mais', 'sobre', 'temos', 'podes', 'dar', 'quais', 'sao'].includes(s));
 
+  const matchesWordOrPrefix = (haystack: string, needle: string): boolean => {
+    if (!haystack || !needle) return false;
+    // Para termos curtos (<= 5 letras, ex: "bial", "teva", "krka"), exige início de palavra (\b) para que "bial" nunca case com "labial"
+    const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (needle.length <= 5) {
+      return new RegExp(`\\b${esc}`, 'i').test(haystack);
+    }
+    return haystack.includes(needle);
+  };
+
   const scored = catalog
     .map((it) => {
       const des = stripAccents(it.designacao);
       const cat = stripAccents(it.categoria || '');
       const subcat = stripAccents(it.subcategoria || '');
-      const dci = stripAccents(it.moleculaDci || it.grupoDci || '');
+      const dci = stripAccents(it.dci || it.moleculaDci || it.grupoDci || '');
+      const lab = stripAccents(it.laboratorioTitular || '');
       const cnp = it.cnp;
 
       let score = 0;
-      if (des.includes(cleanQuery)) score += 100;
-      if (cnp === cleanQuery) score += 150;
+      if (cnp === cleanQuery) score += 200;
+      if (lab && matchesWordOrPrefix(lab, cleanQuery)) score += 120;
+      if (matchesWordOrPrefix(des, cleanQuery)) score += 100;
 
       for (const t of tokens) {
-        if (des.includes(t)) score += 60;
-        else if (dci.includes(t)) score += 40;
-        else if (subcat.includes(t)) score += 20;
-        else if (cat.includes(t)) score += 10;
+        if (lab && matchesWordOrPrefix(lab, t)) score += 80;
+        else if (matchesWordOrPrefix(des, t)) score += 60;
+        else if (matchesWordOrPrefix(dci, t)) score += 40;
+        else if (matchesWordOrPrefix(subcat, t)) score += 20;
+        else if (matchesWordOrPrefix(cat, t)) score += 10;
       }
 
       // Expansão de sinónimos frequentes em farmácia
@@ -843,6 +885,8 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
       return {
         cnp: it.cnp,
         designacao: it.designacao,
+        laboratorioTitular: it.laboratorioTitular || 'Sem dados',
+        dci: it.dci || it.moleculaDci || 'Sem dados',
         segmento: it.tipoVenda,
         categoria: it.categoria,
         stockAtual: it.stock,
@@ -858,9 +902,9 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
           outono_Set_Out: outonoQtd,
         },
         mesPico,
-        custoUnitarioEur: Number(it.custo.toFixed(2)),
+        custoUnitarioEur: it.custo > 0 ? Number(it.custo.toFixed(2)) : null,
         pvpEur: Number(it.pvp.toFixed(2)),
-        margemComercialPct: Number(it.margem.toFixed(1)),
+        margemComercialPct: it.custo > 0 && it.margem < 99.9 ? Number(it.margem.toFixed(1)) : null,
         validade: it.validade || 'S/ Registo',
         recomendacaoEncomenda,
       };
@@ -890,13 +934,22 @@ export async function toolCompararSimilaresERentabilidade(
 
   const catalog = await getPharmacyCatalog(prisma, ctx.farmaciaId);
   const cleanQ = stripAccents(query);
+  const tokens = cleanQ.split(/\s+/).filter((t) => t.length > 0);
 
-  // Filtra similares pelo nome, DCI ou grupo equivalente
+  // Filtra similares pelo nome, DCI ou grupo equivalente usando token matching flexível (ex: "atorvastatina 20" casa com "20mg")
   const matches = catalog.filter((it) => {
     const des = stripAccents(it.designacao);
     const dci = stripAccents(it.moleculaDci || it.grupoDci || '');
     const cat = stripAccents(it.categoria || '');
-    return des.includes(cleanQ) || dci.includes(cleanQ) || (cleanQ.length >= 4 && cat.includes(cleanQ));
+    const combined = `${des} ${dci} ${cat}`;
+
+    return tokens.every((tok) => {
+      if (/^\d+$/.test(tok)) {
+        const regex = new RegExp(`\\b${tok}(mg|g|ml|ui|%)?`, 'i');
+        return regex.test(combined);
+      }
+      return combined.includes(tok);
+    });
   });
 
   if (matches.length === 0) {
@@ -1185,7 +1238,7 @@ export async function toolCalcularNiveisSazonaisDinamicos(
         fase = '4. FORA DE ÉPOCA (Época Baixa)';
         minDias = 2;
         maxDias = 5;
-        recomendacaoFase = 'Ponto de Encomenda = 0 no Sifarma. Apenas stock residual de balcão.';
+        recomendacaoFase = 'Ponto de Encomenda = 0 no sistema de gestão. Apenas stock residual de balcão.';
       }
     } else if (isAlergia) {
       if (currentMonth >= 2 && currentMonth <= 4) {
@@ -1390,7 +1443,7 @@ export async function toolGerarPropostaEncomendaReposicao(
         designacao: it.designacao,
         stockAtual: it.stock,
         vendas12M: it.vendasQtd,
-        motivoBloqueio: 'Margem Negativa (PVP < Custo - venda dá prejuízo até retificação no Sifarma)',
+        motivoBloqueio: 'Margem Negativa (PVP < Custo - venda dá prejuízo até retificação no sistema de gestão)',
         poupancaEvitadaEur: Number((it.custo).toFixed(2)),
       });
       capitalPoupadoBloqueios += it.custo;
@@ -1709,11 +1762,11 @@ export async function toolAuditarAnomaliasMargemEPrecos(
 
     if (isNegativa) {
       if (isMsrm) {
-        tipoAnomalia = '🚨 DIVERGÊNCIA CUSTO SIFARMA (MSRM Preço Regulado Infarmed)';
-        correcaoSugeridaSifarma = `Medicamento de receita médica (MSRM) com PVP oficial de ${it.pvp.toFixed(2)}€ tabelado pelo Infarmed. O PVP NÃO PODE ser alterado por lei! Auditar com urgência a fatura de compra do armazenista no Sifarma: o custo registado de ${it.custo.toFixed(2)}€ contém provável erro de lançamento (IVA duplicado ou código de embalagem hospitalar).`;
+        tipoAnomalia = '🚨 DIVERGÊNCIA DE CUSTO (MSRM Preço Regulado Infarmed)';
+        correcaoSugeridaSifarma = `Medicamento de receita médica (MSRM) com PVP oficial de ${it.pvp.toFixed(2)}€ tabelado pelo Infarmed. O PVP NÃO PODE ser alterado por lei! Auditar com urgência a fatura de compra do armazenista no sistema de gestão: o custo registado de ${it.custo.toFixed(2)}€ contém provável erro de lançamento (IVA duplicado ou código de embalagem hospitalar).`;
       } else {
         tipoAnomalia = '🚨 VENDA COM PREJUÍZO (PVP < Custo)';
-        correcaoSugeridaSifarma = `Produto de venda livre. Atualizar PVP para ~${pvpSugerido}€ no Sifarma para cobrir o custo de ${it.custo.toFixed(2)}€ e restabelecer margem viável de 20%.`;
+        correcaoSugeridaSifarma = `Produto de venda livre. Atualizar PVP para ~${pvpSugerido}€ no sistema de gestão para cobrir o custo de ${it.custo.toFixed(2)}€ e restabelecer margem viável de 20%.`;
       }
     } else {
       if (isFixedPvpDevice) {
@@ -1724,7 +1777,7 @@ export async function toolAuditarAnomaliasMargemEPrecos(
         correcaoSugeridaSifarma = `PVP oficial Infarmed (${it.pvp.toFixed(2)}€). As margens de MSRM são reguladas por portaria. Recomenda-se incentivar a dispensa de genéricos equivalentes com maior margem unitária no balcão.`;
       } else {
         tipoAnomalia = '⚠️ MARGEM ANORMALMENTE BAIXA (< 5%)';
-        correcaoSugeridaSifarma = `Produto de venda livre. Rever preço de venda no Sifarma para ~${pvpSugerido}€ de modo a assegurar margem saudável.`;
+        correcaoSugeridaSifarma = `Produto de venda livre. Rever preço de venda no sistema de gestão para ~${pvpSugerido}€ de modo a assegurar margem saudável.`;
       }
     }
 
@@ -2069,6 +2122,7 @@ export async function toolAnalisarEvolucaoMensalFinanceira(
       skusDistintos: st.skusSet.size,
       topCategorias,
       topProdutos,
+      produtosMap: st.produtosMap,
     });
   }
 
@@ -2139,6 +2193,60 @@ export async function toolAnalisarEvolucaoMensalFinanceira(
   };
 }
 
+// Helper para normalizar inputs de períodos (ex: "outubro de 2026", "2026-10", "setembro")
+export function normalizePeriodInput(input?: string): string {
+  if (!input) return '';
+  const s = input.trim().toLowerCase();
+
+  // YYYY-MM ou YYYY/MM ou YYYY.MM
+  const isoMatch = s.match(/(\d{4})[-/. ](\d{1,2})/);
+  if (isoMatch) {
+    const year = isoMatch[1];
+    const month = isoMatch[2].padStart(2, '0');
+    return `${year}-${month}`;
+  }
+
+  // MM-YYYY ou MM/YYYY
+  const reverseMatch = s.match(/(\d{1,2})[-/. ](\d{4})/);
+  if (reverseMatch) {
+    const month = reverseMatch[1].padStart(2, '0');
+    const year = reverseMatch[2];
+    return `${year}-${month}`;
+  }
+
+  const monthNames: Record<string, string> = {
+    janeiro: '01', jan: '01',
+    fevereiro: '02', fev: '02',
+    marco: '03', 'março': '03', mar: '03',
+    abril: '04', abr: '04',
+    maio: '05', mai: '05',
+    junho: '06', jun: '06',
+    julho: '07', jul: '07',
+    agosto: '08', ago: '08',
+    setembro: '09', set: '09',
+    outubro: '10', out: '10',
+    novembro: '11', nov: '11',
+    dezembro: '12', dez: '12',
+  };
+
+  let foundMonth = '';
+  for (const [name, num] of Object.entries(monthNames)) {
+    if (s.includes(name)) {
+      foundMonth = num;
+      break;
+    }
+  }
+
+  const yearMatch = s.match(/\b(20\d\d)\b/);
+  const year = yearMatch ? yearMatch[1] : '2026';
+
+  if (foundMonth) {
+    return `${year}-${foundMonth}`;
+  }
+
+  return input.trim();
+}
+
 // ============================================================================
 // 15C. COMPARAR PERFORMANCE FINANCEIRA ENTRE DOIS PERÍODOS
 // ============================================================================
@@ -2146,12 +2254,12 @@ export async function toolCompararPerformancePeriodos(
   prisma: PrismaClient,
   ctx: ToolSecurityContext,
   args: {
-    periodo_a: string; // ex: "2026-07"
-    periodo_b: string; // ex: "2026-06"
+    periodo_a: string; // ex: "2026-07" ou "outubro 2026"
+    periodo_b: string; // ex: "2026-06" ou "setembro 2026"
   }
 ) {
-  const pA = args.periodo_a.trim();
-  const pB = args.periodo_b.trim();
+  const pA = normalizePeriodInput(args.periodo_a);
+  const pB = normalizePeriodInput(args.periodo_b);
 
   // Executa evolução mensal completa
   const dadosGerais = await toolAnalisarEvolucaoMensalFinanceira(prisma, ctx, { ordenar_por: 'CRONOLOGICO' });
@@ -2161,7 +2269,7 @@ export async function toolCompararPerformancePeriodos(
 
   if (!stA || !stB) {
     return {
-      error: `Um ou ambos os períodos não foram encontrados nos registos da farmácia (${pA}: ${stA ? 'Encontrado' : 'Não encontrado'}, ${pB}: ${stB ? 'Encontrado' : 'Não encontrado'}). Meses disponíveis: ${mesesList.map((m: any) => m.mes).join(', ')}`,
+      error: `Um ou ambos os períodos não foram encontrados nos registos da farmácia (${args.periodo_a} -> ${pA}: ${stA ? 'Encontrado' : 'Não encontrado'}, ${args.periodo_b} -> ${pB}: ${stB ? 'Encontrado' : 'Não encontrado'}). Meses disponíveis: ${mesesList.map((m: any) => m.mes).join(', ')}`,
     };
   }
 
@@ -2175,6 +2283,61 @@ export async function toolCompararPerformancePeriodos(
   const deltaUnidPct = stB.unidadesTotal > 0 ? Math.round((deltaUnid / stB.unidadesTotal) * 1000) / 10 : 0;
 
   const deltaMargemPontosPct = Math.round((stA.margemBrutaPct - stB.margemBrutaPct) * 10) / 10;
+
+  // Comparação detalhada produto a produto
+  const mapA = (stA as any).produtosMap as Map<string, { cnp: string; designacao: string; margemEur: number; faturacaoEur: number; unidades: number }> | undefined;
+  const mapB = (stB as any).produtosMap as Map<string, { cnp: string; designacao: string; margemEur: number; faturacaoEur: number; unidades: number }> | undefined;
+
+  const allCnps = new Set<string>();
+  if (mapA) for (const k of mapA.keys()) allCnps.add(k);
+  if (mapB) for (const k of mapB.keys()) allCnps.add(k);
+
+  const diffProdutos: any[] = [];
+  for (const cnp of allCnps) {
+    const itemA = mapA?.get(cnp);
+    const itemB = mapB?.get(cnp);
+    const designacao = itemA?.designacao || itemB?.designacao || cnp;
+    const unidA = itemA?.unidades || 0;
+    const unidB = itemB?.unidades || 0;
+    const fatA = itemA?.faturacaoEur || 0;
+    const fatB = itemB?.faturacaoEur || 0;
+    const margemA = itemA?.margemEur || 0;
+    const margemB = itemB?.margemEur || 0;
+
+    const deltaUnidProd = unidA - unidB;
+    const deltaFatProd = Math.round((fatA - fatB) * 100) / 100;
+    const deltaMargemProd = Math.round((margemA - margemB) * 100) / 100;
+
+    diffProdutos.push({
+      cnp,
+      designacao,
+      unidadesPeriodoA: unidA,
+      unidadesPeriodoB: unidB,
+      variacaoUnidades: deltaUnidProd,
+      faturacaoPeriodoAEur: Math.round(fatA * 100) / 100,
+      faturacaoPeriodoBEur: Math.round(fatB * 100) / 100,
+      variacaoFaturacaoEur: deltaFatProd,
+      variacaoMargemEur: deltaMargemProd,
+    });
+  }
+
+  // Top produtos que mais aumentaram vendas em Faturação (€)
+  const produtosComMaiorAumentoVendas = [...diffProdutos]
+    .filter((p) => p.variacaoFaturacaoEur > 0 || p.variacaoUnidades > 0)
+    .sort((a, b) => b.variacaoFaturacaoEur - a.variacaoFaturacaoEur)
+    .slice(0, 10);
+
+  // Top produtos que mais aumentaram vendas em Volume (Unidades)
+  const produtosComMaiorAumentoVolume = [...diffProdutos]
+    .filter((p) => p.variacaoUnidades > 0)
+    .sort((a, b) => b.variacaoUnidades - a.variacaoUnidades)
+    .slice(0, 10);
+
+  // Top produtos com maior queda de vendas em Faturação (€)
+  const produtosComMaiorQuedaVendas = [...diffProdutos]
+    .filter((p) => p.variacaoFaturacaoEur < 0 || p.variacaoUnidades < 0)
+    .sort((a, b) => a.variacaoFaturacaoEur - b.variacaoFaturacaoEur)
+    .slice(0, 10);
 
   return {
     farmacia: ctx.farmaciaNome,
@@ -2205,7 +2368,255 @@ export async function toolCompararPerformancePeriodos(
     },
     topCategoriasPeriodoA: stA.topCategorias,
     topCategoriasPeriodoB: stB.topCategorias,
-    diagnosticoExplicativo: `No comparativo de ${stA.mes} face a ${stB.mes}, a margem bruta variou €${deltaMargemEur > 0 ? '+' : ''}${deltaMargemEur} (${deltaMargemPct > 0 ? '+' : ''}${deltaMargemPct}%), com uma variação de volume de ${deltaUnid > 0 ? '+' : ''}${deltaUnid} embalagens.`,
+    produtosComMaiorAumentoVendas,
+    produtosComMaiorAumentoVolume,
+    produtosComMaiorQuedaVendas,
+    diagnosticoExplicativo: `No comparativo de ${stA.mes} face a ${stB.mes}, a faturação variou €${deltaFatEur > 0 ? '+' : ''}${deltaFatEur} (${deltaFatPct > 0 ? '+' : ''}${deltaFatPct}%), a margem bruta variou €${deltaMargemEur > 0 ? '+' : ''}${deltaMargemEur} (${deltaMargemPct > 0 ? '+' : ''}${deltaMargemPct}%), com uma variação de volume de ${deltaUnid > 0 ? '+' : ''}${deltaUnid} embalagens.`,
+  };
+}
+
+// ============================================================================
+// 15C-2. AUDITORIA DE ESCOAMENTO, REATIVAÇÃO DE MONOS E DESTRAVE DE CAPITAL
+// ============================================================================
+export async function toolAuditarEscoamentoEDestraveStock(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: {
+    mes_venda: string; // ex: "2026-10" ou "outubro 2026"
+    meses_parado_minimo?: number; // ex: 2, 3, 6 (default: 3)
+    parado_desde?: string; // ex: "2026-08", "agosto"
+    apenas_eliminados_a_zero?: boolean;
+    excluir_sazonais?: boolean;
+    limite_produtos?: number;
+  }
+) {
+  const mesVenda = normalizePeriodInput(args.mes_venda);
+  if (!mesVenda || !/^\d{4}-\d{2}$/.test(mesVenda)) {
+    return {
+      error: `Mês de venda inválido: "${args.mes_venda}". Forneça no formato YYYY-MM (ex: "2026-10" ou "outubro 2026").`,
+    };
+  }
+
+  const [vYearStr, vMonthStr] = mesVenda.split('-');
+  const vYear = parseInt(vYearStr, 10);
+  const vMonth = parseInt(vMonthStr, 10);
+
+  // Calcula os meses de inatividade que definem o "mono"
+  let mesesInativos: string[] = [];
+
+  if (args.parado_desde) {
+    const pDesde = normalizePeriodInput(args.parado_desde);
+    if (pDesde && /^\d{4}-\d{2}$/.test(pDesde) && pDesde < mesVenda) {
+      const [sy, sm] = pDesde.split('-').map(Number);
+      let curY = sy;
+      let curM = sm;
+      while (curY < vYear || (curY === vYear && curM < vMonth)) {
+        mesesInativos.push(`${curY}-${String(curM).padStart(2, '0')}`);
+        curM += 1;
+        if (curM > 12) {
+          curM = 1;
+          curY += 1;
+        }
+      }
+    }
+  }
+
+  // Critério canónico de Mono em farmácia (>= 3 meses / 90 dias de paragem)
+  // Se o utilizador não especificar meses_parado_minimo explicitamente, assegura pelo menos 3 meses
+  const minMeses = args.meses_parado_minimo !== undefined ? Math.max(args.meses_parado_minimo, 1) : 3;
+  if (mesesInativos.length < minMeses) {
+    let curY = vYear;
+    let curM = vMonth;
+    mesesInativos = [];
+    for (let i = 0; i < minMeses; i++) {
+      curM -= 1;
+      if (curM === 0) {
+        curM = 12;
+        curY -= 1;
+      }
+      mesesInativos.push(`${curY}-${String(curM).padStart(2, '0')}`);
+    }
+  }
+
+  // 1. Carrega todas as vendas da farmácia
+  const vendasRaw = await prisma.venda.findMany({
+    where: { farmaciaId: ctx.farmaciaId },
+    select: { cnp_codigo: true, quantidade: true, valor_total: true, data_venda: true },
+  });
+
+  if (vendasRaw.length === 0) {
+    return {
+      farmacia: ctx.farmaciaNome,
+      mensagem: 'Não existem registos de vendas para analisar nesta farmácia.',
+    };
+  }
+
+  // 2. Mapeamento de produtos e preços de referência
+  const prods = await prisma.produtoMestre.findMany({
+    select: {
+      cnp_codigo: true,
+      designacao: true,
+      dci: true,
+      categoria: true,
+      subcategoria: true,
+      macro_area: true,
+      tipo_venda: true,
+      indicacoes_clinicas: true,
+      pvp: true,
+      margem_padrao: true,
+    },
+  });
+  const prodMap = new Map(prods.map((p) => [p.cnp_codigo, p]));
+
+  const precos = await prisma.precoFarmacia.findMany({
+    where: { farmaciaId: ctx.farmaciaId },
+    select: { cnp_codigo: true, pvp: true, custo_ref: true },
+  });
+  const precoMap = new Map(precos.map((p) => [p.cnp_codigo, { pvp: Number(p.pvp || 0), custo: Number(p.custo_ref || 0) }]));
+
+  // 3. Stock físico atual na farmácia
+  const inventarios = await prisma.inventario.findMany({
+    where: { farmaciaId: ctx.farmaciaId },
+    select: { cnp_codigo: true, quantidade: true, custo_unitario: true },
+  });
+  const stockMap = new Map<string, { qtd: number; custo: number }>();
+  for (const inv of inventarios) {
+    const cur = stockMap.get(inv.cnp_codigo) || { qtd: 0, custo: Number(inv.custo_unitario || 0) };
+    cur.qtd += inv.quantidade;
+    stockMap.set(inv.cnp_codigo, cur);
+  }
+
+  // 4. Agrupa vendas por CNP e Mês
+  const salesMap = new Map<string, Map<string, { qtd: number; valor: number }>>();
+  for (const v of vendasRaw) {
+    const mesKey = v.data_venda.toISOString().slice(0, 7);
+    if (!salesMap.has(v.cnp_codigo)) salesMap.set(v.cnp_codigo, new Map());
+    const m = salesMap.get(v.cnp_codigo)!;
+    const cur = m.get(mesKey) || { qtd: 0, valor: 0 };
+    cur.qtd += Number(v.quantidade || 0);
+    cur.valor += Number(v.valor_total || 0);
+    m.set(mesKey, cur);
+  }
+
+  // 5. Filtrar produtos reativados
+  const limite = Math.min(Math.max(args.limite_produtos || 20, 1), 100);
+  const reativados: any[] = [];
+
+  for (const [cnp, months] of salesMap.entries()) {
+    const vendaAlvo = months.get(mesVenda);
+    if (!vendaAlvo || vendaAlvo.qtd <= 0) continue;
+
+    // Verificar se esteve rigorosamente sem vendas em TODOS os meses de inatividade
+    let teveVendaInativo = false;
+    for (const mInativo of mesesInativos) {
+      const v = months.get(mInativo);
+      if (v && v.qtd > 0) {
+        teveVendaInativo = true;
+        break;
+      }
+    }
+    if (teveVendaInativo) continue;
+
+    const pInfo = prodMap.get(cnp);
+    const prInfo = precoMap.get(cnp);
+    const invInfo = stockMap.get(cnp);
+
+    let custoUnit = 0;
+    if (prInfo && prInfo.custo > 0) custoUnit = prInfo.custo;
+    else if (invInfo && invInfo.custo > 0) custoUnit = invInfo.custo;
+    else if (pInfo && pInfo.pvp && pInfo.margem_padrao) {
+      custoUnit = Number(pInfo.pvp) * (1 - Number(pInfo.margem_padrao) / 100);
+    } else {
+      custoUnit = (vendaAlvo.valor / (vendaAlvo.qtd || 1)) * 0.7;
+    }
+
+    const designacao = pInfo?.designacao || cnp;
+    const isSazonal = /gripe|griponal|ilvico|pastilha|tosse|broncho-vaxom|solar|spf|repelente/i.test(designacao);
+    if (args.excluir_sazonais && isSazonal) continue;
+
+    const stockAtual = invInfo?.qtd || 0;
+    const eliminadoTotalmente = stockAtual === 0;
+    if (args.apenas_eliminados_a_zero && !eliminadoTotalmente) continue;
+
+    const capitalRecuperadoEur = Math.round(vendaAlvo.qtd * custoUnit * 100) / 100;
+    const faturacaoEur = Math.round(vendaAlvo.valor * 100) / 100;
+    const margemEur = Math.round((faturacaoEur - capitalRecuperadoEur) * 100) / 100;
+
+    const macroArea = pInfo?.macro_area || (pInfo?.tipo_venda === 'MSRM' ? 'MSRM' : 'OUTRO');
+    const ehMsrmOuVacina = macroArea === 'MSRM' || /vacina|injetavel|insulina/i.test(designacao);
+
+    // Classificação operacional factual
+    let tipoClassificacao = '';
+    let recomendacaoOperacional = '';
+    if (eliminadoTotalmente) {
+      if (ehMsrmOuVacina) {
+        tipoClassificacao = 'Stock 0 un (MSRM)';
+        recomendacaoOperacional = 'Verificar se existe prescrição ativa habitual antes de repor.';
+      } else {
+        tipoClassificacao = 'Stock 0 un (Liquidado)';
+        recomendacaoOperacional = 'Stock totalmente escoado.';
+      }
+    } else {
+      tipoClassificacao = `Resta stock (${stockAtual} un)`;
+      recomendacaoOperacional = ehMsrmOuVacina
+        ? `Restam ${stockAtual} un; priorizar dispensa desta embalagem perante receita médica.`
+        : `Restam ${stockAtual} un em stock.`;
+    }
+
+    reativados.push({
+      cnp,
+      designacao,
+      dci: pInfo?.dci || null,
+      macroArea,
+      categoria: pInfo?.categoria || 'Medicamentos',
+      subcategoria: pInfo?.subcategoria || null,
+      indicacoesClinicas: pInfo?.indicacoes_clinicas || null,
+      mesesInativo: mesesInativos.length,
+      periodoParado: `${mesesInativos[mesesInativos.length - 1]} a ${mesesInativos[0]}`,
+      unidadesVendidas: vendaAlvo.qtd,
+      custoUnitarioEur: Math.round(custoUnit * 100) / 100,
+      capitalRecuperadoEur,
+      faturacaoEur,
+      margemEur,
+      stockAtual,
+      eliminadoTotalmente,
+      ehSazonal: isSazonal,
+      tipoClassificacao,
+      recomendacaoOperacional,
+    });
+  }
+
+  // Ordenar por capital recuperado decrescente
+  reativados.sort((a, b) => b.capitalRecuperadoEur - a.capitalRecuperadoEur);
+
+  const totalUnidades = reativados.reduce((s, i) => s + i.unidadesVendidas, 0);
+  const totalCapitalRecuperado = reativados.reduce((s, i) => s + i.capitalRecuperadoEur, 0);
+  const totalFaturacao = reativados.reduce((s, i) => s + i.faturacaoEur, 0);
+  const totalEliminados = reativados.filter((i) => i.eliminadoTotalmente).length;
+
+  const descInat = mesesInativos.length === 1
+    ? `mês anterior (${mesesInativos[0]})`
+    : `${mesesInativos.length} meses (${mesesInativos[mesesInativos.length - 1]} a ${mesesInativos[0]})`;
+
+  return {
+    farmacia: ctx.farmaciaNome,
+    mesVenda,
+    criterioInatividade: {
+      mesesAvaliados: mesesInativos,
+      descricao: `Sem vendas durante ${descInat}`,
+    },
+    resumoExecutivo: {
+      totalArtigosReativados: reativados.length,
+      totalUnidadesVendidas: totalUnidades,
+      totalCapitalRecuperadoEur: Math.round(totalCapitalRecuperado * 100) / 100,
+      totalFaturacaoGeradaEur: Math.round(totalFaturacao * 100) / 100,
+      totalMargemGeradaEur: Math.round((totalFaturacao - totalCapitalRecuperado) * 100) / 100,
+      artigosTotalmenteEliminadosCount: totalEliminados,
+      artigosComStockResidualCount: reativados.length - totalEliminados,
+    },
+    topArtigosDescongelados: reativados.slice(0, limite),
+    artigosEliminadosTotalmente: reativados.filter((i) => i.eliminadoTotalmente).slice(0, limite),
+    diagnosticoExplicativo: `Em ${mesVenda}, foram vendidos ${totalUnidades} unidades de ${reativados.length} artigos que estavam inativos há ${descInat}, libertando €${totalCapitalRecuperado.toFixed(2)} de capital de custo imobilizado (€${totalFaturacao.toFixed(2)} em faturação). Desses, ${totalEliminados} produtos foram totalmente esgotados na gaveta (stock final = 0 un).`,
   };
 }
 
@@ -2479,6 +2890,23 @@ export async function toolConsultarCampanhasAtivasEHistorico(
 }
 
 // ============================================================================
+// 18.1. CONSULTAR DESEMPENHO E VENDAS DE CAMPANHAS (ESPECÍFICO VS GLOBAL)
+// ============================================================================
+export async function toolConsultarDesempenhoCampanhas(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args?: {
+    campanha_id?: string;
+    incluir_concluidas?: boolean;
+    data_inicio?: string;
+    data_fim?: string;
+  }
+) {
+  const { toolConsultarDesempenhoCampanhas: runAudit } = await import('./copilot_semantic_layer');
+  return runAudit(prisma, ctx, args || {});
+}
+
+// ============================================================================
 // 19. ATIVAR CAMPANHA NA FARMÁCIA (GERANDO TAREFAS AUTOMÁTICAS P/ EQUIPA)
 // ============================================================================
 export async function toolAtivarCampanhaFarmacia(
@@ -2489,13 +2917,40 @@ export async function toolAtivarCampanhaFarmacia(
     titulo?: string;
     icone?: string;
     tema_ou_evento?: string;
+    tema_ou_categoria?: string;
     produtos_cnps?: string[];
+    cnps_especificos?: string[];
     foco_stock?: 'TODOS_ELEGIVEIS' | 'PRIORIDADE_VALIDADES_MONOS' | 'SO_VALIDADES_E_MONOS';
     desconto_pct?: number;
     dias_duracao?: number;
     criado_por?: string;
   }
 ) {
+  const cnpsList = args.produtos_cnps || args.cnps_especificos || [];
+  if (cnpsList.length > 0) {
+    const msrmFound = await prisma.produtoMestre.findMany({
+      where: { cnp_codigo: { in: cnpsList }, tipo_venda: 'MSRM' },
+      select: { cnp_codigo: true, designacao: true },
+    });
+    if (msrmFound.length > 0) {
+      return {
+        ok: false,
+        success: false,
+        erro: {
+          codigo: 'REGRA_LEGAL_VIOLADA',
+          mensagem: `Proibido incluir medicamentos MSRM em campanhas ou descontos: ${msrmFound
+            .map((m) => `${m.cnp_codigo} (${m.designacao})`)
+            .join(', ')}.`,
+        },
+      };
+    }
+  }
+  if (!args.tema_ou_evento && args.tema_ou_categoria) {
+    args.tema_ou_evento = args.tema_ou_categoria;
+  }
+  if (!args.produtos_cnps && args.cnps_especificos) {
+    args.produtos_cnps = args.cnps_especificos;
+  }
   const { activateCampaign } = await import('./active_campaigns');
   const { getSeasonalCampaignSuggestions } = await import('./campaigns');
 
@@ -2649,5 +3104,413 @@ export async function toolSugerirVendaCruzadaEComplementares(
       pvp: s.produto.pvp,
       margemPct: s.produto.margem,
     })),
+  };
+}
+
+/**
+ * 24. Analisar Desempenho e Auditoria de Compras de Laboratório Titular
+ * Permite à direção ou responsável de compras auditar o portfólio completo de um laboratório:
+ * - Faturação e rotação real dos últimos 12 meses;
+ * - Valor total de stock imobilizado;
+ * - Produtos recomendados para encomendar (em rutura ou com stock <30 dias);
+ * - Produtos com encomenda estritamente proibida (Monos ou Excesso >4 meses de cobertura).
+ */
+export async function toolAnalisarDesempenhoLaboratorio(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: { nome_laboratorio: string; limite_detalhes?: number }
+) {
+  const nomeLab = (args.nome_laboratorio || '').trim();
+  if (!nomeLab) {
+    return {
+      success: false,
+      mensagem: 'Por favor, indique o nome do laboratório a analisar (ex: Generis, Teva, Pierre Fabre, Viatris, etc.).',
+    };
+  }
+
+  const limite = Math.min(args.limite_detalhes || 25, 50);
+
+  // 1. Procurar em MartProdutoMetricas com filtro rigoroso de palavra inteira (evita que "Bial" case com "Labial")
+  const rawMarts = await prisma.martProdutoMetricas.findMany({
+    where: {
+      farmaciaId: ctx.farmaciaId,
+      OR: [
+        { laboratorio_titular: { contains: nomeLab, mode: 'insensitive' } },
+        { designacao: { contains: nomeLab, mode: 'insensitive' } },
+      ],
+    },
+    orderBy: { total_unidades_vendidas: 'desc' },
+  });
+
+  const escapedLab = nomeLab.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const labWordRx = new RegExp(`\\b${escapedLab}\\b`, 'i');
+  const labPrefixRx = new RegExp(`^${escapedLab}`, 'i');
+
+  const marts = rawMarts.filter((m) => {
+    const lab = (m.laboratorio_titular || '').trim();
+    if (lab) {
+      return labWordRx.test(lab);
+    }
+    return labWordRx.test(m.designacao) || labPrefixRx.test(m.designacao);
+  });
+
+  if (marts.length === 0) {
+    return {
+      success: false,
+      laboratorioPesquisado: nomeLab,
+      mensagem: `Nenhum produto encontrado na farmácia ${ctx.farmaciaNome} associado ao laboratório "${nomeLab}". Verifique a grafia ou consulte os produtos por categoria.`,
+    };
+  }
+
+  // 1.1 Obter sazonalidade oficial de ProdutoMestre, consolidação DCI, faturação e vendas mensais (últimos 3 meses)
+  const cnpList = marts.map((m) => m.cnp_codigo);
+  const [produtosMestre, dciGrupos, fatAgregada, vendasMensaisLab] = await Promise.all([
+    prisma.produtoMestre.findMany({
+      where: { cnp_codigo: { in: cnpList } },
+      select: { cnp_codigo: true, sazonalidade: true, dci: true, laboratorio_titular: true },
+    }),
+    prisma.martDciGrupo.findMany({
+      where: { farmaciaId: ctx.farmaciaId },
+      select: { grupo_equivalencia_dci: true, stock_total_unidades: true, vmm_total_grupo: true, custo_minimo: true, labsJson: true },
+    }),
+    prisma.martProdutoMes.aggregate({
+      where: { farmaciaId: ctx.farmaciaId, cnp_codigo: { in: cnpList } },
+      _sum: { valor_total: true },
+    }),
+    prisma.martProdutoMes.findMany({
+      where: { farmaciaId: ctx.farmaciaId, cnp_codigo: { in: cnpList } },
+      select: { cnp_codigo: true, mes: true, quantidade: true, valor_total: true },
+      orderBy: { mes: 'asc' },
+    }),
+  ]);
+
+  const totalFaturacao12mEur = Number(fatAgregada._sum.valor_total || 0);
+
+  const pmMap = new Map(produtosMestre.map((p) => [p.cnp_codigo, p]));
+  const dciMap = new Map(dciGrupos.map((d) => [d.grupo_equivalencia_dci.toLowerCase(), d]));
+
+  const currentMonth = new Date().getMonth() + 1; // 1-12
+  const isWinterWindow = currentMonth >= 10 || currentMonth <= 3; // Outubro a Março
+  const isSummerWindow = currentMonth >= 5 && currentMonth <= 9;  // Maio a Setembro
+
+  let totalStockUnidades = 0;
+  let totalStockValor = 0;
+  let totalVendidos12m = 0;
+  let produtosComStock = 0;
+  let capitalMonos = 0;
+  let capitalExcesso = 0;
+
+  const paraRepor: any[] = [];
+  const travarMono: any[] = [];
+  const travarExcesso: any[] = [];
+  const travarSazonal: any[] = [];
+  const confortavel: any[] = [];
+
+  // Agrupar vendas mensais por CNP e identificar os últimos 3 meses disponíveis
+  const mesesSet = new Set<string>();
+  const vendasPorCnpMes = new Map<string, Map<string, number>>();
+  for (const vm of vendasMensaisLab) {
+    mesesSet.add(vm.mes);
+    let m = vendasPorCnpMes.get(vm.cnp_codigo);
+    if (!m) {
+      m = new Map();
+      vendasPorCnpMes.set(vm.cnp_codigo, m);
+    }
+    m.set(vm.mes, (m.get(vm.mes) || 0) + vm.quantidade);
+  }
+  const ultimos3Meses = [...mesesSet].sort().slice(-3);
+
+  const produtosEmCrescimento3M: any[] = [];
+  const produtosEmQuedaOuParados3M: any[] = [];
+
+  for (const item of marts) {
+    const stock = item.stock_total_unidades;
+    const valor = Number(item.stock_total_valor_custo || 0);
+    const custoUnit = Number(item.custo_unitario_medio || 0);
+    const vmm = Number(item.vmm || 0);
+    const vendas12m = item.total_unidades_vendidas || 0;
+    const cobertura = Number(item.cobertura_meses || 0);
+    const pvp = Number(item.pvp || 0);
+    const rawMargem = Number(item.margem_padrao || 0);
+    // Nunca devolver 100% quando não há custo unitário registado
+    const margem: number | null =
+      custoUnit > 0 && pvp > 0
+        ? Number((((pvp - custoUnit) / pvp) * 100).toFixed(1))
+        : rawMargem > 0 && rawMargem < 99.9
+        ? rawMargem
+        : null;
+
+    const pm = pmMap.get(item.cnp_codigo);
+    const sazonalidade = (pm?.sazonalidade || 'TODO_O_ANO').toUpperCase();
+    const dciOficial = pm?.dci || item.molecula_dci || null;
+    const labOficial = pm?.laboratorio_titular || item.laboratorio_titular || nomeLab;
+    const dciKey = (item.grupo_equivalencia_dci || dciOficial || '').toLowerCase();
+    const dciInfo = dciKey ? dciMap.get(dciKey) : null;
+
+    // Evolução nos últimos 3 meses
+    if (ultimos3Meses.length === 3) {
+      const mMap = vendasPorCnpMes.get(item.cnp_codigo) || new Map<string, number>();
+      const [m1, m2, m3] = ultimos3Meses;
+      const q1 = mMap.get(m1) || 0;
+      const q2 = mMap.get(m2) || 0;
+      const q3 = mMap.get(m3) || 0;
+      const total3m = q1 + q2 + q3;
+
+      if (total3m > 0 || stock > 0 || vendas12m > 0) {
+        const registo3m = {
+          cnp: item.cnp_codigo,
+          designacao: item.designacao,
+          laboratorioTitular: labOficial,
+          dci: dciOficial || 'Sem dados',
+          vendasMeses: { [m1]: q1, [m2]: q2, [m3]: q3 },
+          totalUltimos3Meses: total3m,
+          vendas12m,
+          stockAtual: stock,
+          margemPct: margem,
+        };
+        if (q3 > q1 || (q3 > 0 && q3 >= q2 && q2 >= q1)) {
+          produtosEmCrescimento3M.push({ ...registo3m, tendencia: q3 > q1 ? 'A_SUBIR' : 'ESTAVEL_ATIVO' });
+        } else {
+          produtosEmQuedaOuParados3M.push({
+            ...registo3m,
+            tendencia: total3m === 0 ? 'SEM_VENDAS_3M' : 'A_DESCER',
+          });
+        }
+      }
+    }
+
+    totalStockUnidades += stock;
+    totalStockValor += valor;
+    totalVendidos12m += vendas12m;
+    if (stock > 0) produtosComStock++;
+
+    // A) Verificação de Sazonalidade Fora de Época (Reutilização da Inteligência de Épocas)
+    const foraDeEpoca =
+      (sazonalidade === 'VERAO' && isWinterWindow) ||
+      (sazonalidade === 'INVERNO' && isSummerWindow);
+
+    if (foraDeEpoca) {
+      travarSazonal.push({
+        cnp: item.cnp_codigo,
+        designacao: item.designacao,
+        laboratorioTitular: labOficial,
+        dci: dciOficial || 'Sem dados',
+        stockAtual: stock,
+        capitalImobilizado: Math.round(valor * 100) / 100,
+        sazonalidade,
+        epocaAtual: isWinterWindow ? 'OUTONO / INVERNO' : 'PRIMAVERA / VERÃO',
+        motivoBloqueio: `Artigo sazonal de ${sazonalidade} fora de época. Procura natural estagnada — NÃO voltar a encomendar agora para não gerar mono.`,
+      });
+      continue;
+    }
+
+    // B) Classificação Contábil e Matemática
+    if (item.eh_mono && stock > 0) {
+      capitalMonos += valor;
+      travarMono.push({
+        cnp: item.cnp_codigo,
+        designacao: item.designacao,
+        laboratorioTitular: labOficial,
+        dci: dciOficial || 'Sem dados',
+        stockAtual: stock,
+        capitalImobilizado: Math.round(valor * 100) / 100,
+        diasSemVendas: item.dias_sem_vendas || 90,
+        motivoBloqueio: `Mono parado há ${item.dias_sem_vendas || '>90'} dias sem vendas. Capital empatado.`,
+      });
+    } else if (item.eh_excesso_cobertura || cobertura > 4) {
+      capitalExcesso += valor;
+      travarExcesso.push({
+        cnp: item.cnp_codigo,
+        designacao: item.designacao,
+        laboratorioTitular: labOficial,
+        dci: dciOficial || 'Sem dados',
+        stockAtual: stock,
+        capitalImobilizado: Math.round(valor * 100) / 100,
+        coberturaMeses: Math.round(cobertura * 10) / 10,
+        vmmMensal: vmm,
+        motivoBloqueio: `Excesso de stock (${Math.round(cobertura * 10) / 10} meses de autonomia ao ritmo de ${vmm}/mês). Travar compras.`,
+      });
+    } else if ((vmm >= 0.5 || vendas12m >= 6) && (cobertura < 1.0 || stock === 0)) {
+      const vmmEfetivo = vmm > 0 ? vmm : Math.round((vendas12m / 12) * 100) / 100;
+      const coberturaDias = vmmEfetivo > 0 ? Math.round((stock / (vmmEfetivo / 30))) : 0;
+      const ehPicoInverno = sazonalidade === 'INVERNO' && isWinterWindow;
+      // No pico sazonal, cobertura sugerida é 45 dias; fora de pico 30 dias
+      const diasAlvo = ehPicoInverno ? 45 : 30;
+      const qtdSugerida = Math.max(1, Math.ceil(vmmEfetivo * (diasAlvo / 30)) - stock);
+
+      // Verificação DCI: se outro lab já cobre a molécula
+      let avisoDci: string | null = null;
+      if (dciInfo && dciInfo.stock_total_unidades > stock) {
+        const dciCobMeses = Number(dciInfo.vmm_total_grupo) > 0 ? dciInfo.stock_total_unidades / Number(dciInfo.vmm_total_grupo) : 0;
+        if (dciCobMeses > 2) {
+          avisoDci = `Atenção: A molécula ${item.grupo_equivalencia_dci} já tem ${dciInfo.stock_total_unidades} un em stock total (${Math.round(dciCobMeses * 10) / 10} meses) noutros laboratórios. Priorizar escoamento existente.`;
+        }
+      }
+
+      paraRepor.push({
+        cnp: item.cnp_codigo,
+        designacao: item.designacao,
+        laboratorioTitular: labOficial,
+        dci: dciOficial || 'Sem dados',
+        stockAtual: stock,
+        vmmMensal: vmmEfetivo,
+        diasCobertura: coberturaDias,
+        sugestaoEncomenda: qtdSugerida,
+        margemPct: margem,
+        sazonalidade: sazonalidade !== 'TODO_O_ANO' ? sazonalidade : undefined,
+        picoSazonalAtivo: ehPicoInverno,
+        avisoConsolidacaoDci: avisoDci,
+        motivo: stock === 0
+          ? `RUTURA! Vende ${vmmEfetivo}/mês (${vendas12m} un no ano).${ehPicoInverno ? ' [PICO DE INVERNO ATIVO 🔥]' : ''}`
+          : `Stock crítico (${coberturaDias} dias de autonomia).${ehPicoInverno ? ' [Reforço Sazonal]' : ''}`,
+      });
+    } else if (stock > 0) {
+      confortavel.push({
+        cnp: item.cnp_codigo,
+        designacao: item.designacao,
+        laboratorioTitular: labOficial,
+        dci: dciOficial || 'Sem dados',
+        stockAtual: stock,
+        coberturaMeses: Math.round(cobertura * 10) / 10,
+        vmmMensal: vmm,
+      });
+    }
+  }
+
+  // Ordenações analíticas
+  paraRepor.sort((a, b) => b.vmmMensal - a.vmmMensal);
+  travarExcesso.sort((a, b) => b.capitalImobilizado - a.capitalImobilizado);
+  travarMono.sort((a, b) => b.capitalImobilizado - a.capitalImobilizado);
+  produtosEmCrescimento3M.sort((a, b) => b.totalUltimos3Meses - a.totalUltimos3Meses);
+  produtosEmQuedaOuParados3M.sort((a, b) => b.stockAtual - a.stockAtual || b.vendas12m - a.vendas12m);
+
+  // Top produtos mais vendidos da marca no período homólogo
+  const topMaisVendidos = marts
+    .filter((m) => m.total_unidades_vendidas > 0)
+    .sort((a, b) => b.total_unidades_vendidas - a.total_unidades_vendidas)
+    .slice(0, 8)
+    .map((m) => {
+      const pm = pmMap.get(m.cnp_codigo);
+      const vmm = Number(m.vmm || 0);
+      const stock = m.stock_total_unidades;
+      const cobDias = vmm > 0 ? Math.round(stock / (vmm / 30)) : 999;
+      const custoUnit = Number(m.custo_unitario_medio || 0);
+      const pvp = Number(m.pvp || 0);
+      const rawMargem = Number(m.margem_padrao || 0);
+      const margemSegura =
+        custoUnit > 0 && pvp > 0
+          ? Number((((pvp - custoUnit) / pvp) * 100).toFixed(1))
+          : rawMargem > 0 && rawMargem < 99.9
+          ? rawMargem
+          : null;
+      return {
+        cnp: m.cnp_codigo,
+        designacao: m.designacao,
+        laboratorioTitular: pm?.laboratorio_titular || m.laboratorio_titular || nomeLab,
+        dci: pm?.dci || m.molecula_dci || 'Sem dados',
+        unidadesVendidas12M: m.total_unidades_vendidas,
+        vmmMensal: vmm,
+        stockAtual: stock,
+        diasCobertura: cobDias,
+        pvpEur: pvp,
+        margemComercialPct: margemSegura,
+        situacao: stock === 0 ? 'Rutura' : cobDias <= 25 ? 'Stock Baixo (Repor)' : 'Stock Seguro',
+      };
+    });
+
+  // Análise de Quota de Mercado Interno (Market Share por Molécula DCI na Farmácia)
+  const cnpSet = new Set(cnpList);
+  const lideresQuota: any[] = [];
+  const subPerformersQuota: any[] = [];
+
+  for (const g of dciGrupos) {
+    const labs = (g.labsJson as any[]) || [];
+    const itemLab = labs.find((l) => cnpSet.has(l.cnp_codigo) || labWordRx.test(l.designacao || ''));
+    if (!itemLab) continue;
+
+    const vmmTotal = Number(g.vmm_total_grupo || 0);
+    if (vmmTotal < 0.5) continue;
+
+    const vmmLab = Number(itemLab.vmm || 0);
+    const quotaPct = Math.round((vmmLab / vmmTotal) * 100);
+
+    const sortedLabs = [...labs].sort((a, b) => Number(b.vmm || 0) - Number(a.vmm || 0));
+    const labLider = sortedLabs[0];
+    const liderQuotaPct = Math.round((Number(labLider.vmm || 0) / vmmTotal) * 100);
+
+    if (quotaPct >= 50) {
+      lideresQuota.push({
+        moleculaDci: g.grupo_equivalencia_dci,
+        produto: itemLab.designacao,
+        vmmMarca: vmmLab,
+        quotaMercadoInterno: `${quotaPct}%`,
+        vmmTotalGrupo: vmmTotal,
+        stockAtual: itemLab.stock_atual,
+        custoUnitario: itemLab.custo_unitario,
+        posicao: 'LÍDER DA MOLÉCULA NA FARMÁCIA',
+        recomendacao: `A farmácia tem preferência clara por ${nomeLab} nesta molécula (${quotaPct}% das vendas da farmácia). Manter como marca prioritária de reposição.`,
+      });
+    } else if (quotaPct < 30 && labs.length >= 2) {
+      subPerformersQuota.push({
+        moleculaDci: g.grupo_equivalencia_dci,
+        produto: itemLab.designacao,
+        vmmMarca: vmmLab,
+        quotaMercadoInterno: `${quotaPct}%`,
+        vmmTotalGrupo: vmmTotal,
+        stockAtual: itemLab.stock_atual,
+        liderMercadoInterno: labLider.designacao,
+        liderQuota: `${liderQuotaPct}%`,
+        liderStock: labLider.stock_atual,
+        posicao: 'SUB-PERFORMER / MARCA RESIDUAL NA FARMÁCIA',
+        recomendacao: `Atenção: ${nomeLab} vende muito pouco desta molécula (${quotaPct}% de quota, VMM ${vmmLab}/mês) em comparação com o líder ${labLider.designacao.split(' ')[0]} (${liderQuotaPct}%, VMM ${labLider.vmm}/mês). Não sobrecarregar encomendas a ${nomeLab} aqui; dar prioridade à marca líder.`,
+      });
+    }
+  }
+
+  lideresQuota.sort((a, b) => b.vmmMarca - a.vmmMarca);
+  subPerformersQuota.sort((a, b) => b.vmmTotalGrupo - a.vmmTotalGrupo);
+
+  return {
+    success: true,
+    laboratorioPesquisado: nomeLab,
+    farmacia: ctx.farmaciaNome,
+    resumoExecutivo: {
+      totalReferenciasNoCatalogo: marts.length,
+      artigosComStockFisico: produtosComStock,
+      stockTotalUnidades: totalStockUnidades,
+      stockTotalValorCusto: Math.round(totalStockValor * 100) / 100,
+      vendasTotais12mUnidades: totalVendidos12m,
+      faturacaoTotal12mEur: Math.round(totalFaturacao12mEur * 100) / 100,
+      capitalEmpatadoEmMonos: Math.round(capitalMonos * 100) / 100,
+      totalReferenciasMonos: travarMono.length,
+      capitalEmExcessoCobertura: Math.round(capitalExcesso * 100) / 100,
+      totalReferenciasExcesso: travarExcesso.length,
+      totalArtigosSazonaisForaDeEpoca: travarSazonal.length,
+      totalArtigosParaReporUrgente: paraRepor.length,
+      totalArtigosStockConfortavel: confortavel.length,
+    },
+    recomendacaoEstrategicaCompras: {
+      diagnostico:
+        travarMono.length > 0 || travarExcesso.length > 0 || travarSazonal.length > 0
+          ? `Atenção na negociação com ${nomeLab}: Faturação de €${Math.round(totalFaturacao12mEur * 100) / 100} (${totalVendidos12m} un). Existem €${Math.round((capitalMonos + capitalExcesso) * 100) / 100} empatados em stock ineficiente (${travarMono.length} monos e ${travarExcesso.length} produtos em excesso)${travarSazonal.length > 0 ? ` e ${travarSazonal.length} produtos sazonais fora de época` : ''}. Exigir devolução/troca dos monos e focar estritamente nas necessidades comprovadas de reposição.`
+          : `Portfólio equilibrado com ${nomeLab}. Faturação de €${Math.round(totalFaturacao12mEur * 100) / 100} (${totalVendidos12m} un).`,
+    },
+    produtosMaisVendidosAltaRotacao: topMaisVendidos,
+    evolucaoUltimos3Meses: {
+      mesesAvaliados: ultimos3Meses,
+      produtosEmCrescimentoOuAtivos: produtosEmCrescimento3M.slice(0, limite),
+      produtosEmQuedaOuParados: produtosEmQuedaOuParados3M.slice(0, limite),
+    },
+    performanceComparativaMoléculaDci: {
+      produtosLideresQuotaMercadoInterno: lideresQuota.slice(0, 10),
+      produtosSubPerformersBaixaQuotaVsConcorrentes: subPerformersQuota.slice(0, 10),
+    },
+    produtosParaEncomendar: paraRepor.slice(0, limite),
+    produtosProibidosDeEncomendar: {
+      sazonaisForaDeEpoca: travarSazonal.slice(0, limite),
+      excessoDeCobertura: travarExcesso.slice(0, limite),
+      monosParados: travarMono.slice(0, limite),
+    },
+    produtosStockConfortavelAmostra: confortavel.slice(0, 10),
   };
 }

@@ -1,4 +1,15 @@
 import crypto from 'crypto';
+import { PrismaClient } from '@prisma/client';
+import {
+  validateNewPin,
+  hashPinWithPepper,
+  verifyPinHash,
+  generateTemporaryPin,
+  hashOpaqueToken,
+  checkDbRateLimit,
+  recordDbRateLimitHit,
+  resetDbRateLimit,
+} from './security_phase0';
 
 export type UserRole = 'AUXILIAR' | 'DIRETOR' | 'GESTOR' | 'SUPORTE';
 
@@ -8,7 +19,10 @@ export interface PharmacyTeamMember {
   nome: string;
   email: string;
   role: UserRole;
-  pin: string;
+  hasPin: boolean;
+  pinTemporario: boolean;
+  pinAlteradoEm?: Date;
+  pinBloqueadoAte?: Date;
   ativo: boolean;
   criadoEm: Date;
   ultimoAcessoEm?: Date;
@@ -28,196 +42,564 @@ export interface ActiveUserSession {
 }
 
 export interface PasswordResetToken {
-  token: string;
   email: string;
   farmaciaId?: string;
   expiresAt: number;
 }
 
-// Armazenamento em memória (persiste durante o ciclo de vida do servidor)
-const teamMembersStore = new Map<string, PharmacyTeamMember[]>();
-const activeSessionsStore = new Map<string, ActiveUserSession>();
-const passwordResetTokens = new Map<string, PasswordResetToken>();
-
-// Membros pré-configurados por omissão para testes
-function initDefaultTeam(farmaciaId: string): PharmacyTeamMember[] {
-  return [
-    {
-      id: 'usr_dir_' + farmaciaId.slice(0, 6),
-      farmaciaId,
-      nome: 'Diretor Técnico',
-      email: 'direcao@farmacia.pt',
-      role: 'DIRETOR',
-      pin: '9876',
-      ativo: true,
-      criadoEm: new Date(),
-    },
-    {
-      id: 'usr_gest_' + farmaciaId.slice(0, 6),
-      farmaciaId,
-      nome: 'Gestor de Operações',
-      email: 'gestao@farmacia.pt',
-      role: 'GESTOR',
-      pin: '5566',
-      ativo: true,
-      criadoEm: new Date(),
-    },
-    {
-      id: 'usr_aux_' + farmaciaId.slice(0, 6),
-      farmaciaId,
-      nome: 'Colaborador Balcão',
-      email: 'balcao@farmacia.pt',
-      role: 'AUXILIAR',
-      pin: '1234',
-      ativo: true,
-      criadoEm: new Date(),
-    },
-  ];
-}
-
-export function getPharmacyTeam(farmaciaId: string): PharmacyTeamMember[] {
-  if (!teamMembersStore.has(farmaciaId)) {
-    teamMembersStore.set(farmaciaId, initDefaultTeam(farmaciaId));
-  }
-  return teamMembersStore.get(farmaciaId) || [];
-}
-
-export function addPharmacyTeamMember(
-  farmaciaId: string,
-  params: { nome: string; email: string; role: UserRole; pin?: string }
-): PharmacyTeamMember {
-  const team = getPharmacyTeam(farmaciaId);
-  const newMember: PharmacyTeamMember = {
-    id: 'usr_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
-    farmaciaId,
-    nome: params.nome.trim(),
-    email: params.email.trim().toLowerCase(),
-    role: params.role || 'AUXILIAR',
-    pin: params.pin ? params.pin.trim() : Math.floor(1000 + Math.random() * 9000).toString(),
-    ativo: true,
-    criadoEm: new Date(),
-  };
-  team.push(newMember);
-  teamMembersStore.set(farmaciaId, team);
-  return newMember;
-}
-
-export function updatePharmacyTeamMember(
-  farmaciaId: string,
-  userId: string,
-  updates: Partial<Pick<PharmacyTeamMember, 'nome' | 'email' | 'role' | 'pin' | 'ativo'>>
-): PharmacyTeamMember | null {
-  const team = getPharmacyTeam(farmaciaId);
-  const idx = team.findIndex(m => m.id === userId);
-  if (idx === -1) return null;
-
-  const current = team[idx];
-  team[idx] = {
-    ...current,
-    ...updates,
-    nome: updates.nome ? updates.nome.trim() : current.nome,
-    email: updates.email ? updates.email.trim().toLowerCase() : current.email,
-  };
-  teamMembersStore.set(farmaciaId, team);
-  return team[idx];
-}
-
-export function deletePharmacyTeamMember(farmaciaId: string, userId: string): boolean {
-  const team = getPharmacyTeam(farmaciaId);
-  const filtered = team.filter(m => m.id !== userId);
-  if (filtered.length === team.length) return false;
-  teamMembersStore.set(farmaciaId, filtered);
-  return true;
+export interface PinVerificationResult {
+  valid: boolean;
+  error?: string;
+  lockedUntil?: Date;
+  requiresPinChange?: boolean;
+  member?: PharmacyTeamMember;
 }
 
 // ============================================================================
-// GESTÃO DE SESSÕES ATIVAS
+// GESTÃO DE EQUIPA (PERSISTIDO EM POSTGRESQL — SEM PINS EM TEXTO CLARO)
 // ============================================================================
 
-export function recordUserSession(session: {
-  sessionId?: string;
-  farmaciaId: string;
-  userName: string;
-  userEmail?: string;
-  role: UserRole;
-  ip: string;
-  device: string;
-}): ActiveUserSession {
-  const sid = session.sessionId || 'sess_' + crypto.randomBytes(16).toString('hex');
-  const record: ActiveUserSession = {
-    sessionId: sid,
-    farmaciaId: session.farmaciaId,
-    userName: session.userName,
-    userEmail: session.userEmail,
-    role: session.role,
-    ip: session.ip || '127.0.0.1',
-    device: session.device || 'Desconhecido',
-    loginAt: new Date(),
-    lastSeenAt: new Date(),
-  };
-  activeSessionsStore.set(sid, record);
-  return record;
-}
-
-export function touchUserSession(sessionId: string): void {
-  const s = activeSessionsStore.get(sessionId);
-  if (s) {
-    s.lastSeenAt = new Date();
-  }
-}
-
-export function getActivePharmacySessions(farmaciaId: string): ActiveUserSession[] {
-  const list: ActiveUserSession[] = [];
-  const now = Date.now();
-  const MAX_INACTIVE_MS = 8 * 60 * 60 * 1000; // 8 horas
-
-  for (const [sid, s] of activeSessionsStore.entries()) {
-    if (now - s.lastSeenAt.getTime() > MAX_INACTIVE_MS) {
-      activeSessionsStore.delete(sid);
-      continue;
-    }
-    if (s.farmaciaId === farmaciaId) {
-      list.push(s);
-    }
-  }
-  return list.sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime());
-}
-
-export function revokeUserSession(sessionId: string): boolean {
-  return activeSessionsStore.delete(sessionId);
-}
-
-// ============================================================================
-// FLUXO DE RECUPERAÇÃO DE PALAVRA-PASSE POR EMAIL
-// ============================================================================
-
-export function createPasswordResetToken(email: string, farmaciaId?: string): string {
-  const cleanEmail = email.trim().toLowerCase();
-  const token = 'rst_' + crypto.randomBytes(24).toString('hex');
-  const expiresAt = Date.now() + 15 * 60 * 1000; // 15 minutos
-
-  passwordResetTokens.set(token, {
-    token,
-    email: cleanEmail,
-    farmaciaId,
-    expiresAt,
+export async function getPharmacyTeam(
+  prisma: PrismaClient,
+  farmaciaId: string
+): Promise<PharmacyTeamMember[]> {
+  const rows = await prisma.membroEquipa.findMany({
+    where: { farmaciaId },
+    orderBy: { criadoEm: 'asc' },
   });
 
-  return token;
+  if (rows.length === 0) {
+    // Inicializar estrutura base da equipa SEM qualquer PIN por omissão (Fase 0)
+    const defaults = [
+      {
+        farmaciaId,
+        nome: 'Diretor Técnico',
+        email: `direcao@${farmaciaId.slice(0, 6)}.pt`,
+        role: 'DIRETOR',
+        pin: null,
+        pinHash: null,
+      },
+      {
+        farmaciaId,
+        nome: 'Gestor de Turno',
+        email: `gestao@${farmaciaId.slice(0, 6)}.pt`,
+        role: 'GESTOR',
+        pin: null,
+        pinHash: null,
+      },
+      {
+        farmaciaId,
+        nome: 'Colaborador Balcão',
+        email: `balcao@${farmaciaId.slice(0, 6)}.pt`,
+        role: 'AUXILIAR',
+        pin: null,
+        pinHash: null,
+      },
+    ];
+
+    await prisma.membroEquipa.createMany({
+      data: defaults,
+      skipDuplicates: true,
+    });
+
+    const refreshed = await prisma.membroEquipa.findMany({
+      where: { farmaciaId },
+      orderBy: { criadoEm: 'asc' },
+    });
+    return refreshed.map(mapMember);
+  }
+
+  return rows.map(mapMember);
 }
 
-export function verifyPasswordResetToken(token: string): PasswordResetToken | null {
-  const record = passwordResetTokens.get(token);
+function mapMember(r: any): PharmacyTeamMember {
+  return {
+    id: r.id,
+    farmaciaId: r.farmaciaId,
+    nome: r.nome,
+    email: r.email,
+    role: (r.role as UserRole) || 'AUXILIAR',
+    hasPin: Boolean(r.pinHash),
+    pinTemporario: Boolean(r.pinTemporario),
+    pinAlteradoEm: r.pinAlteradoEm || undefined,
+    pinBloqueadoAte: r.pinBloqueadoAte || undefined,
+    ativo: r.ativo,
+    criadoEm: r.criadoEm,
+    ultimoAcessoEm: r.ultimoAcessoEm || undefined,
+  };
+}
+
+export async function addPharmacyTeamMember(
+  prisma: PrismaClient,
+  farmaciaId: string,
+  params: { nome: string; email: string; role: UserRole; pin?: string; generatePin?: boolean }
+): Promise<{ member: PharmacyTeamMember; temporaryPin?: string }> {
+  const cleanEmail = params.email.trim().toLowerCase();
+  const cleanNome = params.nome.trim();
+  const memberId = crypto.randomUUID();
+
+  let pinHash: string | null = null;
+  let pinTemporario = false;
+  let temporaryPin: string | undefined;
+
+  if (params.pin && params.pin.trim().length > 0) {
+    const check = validateNewPin(params.pin);
+    if (!check.valid) {
+      throw new Error(check.error || 'PIN inválido.');
+    }
+    pinHash = hashPinWithPepper(params.pin.trim(), memberId);
+    pinTemporario = false;
+  } else if (params.generatePin) {
+    temporaryPin = generateTemporaryPin();
+    pinHash = hashPinWithPepper(temporaryPin, memberId);
+    pinTemporario = true;
+  }
+
+  const created = await prisma.membroEquipa.create({
+    data: {
+      id: memberId,
+      farmaciaId,
+      nome: cleanNome,
+      email: cleanEmail,
+      role: params.role || 'AUXILIAR',
+      pin: null,
+      pinHash,
+      pinAlteradoEm: pinHash ? new Date() : null,
+      pinFalhas: 0,
+      pinBloqueadoAte: null,
+      pinTemporario,
+      ativo: true,
+    },
+  });
+
+  return { member: mapMember(created), temporaryPin };
+}
+
+export async function updatePharmacyTeamMember(
+  prisma: PrismaClient,
+  farmaciaId: string,
+  userId: string,
+  updates: {
+    nome?: string;
+    email?: string;
+    role?: UserRole;
+    pin?: string;
+    resetPin?: boolean;
+    ativo?: boolean;
+  }
+): Promise<{ member: PharmacyTeamMember; temporaryPin?: string } | null> {
+  const existing = await prisma.membroEquipa.findFirst({
+    where: { id: userId, farmaciaId },
+  });
+  if (!existing) return null;
+
+  const data: any = {};
+  let temporaryPin: string | undefined;
+
+  if (updates.nome !== undefined) data.nome = updates.nome.trim();
+  if (updates.email !== undefined) data.email = updates.email.trim().toLowerCase();
+  if (updates.role !== undefined) data.role = updates.role;
+  if (updates.ativo !== undefined) data.ativo = updates.ativo;
+
+  if (updates.resetPin) {
+    temporaryPin = generateTemporaryPin();
+    data.pin = null;
+    data.pinHash = hashPinWithPepper(temporaryPin, existing.id);
+    data.pinAlteradoEm = new Date();
+    data.pinFalhas = 0;
+    data.pinBloqueadoAte = null;
+    data.pinTemporario = true;
+  } else if (updates.pin !== undefined && updates.pin.trim().length > 0) {
+    const check = validateNewPin(updates.pin);
+    if (!check.valid) {
+      throw new Error(check.error || 'PIN inválido.');
+    }
+    data.pin = null;
+    data.pinHash = hashPinWithPepper(updates.pin.trim(), existing.id);
+    data.pinAlteradoEm = new Date();
+    data.pinFalhas = 0;
+    data.pinBloqueadoAte = null;
+    data.pinTemporario = false;
+  }
+
+  const updated = await prisma.membroEquipa.update({
+    where: { id: existing.id },
+    data,
+  });
+
+  return { member: mapMember(updated), temporaryPin };
+}
+
+export async function deletePharmacyTeamMember(
+  prisma: PrismaClient,
+  farmaciaId: string,
+  userId: string
+): Promise<boolean> {
+  const res = await prisma.membroEquipa.deleteMany({
+    where: { id: userId, farmaciaId },
+  });
+  return res.count > 0;
+}
+
+// ============================================================================
+// VERIFICAÇÃO SEGURA DE PIN DE BALCÃO (HMAC + PEPPER + BLOQUEIO 5 FALHAS / 15M)
+// ============================================================================
+
+const PIN_MAX_ATTEMPTS = 5;
+const PIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutos
+const PIN_BASE_BLOCK_MS = 5 * 60 * 1000; // 5 minutos (duplica a cada bloqueio adicional)
+
+export async function verifyMemberPin(
+  prisma: PrismaClient,
+  farmaciaId: string,
+  rawPin: string,
+  memberId?: string
+): Promise<PinVerificationResult> {
+  const cleanPin = String(rawPin || '').trim();
+  if (!/^\d{4,6}$/.test(cleanPin)) {
+    return { valid: false, error: 'PIN inválido.' };
+  }
+
+  const scopeKey = memberId
+    ? `pin:member:${farmaciaId}:${memberId}`
+    : `pin:farm:${farmaciaId}`;
+
+  const rlCheck = await checkDbRateLimit(prisma, scopeKey, PIN_MAX_ATTEMPTS, PIN_WINDOW_MS);
+  if (!rlCheck.allowed) {
+    const mins = Math.max(1, Math.ceil(rlCheck.retryAfterSec / 60));
+    return {
+      valid: false,
+      error: `Demasiadas tentativas de PIN incorreto. Tente novamente dentro de ${mins} minuto(s).`,
+      lockedUntil: new Date(Date.now() + rlCheck.retryAfterSec * 1000),
+    };
+  }
+
+  const candidates = await prisma.membroEquipa.findMany({
+    where: {
+      farmaciaId,
+      ativo: true,
+      pinHash: { not: null },
+      ...(memberId ? { id: memberId } : {}),
+    },
+  });
+
+  if (candidates.length === 0) {
+    return {
+      valid: false,
+      error: 'Nenhum PIN configurado nesta farmácia. Peça ao gestor para definir o PIN em Definições.',
+    };
+  }
+
+  const now = new Date();
+
+  // Verificar se o membro específico está bloqueado
+  if (memberId && candidates[0]?.pinBloqueadoAte && candidates[0].pinBloqueadoAte > now) {
+    const mins = Math.max(1, Math.ceil((candidates[0].pinBloqueadoAte.getTime() - now.getTime()) / 60000));
+    return {
+      valid: false,
+      error: `PIN temporariamente bloqueado. Aguarde ${mins} minuto(s) ou peça reposição ao gestor.`,
+      lockedUntil: candidates[0].pinBloqueadoAte,
+    };
+  }
+
+  let matched: any = null;
+  for (const m of candidates) {
+    if (m.pinBloqueadoAte && m.pinBloqueadoAte > now) continue;
+    if (verifyPinHash(cleanPin, m.id, m.pinHash)) {
+      matched = m;
+      break;
+    }
+  }
+
+  if (matched) {
+    await resetDbRateLimit(prisma, scopeKey);
+    const updated = await prisma.membroEquipa.update({
+      where: { id: matched.id },
+      data: {
+        pinFalhas: 0,
+        pinBloqueadoAte: null,
+        ultimoAcessoEm: now,
+      },
+    });
+    return {
+      valid: true,
+      requiresPinChange: Boolean(updated.pinTemporario),
+      member: mapMember(updated),
+    };
+  }
+
+  // Falha: registar tentativa em Postgres e incrementar contador do membro se especificado
+  const hit = await recordDbRateLimitHit(prisma, scopeKey, PIN_WINDOW_MS, {
+    maxBeforeBlock: PIN_MAX_ATTEMPTS,
+    baseBlockMs: PIN_BASE_BLOCK_MS,
+  });
+
+  if (memberId && candidates[0]) {
+    const m = candidates[0];
+    const nextFails = (m.pinFalhas || 0) + 1;
+    let blockedUntil: Date | null = null;
+    if (nextFails >= PIN_MAX_ATTEMPTS) {
+      const mult = Math.min(8, Math.pow(2, nextFails - PIN_MAX_ATTEMPTS));
+      blockedUntil = new Date(now.getTime() + PIN_BASE_BLOCK_MS * mult);
+      console.warn(
+        JSON.stringify({
+          evento: 'PIN_BLOQUEADO',
+          ts: now.toISOString(),
+          farmaciaId,
+          memberId: m.id,
+          tentativas: nextFails,
+          bloqueadoAte: blockedUntil.toISOString(),
+        })
+      );
+    }
+    await prisma.membroEquipa.update({
+      where: { id: m.id },
+      data: {
+        pinFalhas: nextFails,
+        pinBloqueadoAte: blockedUntil,
+      },
+    });
+  } else if (hit.blockedUntil) {
+    console.warn(
+      JSON.stringify({
+        evento: 'PIN_BLOQUEADO',
+        ts: now.toISOString(),
+        farmaciaId,
+        scope: scopeKey,
+        tentativas: hit.count,
+        bloqueadoAte: hit.blockedUntil.toISOString(),
+      })
+    );
+  }
+
+  if (hit.blockedUntil) {
+    const mins = Math.max(1, Math.ceil((hit.blockedUntil.getTime() - now.getTime()) / 60000));
+    return {
+      valid: false,
+      error: `Demasiadas tentativas falhadas. Acesso por PIN bloqueado durante ${mins} minuto(s).`,
+      lockedUntil: hit.blockedUntil,
+    };
+  }
+
+  return { valid: false, error: 'PIN incorreto.' };
+}
+
+/**
+ * Troca obrigatória do PIN temporário (ou voluntária pelo operador).
+ * Valida o PIN atual, recusa PINs triviais e impede reaproveitar o PIN anterior/temporário.
+ */
+export async function changeMemberPin(
+  prisma: PrismaClient,
+  farmaciaId: string,
+  memberId: string,
+  currentPin: string,
+  newPin: string
+): Promise<{ ok: boolean; error?: string; member?: PharmacyTeamMember }> {
+  const member = await prisma.membroEquipa.findFirst({
+    where: { id: memberId, farmaciaId, ativo: true },
+  });
+  if (!member || !member.pinHash) {
+    return { ok: false, error: 'Colaborador não encontrado ou sem PIN configurado.' };
+  }
+
+  if (!verifyPinHash(currentPin, member.id, member.pinHash)) {
+    return { ok: false, error: 'PIN atual incorreto.' };
+  }
+
+  const check = validateNewPin(newPin);
+  if (!check.valid) {
+    return { ok: false, error: check.error || 'Novo PIN inválido.' };
+  }
+
+  // Impedir reaproveitamento do PIN temporário/atual
+  if (verifyPinHash(newPin, member.id, member.pinHash)) {
+    return { ok: false, error: 'O novo PIN tem de ser diferente do PIN temporário/anterior.' };
+  }
+
+  const updated = await prisma.membroEquipa.update({
+    where: { id: member.id },
+    data: {
+      pin: null,
+      pinHash: hashPinWithPepper(newPin.trim(), member.id),
+      pinAlteradoEm: new Date(),
+      pinFalhas: 0,
+      pinBloqueadoAte: null,
+      pinTemporario: false,
+    },
+  });
+
+  return { ok: true, member: mapMember(updated) };
+}
+
+// ============================================================================
+// GESTÃO DE SESSÕES ATIVAS (PERSISTIDAS EM POSTGRESQL)
+// ============================================================================
+
+export async function recordUserSession(
+  prisma: PrismaClient,
+  session: {
+    sessionId?: string;
+    farmaciaId: string;
+    userName: string;
+    userEmail?: string;
+    role: UserRole;
+    ip: string;
+    device: string;
+  }
+): Promise<ActiveUserSession> {
+  const token = session.sessionId || 'sess_' + crypto.randomBytes(32).toString('hex');
+  const now = new Date();
+  const expiraEm = new Date(now.getTime() + 8 * 60 * 60 * 1000); // 8 horas
+
+  const s = await prisma.sessaoUtilizador.create({
+    data: {
+      token: hashOpaqueToken(token),
+      farmaciaId: session.farmaciaId,
+      userName: session.userName,
+      userEmail: session.userEmail || null,
+      role: session.role,
+      ip: session.ip || '127.0.0.1',
+      device: session.device || 'Desconhecido',
+      criadoEm: now,
+      ultimoAcessoEm: now,
+      expiraEm,
+    },
+  });
+
+  return {
+    sessionId: s.id,
+    farmaciaId: s.farmaciaId,
+    userName: s.userName,
+    userEmail: s.userEmail || undefined,
+    role: (s.role as UserRole) || 'AUXILIAR',
+    ip: s.ip || '127.0.0.1',
+    device: s.device || 'Desconhecido',
+    loginAt: s.criadoEm,
+    lastSeenAt: s.ultimoAcessoEm,
+  };
+}
+
+export async function touchUserSession(prisma: PrismaClient, token: string): Promise<void> {
+  const hashed = hashOpaqueToken(token);
+  await prisma.sessaoUtilizador
+    .update({
+      where: { token: hashed },
+      data: { ultimoAcessoEm: new Date() },
+    })
+    .catch(() => {});
+}
+
+export async function getActivePharmacySessions(
+  prisma: PrismaClient,
+  farmaciaId: string
+): Promise<ActiveUserSession[]> {
+  const now = new Date();
+  await prisma.sessaoUtilizador
+    .deleteMany({
+      where: { expiraEm: { lt: now } },
+    })
+    .catch(() => {});
+
+  const rows = await prisma.sessaoUtilizador.findMany({
+    where: { farmaciaId, expiraEm: { gte: now } },
+    orderBy: { ultimoAcessoEm: 'desc' },
+  });
+
+  return rows.map((s) => ({
+    sessionId: s.id,
+    farmaciaId: s.farmaciaId,
+    userName: s.userName,
+    userEmail: s.userEmail || undefined,
+    role: (s.role as UserRole) || 'AUXILIAR',
+    ip: s.ip || '127.0.0.1',
+    device: s.device || 'Desconhecido',
+    loginAt: s.criadoEm,
+    lastSeenAt: s.ultimoAcessoEm,
+  }));
+}
+
+export async function revokeUserSession(
+  prisma: PrismaClient,
+  sessionIdOrToken: string,
+  farmaciaId?: string
+): Promise<boolean> {
+  try {
+    const hashed = hashOpaqueToken(sessionIdOrToken);
+    const res = await prisma.sessaoUtilizador.deleteMany({
+      where: {
+        OR: [{ id: sessionIdOrToken }, { token: hashed }, { token: sessionIdOrToken }],
+        ...(farmaciaId ? { farmaciaId } : {}),
+      },
+    });
+    return res.count > 0;
+  } catch {
+    return false;
+  }
+}
+
+// ============================================================================
+// FLUXO DE RECUPERAÇÃO DE PALAVRA-PASSE (APENAS HASH SHA-256 EM POSTGRESQL)
+// ============================================================================
+
+export async function createPasswordResetToken(
+  prisma: PrismaClient,
+  email: string,
+  farmaciaId?: string
+): Promise<string> {
+  const cleanEmail = email.trim().toLowerCase();
+  // 256 bits aleatórios; devolvido apenas ao chamador (envio de email), nunca guardado em claro
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = hashOpaqueToken(rawToken);
+  const expiraEm = new Date(Date.now() + 15 * 60 * 1000); // 15 minutos
+
+  await prisma.tokenRecuperacao.create({
+    data: {
+      token: tokenHash,
+      email: cleanEmail,
+      farmaciaId: farmaciaId || null,
+      expiraEm,
+    },
+  });
+
+  return rawToken;
+}
+
+export async function verifyPasswordResetToken(
+  prisma: PrismaClient,
+  rawToken: string
+): Promise<PasswordResetToken | null> {
+  if (!rawToken || rawToken.trim().length < 16) return null;
+  const tokenHash = hashOpaqueToken(rawToken.trim());
+  const record = await prisma.tokenRecuperacao.findUnique({
+    where: { token: tokenHash },
+  });
+
   if (!record) return null;
-  if (Date.now() > record.expiresAt) {
-    passwordResetTokens.delete(token);
+  if (record.usadoEm !== null || record.expiraEm.getTime() < Date.now()) {
     return null;
   }
-  return record;
+
+  return {
+    email: record.email,
+    farmaciaId: record.farmaciaId || undefined,
+    expiresAt: record.expiraEm.getTime(),
+  };
 }
 
-export function consumePasswordResetToken(token: string): boolean {
-  return passwordResetTokens.delete(token);
+export async function consumePasswordResetToken(
+  prisma: PrismaClient,
+  rawToken: string
+): Promise<boolean> {
+  try {
+    const tokenHash = hashOpaqueToken(rawToken.trim());
+    const res = await prisma.tokenRecuperacao.updateMany({
+      where: { token: tokenHash, usadoEm: null },
+      data: { usadoEm: new Date() },
+    });
+    return res.count > 0;
+  } catch {
+    return false;
+  }
 }
 
 // ============================================================================

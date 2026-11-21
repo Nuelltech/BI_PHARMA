@@ -16,6 +16,7 @@ export interface ProdutoCoberturaItem {
   segmento: SegmentoProduto;
   eh_generico: boolean;
   grupo_equivalencia_dci: string | null;
+  laboratorio_titular?: string | null;
   macro_area?: string | null;
   categoria: string;
   subcategoria?: string | null;
@@ -40,6 +41,7 @@ export interface ProdutoMonoItem {
   segmento: SegmentoProduto;
   eh_generico: boolean;
   grupo_equivalencia_dci: string | null;
+  laboratorio_titular?: string | null;
   macro_area?: string | null;
   categoria: string;
   subcategoria?: string | null;
@@ -64,6 +66,7 @@ export interface ProdutoRiscoCaducidadeItem {
   segmento: SegmentoProduto;
   eh_generico: boolean;
   grupo_equivalencia_dci: string | null;
+  laboratorio_titular?: string | null;
   macro_area?: string | null;
   categoria: string;
   subcategoria?: string | null;
@@ -103,6 +106,7 @@ export interface GrupoConsolidacaoGenericoItem {
     stock_atual: number;
     custo_unitario: number;
     data_validade: string | null;
+    laboratorio_titular?: string | null;
   }>;
   todos_laboratorios: Array<{
     cnp_codigo: string;
@@ -111,6 +115,7 @@ export interface GrupoConsolidacaoGenericoItem {
     custo_unitario: number;
     vmm: number;
     data_validade: string | null;
+    laboratorio_titular?: string | null;
   }>;
 }
 
@@ -129,6 +134,7 @@ export interface ProdutoRiscoRuturaItem {
   custo_unitario: number;
   pvp: number;
   motivo_urgencia: string;
+  laboratorio_titular?: string | null;
 }
 
 export interface PharmacyAnalysisReport {
@@ -464,6 +470,7 @@ export async function analyzePharmacyInventory(
         custo_unitario: number;
         vmm: number;
         data_validade: string | null;
+        laboratorio_titular?: string | null;
       }>;
     }
   >();
@@ -517,6 +524,7 @@ export async function analyzePharmacyInventory(
         custo_unitario: Number(item.custo_unitario),
         vmm,
         data_validade: item.data_validade ? item.data_validade.toISOString().slice(0, 10) : null,
+        laboratorio_titular: item.produto.laboratorio_titular || null,
       });
       dciGroupsMap.set(computedClass.grupo_equivalencia_dci, grp);
     }
@@ -587,6 +595,7 @@ export async function analyzePharmacyInventory(
         artigosRiscoRutura.push({
           cnp_codigo: item.cnp_codigo,
           designacao: item.produto.designacao,
+          laboratorio_titular: item.produto.laboratorio_titular || null,
           tipo_venda: tipoVenda,
           segmento,
           categoria,
@@ -643,6 +652,7 @@ export async function analyzePharmacyInventory(
       alertasExcessoCobertura.push({
         cnp_codigo: item.cnp_codigo,
         designacao: item.produto.designacao,
+        laboratorio_titular: item.produto.laboratorio_titular || null,
         tipo_venda: tipoVenda,
         segmento,
         eh_generico: ehGenerico,
@@ -690,6 +700,7 @@ export async function analyzePharmacyInventory(
       monos.push({
         cnp_codigo: item.cnp_codigo,
         designacao: item.produto.designacao,
+        laboratorio_titular: item.produto.laboratorio_titular || null,
         tipo_venda: tipoVenda,
         segmento,
         eh_generico: ehGenerico,
@@ -753,6 +764,7 @@ export async function analyzePharmacyInventory(
         riscoElevadoCaducidade.push({
           cnp_codigo: item.cnp_codigo,
           designacao: item.produto.designacao,
+          laboratorio_titular: item.produto.laboratorio_titular || null,
           tipo_venda: tipoVenda,
           segmento,
           eh_generico: ehGenerico,
@@ -808,6 +820,7 @@ export async function analyzePharmacyInventory(
         stock_atual: i.stock_atual,
         custo_unitario: i.custo_unitario,
         data_validade: i.data_validade,
+        laboratorio_titular: i.laboratorio_titular || null,
       }));
 
     consolidacaoGenericosDci.push({

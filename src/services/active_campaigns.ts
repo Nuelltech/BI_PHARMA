@@ -101,7 +101,7 @@ export async function activateCampaign(
     {
       taskId: `CAMPANHA_${campanhaId}_SIFARMA`,
       categoria: 'ENCOMENDAS_CAMPANHA',
-      designacao: `[${icone} Campanha] Travar Sifarma: Ponto de Encomenda = 0 em produtos concorrentes enquanto decorre a campanha (${totalProdutos} SKUs, ${totalUnidades} un)`,
+      designacao: `[${icone} Campanha] Travar Encomendas: Ponto de Encomenda = 0 no Sistema de Gestão em produtos concorrentes enquanto decorre a campanha (${totalProdutos} SKUs, ${totalUnidades} un)`,
       valorImpacto: undefined,
     }
   ];

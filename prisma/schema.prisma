@@ -3,32 +3,352 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ==========================================
 // TABELAS DE DOMÍNIO E MULTI-TENANT
 // ==========================================
+model Organizacao {
+  id             String          @id @default(uuid())
+  nome           String
+  nif            String?         @unique
+  plano          String          @default("PILOTO") // "PILOTO" | "PRO" | "ENTERPRISE"
+  farmacias      Farmacia[]
+  criadoEm       DateTime        @default(now())
+  atualizadoEm   DateTime        @updatedAt
+}
+
 model Farmacia {
-  id                 String              @id @default(uuid())
-  nome               String
-  nif                String              @unique
-  codigo_acesso      String?             @unique
-  inventarios        Inventario[]
-  vendas             Venda[]
-  stagingInventario  StagingInventario[]
-  stagingVendas      StagingVendas[]
-  stagingValidades   StagingValidades[]
+  id                  String              @id @default(uuid())
+  organizacaoId       String?
+  organizacao         Organizacao?        @relation(fields: [organizacaoId], references: [id], onDelete: SetNull)
+  nome                String
+  nif                 String              @unique
+  slug                String?             @unique
+  morada              String?
+  estado              String              @default("ATIVO") // "ATIVO" | "SUSPENSA" | "INATIVA"
+  planoSaas           String              @default("PILOTO") @map("plano_saas")
+  acessoLegadoAte     DateTime?           @map("acesso_legado_ate")
+  codigo_acesso       String?             @unique
+  membros             MembroEquipa[]
+  membrosFarmacia     MembroFarmacia[]
+  sessoes             SessaoUtilizador[]
+  sessoesV2           Sessao[]
+  dispositivosBalcao  DispositivoBalcao[]
+  codigosEmparelh     CodigoEmparelhamento[]
+  consentimentosSup   ConsentimentoSuporte[]
+  inventarios         Inventario[]
+  vendas              Venda[]
+  stagingInventario   StagingInventario[]
+  stagingVendas       StagingVendas[]
+  stagingValidades    StagingValidades[]
   inventariosSnapshot InventarioSnapshot[]
-  precos             PrecoFarmacia[]
-  tarefasEquipa      TarefaEquipa[]
-  campanhasAtivas    CampanhaAtiva[]
-  copilotUsageLogs   CopilotUsageLog[]
-  mcpPermitido       Boolean             @default(true)
-  mcpConnectors      McpConnector[]
-  mcpAuditLogs       McpAuditLog[]
-  criadoEm           DateTime            @default(now())
+  precos              PrecoFarmacia[]
+  tarefasEquipa       TarefaEquipa[]
+  campanhasAtivas     CampanhaAtiva[]
+  copilotUsageLogs    CopilotUsageLog[]
+  mcpPermitido        Boolean             @default(true)
+  mcpConnectors       McpConnector[]
+  mcpAuditLogs        McpAuditLog[]
+  martTenantKpis      MartTenantKpis?
+  martProdutoMetricas MartProdutoMetricas[]
+  martProdutoMes      MartProdutoMes[]
+  martDciGrupos       MartDciGrupo[]
+  criadoEm            DateTime            @default(now())
+}
+
+model Utilizador {
+  id                 String                @id @default(uuid())
+  email              String?               @unique
+  nome               String
+  telemovel          String?
+  passwordHash       String?               @map("password_hash")
+  emailVerificadoEm  DateTime?             @map("email_verificado_em")
+  ativo              Boolean               @default(true)
+  isSuperadmin       Boolean               @default(false) @map("is_superadmin")
+  totpSecretEnc      String?               @map("totp_secret_enc")
+  totpAtivo          Boolean               @default(false) @map("totp_ativo")
+  totpUltimoPasso    BigInt?               @map("totp_ultimo_passo")
+  totpRecoveryHashes String[]              @default([]) @map("totp_recovery_hashes")
+  passwordAlteradaEm DateTime?             @map("password_alterada_em")
+  membroEquipas      MembroEquipa[]
+  vinculosFarmacia   MembroFarmacia[]
+  sessoes            SessaoUtilizador[]
+  sessoesV2          Sessao[]
+  dispositivosConf   DispositivoConfiado[]
+  credenciaisPasskey CredencialPasskey[]
+  criadoEm           DateTime              @default(now())
+  atualizadoEm       DateTime              @updatedAt
+}
+
+model MembroEquipa {
+  id               String              @id @default(uuid())
+  farmaciaId       String
+  utilizadorId     String?
+  nome             String
+  email            String
+  role             String              @default("AUXILIAR") // "DIRETOR" | "GESTOR" | "AUXILIAR" | "SUPORTE"
+  pin              String?             // LEGADO — invalidado na Fase 0 (nunca usar em texto claro)
+  pinHash          String?             // HMAC-SHA256 versionado com pepper + salt por vínculo
+  pinAlteradoEm    DateTime?
+  pinFalhas        Int                 @default(0)
+  pinBloqueadoAte  DateTime?
+  pinTemporario    Boolean             @default(false)
+  ativo            Boolean             @default(true)
+  ultimoAcessoEm   DateTime?
+  criadoEm         DateTime            @default(now())
+  atualizadoEm     DateTime            @updatedAt
+
+  farmacia         Farmacia            @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+  utilizador       Utilizador?         @relation(fields: [utilizadorId], references: [id], onDelete: SetNull)
+
+  @@unique([farmaciaId, email])
+  @@index([farmaciaId])
+  @@index([utilizadorId])
+}
+
+model SessaoUtilizador {
+  id               String              @id @default(uuid())
+  token            String              @unique
+  farmaciaId       String
+  utilizadorId     String?
+  userName         String
+  userEmail        String?
+  role             String              @default("AUXILIAR")
+  ip               String?
+  device           String?
+  criadoEm         DateTime            @default(now())
+  ultimoAcessoEm   DateTime            @default(now())
+  expiraEm         DateTime
+
+  farmacia         Farmacia            @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+  utilizador       Utilizador?         @relation(fields: [utilizadorId], references: [id], onDelete: SetNull)
+
+  @@index([farmaciaId])
+  @@index([token])
+  @@index([expiraEm])
+}
+
+model TokenRecuperacao {
+  id               String              @id @default(uuid())
+  token            String              @unique
+  email            String
+  farmaciaId       String?
+  expiraEm         DateTime
+  usadoEm          DateTime?
+  criadoEm         DateTime            @default(now())
+
+  @@index([token])
+  @@index([email])
+}
+
+model SessaoAdmin {
+  id               String              @id @default(uuid())
+  token            String              @unique
+  ip               String?
+  userAgent        String?
+  criadoEm         DateTime            @default(now())
+  expiraEm         DateTime
+
+  @@index([token])
+}
+
+model LimiteTaxa {
+  chave            String              @id
+  janelaInicio     DateTime            @map("janela_inicio")
+  contador         Int                 @default(1)
+  bloqueadoAte     DateTime?           @map("bloqueado_ate")
+  atualizadoEm     DateTime            @updatedAt @map("atualizado_em")
+
+  @@index([janelaInicio])
+  @@map("limites_taxa")
+}
+
+// ==========================================
+// FASE 1 — IDENTIDADE, VÍNCULOS, SESSÕES OPACAS E AUDITORIA (Spec v2.1)
+// ==========================================
+
+model MembroFarmacia {
+  id               String              @id @default(uuid())
+  utilizadorId     String?             @map("utilizador_id")
+  farmaciaId       String              @map("farmacia_id")
+  nome             String
+  perfil           String              @default("OPERADOR_BALCAO") // PROPRIETARIO | DIRETOR_TECNICO | COMPRADOR | OPERADOR_BALCAO
+  permissoesExtra  String[]            @default([]) @map("permissoes_extra")
+  farmaciaPadrao   Boolean             @default(false) @map("farmacia_padrao")
+  estado           String              @default("PENDENTE") // PENDENTE | ATIVO | SUSPENSO
+  pinHash          String?             @map("pin_hash")
+  pinAlteradoEm    DateTime?           @map("pin_alterado_em")
+  pinFalhas        Int                 @default(0) @map("pin_falhas")
+  pinBloqueadoAte  DateTime?           @map("pin_bloqueado_ate")
+  pinTemporario    Boolean             @default(false) @map("pin_temporario")
+  ultimoAcessoEm   DateTime?           @map("ultimo_acesso_em")
+  criadoEm         DateTime            @default(now()) @map("criado_em")
+  atualizadoEm     DateTime            @updatedAt @map("atualizado_em")
+
+  farmacia         Farmacia            @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+  utilizador       Utilizador?         @relation(fields: [utilizadorId], references: [id], onDelete: SetNull)
+  sessoes          Sessao[]
+
+  @@unique([utilizadorId, farmaciaId])
+  @@index([farmaciaId])
+  @@index([utilizadorId])
+  @@map("membros_farmacia")
+}
+
+model Sessao {
+  id               String              @id @default(uuid())
+  tokenHash        String              @unique @map("token_hash")
+  utilizadorId     String?             @map("utilizador_id")
+  membroId         String?             @map("membro_id")
+  farmaciaAtivaId  String?             @map("farmacia_ativa_id")
+  metodo           String              @default("PASSWORD") // PASSWORD | PIN | PASSKEY
+  dispositivoId    String?             @map("dispositivo_id")
+  ip               String?
+  userAgent        String?             @map("user_agent")
+  criadaEm         DateTime            @default(now()) @map("criada_em")
+  ultimoUsoEm      DateTime            @default(now()) @map("ultimo_uso_em")
+  expiraEm         DateTime            @map("expira_em")
+  revogadaEm       DateTime?           @map("revogada_em")
+
+  utilizador       Utilizador?         @relation(fields: [utilizadorId], references: [id], onDelete: Cascade)
+  membro           MembroFarmacia?     @relation(fields: [membroId], references: [id], onDelete: Cascade)
+  farmaciaAtiva    Farmacia?           @relation(fields: [farmaciaAtivaId], references: [id], onDelete: SetNull)
+
+  @@index([utilizadorId])
+  @@index([membroId])
+  @@index([expiraEm])
+  @@map("sessoes")
+}
+
+model DispositivoBalcao {
+  id               String              @id @default(uuid())
+  farmaciaId       String              @map("farmacia_id")
+  nome             String
+  tokenHash        String              @unique @map("token_hash")
+  emparelhadoPor   String              @map("emparelhado_por")
+  emparelhadoEm    DateTime            @default(now()) @map("emparelhado_em")
+  ultimoUsoEm      DateTime?           @map("ultimo_uso_em")
+  revogadoEm       DateTime?           @map("revogado_em")
+
+  farmacia         Farmacia            @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+
+  @@index([farmaciaId])
+  @@map("dispositivos_balcao")
+}
+
+model CodigoEmparelhamento {
+  id               String              @id @default(uuid())
+  farmaciaId       String              @map("farmacia_id")
+  codigoHash       String              @unique @map("codigo_hash")
+  criadoPor        String              @map("criado_por")
+  expiraEm         DateTime            @map("expira_em")
+  usadoEm          DateTime?           @map("usado_em")
+
+  farmacia         Farmacia            @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+
+  @@index([farmaciaId])
+  @@map("codigos_emparelhamento")
+}
+
+model DispositivoConfiado {
+  id               String              @id @default(uuid())
+  utilizadorId     String              @map("utilizador_id")
+  tokenHash        String              @unique @map("token_hash")
+  expiraEm         DateTime            @map("expira_em")
+  revogadoEm       DateTime?           @map("revogado_em")
+
+  utilizador       Utilizador          @relation(fields: [utilizadorId], references: [id], onDelete: Cascade)
+
+  @@index([utilizadorId])
+  @@map("dispositivos_confiados")
+}
+
+model CredencialPasskey {
+  id              String      @id @default(uuid())
+  utilizadorId    String      @map("utilizador_id")
+  credentialId    String      @unique @map("credential_id")
+  publicKey       Bytes       @map("public_key")
+  counter         BigInt      @default(0)
+  deviceType      String?     @map("device_type")
+  backedUp        Boolean     @default(false) @map("backed_up")
+  transports      String[]    @default([])
+  nomeAmigavel    String?     @map("nome_amigavel")
+  criadoEm        DateTime    @default(now()) @map("criado_em")
+  ultimoUsoEm     DateTime?   @map("ultimo_uso_em")
+  revogadoEm      DateTime?   @map("revogado_em")
+
+  utilizador      Utilizador  @relation(fields: [utilizadorId], references: [id], onDelete: Cascade)
+
+  @@index([utilizadorId])
+  @@map("credenciais_passkey")
+}
+
+model DesafioWebAuthn {
+  id           String    @id @default(uuid())
+  utilizadorId String?   @map("utilizador_id")
+  email        String?
+  challenge    String    @unique
+  tipo         String    // REGISTO | LOGIN
+  expiraEm     DateTime  @map("expira_em")
+  criadoEm     DateTime  @default(now()) @map("criado_em")
+
+  @@index([challenge])
+  @@index([expiraEm])
+  @@map("desafios_webauthn")
+}
+
+model TokenSeguranca {
+  id               String              @id @default(uuid())
+  tipo             String              // RESET_PASSWORD | RESET_PIN | CONVITE | VERIFICAR_EMAIL | CODIGO_LOGIN | CHALLENGE_LOGIN
+  tokenHash        String              @unique @map("token_hash")
+  utilizadorId     String?             @map("utilizador_id")
+  membroId         String?             @map("membro_id")
+  farmaciaId       String?             @map("farmacia_id")
+  tentativas       Int                 @default(0)
+  expiraEm         DateTime            @map("expira_em")
+  usadoEm          DateTime?           @map("usado_em")
+  criadoEm         DateTime            @default(now()) @map("criado_em")
+
+  @@index([utilizadorId])
+  @@index([farmaciaId])
+  @@map("tokens_seguranca")
+}
+
+model AuditoriaSeguranca {
+  id               String              @id @default(uuid())
+  ts               DateTime            @default(now())
+  evento           String
+  utilizadorId     String?             @map("utilizador_id")
+  membroId         String?             @map("membro_id")
+  farmaciaId       String?             @map("farmacia_id")
+  ip               String?
+  userAgent        String?             @map("user_agent")
+  detalhes         Json?
+
+  @@index([farmaciaId, ts])
+  @@index([utilizadorId, ts])
+  @@index([evento, ts])
+  @@map("auditoria_seguranca")
+}
+
+model ConsentimentoSuporte {
+  id                  String           @id @default(uuid())
+  farmaciaId          String           @map("farmacia_id")
+  utilizadorSuporteId String           @map("utilizador_suporte_id")
+  concedidoPor        String           @map("concedido_por")
+  expiraEm            DateTime         @map("expira_em")
+  revogadoEm          DateTime?        @map("revogado_em")
+  criadoEm            DateTime         @default(now()) @map("criado_em")
+
+  farmacia            Farmacia         @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+
+  @@index([farmaciaId])
+  @@index([utilizadorSuporteId])
+  @@map("consentimentos_suporte")
 }
 
 model ProdutoMestre {
@@ -393,4 +713,200 @@ model FaturasNuelltechExistente {
 
   @@map("faturas_nuelltech")
   @@ignore
+}
+
+// ==========================================
+// CAMADA ANALÍTICA PRÉ-COMPUTADA (MARTS)
+// ==========================================
+model MartTenantKpis {
+  farmaciaId                          String    @id
+  total_artigos_inventario            Int
+  total_unidades_stock                Int
+  valor_total_stock_custo             Decimal   @db.Decimal(12, 2)
+  artigos_venda_livre_psbe            Int
+  valor_stock_venda_livre_psbe        Decimal   @db.Decimal(12, 2)
+  artigos_mnsrm                       Int
+  artigos_msrm_receita                Int
+  artigos_genericos_mg                Int
+  valor_stock_genericos_mg            Decimal   @db.Decimal(12, 2)
+  artigos_medicamentos_marca          Int
+  valor_stock_medicamentos_marca      Decimal   @db.Decimal(12, 2)
+  grupos_dci_com_multiplos_labs       Int
+  total_artigos_excesso_cobertura     Int
+  total_artigos_monos                 Int
+  valor_total_monos                   Decimal   @db.Decimal(12, 2)
+  total_artigos_restos_gaveta         Int
+  valor_total_restos_gaveta           Decimal   @db.Decimal(12, 2)
+  total_artigos_monos_profundidade    Int
+  valor_total_monos_profundidade      Decimal   @db.Decimal(12, 2)
+  data_ultima_venda                   String?
+  percentagem_capital_em_monos        Decimal   @db.Decimal(5, 2)
+  total_artigos_com_validade_registada Int
+  total_artigos_risco_caducidade      Int
+  unidades_totais_risco_caducidade    Int
+  valor_total_risco_caducidade        Decimal   @db.Decimal(12, 2)
+  data_referencia                     DateTime  @default(now())
+  data_version                        BigInt    @default(1)
+  atualizadoEm                        DateTime  @default(now())
+
+  farmacia                            Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+}
+
+model MartProdutoMetricas {
+  id                                  String    @id @default(uuid())
+  farmaciaId                          String
+  cnp_codigo                          String
+  aim                                 String?
+  designacao                          String
+  tipo_venda                          String?
+  segmento                            String?
+  categoria                           String?
+  subcategoria                        String?
+  eh_generico                         Boolean   @default(false)
+  grupo_equivalencia_dci              String?
+  molecula_dci                        String?
+  laboratorio_titular                 String?
+  stock_total_unidades                Int       @default(0)
+  stock_total_valor_custo             Decimal   @db.Decimal(12, 2) @default(0)
+  custo_unitario_medio                Decimal   @db.Decimal(10, 4) @default(0)
+  pvp                                 Decimal?  @db.Decimal(10, 2)
+  margem_padrao                       Decimal?  @db.Decimal(6, 2)
+  taxa_iva                            Int?
+  total_unidades_vendidas             Int       @default(0)
+  vmm                                 Decimal   @db.Decimal(10, 2) @default(0)
+  cobertura_meses                     Decimal   @db.Decimal(10, 2) @default(0)
+  data_ultima_venda                   DateTime?
+  dias_sem_vendas                     Int?
+  eh_mono                             Boolean   @default(false)
+  eh_excesso_cobertura                Boolean   @default(false)
+  unidades_excesso                    Int       @default(0)
+  capital_excesso                     Decimal   @db.Decimal(12, 2) @default(0)
+  data_validade_mais_proxima          DateTime?
+  meses_ate_validade                  Int?
+  unidades_em_risco_caducidade        Int       @default(0)
+  valor_em_risco_caducidade           Decimal   @db.Decimal(12, 2) @default(0)
+  eh_risco_caducidade                 Boolean   @default(false)
+  eh_risco_rutura                     Boolean   @default(false)
+  sugestao_cross_sell                 String?
+  atualizadoEm                        DateTime  @default(now())
+
+  farmacia                            Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+
+  @@unique([farmaciaId, cnp_codigo])
+  @@index([farmaciaId])
+  @@index([farmaciaId, eh_mono])
+  @@index([farmaciaId, eh_excesso_cobertura])
+  @@index([farmaciaId, eh_risco_caducidade])
+  @@index([farmaciaId, grupo_equivalencia_dci])
+  @@index([cnp_codigo])
+}
+
+model MartProdutoMes {
+  id                                  String    @id @default(uuid())
+  farmaciaId                          String
+  cnp_codigo                          String
+  mes                                 String    // YYYY-MM
+  quantidade                          Int
+  valor_total                         Decimal   @db.Decimal(12, 2)
+
+  farmacia                            Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+
+  @@unique([farmaciaId, cnp_codigo, mes])
+  @@index([farmaciaId, cnp_codigo])
+  @@index([mes])
+}
+
+model MartDciGrupo {
+  id                                  String    @id @default(uuid())
+  farmaciaId                          String
+  grupo_equivalencia_dci              String
+  num_laboratorios_abertos            Int
+  stock_total_unidades                Int
+  stock_total_valor_custo             Decimal   @db.Decimal(12, 2)
+  vmm_total_grupo                     Decimal   @db.Decimal(10, 2)
+  custo_minimo                        Decimal   @db.Decimal(10, 4)
+  custo_maximo                        Decimal   @db.Decimal(10, 4)
+  poupanca_potencial_anual            Decimal   @db.Decimal(12, 2)
+  labsJson                            Json
+  atualizadoEm                        DateTime  @default(now())
+
+  farmacia                            Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)
+
+  @@unique([farmaciaId, grupo_equivalencia_dci])
+  @@index([farmaciaId])
+}
+
+// ==========================================
+// ENRIQUECIMENTO AUTOMÁTICO DE CATÁLOGO
+// ==========================================
+model EnriquecimentoFila {
+  id                Int       @id @default(autoincrement())
+  cnp_codigo        String    @unique
+  via               String    // MEDICAMENTO | VENDA_LIVRE
+  prioridade        Decimal   @default(0) @db.Decimal(14, 2) // valor em stock (custo)
+  estado            String    @default("pendente") // pendente | em_curso | concluido | erro | ignorado
+  tentativas        Int       @default(0)
+  proxima_tentativa DateTime  @default(now())
+  ultimo_erro       String?
+  criado_em         DateTime  @default(now())
+  atualizado_em     DateTime  @default(now()) @updatedAt
+
+  @@index([estado, proxima_tentativa, prioridade])
+  @@map("EnriquecimentoFila")
+}
+
+model ProdutoEnriquecimento {
+  id                      String   @id @default(uuid())
+  cnp_codigo              String
+  versao                  Int      @default(1)
+  ativo                   Boolean  @default(true)
+  // ativo_provisorio | revisao | nao_encontrado | regra_interna | validado | rejeitado
+  estado                  String
+  confianca               String   // alta | media | baixa
+  correspondencia_produto String   // cnp | nome | nenhum
+  origem                  String   // web_llm | regra_interna | rcm
+  tipo_produto            String?
+  dci                     String?
+  atc                     String?
+  composicao              Json?
+  forma                   String?
+  via_administracao       String?
+  finalidade              String?
+  patologias              Json?    // [{termo, evidencia, url}]
+  sintomas                Json?    // [{termo, evidencia, url}]
+  publico                 Json?    // {sexo, idade_min_meses, evidencias...}
+  tipo_venda_fonte        String?
+  categoria_sugerida      String?
+  subcategoria_sugerida   String?
+  rejeitados              Json?    // itens que falharam a validação (com motivo)
+  termos_novos            Json?    // termos fora do vocabulário (para rever)
+  modelo                  String?
+  prompt_version          String?
+  uso_tokens              Json?
+  criado_em               DateTime @default(now())
+
+  fontes EnriquecimentoFonte[]
+
+  @@index([cnp_codigo, ativo])
+  @@index([estado])
+  @@map("ProdutoEnriquecimento")
+}
+
+model EnriquecimentoFonte {
+  id               String   @id @default(uuid())
+  enriquecimento_id String
+  cnp_codigo       String
+  url              String
+  dominio          String
+  tipo             String   // ema | infarmed_publico | fabricante | folheto_pt_espelho | farmacia_pt | retalho_estrangeiro | outro
+  nivel            Int      // 1 = mais fiável ... 4 = menos fiável
+  titulo           String?
+  data_documento   String?
+  lida_pelo_modelo Boolean  @default(false) // a página foi efetivamente obtida (web_fetch) nesta execução
+  obtido_em        DateTime @default(now())
+
+  enriquecimento ProdutoEnriquecimento @relation(fields: [enriquecimento_id], references: [id], onDelete: Cascade)
+
+  @@index([cnp_codigo])
+  @@map("EnriquecimentoFonte")
 }

@@ -120,8 +120,14 @@ import {
   deactivateCampaign,
 } from './services/active_campaigns';
 
+import { computePackCompositionHash } from './services/comercial';
+import { verifyPasswordScrypt } from './services/auth_crypto';
+import { logSecurityAudit } from './services/audit_service';
+import { resolveSessionAndTenant } from './services/auth_service';
+
 const customWeeklyTasksStore = new Map<string, any[]>();
 const customPacksStore = new Map<string, any[]>();
+const customRejectedPacksStore = new Map<string, Set<string>>();
 // ============================================================================
 // SINCRONIZAÇÃO EM TEMPO REAL MULTI-DISPOSITIVO (SSE PUBSUB POR FARMÁCIA)
 // ============================================================================
@@ -533,9 +539,22 @@ async function startServer() {
         pathname.startsWith('/sse') ||
         pathname.startsWith('/oauth') ||
         pathname.startsWith('/.well-known');
-      const allowedOrigin = isMcpRoute
-        ? (req.headers.origin || '*')
-        : (process.env.ALLOWED_ORIGIN || (IS_PROD ? '' : '*'));
+      const configuredOrigins = (process.env.ALLOWED_ORIGIN || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      let allowedOrigin = '*';
+      if (isMcpRoute) {
+        allowedOrigin = req.headers.origin || '*';
+      } else if (IS_PROD) {
+        if (req.headers.origin && configuredOrigins.includes(req.headers.origin)) {
+          allowedOrigin = req.headers.origin;
+        } else if (configuredOrigins.length > 0) {
+          allowedOrigin = configuredOrigins[0];
+        } else {
+          allowedOrigin = '';
+        }
+      }
       if (allowedOrigin) {
         res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
       }
@@ -561,7 +580,14 @@ async function startServer() {
           authBearer = req.headers.authorization.slice(7).trim();
         }
         const headerToken = String(req.headers['x-access-code'] || '').trim();
-        const candidateToken = headerToken || authBearer || (explicitCode ? explicitCode.trim() : '');
+        let adminCookieToken = '';
+        if (req.headers.cookie) {
+          const mAdm = req.headers.cookie.match(/(?:^|;\s*)(?:admin_session_token|bi_admin_token)=([^;]+)/i);
+          if (mAdm) {
+            try { adminCookieToken = decodeURIComponent(mAdm[1].trim()); } catch { adminCookieToken = mAdm[1].trim(); }
+          }
+        }
+        const candidateToken = headerToken || authBearer || adminCookieToken || (explicitCode ? explicitCode.trim() : '');
 
         // O Modo Admin SÓ é aceite através do Token Efémero Assinado e Ativo
         if (candidateToken && isValidAdminSession(candidateToken)) {
@@ -1273,6 +1299,12 @@ async function startServer() {
 
           resetFailedAttempts(clientIp);
 
+          if (ctx.role === 'ADMIN') {
+            res.setHeader('Set-Cookie', `admin_session_token=${encodeURIComponent(ctx.code)}; Path=/; SameSite=Lax; Max-Age=86400`);
+          } else if (ctx.role === 'PHARMACY') {
+            res.setHeader('Set-Cookie', `farmacia_access_code=${encodeURIComponent(ctx.code)}; Path=/; SameSite=Lax; Max-Age=2592000`);
+          }
+
           const allFarms =
             ctx.role === 'ADMIN'
               ? await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } })
@@ -1316,6 +1348,10 @@ async function startServer() {
           if (headerToken) {
             invalidateAdminSession(headerToken);
           }
+          res.setHeader('Set-Cookie', [
+            'farmacia_access_code=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax',
+            'admin_session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax'
+          ]);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true }));
         } catch (e: any) {
@@ -2042,8 +2078,299 @@ async function startServer() {
         const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
         const packs = await generateClinicalThemePacks(prisma, activeFarmacia.id);
         const userSaved = customPacksStore.get(activeFarmacia.id) || [];
+        const rejectedSet = customRejectedPacksStore.get(activeFarmacia.id) || new Set<string>();
+        const filteredPacks = [...userSaved, ...packs].filter(p => !rejectedSet.has(p.id));
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, farmaciaId: activeFarmacia.id, packs: [...userSaved, ...packs] }));
+        res.end(JSON.stringify({ ok: true, farmaciaId: activeFarmacia.id, packs: filteredPacks }));
+        return;
+      }
+
+      // 2.5E2. Endpoint Aprovação Clínica com Hash & Reautenticação pelo Diretor Técnico (Fase 4)
+      if (pathname === '/api/packs/approve' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const farmIdQuery = String(parsed.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+
+          // 1. Extrair token de sessão ou cookie
+          let rawSid = '';
+          if (req.headers.authorization && req.headers.authorization.toLowerCase().startsWith('bearer ')) {
+            rawSid = req.headers.authorization.slice(7).trim();
+          } else if (req.headers.cookie) {
+            const m = req.headers.cookie.match(/(?:^|;\s*)sid=([^;]+)/i);
+            if (m) {
+              try { rawSid = decodeURIComponent(m[1].trim()); } catch { rawSid = m[1].trim(); }
+            }
+          }
+
+          // 2. Validar sessão e permissão validar_clinica (DIRETOR_TECNICO ou SUPERADMIN)
+          const sessionCtx = await resolveSessionAndTenant(prisma, { rawToken: rawSid });
+
+          // Se sessão foi iniciada por PIN (balcão), rejeitar taxativamente
+          if (sessionCtx.ok && (sessionCtx.ctx.metodo as any) === 'PIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Aprovação clínica rejeitada: utilizador autenticado por PIN de balcão não possui permissão clínica.' }));
+            return;
+          }
+
+          // 3. Reautenticação estrita do DT por Palavra-Passe
+          const dtPassword = String(parsed.dtPassword || parsed.password || parsed.reauth?.password || '').trim();
+          if (!dtPassword) {
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Aprovação clínica exige reautenticação com palavra-passe do Diretor Técnico.' }));
+            return;
+          }
+
+          let dtUserName = 'Diretor Técnico';
+          let dtUserId = 'dt-auto';
+
+          if (sessionCtx.ok) {
+            dtUserName = sessionCtx.ctx.nome || dtUserName;
+            dtUserId = sessionCtx.ctx.utilizadorId || dtUserId;
+            if (sessionCtx.ctx.utilizadorId) {
+              const u = await prisma.utilizador.findUnique({ where: { id: sessionCtx.ctx.utilizadorId } });
+              if (u?.passwordHash) {
+                const pwdValid = await verifyPasswordScrypt(dtPassword, u.passwordHash);
+                if (!pwdValid) {
+                  res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+                  res.end(JSON.stringify({ ok: false, error: 'Palavra-passe de Diretor Técnico incorreta. Assinatura recusada.' }));
+                  return;
+                }
+              }
+            }
+          } else {
+            // Se sessão foi via token de farmácia/admin na interface, validar credencial do DT ou SuperAdmin
+            let authenticatedDt: { nome: string; id: string } | null = null;
+            if (ADMIN_PASSWORD.length >= 6 && safeCompareStrings(dtPassword, ADMIN_PASSWORD)) {
+              authenticatedDt = { nome: 'Administrador Nuelltech', id: 'superadmin' };
+            } else {
+              const dtUsers = await (prisma as any).utilizador.findMany({
+                where: {
+                  ativo: true,
+                  OR: [
+                    { isSuperadmin: true },
+                    {
+                      vinculosFarmacia: {
+                        some: {
+                          farmaciaId: activeFarmacia.id,
+                          estado: 'ATIVO',
+                          perfil: { in: ['DIRETOR_TECNICO', 'PROPRIETARIO'] },
+                        },
+                      },
+                    },
+                  ],
+                },
+              });
+              for (const u of dtUsers) {
+                if (u.passwordHash && (await verifyPasswordScrypt(dtPassword, u.passwordHash))) {
+                  authenticatedDt = { nome: u.nome, id: u.id };
+                  break;
+                }
+              }
+            }
+
+            if (!authenticatedDt) {
+              res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: 'Palavra-passe de Diretor Técnico incorreta ou utilizador sem permissão clínica.' }));
+              return;
+            }
+            dtUserName = authenticatedDt.nome;
+            dtUserId = authenticatedDt.id;
+          }
+
+          // 4. Validar integridade da Composição do Pack e Hash SHA-256
+          const packData: ClinicalThemePack = parsed.pack || parsed.packData;
+          if (!packData || !packData.produtos || packData.produtos.length < 2) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Pack inválido: requer pelo menos 2 produtos farmacêuticos.' }));
+            return;
+          }
+
+          const expectedHash = computePackCompositionHash(
+            packData.produtos.map(p => p.cnp),
+            packData.publicoAlvo,
+            packData.descontoPct
+          );
+
+          if (packData.hashComposicao && packData.hashComposicao !== expectedHash) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Violação de integridade farmacêutica: o Hash SHA-256 da composição não coincide com a regra validada.' }));
+            return;
+          }
+
+          // 5. Ativar no Balcão através de active_campaigns
+          const nowIso = new Date().toISOString();
+          const activeCamp = await activateCampaign(prisma, {
+            farmaciaId: activeFarmacia.id,
+            campanhaId: packData.id,
+            titulo: packData.titulo,
+            icone: packData.icone || '🎯',
+            descontoPct: packData.descontoPct,
+            diasDuracao: 30,
+            criadoPor: dtUserName,
+            produtos: packData.produtos.map(p => ({
+              cnp_codigo: p.cnp,
+              designacao: p.designacao,
+              stock_atual: p.stockAtual,
+              custo_unitario: p.custoUnitario || 0,
+              pvp_atual: p.pvpUnitario,
+              pvp_campanha: Number((p.pvpUnitario * (1 - packData.descontoPct / 100)).toFixed(2)),
+              desconto_pct: packData.descontoPct,
+              margem_pct: p.margemPct,
+            })),
+          });
+
+          // 6. Atualizar estado do pack para ATIVO com assinatura do DT
+          const approvedPack: ClinicalThemePack = {
+            ...packData,
+            estadoCiclo: 'ATIVO',
+            validadoPor: dtUserName,
+            validadoEm: nowIso,
+            campanhaAtivaId: activeCamp.campanhaAtiva?.id,
+            hashComposicao: expectedHash,
+          };
+
+          const currentSaved = customPacksStore.get(activeFarmacia.id) || [];
+          const updatedSaved = currentSaved.filter(p => p.id !== approvedPack.id);
+          updatedSaved.unshift(approvedPack);
+          customPacksStore.set(activeFarmacia.id, updatedSaved);
+
+          // 7. Gerar automaticamente 3 Tarefas Operacionais na Folha da Equipa
+          const tasksToAdd = [
+            {
+              id: `pack_montagem_${approvedPack.id}`,
+              categoria: 'ORGANIZACAO_FISICA',
+              titulo: `Montar Cesto Físico: ${approvedPack.titulo}`,
+              instrucao: `Colocar ${approvedPack.disposicaoFisica}. Garantir etiqueta com preço promocional de conjunto (${approvedPack.pvpPackComDesconto.toFixed(2)}€) e destaque de poupança (-${approvedPack.descontoPct}%).`,
+              artigos: approvedPack.produtos.map(p => ({ cnp: p.cnp, designacao: p.designacao })),
+              impactoEstimado: approvedPack.pvpPackComDesconto * Math.min(approvedPack.packsMontaveis, 5),
+              prioridade: 'ALTA',
+              concluido: false,
+              origem: 'PACK_DT',
+            },
+            {
+              id: `pack_script_${approvedPack.id}`,
+              categoria: 'EQUIPA_BALCAO',
+              titulo: `Aconselhamento Clínico: ${approvedPack.titulo}`,
+              instrucao: approvedPack.orientacaoBalcao,
+              artigos: approvedPack.produtos.map(p => ({ cnp: p.cnp, designacao: p.designacao })),
+              impactoEstimado: 0,
+              prioridade: 'MEDIA',
+              concluido: false,
+              origem: 'PACK_DT',
+            },
+            {
+              id: `pack_stock_${approvedPack.id}`,
+              categoria: 'REPOSICAO_RAPIDA',
+              titulo: `Monitorizar Stock Mínimo (≥ 3 un): ${approvedPack.titulo}`,
+              instrucao: `Verificar rotura dos componentes do cesto. O pack suspende automaticamente quando qualquer dos itens tiver stock < 3 unidades.`,
+              artigos: approvedPack.produtos.map(p => ({ cnp: p.cnp, designacao: p.designacao })),
+              impactoEstimado: 0,
+              prioridade: 'MEDIA',
+              concluido: false,
+              origem: 'PACK_DT',
+            },
+          ];
+
+          const farmTasks = customWeeklyTasksStore.get(activeFarmacia.id) || [];
+          const existingIds = new Set(farmTasks.map(t => t.id));
+          for (const t of tasksToAdd) {
+            if (!existingIds.has(t.id)) farmTasks.unshift(t);
+          }
+          customWeeklyTasksStore.set(activeFarmacia.id, farmTasks);
+
+          // 8. Registar Auditoria de Segurança
+          try {
+            await logSecurityAudit(prisma, {
+              evento: 'PACK_CLINICO_APROVADO_DT',
+              farmaciaId: activeFarmacia.id,
+              utilizadorId: dtUserId,
+              detalhes: {
+                packId: approvedPack.id,
+                titulo: approvedPack.titulo,
+                dt: dtUserName,
+                hash: expectedHash,
+                campanhaAtivaId: activeCamp.campanhaAtiva?.id,
+              },
+              ip: req.socket.remoteAddress || null,
+            });
+          } catch {}
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({
+            ok: true,
+            message: `Pack "${approvedPack.titulo}" validado e assinado com sucesso pelo DT!`,
+            pack: approvedPack,
+            tasksGenerated: tasksToAdd.length,
+          }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 2.5E3. Endpoint Rejeição de Pack Clínico pelo DT
+      if (pathname === '/api/packs/reject' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const farmIdQuery = String(parsed.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          const packId = String(parsed.packId || '').trim();
+
+          if (!packId) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'packId é obrigatório.' }));
+            return;
+          }
+
+          let rejectedSet = customRejectedPacksStore.get(activeFarmacia.id);
+          if (!rejectedSet) {
+            rejectedSet = new Set<string>();
+            customRejectedPacksStore.set(activeFarmacia.id, rejectedSet);
+          }
+          rejectedSet.add(packId);
+
+          const currentSaved = customPacksStore.get(activeFarmacia.id) || [];
+          customPacksStore.set(activeFarmacia.id, currentSaved.filter(p => p.id !== packId));
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, message: `Pack ${packId} rejeitado com sucesso.` }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 2.5E4. Endpoint Desativar Pack Ativo
+      if (pathname === '/api/packs/deactivate' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const farmIdQuery = String(parsed.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          const packId = String(parsed.packId || '').trim();
+          const campanhaAtivaId = String(parsed.campanhaAtivaId || '').trim();
+
+          if (campanhaAtivaId) {
+            try { await deactivateCampaign(prisma, activeFarmacia.id, campanhaAtivaId); } catch {}
+          }
+
+          const currentSaved = customPacksStore.get(activeFarmacia.id) || [];
+          customPacksStore.set(activeFarmacia.id, currentSaved.filter(p => p.id !== packId));
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, message: `Pack ${packId} desativado com sucesso do balcão.` }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
         return;
       }
 
@@ -2380,11 +2707,21 @@ async function startServer() {
           res.write(': connected\n\n');
 
           const clientId = 'sse_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+          const cip = getClientIp(req);
+
+          // Fechar conexões órfãs anteriores do mesmo cliente para evitar esgotamento de sockets
+          for (const c of Array.from(taskStreamClients)) {
+            if (c.farmaciaId === activeFarmacia.id && c.clientIp === cip) {
+              try { c.res.end(); } catch {}
+              taskStreamClients.delete(c);
+            }
+          }
+
           const clientObj: TaskStreamClient = {
             id: clientId,
             farmaciaId: activeFarmacia.id,
             res,
-            clientIp: getClientIp(req),
+            clientIp: cip,
           };
           taskStreamClients.add(clientObj);
 
@@ -2599,7 +2936,7 @@ self.addEventListener('fetch', (e) => {
         try {
           const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
           const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
-          const team = getPharmacyTeam(activeFarmacia.id);
+          const team = await getPharmacyTeam(prisma, activeFarmacia.id);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true, farmaciaId: activeFarmacia.id, team }));
         } catch (e: any) {
@@ -2618,7 +2955,7 @@ self.addEventListener('fetch', (e) => {
           if (!nome || !email) {
             throw new Error('Nome e email são de preenchimento obrigatório.');
           }
-          const member = addPharmacyTeamMember(activeFarmacia.id, { nome, email, role, pin });
+          const member = await addPharmacyTeamMember(prisma, activeFarmacia.id, { nome, email, role, pin });
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true, member }));
         } catch (e: any) {
@@ -2634,7 +2971,7 @@ self.addEventListener('fetch', (e) => {
           const rawBody = await readRequestBody(req, 64 * 1024);
           const { farmaciaId, userId, updates } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
-          const updated = updatePharmacyTeamMember(activeFarmacia.id, userId, updates || {});
+          const updated = await updatePharmacyTeamMember(prisma, activeFarmacia.id, userId, updates || {});
           if (!updated) throw new Error('Utilizador não encontrado.');
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true, member: updated }));
@@ -2651,7 +2988,7 @@ self.addEventListener('fetch', (e) => {
           const rawBody = await readRequestBody(req, 64 * 1024);
           const { farmaciaId, userId } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
-          const deleted = deletePharmacyTeamMember(activeFarmacia.id, userId);
+          const deleted = await deletePharmacyTeamMember(prisma, activeFarmacia.id, userId);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: deleted }));
         } catch (e: any) {
@@ -2669,9 +3006,9 @@ self.addEventListener('fetch', (e) => {
           // Regista a sessão atual de navegação se ainda não existir
           const ip = getClientIp(req);
           const userAgent = String(req.headers['user-agent'] || 'Desktop Browser');
-          const sessions = getActivePharmacySessions(activeFarmacia.id);
+          const sessions = await getActivePharmacySessions(prisma, activeFarmacia.id);
           if (sessions.length === 0) {
-            recordUserSession({
+            await recordUserSession(prisma, {
               farmaciaId: activeFarmacia.id,
               userName: 'Diretor / Gestão',
               role: 'GESTOR',
@@ -2679,8 +3016,9 @@ self.addEventListener('fetch', (e) => {
               device: userAgent.includes('Mobile') ? 'Dispositivo Móvel' : 'Computador Desktop',
             });
           }
+          const currentSessions = await getActivePharmacySessions(prisma, activeFarmacia.id);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, sessions: getActivePharmacySessions(activeFarmacia.id) }));
+          res.end(JSON.stringify({ ok: true, sessions: currentSessions }));
         } catch (e: any) {
           res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -2693,7 +3031,7 @@ self.addEventListener('fetch', (e) => {
         try {
           const rawBody = await readRequestBody(req, 32 * 1024);
           const { sessionId } = JSON.parse(rawBody || '{}');
-          const revoked = revokeUserSession(sessionId);
+          const revoked = await revokeUserSession(prisma, sessionId);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: revoked, message: 'Sessão revogada com sucesso.' }));
         } catch (e: any) {
@@ -2712,7 +3050,7 @@ self.addEventListener('fetch', (e) => {
           if (!cleanEmail || !cleanEmail.includes('@')) {
             throw new Error('Por favor introduza um endereço de email válido.');
           }
-          const token = createPasswordResetToken(cleanEmail, farmaciaId);
+          const token = await createPasswordResetToken(prisma, cleanEmail, farmaciaId);
           const resetLink = `${getBaseIssuerUrl(req)}/?resetToken=${token}`;
           console.log(`📧 [Simulação de Envio de Email]: Link de recuperação gerado para ${cleanEmail}: ${resetLink} (válido por 15 min)`);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -2733,14 +3071,14 @@ self.addEventListener('fetch', (e) => {
         try {
           const rawBody = await readRequestBody(req, 32 * 1024);
           const { token, newPassword } = JSON.parse(rawBody || '{}');
-          const tokenRecord = verifyPasswordResetToken(token);
+          const tokenRecord = await verifyPasswordResetToken(prisma, token);
           if (!tokenRecord) {
             throw new Error('O token de recuperação é inválido ou já expirou.');
           }
           if (!newPassword || newPassword.length < 6) {
             throw new Error('A nova palavra-passe deve ter pelo menos 6 caracteres.');
           }
-          consumePasswordResetToken(token);
+          await consumePasswordResetToken(prisma, token);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true, message: 'Palavra-passe redefinida com sucesso. Pode agora iniciar sessão.' }));
         } catch (e: any) {
@@ -2830,7 +3168,32 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
+      if (pathname === '/login') {
+        res.setHeader('Set-Cookie', [
+          'farmacia_access_code=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax',
+          'admin_session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax'
+        ]);
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(getDashboardHtml());
+        return;
+      }
+
       if (pathname === '/' || pathname === '/index.html') {
+        const isLogout = String(parsedUrl.query.logout || '') === '1';
+        if (isLogout) {
+          res.setHeader('Set-Cookie', [
+            'farmacia_access_code=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax',
+            'admin_session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax'
+          ]);
+        } else {
+          const acessoParam = String(parsedUrl.query.acesso || parsedUrl.query.code || parsedUrl.query.accessCode || '').trim();
+          if (acessoParam) {
+            res.setHeader('Set-Cookie', `farmacia_access_code=${encodeURIComponent(acessoParam)}; Path=/; SameSite=Lax; Max-Age=2592000`);
+          }
+        }
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
@@ -3161,26 +3524,6 @@ function getDashboardHtml(): string {
     .cnp-link:hover {
       background: #0284c7 !important;
       color: #ffffff !important;
-    }
-
-    .director-question-card {
-      background: #ffffff !important;
-      border: 1px solid #e2e8f0 !important;
-      border-radius: 10px;
-      padding: 12px 14px;
-      cursor: pointer;
-      transition: all 0.2s ease;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      text-align: left;
-    }
-
-    .director-question-card:hover {
-      border-color: #0284c7 !important;
-      background: #f0f9ff !important;
-      transform: translateY(-1px);
-      box-shadow: 0 2px 6px rgba(2, 132, 199, 0.12);
     }
 
 .tenant-badge {
@@ -4420,7 +4763,7 @@ function getDashboardHtml(): string {
   </style>
 </head>
 <body>
-  <div class="app-layout">
+  <div class="app-layout" id="mainAppLayout" style="display: none;">
     <!-- BARRA LATERAL DE NAVEGAÇÃO CLÍNICA (SIDEBAR) -->
     <aside class="sidebar">
       <div class="sidebar-brand">
@@ -4782,11 +5125,11 @@ function getDashboardHtml(): string {
           </div>
         </div>
 
-        <!-- CARTÃO 3: TRAVAR ENCOMENDAS NO SIFARMA -->
+        <!-- CARTÃO 3: TRAVAR ENCOMENDAS NO SISTEMA DE GESTÃO -->
         <div style="background: var(--surface); border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #b45309; display: flex; align-items: center; gap: 8px;">
-              🛑 3. Encomendas (Sifarma): O que NÃO Encomendar Mais
+              🛑 3. Compras & Encomendas: O que NÃO Encomendar Mais
             </div>
             <span id="planoCard3Savings" class="badge badge-warning">-- € poupança</span>
           </div>
@@ -4831,7 +5174,7 @@ function getDashboardHtml(): string {
         <div style="background: var(--surface); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 12px; padding: 18px; display: flex; flex-direction: column;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
             <div style="font-size: 1.05rem; font-weight: 800; color: #0284c7; display: flex; align-items: center; gap: 8px;">
-              🟢 4. Encomendas (Sifarma): Ajustar Níveis & Prevenir Ruturas
+              🟢 4. Compras & Encomendas: Ajustar Níveis & Prevenir Ruturas
             </div>
             <span id="planoCard4Count" class="badge badge-info">Subir Ponto de Encomenda</span>
           </div>
@@ -4939,7 +5282,7 @@ function getDashboardHtml(): string {
               Esta é a fotografia patrimonial inicial da farmácia. Por rigor contabilístico, <b>não se simulam dados passados</b>. A evolução de stock, a redução do imobilizado e a liquidez recuperada serão medidas a partir da importação do fecho do próximo mês.
             </p>
             <div style="display: flex; gap: 12px; margin-top: 10px; font-size: 0.76rem; color: #94a3b8; flex-wrap: wrap;">
-              <span>📊 <b>Dados Auditados:</b> Inventário Físico Inicial Sifarma</span>
+              <span>📊 <b>Dados Auditados:</b> Inventário Físico Inicial da Farmácia</span>
               <span>🔒 <b>Critério Monos:</b> Artigos com stock e sem vendas há >90 dias</span>
               <span>✅ <b>Critério Poupança:</b> Vendas comprovadas após o Marco Zero</span>
             </div>
@@ -4999,7 +5342,7 @@ function getDashboardHtml(): string {
             </p>
           </div>
           <button class="btn" onclick="openInteractiveImportModal()" style="background: #0284c7; color: #ffffff; font-weight: 700; padding: 11px 20px; border-radius: 8px; border: none; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 0.9rem; box-shadow: 0 2px 6px rgba(2,132,199,0.25);">
-            📥 Carregar Fecho de Mês Seguinte (Sifarma)
+            📥 Carregar Fecho de Mês Seguinte
           </button>
         </div>
       </div>
@@ -5045,7 +5388,7 @@ function getDashboardHtml(): string {
           <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 16px;">
             <div style="font-size: 0.74rem; font-weight: 700; color: #64748b; text-transform: uppercase;">Dinheiro de Monos Resgatado no Mês</div>
             <div id="evoMomLiqDelta" style="font-size: 1.45rem; font-weight: 800; color: #059669; margin-top: 4px;">+0,00 €</div>
-            <div style="font-size: 0.76rem; color: #059669; margin-top: 2px;">Comprovado por talões de vendas Sifarma</div>
+            <div style="font-size: 0.76rem; color: #059669; margin-top: 2px;">Comprovado por histórico de vendas registadas</div>
           </div>
         </div>
 
@@ -5212,65 +5555,13 @@ function getDashboardHtml(): string {
           <span id="copilotModeTag" style="font-weight: 800; font-size: 0.72rem; text-transform: uppercase; background: #e0f2fe; color: #0369a1; padding: 2px 8px; border-radius: 6px;">GERAL</span>
         </div>
 
-        <!-- PAINEL DE PERGUNTAS ESTRATÉGICAS DA DIREÇÃO TÉCNICA -->
-        <div id="directorQuestionsAccordion" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; cursor: pointer;" onclick="toggleDirectorQuestionsPanel()">
-            <div style="font-size: 0.82rem; font-weight: 800; color: #0f172a; text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; gap: 6px;">
-              ⭐ Perguntas Executivas da Direção Técnica (Casos Práticos Reais)
-            </div>
-            <span id="directorQuestionsToggleIcon" style="font-size: 0.85rem; color: #64748b; font-weight: 700;">▲ Ocultar</span>
-          </div>
-
-          <div id="directorQuestionsGrid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px;">
-            <div class="director-question-card" onclick="runDirectorQuestion('Tendo em conta as vendas faz um cálculo do mínimo de stock que deverias ter para uma semana')">
-              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">📊 1. Stock Mínimo para 1 Semana</div>
-              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Cálculo do stock semanal com base na VMM diária e identificação de défices críticos.</div>
-            </div>
-
-            <div class="director-question-card" onclick="runDirectorQuestion('Relativamente aos produtos de venda livre com validade até 2027, faz uma listagem do pvp a que poderiam ser vendidos não ficando a margem de lucro abaixo dos 10%')">
-              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">🏷️ 2. Promoção PVP c/ Margem ≥10%</div>
-              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Venda livre com validade até 2027 e novo PVP promocional protegido.</div>
-            </div>
-
-            <div class="director-question-card" onclick="runDirectorQuestion('Nos produtos de venda livre com validade até 2027, sugere packs de pelo menos 2 a 3 produtos que a margem de cada não seja abaixo de 5%')">
-              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">📦 3. Packs Promocionais (2-3 un)</div>
-              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Combinações clínicas com margem garantida para acelerar rotação de stock.</div>
-            </div>
-
-            <div class="director-question-card" onclick="runDirectorQuestion('Faz uma listagem de todos os produtos existentes em stock sem vendas nos últimos 6 meses e como sugeres a sua dispensa (troca de laboratório, associar com produto de venda livre)')">
-              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">🛑 4. Monos 6 Meses & Estratégia</div>
-              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Artigos sem rotação e ações recomendadas (troca lab, cesto balcão).</div>
-            </div>
-
-            <div class="director-question-card" onclick="runDirectorQuestion('Definindo o número de laboratórios que quero ter por molécula e respetiva dosagem, tendo por base o pvp máximo e mínimo definido no infarmed e o que há em stock e é necessário escoar, cria uma listagem')">
-              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">🧬 5. Racionalização de Labs DCI</div>
-              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Consolidação de genéricos duplicados e eliminação de restos de gaveta.</div>
-            </div>
-
-            <div class="director-question-card" onclick="runDirectorQuestion('Tendo em conta as vendas de produtos de venda livre no último ano e sua sazonalidade, que quantidades sugeres serem compradas diretamente a laboratórios e em que datas sugeres que sejam entregues na farmácia')">
-              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">🗓️ 6. Plano Anual Compras Labs</div>
-              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Calendário sazonal de encomendas diretas a fornecedores por épocas.</div>
-            </div>
-
-            <div class="director-question-card" onclick="runDirectorQuestion('Para as moléculas sujeitas a receita que mais se vendem, que vendas cruzadas sugeres')">
-              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">💊 7. Venda Cruzada Clínica MSRM</div>
-              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Co-prescrições e proteção gástrica/suplementar para receitas mais frequentes.</div>
-            </div>
-
-            <div class="director-question-card" onclick="runDirectorQuestion('De forma a reduzir o valor de inventário qual seria a estratégia que adotarias tendo em conta o stock, validade, produtos sem rotação e produtos a não encomendar')">
-              <div style="font-weight: 700; font-size: 0.86rem; color: #0284c7;">📉 8. Redução Global de Inventário</div>
-              <div style="font-size: 0.77rem; color: #475569; line-height: 1.35;">Parecer executivo para libertar liquidez e baixar capital empatado.</div>
-            </div>
-          </div>
-        </div>
-
         <!-- FEED CONVERSACIONAL COM HISTÓRICO E MEMÓRIA -->
         <div id="copilotChatFeed" class="copilot-chat-feed">
           <div id="copilotWelcomeGreeting" style="text-align: center; padding: 28px 16px; background: #ffffff; border: 1px dashed #cbd5e1; border-radius: 12px;">
             <div style="font-size: 2.2rem; margin-bottom: 8px;">💡</div>
             <div style="font-size: 1rem; font-weight: 700; color: #0f172a; margin-bottom: 4px;">O que pretende analisar hoje na sua farmácia?</div>
             <div style="font-size: 0.84rem; color: #64748b; max-width: 580px; margin: 0 auto; line-height: 1.45;">
-              Clique num dos casos executivos acima ou escreva livremente na barra inferior. Pode fazer perguntas de seguimento a qualquer momento — o Copilot mantém o contexto da conversa.
+              Coloque qualquer questão ou pedido de análise na barra inferior. Pode fazer perguntas de seguimento a qualquer momento — o Copilot mantém o contexto da conversa.
             </div>
           </div>
         </div>
@@ -5920,85 +6211,99 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
-  <!-- MODAL 3: GATE DE ACESSO ISOLADO POR FARMÁCIA OU ADMIN COM PASSWORD -->
-  <div class="modal-backdrop" id="authGateModal" style="display: none; z-index: 250; background: rgba(2, 6, 23, 0.94);">
-    <div class="modal" style="max-width: 460px; border-color: var(--primary); box-shadow: 0 20px 50px rgba(0,0,0,0.7);">
+  <!-- PORTAL DEDICADO DE LOGIN / ACESSO ISOLADO POR FARMÁCIA OU ADMIN COM PASSWORD -->
+  <div id="authGateModal" style="display: none; position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 999999; background: #0b1329; background-image: radial-gradient(circle at 50% 15%, #1e293b 0%, #0b1329 100%); align-items: center; justify-content: center; padding: 24px; overflow-y: auto;">
+    <div style="max-width: 460px; width: 100%; background: #ffffff; border-radius: 20px; padding: 36px 32px; box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255,255,255,0.08); text-align: center;">
       
-      <!-- VISTA A: ACESSO CLIENTE DE FARMÁCIA -->
-      <div id="authGatePharmacyView">
-        <div style="text-align: center; margin-bottom: 18px;">
-          <div style="font-size: 2.3rem; margin-bottom: 8px;">🏥</div>
-          <h2 style="font-size: 1.25rem; color: var(--text); font-weight: 800;">BI Pharma — Acesso da Farmácia</h2>
-          <p style="font-size: 0.85rem; color: var(--muted); margin-top: 6px; line-height: 1.45;">
-            Introduza o <b>Código de Acesso Exclusivo</b> da sua Farmácia para aceder ao seu painel isolado.
-          </p>
-        </div>
+      <!-- LOGO E MARCA BI PHARMA -->
+      <div style="display: inline-flex; align-items: center; justify-content: center; width: 56px; height: 56px; border-radius: 14px; background: #e0f2fe; color: #0284c7; font-size: 1.8rem; margin-bottom: 12px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.15);">
+        💊
+      </div>
+      <h1 style="font-size: 1.55rem; font-weight: 900; color: #0f172a; letter-spacing: -0.5px; margin: 0 0 4px 0;">
+        BI Pharma
+      </h1>
+      <p style="font-size: 0.82rem; color: #64748b; margin: 0 0 18px 0; font-weight: 500;">
+        Inteligência de Balcão, Genéricos e Rentabilidade Farmacêutica
+      </p>
 
-        <div style="display: flex; flex-direction: column; gap: 12px;">
+      <!-- BANNER DE SESSÃO ENCERRADA (LOGOUT) -->
+      <div id="authGateLogoutBanner" style="display: none; margin-bottom: 18px; padding: 10px 14px; border-radius: 10px; background: #dcfce7; border: 1px solid #86efac; color: #15803d; font-size: 0.84rem; font-weight: 700; text-align: center;">
+        🔒 Sessão terminada com segurança.
+      </div>
+
+      <!-- SELETOR SEGMENTADO (TABS) DE MODO DE ACESSO -->
+      <div style="display: flex; background: #f1f5f9; padding: 4px; border-radius: 10px; margin-bottom: 22px; gap: 4px;">
+        <button type="button" id="tabGatePharmacy" onclick="toggleAuthGateMode('PHARMACY')" style="flex: 1; padding: 9px 12px; border-radius: 8px; border: none; font-size: 0.82rem; font-weight: 700; cursor: pointer; transition: all 0.2s; background: #ffffff; color: #0284c7; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
+          🏥 Farmácia
+        </button>
+        <button type="button" id="tabGateAdmin" onclick="toggleAuthGateMode('ADMIN')" style="flex: 1; padding: 9px 12px; border-radius: 8px; border: none; font-size: 0.82rem; font-weight: 700; cursor: pointer; transition: all 0.2s; background: transparent; color: #64748b;">
+          👑 Administração
+        </button>
+      </div>
+
+      <!-- VISTA A: ACESSO DE CLIENTE DE FARMÁCIA -->
+      <div id="authGatePharmacyView">
+        <form onsubmit="event.preventDefault(); submitPharmacyAccessCode();" style="display: flex; flex-direction: column; gap: 14px; text-align: left;">
           <div>
-            <label style="font-size: 0.78rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; display: block; margin-bottom: 6px;">
+            <label style="font-size: 0.76rem; font-weight: 800; color: #475569; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 6px;">
               Código da Farmácia:
             </label>
-            <input
-              type="text"
-              id="authAccessCodeInput"
-              placeholder="Introduza o código da sua farmácia"
-              style="width: 100%; font-size: 1rem; font-weight: 700; text-align: center; letter-spacing: 1px; text-transform: uppercase; padding: 12px;"
-              onkeydown="if(event.key==='Enter') submitPharmacyAccessCode()"
-            />
+            <div style="position: relative;">
+              <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); font-size: 1.1rem; color: #94a3b8;">🔑</span>
+              <input
+                type="text"
+                id="authAccessCodeInput"
+                placeholder="EX: FARM-A-279188"
+                style="width: 100%; font-size: 0.98rem; font-weight: 700; text-align: center; letter-spacing: 1.5px; text-transform: uppercase; padding: 12px 14px 12px 40px; border: 1.5px solid #cbd5e1; border-radius: 10px; outline: none; transition: border-color 0.2s; background: #f8fafc;"
+                onfocus="this.style.borderColor='#0284c7'; this.style.background='#ffffff';"
+                onblur="this.style.borderColor='#cbd5e1'; this.style.background='#f8fafc';"
+                onkeydown="if(event.key==='Enter') submitPharmacyAccessCode()"
+              />
+            </div>
           </div>
 
-          <div id="authGateError" style="display: none; font-size: 0.82rem; color: #fb7185; background: rgba(244, 63, 94, 0.12); border: 1px solid rgba(244, 63, 94, 0.3); padding: 8px 12px; border-radius: 8px; text-align: center;"></div>
+          <div id="authGateError" style="display: none; font-size: 0.82rem; color: #dc2626; background: #fee2e2; border: 1px solid #fca5a5; padding: 9px 12px; border-radius: 8px; text-align: center; font-weight: 600;"></div>
 
-          <button class="btn" onclick="submitPharmacyAccessCode()" style="width: 100%; padding: 12px; font-size: 0.96rem; justify-content: center;">
-            🚀 Entrar no Painel da Farmácia
+          <button type="submit" class="btn" style="width: 100%; padding: 13px; font-size: 0.96rem; font-weight: 800; justify-content: center; background: #0284c7; color: #ffffff; border-radius: 10px; border: none; cursor: pointer; box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);">
+            Entrar no Painel da Farmácia →
           </button>
-
-          <div style="border-top: 1px solid var(--border); padding-top: 12px; margin-top: 8px; text-align: center;">
-            <button class="btn btn-secondary" onclick="toggleAuthGateMode('ADMIN')" style="font-size: 0.78rem; padding: 6px 14px; border-color: rgba(148,163,184,0.3); color: var(--muted);">
-              🔐 Área Reservada (Administração)
-            </button>
-          </div>
-        </div>
+        </form>
       </div>
 
       <!-- VISTA B: ACESSO DE ADMINISTRAÇÃO (PASSWORD OBRIGATÓRIA) -->
       <div id="authGateAdminView" style="display: none;">
-        <div style="text-align: center; margin-bottom: 18px;">
-          <div style="font-size: 2.3rem; margin-bottom: 8px;">👑</div>
-          <h2 style="font-size: 1.25rem; color: #c084fc; font-weight: 800;">Administração BI Pharma</h2>
-          <p style="font-size: 0.85rem; color: var(--muted); margin-top: 6px; line-height: 1.45;">
-            Área restrita de gestão multi-farmácia. Introduza a <b>Password de Administrador</b>.
-          </p>
-        </div>
-
-        <div style="display: flex; flex-direction: column; gap: 12px;">
-          <form onsubmit="event.preventDefault(); submitAdminPassword();">
-            <label style="font-size: 0.78rem; font-weight: 700; color: #c084fc; text-transform: uppercase; display: block; margin-bottom: 6px;">
-              Password de Administrador:
+        <form onsubmit="event.preventDefault(); submitAdminPassword();" style="display: flex; flex-direction: column; gap: 14px; text-align: left;">
+          <input type="text" name="username" value="admin" autocomplete="username" style="display:none;" />
+          <div>
+            <label style="font-size: 0.76rem; font-weight: 800; color: #7c3aed; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 6px;">
+              Palavra-Passe de Administrador:
             </label>
-            <input
-              type="password"
-              id="authAdminPasswordInput"
-              placeholder="••••••••••••"
-              autocomplete="current-password"
-              style="width: 100%; font-size: 1rem; font-weight: 700; text-align: center; letter-spacing: 2px; padding: 12px;"
-              onkeydown="if(event.key==='Enter') submitAdminPassword()"
-            />
-          </form>
-
-          <div id="authGateAdminError" style="display: none; font-size: 0.82rem; color: #fb7185; background: rgba(244, 63, 94, 0.12); border: 1px solid rgba(244, 63, 94, 0.3); padding: 8px 12px; border-radius: 8px; text-align: center;"></div>
-
-          <button class="btn" onclick="submitAdminPassword()" style="width: 100%; padding: 12px; font-size: 0.96rem; justify-content: center; background: linear-gradient(135deg, #a855f7, #7c3aed); border-color: #a855f7;">
-            🔓 Entrar como Administrador
-          </button>
-
-          <div style="border-top: 1px solid var(--border); padding-top: 12px; margin-top: 8px; text-align: center;">
-            <button class="btn btn-secondary" onclick="toggleAuthGateMode('PHARMACY')" style="font-size: 0.78rem; padding: 6px 14px; border-color: rgba(148,163,184,0.3); color: var(--muted);">
-              ← Voltar ao Acesso de Farmácia
-            </button>
+            <div style="position: relative;">
+              <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); font-size: 1.1rem; color: #94a3b8;">🛡️</span>
+              <input
+                type="password"
+                id="authAdminPasswordInput"
+                placeholder="••••••••••••"
+                autocomplete="current-password"
+                style="width: 100%; font-size: 1rem; font-weight: 700; text-align: center; letter-spacing: 2px; padding: 12px 14px 12px 40px; border: 1.5px solid #cbd5e1; border-radius: 10px; outline: none; transition: border-color 0.2s; background: #f8fafc;"
+                onfocus="this.style.borderColor='#7c3aed'; this.style.background='#ffffff';"
+                onblur="this.style.borderColor='#cbd5e1'; this.style.background='#f8fafc';"
+                onkeydown="if(event.key==='Enter') submitAdminPassword()"
+              />
+            </div>
           </div>
-        </div>
+
+          <div id="authGateAdminError" style="display: none; font-size: 0.82rem; color: #dc2626; background: #fee2e2; border: 1px solid #fca5a5; padding: 9px 12px; border-radius: 8px; text-align: center; font-weight: 600;"></div>
+
+          <button type="submit" class="btn" style="width: 100%; padding: 13px; font-size: 0.96rem; font-weight: 800; justify-content: center; background: linear-gradient(135deg, #7c3aed, #6d28d9); color: #ffffff; border-radius: 10px; border: none; cursor: pointer; box-shadow: 0 4px 14px rgba(124, 58, 237, 0.35);">
+            Entrar como Administrador →
+          </button>
+        </form>
+      </div>
+
+      <!-- RODAPÉ DE SEGURANÇA E CONFORMIDADE -->
+      <div style="margin-top: 24px; padding-top: 18px; border-top: 1px solid #f1f5f9; display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 0.74rem; color: #94a3b8; font-weight: 600;">
+        <span>🔒</span> Ligação Encriptada • Conforme RGPD & Boas Práticas Farmacêuticas
       </div>
 
     </div>
@@ -6588,7 +6893,7 @@ function getDashboardHtml(): string {
         </div>
         <div style="display: flex; flex-wrap: wrap; gap: 8px;">
           <button class="btn btn-sm" onclick="exportInteractiveOrderCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
-            📥 Descarregar CSV para Sifarma
+            📥 Descarregar CSV de Encomenda
           </button>
           <button class="btn btn-sm" onclick="exportInteractiveOrderPdf()" style="background:#dc2626;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
             📄 Imprimir / Guardar em PDF
@@ -6791,6 +7096,41 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
+  <!-- MODAL DE ASSINATURA & APROVAÇÃO CLÍNICA PELO DIRETOR TÉCNICO (DT) -->
+  <div id="dtApprovalModal" style="display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(4px); z-index: 99999; align-items: center; justify-content: center;">
+    <div style="background: var(--surface); border: 2px solid #059669; border-radius: 16px; padding: 26px; max-width: 500px; width: 92%; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35); text-align: left;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h3 style="font-size: 1.15rem; font-weight: 800; color: #047857; margin: 0; display: flex; align-items: center; gap: 8px;">
+          🛡️ Assinatura & Ativação Clínica (Diretor Técnico)
+        </h3>
+        <button onclick="closeDtApprovalModal()" style="background: none; border: none; font-size: 1.2rem; cursor: pointer; color: var(--muted);">&times;</button>
+      </div>
+      <p style="font-size: 0.84rem; color: var(--text-secondary); margin-bottom: 14px; line-height: 1.4;">
+        A validação de um pack promocional de venda no balcão exige assinatura clínica qualificada do Diretor Técnico. Não são permitidos PINs genéricos.
+      </p>
+
+      <div id="dtPackSummaryBox" style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 12px; margin-bottom: 14px; font-size: 0.82rem; color: #166534;">
+        <!-- Injetado dinamicamente -->
+      </div>
+
+      <form onsubmit="event.preventDefault(); submitDtApproval();" style="margin-bottom: 16px;">
+        <input type="text" name="username" value="diretor_tecnico" autocomplete="username" style="display:none;" />
+        <label style="font-size: 0.78rem; font-weight: 700; color: #334155; display: block; margin-bottom: 6px;">Palavra-Passe do Diretor Técnico:</label>
+        <input type="password" id="dtApprovalPassword" autocomplete="current-password" placeholder="Insira a sua palavra-passe para assinar..." style="width: 100%; padding: 10px 12px; border: 1.5px solid #cbd5e1; border-radius: 8px; font-size: 0.9rem;" onkeydown="if(event.key==='Enter') submitDtApproval()" />
+        <div style="font-size: 0.72rem; color: #64748b; margin-top: 4px;">A aprovação é selada com o Hash SHA-256 da composição e cria as tarefas de balcão.</div>
+      </form>
+
+      <div id="dtApprovalFeedback" style="display: none; padding: 10px; border-radius: 6px; font-size: 0.82rem; margin-bottom: 14px;"></div>
+
+      <div style="display: flex; justify-content: flex-end; gap: 10px;">
+        <button class="btn btn-secondary" onclick="closeDtApprovalModal()" style="font-size: 0.85rem; padding: 8px 16px;">Cancelar</button>
+        <button class="btn" id="btnConfirmDtApproval" onclick="submitDtApproval()" style="background: #059669; color: #fff; font-size: 0.85rem; font-weight: 800; padding: 8px 18px; border-radius: 8px; border: none; cursor: pointer;">
+          ✍️ Assinar & Ativar Pack
+        </button>
+      </div>
+    </div>
+  </div>
+
 
   
   <!-- GAVETA LATERAL DIREITA (SLIDE DRAWER) -->
@@ -6990,6 +7330,8 @@ function getDashboardHtml(): string {
     function toggleAuthGateMode(mode) {
       const pharmView = document.getElementById('authGatePharmacyView');
       const adminView = document.getElementById('authGateAdminView');
+      const tabPharm = document.getElementById('tabGatePharmacy');
+      const tabAdmin = document.getElementById('tabGateAdmin');
       const errEl = document.getElementById('authGateError');
       const errAdm = document.getElementById('authGateAdminError');
       if (errEl) errEl.style.display = 'none';
@@ -6998,24 +7340,42 @@ function getDashboardHtml(): string {
       if (mode === 'ADMIN') {
         if (pharmView) pharmView.style.display = 'none';
         if (adminView) adminView.style.display = 'block';
+        if (tabPharm) { tabPharm.style.background = 'transparent'; tabPharm.style.color = '#64748b'; tabPharm.style.boxShadow = 'none'; }
+        if (tabAdmin) { tabAdmin.style.background = '#ffffff'; tabAdmin.style.color = '#7c3aed'; tabAdmin.style.boxShadow = '0 1px 3px rgba(0,0,0,0.08)'; }
         setTimeout(() => document.getElementById('authAdminPasswordInput')?.focus(), 50);
       } else {
         if (pharmView) pharmView.style.display = 'block';
         if (adminView) adminView.style.display = 'none';
+        if (tabPharm) { tabPharm.style.background = '#ffffff'; tabPharm.style.color = '#0284c7'; tabPharm.style.boxShadow = '0 1px 3px rgba(0,0,0,0.08)'; }
+        if (tabAdmin) { tabAdmin.style.background = 'transparent'; tabAdmin.style.color = '#64748b'; tabAdmin.style.boxShadow = 'none'; }
         setTimeout(() => document.getElementById('authAccessCodeInput')?.focus(), 50);
       }
     }
 
     function openAuthGateModal(errMsg, targetMode = 'PHARMACY') {
+      const appLayout = document.getElementById('mainAppLayout');
+      if (appLayout) appLayout.style.display = 'none';
+
       const modal = document.getElementById('authGateModal');
       const input = document.getElementById('authAccessCodeInput');
       const errEl = document.getElementById('authGateError');
       const errAdm = document.getElementById('authGateAdminError');
+      const logoutBanner = document.getElementById('authGateLogoutBanner');
 
       toggleAuthGateMode(targetMode);
 
       if (input && activeAuthRole === 'PHARMACY') input.value = activeAccessCode || '';
-      if (errMsg) {
+      
+      if (logoutBanner) {
+        if (errMsg && (errMsg.includes('terminada') || errMsg.includes('segurança'))) {
+          logoutBanner.textContent = errMsg;
+          logoutBanner.style.display = 'block';
+        } else {
+          logoutBanner.style.display = 'none';
+        }
+      }
+
+      if (errMsg && !(errMsg.includes('terminada') || errMsg.includes('segurança'))) {
         if (targetMode === 'ADMIN' && errAdm) {
           errAdm.textContent = errMsg;
           errAdm.style.display = 'block';
@@ -7122,6 +7482,11 @@ function getDashboardHtml(): string {
 
         const gate = document.getElementById('authGateModal');
         if (gate) gate.style.display = 'none';
+        const appLayout = document.getElementById('mainAppLayout');
+        if (appLayout) appLayout.style.display = 'flex';
+        if (window.location.pathname === '/login' || window.location.search) {
+          window.history.replaceState({}, document.title, '/');
+        }
 
         if (data.role === 'PHARMACY' && data.lockedFarmacia) {
           activeFarmaciaId = data.lockedFarmacia.id;
@@ -7161,6 +7526,26 @@ function getDashboardHtml(): string {
 
     async function initPharmacies() {
       const urlParams = new URLSearchParams(window.location.search);
+      const isLogout = urlParams.get('logout') === '1';
+      const isLogin = window.location.pathname === '/login' || urlParams.get('login') === '1';
+
+      // 0. Se for término de sessão (logout) ou visita explícita à página de login, limpa credenciais e trava no gate
+      if (isLogout || isLogin) {
+        localStorage.removeItem('bi_pharma_access_code');
+        localStorage.removeItem('bi_pharma_auth_role');
+        localStorage.removeItem('bi_pharma_farmacia_id');
+        localStorage.removeItem('bi_pharma_admin_authenticated');
+        sessionStorage.clear();
+        activeAccessCode = '';
+        activeAuthRole = '';
+        activeFarmaciaId = '';
+        document.cookie = 'admin_session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+        document.cookie = 'farmacia_access_code=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+
+        openAuthGateModal(isLogout ? 'Sessão terminada com segurança.' : null, 'PHARMACY');
+        return;
+      }
+
       const urlCode = urlParams.get('acesso') || urlParams.get('accessCode');
       const isAdminFlag = urlParams.get('admin') === '1';
 
@@ -8168,7 +8553,7 @@ function getDashboardHtml(): string {
 
         const r = currentReport.resumo_executivo;
         const p = currentReport.parametros;
-        const lastSaleNote = p && p.data_ultima_venda ? \` | Última Venda Sifarma: \${p.data_ultima_venda}\` : '';
+        const lastSaleNote = p && p.data_ultima_venda ? \` | Última Venda Registada: \${p.data_ultima_venda}\` : '';
         document.getElementById('tenantBadge').textContent = \`🏥 \${currentReport.farmacia.nome} | NIF: \${currentReport.farmacia.nif} | Ref: \${p ? p.data_referencia : ''}\${lastSaleNote}\`;
 
         document.getElementById('kpiStockValor').textContent = \`\${r.valor_total_stock_custo.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €\`;
@@ -8375,7 +8760,16 @@ function getDashboardHtml(): string {
       document.cookie = 'admin_session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
       document.cookie = 'farmacia_access_code=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
       localStorage.removeItem('bi_pharma_admin_authenticated');
-      window.location.href = '/?logout=1';
+      localStorage.removeItem('bi_pharma_access_code');
+      localStorage.removeItem('bi_pharma_auth_role');
+      localStorage.removeItem('bi_pharma_farmacia_id');
+      sessionStorage.clear();
+      activeAccessCode = '';
+      activeAuthRole = '';
+      activeFarmaciaId = '';
+      const appLayout = document.getElementById('mainAppLayout');
+      if (appLayout) appLayout.style.display = 'none';
+      window.location.href = '/login?logout=1';
     }
 
     function shareMobileWhatsApp() {
@@ -8838,10 +9232,20 @@ function getDashboardHtml(): string {
     }
 
     
+    let desktopTasksEventSource = null;
+    let desktopTasksFarmaciaId = null;
+
     function initDesktopTasksRealtime() {
       if (!activeFarmaciaId || typeof EventSource === 'undefined') return;
+      if (desktopTasksEventSource && desktopTasksFarmaciaId === activeFarmaciaId) return;
+      if (desktopTasksEventSource) {
+        try { desktopTasksEventSource.close(); } catch(e) {}
+        desktopTasksEventSource = null;
+      }
+      desktopTasksFarmaciaId = activeFarmaciaId;
       try {
         const es = new EventSource('/api/weekly-tasks/stream?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        desktopTasksEventSource = es;
         es.addEventListener('task_update', function(e) {
           try {
             const data = JSON.parse(e.data);
@@ -8870,8 +9274,19 @@ function getDashboardHtml(): string {
             }
           } catch(err) {}
         });
+        es.onerror = function() {
+          try { es.close(); } catch(e) {}
+          if (desktopTasksEventSource === es) desktopTasksEventSource = null;
+        };
       } catch(err) {}
     }
+
+    window.addEventListener('pagehide', function() {
+      if (desktopTasksEventSource) {
+        try { desktopTasksEventSource.close(); } catch(e) {}
+        desktopTasksEventSource = null;
+      }
+    });
 
     function updateWeeklyTasksCounter() {
       const map = getDoneTasksMap();
@@ -9003,7 +9418,7 @@ function getDashboardHtml(): string {
         return;
       }
 
-      c1El.innerHTML = filtered.map((item, idx) => {
+      c1El.innerHTML = filtered.slice(0, 50).map((item, idx) => {
         const taskId = 'cad_' + item.cnp_codigo + '_' + (item.lote || 0);
         const isDone = !!doneMap[taskId];
         const qtd = item.stock_atual != null ? item.stock_atual : (item.quantidade || 1);
@@ -9092,7 +9507,7 @@ function getDashboardHtml(): string {
 
         if (filteredGen.length > 0) {
           html += '<div style="font-size: 0.78rem; font-weight: 800; color: #7e22ce; text-transform: uppercase; margin: 4px 0 8px;">📦 Restos de Gaveta Alfabéticos (A ➔ Z):</div>';
-          html += filteredGen.map(g => {
+          html += filteredGen.slice(0, 50).map(g => {
             const taskId = 'gen_' + normStr(g.molecula_dci || g.grupo_equivalencia_dci);
             const isDone = !!doneMap[taskId];
             const restos = g.restos_gaveta_escobar_primeiro || [];
@@ -9265,7 +9680,7 @@ function getDashboardHtml(): string {
         return;
       }
 
-      c3El.innerHTML = filtered.map(item => {
+      c3El.innerHTML = filtered.slice(0, 50).map(item => {
         const taskId = 'trav_' + item.cnp_codigo;
         const isDone = !!doneMap[taskId];
         const motivo = item.cobertura_meses
@@ -9281,7 +9696,7 @@ function getDashboardHtml(): string {
                 <span style="font-size: 0.78rem; font-weight: 700; color: #92400e; background: #fef3c7; padding: 2px 8px; border-radius: 4px; font-weight: 800; border: 1px solid #fde68a;">CNP: \${item.cnp_codigo} · \${(item.perda || 0).toFixed(2)} €</span>
               </div>
               <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
-                🛑 <b>Ação no Sifarma:</b> Alterar Ponto de Encomenda / Stock Mínimo para <b>0</b> (\${motivo}).
+                🛑 <b>Ação no Sistema:</b> Alterar Ponto de Encomenda / Stock Mínimo para <b>0</b> (\${motivo}).
               </div>
             </div>
           </div>
@@ -9345,11 +9760,11 @@ function getDashboardHtml(): string {
       }
 
       if (filtered.length === 0) {
-        c4El.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;padding:24px;text-align:center;">✅ Níveis de stock mínimos equilibrados no Sifarma com os filtros atuais.</div>';
+        c4El.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;padding:24px;text-align:center;">✅ Níveis de stock mínimos equilibrados no sistema com os filtros atuais.</div>';
         return;
       }
 
-      c4El.innerHTML = filtered.map(item => {
+      c4El.innerHTML = filtered.slice(0, 50).map(item => {
         const taskId = 'rut_' + item.cnp_codigo;
         const isDone = !!doneMap[taskId];
         const sugestaoEnc = item.sugestao_encomenda || Math.max(2, Math.ceil((item.vmm || 1) * 0.5));
@@ -9366,7 +9781,7 @@ function getDashboardHtml(): string {
                 </span>
               </div>
               <div style="font-size: 0.82rem; color: #334155; margin-top: 5px; line-height: 1.4;">
-                🟢 <b>Ajustar no Sifarma:</b> Subir Ponto de Encomenda para <b>\${sugestaoEnc} un</b> (risco de rutura iminente face às vendas: cobertura atual de apenas \${diasTxt}).
+                🟢 <b>Ajustar no Sistema:</b> Subir Ponto de Encomenda para <b>\${sugestaoEnc} un</b> (risco de rutura iminente face às vendas: cobertura atual de apenas \${diasTxt}).
               </div>
               <div style="font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
                 CNP: <code style="color:#0284c7">\${item.cnp_codigo}</code> | Categoria: \${item.categoria || 'Geral'} | Tipo: \${item.tipo_venda || 'MSRM'}
@@ -9497,7 +9912,7 @@ function getDashboardHtml(): string {
             </tbody>
           </table>
 
-          <h2>🛑 3. O QUE NÃO ENCOMENDAR MAIS (BLOQUEAR NO SIFARMA COM P.E. = 0)</h2>
+          <h2>🛑 3. O QUE NÃO ENCOMENDAR MAIS (BLOQUEAR NO SISTEMA DE GESTÃO COM P.E. = 0)</h2>
           <table>
             <thead>
               <tr>
@@ -9506,7 +9921,7 @@ function getDashboardHtml(): string {
                 <th>Designação</th>
                 <th style="width: 65px;">Stock Atual</th>
                 <th style="width: 80px;">Capital Parado</th>
-                <th>Ação Obrigatória no Sifarma</th>
+                <th>Ação no Sistema de Gestão</th>
               </tr>
             </thead>
             <tbody>
@@ -9523,7 +9938,7 @@ function getDashboardHtml(): string {
             </tbody>
           </table>
 
-          <h2>🟢 4. AJUSTAR NÍVEIS & PREVENIR RUTURAS (SUBIR PONTO DE ENCOMENDA NO SIFARMA)</h2>
+          <h2>🟢 4. AJUSTAR NÍVEIS & PREVENIR RUTURAS (SUBIR PONTO DE ENCOMENDA NO SISTEMA)</h2>
           <table>
             <thead>
               <tr>
@@ -9532,7 +9947,7 @@ function getDashboardHtml(): string {
                 <th>Designação</th>
                 <th style="width: 65px;">Stock Atual</th>
                 <th style="width: 75px;">VMM</th>
-                <th>Ação Recomendada no Sifarma</th>
+                <th>Ação Recomendada no Sistema</th>
               </tr>
             </thead>
             <tbody>
@@ -9682,7 +10097,7 @@ function getDashboardHtml(): string {
         table.innerHTML = \`
           <tbody>
             <tr>
-              <td colspan="10" style="text-align: center; padding: 48px 16px; color: var(--muted); font-size: 0.95rem;">
+              <td colspan="9" style="text-align: center; padding: 48px 16px; color: var(--muted); font-size: 0.95rem;">
                 🔎 Nenhum artigo encontrado para o filtro <b>"\${rawFilter || tvFilter}"</b> nesta aba.<br/>
                 <span style="font-size:0.82rem;margin-top:6px;display:inline-block">Experimente limpar a pesquisa ou selecionar "Todos os Produtos".</span>
               </td>
@@ -9697,7 +10112,6 @@ function getDashboardHtml(): string {
           <thead>
             <tr>
               <th>Código</th>
-              <th>Segmento / Estatuto</th>
               <th>Categoria & Sazonalidade</th>
               <th>Designação</th>
               <th>Stock</th>
@@ -9712,7 +10126,6 @@ function getDashboardHtml(): string {
             \${displayRows.map(r => \`
               <tr class="clickable-row" onclick="openProductModal('\${r.cnp_codigo}')">
                 <td><b>\${r.cnp_codigo}</b></td>
-                <td>\${formatSegmentoBadge(r)}</td>
                 <td>\${formatCategoriaBadge(r)}</td>
                 <td>\${r.designacao}</td>
                 <td>\${r.stock_atual}</td>
@@ -9730,7 +10143,6 @@ function getDashboardHtml(): string {
           <thead>
             <tr>
               <th>Código</th>
-              <th>Segmento / Estatuto</th>
               <th>Categoria & Sazonalidade</th>
               <th>Designação</th>
               <th>Stock</th>
@@ -9745,7 +10157,6 @@ function getDashboardHtml(): string {
             \${displayRows.map(r => \`
               <tr class="clickable-row" onclick="openProductModal('\${r.cnp_codigo}')">
                 <td><b>\${r.cnp_codigo}</b></td>
-                <td>\${formatSegmentoBadge(r)}</td>
                 <td>\${formatCategoriaBadge(r)}</td>
                 <td>\${r.designacao}</td>
                 <td>\${r.stock_atual}</td>
@@ -9763,7 +10174,6 @@ function getDashboardHtml(): string {
           <thead>
             <tr>
               <th>Código</th>
-              <th>Segmento / Estatuto</th>
               <th>Categoria & Sazonalidade</th>
               <th>Designação</th>
               <th>Stock</th>
@@ -9777,7 +10187,6 @@ function getDashboardHtml(): string {
             \${displayRows.map(r => \`
               <tr class="clickable-row" onclick="openProductModal('\${r.cnp_codigo}')">
                 <td><b>\${r.cnp_codigo}</b></td>
-                <td>\${formatSegmentoBadge(r)}</td>
                 <td>\${formatCategoriaBadge(r)}</td>
                 <td>\${r.designacao}</td>
                 <td>\${r.stock_atual}</td>
@@ -9802,19 +10211,6 @@ function getDashboardHtml(): string {
       return copilotSessionId;
     }
 
-    function toggleDirectorQuestionsPanel() {
-      const grid = document.getElementById('directorQuestionsGrid');
-      const icon = document.getElementById('directorQuestionsToggleIcon');
-      if (!grid) return;
-      if (grid.style.display === 'none') {
-        grid.style.display = 'grid';
-        if (icon) icon.textContent = '▲ Ocultar';
-      } else {
-        grid.style.display = 'none';
-        if (icon) icon.textContent = '▼ Expandir';
-      }
-    }
-
     async function resetCopilotConversation() {
       const sid = copilotSessionId;
       try {
@@ -9834,26 +10230,16 @@ function getDashboardHtml(): string {
           '<div style="font-size: 2.2rem; margin-bottom: 8px;">💡</div>' +
           '<div style="font-size: 1rem; font-weight: 700; color: #0f172a; margin-bottom: 4px;">Nova conversa iniciada.</div>' +
           '<div style="font-size: 0.84rem; color: #64748b; max-width: 580px; margin: 0 auto; line-height: 1.45;">' +
-          'A memória anterior foi reiniciada. Selecione um caso executivo acima ou escreva uma nova pergunta.' +
+          'A memória anterior foi reiniciada. Coloque a sua nova pergunta na barra inferior.' +
           '</div>' +
           '</div>';
       }
-      const grid = document.getElementById('directorQuestionsGrid');
-      if (grid) grid.style.display = 'grid';
-      const icon = document.getElementById('directorQuestionsToggleIcon');
-      if (icon) icon.textContent = '▲ Ocultar';
 
       const input = document.getElementById('askInput');
       if (input) {
         input.value = '';
         input.focus();
       }
-    }
-
-    function runDirectorQuestion(questionText) {
-      const input = document.getElementById('askInput');
-      if (input) input.value = questionText;
-      askQuestion(questionText);
     }
 
     function toggleCopilotTask(element) {
@@ -9987,13 +10373,13 @@ function getDashboardHtml(): string {
       }
       // Botão Rever Encomenda (incluindo variações de emojis/texto que Claude possa gerar)
       var orderModalBtnHtml = '<div style="margin: 12px 0;"><button class="btn btn-sm" onclick="openInteractiveOrderModal()" style="background:#6366f1;color:#fff;font-weight:800;padding:9px 16px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:7px;box-shadow:0 2px 4px rgba(99,102,241,0.25);">🛒 Rever & Editar Encomenda Completa</button></div>';
-      var exportCsvBtnHtml = '<div style="margin: 8px 0;"><button class="btn btn-sm" onclick="exportCopilotShoppingListCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📥 Descarregar CSV para Sifarma</button></div>';
-      var applyBlocksBtnHtml = '<div style="margin: 8px 0;"><button class="btn btn-sm" onclick="applySifarmaOrderBlocks()" style="background:#e11d48;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">🛑 Aplicar Bloqueios no Sifarma (Ponto de Encomenda = 0)</button></div>';
+      var exportCsvBtnHtml = '<div style="margin: 8px 0;"><button class="btn btn-sm" onclick="exportCopilotShoppingListCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📥 Descarregar CSV de Encomenda</button></div>';
+      var applyBlocksBtnHtml = '<div style="margin: 8px 0;"><button class="btn btn-sm" onclick="applySifarmaOrderBlocks()" style="background:#e11d48;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">🛑 Bloquear Encomendas no Sistema (Ponto de Encomenda = 0)</button></div>';
 
       rendered = rendered.split('[BOTAO_APLICAR_PLANO]').join('<div style="margin: 10px 0;"><button class="btn btn-sm" onclick="applyCopilotWeeklyPlan()" style="background:#10b981;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">📥 Aplicar à Folha da Semana</button></div>');
       rendered = rendered.split('[BOTAO_GUARDAR_PACK]').join('<div style="margin: 10px 0;"><button class="btn btn-sm" onclick="saveCopilotPack()" style="background:#8b5cf6;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">📦 Guardar Pack no Estúdio de Marketing</button></div>');
       rendered = rendered.split('[BOTAO_EXPORTAR_ENCOMENDA_PDF]').join('<div style="margin: 8px 0;"><button class="btn btn-sm" onclick="exportCopilotShoppingListPdf()" style="background:#dc2626;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">📄 Imprimir / Guardar em PDF</button></div>');
-      rendered = rendered.split('[BOTAO_EXPORTAR_ENCOMENDA_CSV]').join('<div style="display:inline-flex;flex-wrap:wrap;gap:8px;margin:12px 0;"><button class="btn btn-sm" onclick="openInteractiveOrderModal()" style="background:#6366f1;color:#fff;font-weight:800;padding:9px 16px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:7px;box-shadow:0 2px 4px rgba(99,102,241,0.25);">🛒 Rever & Editar Encomenda Completa</button><button class="btn btn-sm" onclick="exportCopilotShoppingListCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📥 CSV Sifarma</button><button class="btn btn-sm" onclick="exportCopilotShoppingListPdf()" style="background:#dc2626;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📄 Guia PDF</button><button class="btn btn-sm" onclick="copyShoppingListToClipboard()" style="background:#475569;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📋 Copiar CNPs</button></div>');
+      rendered = rendered.split('[BOTAO_EXPORTAR_ENCOMENDA_CSV]').join('<div style="display:inline-flex;flex-wrap:wrap;gap:8px;margin:12px 0;"><button class="btn btn-sm" onclick="openInteractiveOrderModal()" style="background:#6366f1;color:#fff;font-weight:800;padding:9px 16px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:7px;box-shadow:0 2px 4px rgba(99,102,241,0.25);">🛒 Rever & Editar Encomenda Completa</button><button class="btn btn-sm" onclick="exportCopilotShoppingListCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📥 CSV Encomenda</button><button class="btn btn-sm" onclick="exportCopilotShoppingListPdf()" style="background:#dc2626;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📄 Guia PDF</button><button class="btn btn-sm" onclick="copyShoppingListToClipboard()" style="background:#475569;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📋 Copiar CNPs</button></div>');
       rendered = rendered.split('[BOTAO_APLICAR_ENCOMENDA_FOLHA]').join('<div style="margin: 10px 0;"><button class="btn btn-sm" onclick="applyShoppingListToWeeklyPlan()" style="background:#10b981;color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 1px 3px rgba(0,0,0,0.1);">📝 Adicionar à Folha Semanal (Pilar 4: Reposição)</button></div>');
 
       // Substituições resilientes caso o LLM escreva os nomes por extenso com emojis
@@ -10331,7 +10717,7 @@ function getDashboardHtml(): string {
       var encodedUri = encodeURI(csvContent);
       var link = document.createElement('a');
       link.setAttribute('href', encodedUri);
-      link.setAttribute('download', 'encomenda_validada_sifarma_' + new Date().toISOString().slice(0, 10) + '.csv');
+      link.setAttribute('download', 'encomenda_validada_' + new Date().toISOString().slice(0, 10) + '.csv');
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -10476,7 +10862,7 @@ function getDashboardHtml(): string {
         text += list[i].cnp + '	' + list[i].quantidadeAEncomendar + '	' + (list[i].designacao || '') + '	' + list[i].canalRotulo + NL;
       }
       navigator.clipboard.writeText(text).then(function() {
-        alert('📋 ' + list.length + ' artigos aprovados copiados para a área de transferência! Pode colar diretamente no Excel ou Sifarma.');
+        alert('📋 ' + list.length + ' artigos aprovados copiados para a área de transferência! Pode colar diretamente no Excel ou no sistema de gestão da farmácia.');
       }).catch(function(e) {
         alert('Erro ao copiar: ' + e);
       });
@@ -10528,7 +10914,7 @@ function getDashboardHtml(): string {
       var encodedUri = encodeURI(csvContent);
       var link = document.createElement('a');
       link.setAttribute('href', encodedUri);
-      link.setAttribute('download', 'encomenda_sifarma_' + new Date().toISOString().slice(0, 10) + '.csv');
+      link.setAttribute('download', 'encomenda_' + new Date().toISOString().slice(0, 10) + '.csv');
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -10655,7 +11041,7 @@ function getDashboardHtml(): string {
         text += list[i].cnp + '\t' + list[i].quantidadeAEncomendar + NL;
       }
       navigator.clipboard.writeText(text).then(function() {
-        alert('📋 ' + list.length + ' artigos copiados para a área de transferência! Pode colar diretamente (Ctrl+V) no Excel ou no módulo de encomenda rápida do Sifarma.');
+        alert('📋 ' + list.length + ' artigos copiados para a área de transferência! Pode colar diretamente (Ctrl+V) no Excel ou no módulo de encomenda do sistema de gestão.');
       }).catch(function(e) {
         alert('Erro ao copiar: ' + e);
       });
@@ -10663,7 +11049,7 @@ function getDashboardHtml(): string {
 
     
     function applySifarmaOrderBlocks() {
-      alert('🛑 Recomendações de Bloqueio: Os artigos com cobertura excessiva ou marcas secundárias foram identificados para que no Sifarma seja colocado Ponto de Encomenda = 0 e Stock Mínimo = 0.');
+      alert('🛑 Recomendações de Bloqueio: Os artigos com cobertura excessiva ou marcas secundárias foram identificados para que no sistema de gestão da farmácia seja colocado Ponto de Encomenda = 0 e Stock Mínimo = 0.');
       switchTab('plano');
     }
 
@@ -10867,7 +11253,7 @@ function getDashboardHtml(): string {
             '<div style="font-size: 0.8rem; font-weight: 800; color: #1e293b; margin-bottom: 10px; display:flex; align-items:center; gap:6px;">🚀 CENTRAL DE ENCOMENDA & REPOSIÇÃO (' + data.shoppingList.length + ' artigos identificados):</div>' +
             '<div style="display: flex; flex-wrap: wrap; gap: 8px;">' +
             '<button class="btn btn-sm" onclick="openInteractiveOrderModal()" style="background:#6366f1;color:#fff;font-weight:800;padding:9px 16px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:7px;box-shadow:0 2px 4px rgba(99,102,241,0.25);">🛒 Rever & Editar Encomenda Completa (' + data.shoppingList.length + ' Artigos)</button>' +
-            '<button class="btn btn-sm" onclick="exportCopilotShoppingListCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📥 Descarregar CSV para Sifarma</button>' +
+            '<button class="btn btn-sm" onclick="exportCopilotShoppingListCsv()" style="background:#0284c7;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📥 Descarregar CSV de Encomenda</button>' +
             '<button class="btn btn-sm" onclick="exportCopilotShoppingListPdf()" style="background:#dc2626;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📄 Imprimir / Guardar em PDF</button>' +
             '<button class="btn btn-sm" onclick="copyShoppingListToClipboard()" style="background:#475569;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📋 Copiar CNPs</button>' +
             '<button class="btn btn-sm" onclick="applyShoppingListToWeeklyPlan()" style="background:#10b981;color:#fff;font-weight:700;padding:9px 14px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;">📝 Adicionar à Folha Semanal (Pilar 4)</button>' +
@@ -10963,7 +11349,7 @@ function getDashboardHtml(): string {
           '<div style="background:#f8fafc;padding:10px 14px;border-radius:8px;border:1px solid #e2e8f0">' +
             '<div style="font-size:0.72rem;font-weight:700;color:#64748b;text-transform:uppercase;">VALIDADE REGISTADA</div>' +
             '<div style="font-size:1.3rem;font-weight:800;color:' + (inv.data_validade ? '#e11d48' : '#0f172a') + ';margin-top:2px;">' + (inv.data_validade || 'S/ Registo') + '</div>' +
-            '<div style="font-size:0.76rem;color:#64748b;">Controlo Sifarma / Winphar</div>' +
+            '<div style="font-size:0.76rem;color:#64748b;">Controlo de Inventário / ERP</div>' +
           '</div>';
       }
 
@@ -11249,72 +11635,299 @@ function getDashboardHtml(): string {
       }
     }
 
+    let activePackForDtApproval = null;
+
     function renderClinicalThemePacks(packs) {
       const grid = document.getElementById('mktPacksGrid');
       if (!grid) return;
       if (!packs || packs.length === 0) {
-        grid.innerHTML = '<div style="padding: 24px; color: var(--muted);">Nenhum pack clínico disponível de momento.</div>';
+        grid.innerHTML = '<div style="padding: 24px; color: var(--muted); grid-column: 1 / -1;">Nenhum pack clínico disponível de momento.</div>';
         return;
       }
-      grid.innerHTML = packs.map(pack => {
-        const itemsHtml = pack.produtos.map(p => \`
-          <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; margin-bottom: 8px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
-              <span style="font-weight: 700; color: #0f172a; font-size: 0.86rem;">💊 \${p.designacao}</span>
-              <span style="font-size: 0.76rem; font-weight: 800; color: #0284c7; background: #e0f2fe; padding: 2px 7px; border-radius: 4px;">\${p.pvpUnitario ? p.pvpUnitario.toFixed(2) + '€' : ''} (Stock: \${p.stockAtual} un)</span>
-            </div>
-            <div style="font-size: 0.78rem; color: #0369a1; font-weight: 600; margin-top: 4px;">
-              💡 <span><b>Para o Utente:</b> \${p.propositoUtente}</span>
-            </div>
-            <div style="font-size: 0.72rem; color: #64748b; margin-top: 3px;">
-              CNP: <code>\${p.cnp}</code> | Margem Individual: \${p.margemPct}%
-            </div>
+
+      const activePacks = packs.filter(p => p.estadoCiclo === 'ATIVO' || p.estadoCiclo === 'SUSPENSO_STOCK_BAIXO');
+      const proposedPacks = packs.filter(p => p.estadoCiclo === 'PROPOSTO' || (!p.estadoCiclo && !activePacks.includes(p)));
+
+      let html = '';
+
+      // SECÇÃO 1: PACKS ATIVOS NO BALCÃO (ASSINADOS PELO DT)
+      html += '<div style="grid-column: 1 / -1; margin-top: 10px; margin-bottom: 6px;">' +
+        '<div style="font-size: 1.15rem; font-weight: 800; color: #047857; display: flex; align-items: center; gap: 8px;">' +
+          '🚀 1. Packs Ativos no Balcão (Assinados & Válidos no Balcão)' +
+          '<span style="font-size: 0.75rem; background: #d1fae5; color: #065f46; padding: 2px 8px; border-radius: 9999px; font-weight: 800;">' + activePacks.length + ' Ativo(s)</span>' +
+        '</div>' +
+        '<p style="font-size: 0.82rem; color: #64748b; margin: 3px 0 0 0;">Packs aprovados formalmente pelo Diretor Técnico com integridade criptográfica SHA-256 e presença confirmada nas folhas e ecrãs de atendimento.</p>' +
+      '</div>';
+
+      if (activePacks.length === 0) {
+        html += '<div style="grid-column: 1 / -1; padding: 18px 24px; background: #f8fafc; border: 1.5px dashed #cbd5e1; border-radius: 12px; color: #64748b; font-size: 0.88rem; text-align: center;">' +
+          'ℹ️ Nenhum pack ativo de momento no balcão. Valide uma das propostas determinísticas abaixo com a sua password de DT para o ativar.' +
+        '</div>';
+      } else {
+        html += activePacks.map(p => renderPackCard(p, true)).join('');
+      }
+
+      // SECÇÃO 2: PROPOSTAS DE PACKS DE ÉPOCA (MOTOR DETERMINÍSTICO)
+      html += '<div style="grid-column: 1 / -1; margin-top: 32px; margin-bottom: 6px;">' +
+        '<div style="font-size: 1.15rem; font-weight: 800; color: #0369a1; display: flex; align-items: center; gap: 8px;">' +
+          '📋 2. Propostas de Packs de Época (Motor Determinístico — Aguardam Validação DT)' +
+          '<span style="font-size: 0.75rem; background: #e0f2fe; color: #075985; padding: 2px 8px; border-radius: 9999px; font-weight: 800;">' + proposedPacks.length + ' Proposta(s)</span>' +
+        '</div>' +
+        '<p style="font-size: 0.82rem; color: #64748b; margin: 3px 0 0 0;">Cestos gerados estritamente por regras farmacêuticas (sem MSRM, vias anatómicas compatíveis, stock ≥ 3 un). Requerem assinatura formal do DT.</p>' +
+      '</div>';
+
+      if (proposedPacks.length === 0) {
+        html += '<div style="grid-column: 1 / -1; padding: 18px 24px; background: #f8fafc; border: 1.5px dashed #cbd5e1; border-radius: 12px; color: #64748b; font-size: 0.88rem; text-align: center;">' +
+          '✅ Todas as propostas determinísticas para este período foram assinadas ou tratadas.' +
+        '</div>';
+      } else {
+        html += proposedPacks.map(p => renderPackCard(p, false)).join('');
+      }
+
+      grid.innerHTML = html;
+    }
+
+    function renderPackCard(pack, isActive) {
+      const isSuspendedStock = pack.estadoCiclo === 'SUSPENSO_STOCK_BAIXO';
+      const itemsHtml = (pack.produtos || []).map(p => \`
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; margin-bottom: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+            <span style="font-weight: 700; color: #0f172a; font-size: 0.86rem;">💊 \${p.designacao}</span>
+            <span style="font-size: 0.76rem; font-weight: 800; color: \${p.stockAtual < 3 ? '#dc2626' : '#0284c7'}; background: \${p.stockAtual < 3 ? '#fee2e2' : '#e0f2fe'}; padding: 2px 7px; border-radius: 4px;">\${p.pvpUnitario ? p.pvpUnitario.toFixed(2) + '€' : ''} (Stock: \${p.stockAtual} un)</span>
           </div>
-        \`).join('');
+          <div style="font-size: 0.78rem; color: #0369a1; font-weight: 600; margin-top: 4px;">
+            💡 <span><b>Para o Utente:</b> \${p.propositoUtente}</span>
+          </div>
+          <div style="font-size: 0.72rem; color: #64748b; margin-top: 3px;">
+            CNP: <code>\${p.cnp}</code> | Margem Individual: \${p.margemPct}%
+          </div>
+        </div>
+      \`).join('');
 
-        return \`
-          <div style="background: #ffffff; border: 1px solid #bae6fd; border-radius: 12px; padding: 18px; display: flex; flex-direction: column; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
-            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 10px;">
-              <div>
-                <div style="font-weight: 800; font-size: 1.05rem; color: #0369a1; display: flex; align-items: center; gap: 6px;">
-                  \${pack.icone} \${pack.titulo}
-                </div>
-                <div style="font-size: 0.78rem; font-weight: 700; color: #be123c; background: #ffe4e6; display: inline-block; padding: 2px 8px; border-radius: 4px; margin-top: 4px;">
-                  🎯 Sintoma / Queixa: \${pack.sintomaOuQueixa}
-                </div>
+      let statusBadge = '';
+      if (isActive) {
+        if (isSuspendedStock) {
+          statusBadge = '<span style="font-size: 0.72rem; font-weight: 800; color: #b45309; background: #fef3c7; border: 1px solid #fde68a; padding: 3px 8px; border-radius: 4px;">⚠️ Cesto Esgotado (< 3 un em stock) - Temporariamente Suspenso</span>';
+        } else {
+          statusBadge = '<span style="font-size: 0.72rem; font-weight: 800; color: #065f46; background: #d1fae5; border: 1px solid #a7f3d0; padding: 3px 8px; border-radius: 4px;">🛡️ Assinado por DT (' + (pack.validadoPor || 'Diretor Técnico') + ')</span>';
+        }
+      } else {
+        statusBadge = '<span style="font-size: 0.72rem; font-weight: 800; color: #0369a1; background: #e0f2fe; border: 1px solid #bae6fd; padding: 3px 8px; border-radius: 4px;">📋 PROPOSTA DETERMINÍSTICA</span>';
+      }
+
+      let actionsHtml = '';
+      if (isActive) {
+        actionsHtml = '<div style="display:flex; justify-content:space-between; align-items:center; margin-top: 14px; padding-top: 12px; border-top: 1px solid #f1f5f9;">' +
+          '<span style="font-size: 0.75rem; color: #64748b;">Hash: <code>' + (pack.hashComposicao ? pack.hashComposicao.slice(0, 10) + '...' : 'Ativo') + '</code></span>' +
+          '<button class="btn btn-sm" data-pack-id="' + pack.id + '" data-campanha-id="' + (pack.campanhaAtivaId || '') + '" onclick="deactivatePackUi(this.dataset.packId, this.dataset.campanhaId)" style="background:#fee2e2;color:#b91c1c;font-weight:700;padding:7px 14px;border-radius:6px;border:1px solid #fca5a5;cursor:pointer;">🛑 Concluir / Desativar do Balcão</button>' +
+        '</div>';
+      } else {
+        actionsHtml = '<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid #f1f5f9;">' +
+          '<span style="font-size: 0.75rem; color: #64748b;">Hash SHA-256: <code>' + (pack.hashComposicao ? pack.hashComposicao.slice(0, 10) + '...' : 'Pendente') + '</code></span>' +
+          '<div style="display:flex; gap:8px; align-items:center;">' +
+            '<button class="btn btn-sm" data-pack-id="' + pack.id + '" onclick="rejectPackUi(this.dataset.packId)" style="background:#f1f5f9;color:#64748b;font-weight:700;padding:7px 12px;border-radius:6px;border:1px solid #cbd5e1;cursor:pointer;">❌ Rejeitar</button>' +
+            '<button class="btn btn-sm" data-pack-id="' + pack.id + '" onclick="openDtApprovalModal(this.dataset.packId)" style="background:#059669;color:#ffffff;font-weight:800;padding:8px 16px;border-radius:6px;border:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;box-shadow:0 2px 4px rgba(5,150,105,0.25);">🛡️ Assinar & Ativar no Balcão (DT)</button>' +
+          '</div>' +
+        '</div>';
+      }
+
+      const borderColor = isActive ? (isSuspendedStock ? '#fcd34d' : '#86efac') : '#bae6fd';
+
+      return \`
+        <div style="background: #ffffff; border: 1.5px solid \${borderColor}; border-radius: 12px; padding: 18px; display: flex; flex-direction: column; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 10px;">
+            <div>
+              <div style="font-weight: 800; font-size: 1.05rem; color: #0369a1; display: flex; align-items: center; gap: 6px;">
+                \${pack.icone} \${pack.titulo}
               </div>
-              <span class="badge badge-success" style="font-size: 0.8rem; font-weight: 800;">
-                Margem Farmácia: \${pack.margemPackPct}%
-              </span>
-            </div>
-
-            <p style="font-size: 0.80rem; color: #64748b; margin-bottom: 12px;">
-              <b>Público-Alvo:</b> \${pack.publicoAlvo}
-            </p>
-
-            <div style="margin-bottom: 12px;">
-              \${itemsHtml}
-            </div>
-
-            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 10px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
-              <div>
-                <span style="font-size: 0.78rem; color: #475569; text-decoration: line-through; margin-right: 6px;">De: \${pack.pvpTotalOriginal.toFixed(2)}€</span>
-                <span style="font-size: 1.15rem; font-weight: 900; color: #15803d;">Por: \${pack.pvpPackComDesconto.toFixed(2)}€</span>
-              </div>
-              <div style="text-align: right;">
-                <span style="font-size: 0.76rem; font-weight: 800; color: #166534; background: #dcfce7; padding: 3px 8px; border-radius: 4px;">
-                  Poupança Utente: \${pack.poupancaUtente.toFixed(2)}€ (-\${pack.descontoPct}%)
+              <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 5px;">
+                \${statusBadge}
+                <span style="font-size: 0.72rem; font-weight: 700; color: #0284c7; background: #e0f2fe; padding: 2px 7px; border-radius: 4px;">
+                  📦 Até \${pack.packsMontaveis || Math.min(...(pack.produtos || []).map(p => p.stockAtual || 0))} packs montáveis
                 </span>
               </div>
+              <div style="font-size: 0.78rem; font-weight: 700; color: #be123c; background: #ffe4e6; display: inline-block; padding: 2px 8px; border-radius: 4px; margin-top: 6px;">
+                🎯 Sintoma / Queixa: \${pack.sintomaOuQueixa}
+              </div>
             </div>
+            <span class="badge badge-success" style="font-size: 0.8rem; font-weight: 800;">
+              Margem Farmácia: \${pack.margemPackPct}%
+            </span>
+          </div>
 
-            <div style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 10px; font-size: 0.80rem; color: #334155;">
-              <div style="margin-bottom: 4px;"><b>🧺 No Balcão / Cesto:</b> \${pack.disposicaoFisica}</div>
-              <div><b>💬 Aconselhamento Clínico:</b> \${pack.orientacaoBalcao}</div>
+          <p style="font-size: 0.80rem; color: #64748b; margin-bottom: 10px;">
+            <b>Público-Alvo:</b> \${pack.publicoAlvo}
+          </p>
+
+          <div style="margin-bottom: 10px;">
+            \${itemsHtml}
+          </div>
+
+          <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 10px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="font-size: 0.78rem; color: #475569; text-decoration: line-through; margin-right: 6px;">De: \${pack.pvpTotalOriginal.toFixed(2)}€</span>
+              <span style="font-size: 1.15rem; font-weight: 900; color: #15803d;">Por: \${pack.pvpPackComDesconto.toFixed(2)}€</span>
+            </div>
+            <div style="text-align: right;">
+              <span style="font-size: 0.76rem; font-weight: 800; color: #166534; background: #dcfce7; padding: 3px 8px; border-radius: 4px;">
+                Poupança Utente: \${pack.poupancaUtente.toFixed(2)}€ (-\${pack.descontoPct}%)
+              </span>
             </div>
           </div>
-        \`;
-      }).join('');
+
+          <div style="background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 10px; font-size: 0.80rem; color: #334155; margin-bottom: 6px;">
+            <div style="margin-bottom: 4px;"><b>🧺 No Balcão / Cesto:</b> \${pack.disposicaoFisica}</div>
+            <div><b>💬 Aconselhamento Clínico:</b> \${pack.orientacaoBalcao}</div>
+          </div>
+
+          \${actionsHtml}
+        </div>
+      \`;
+    }
+
+    function openDtApprovalModal(packId) {
+      const pack = (clinicalThemePacksData || []).find(p => p.id === packId);
+      if (!pack) {
+        alert('Pack não encontrado.');
+        return;
+      }
+      activePackForDtApproval = pack;
+      const box = document.getElementById('dtPackSummaryBox');
+      if (box) {
+        box.innerHTML = '<b>' + pack.icone + ' ' + pack.titulo + '</b><br/>' +
+          '<span style="font-size: 0.78rem; color: #15803d;">Composição: ' + pack.produtos.map(p => p.designacao + ' (' + p.stockAtual + ' un)').join(', ') + '</span><br/>' +
+          '<span style="font-size: 0.78rem; color: #047857; font-weight: 700;">Preço Promo: ' + pack.pvpPackComDesconto.toFixed(2) + '€ (-' + pack.descontoPct + '%) | Margem: ' + pack.margemPackPct + '% | SHA-256: <code>' + (pack.hashComposicao ? pack.hashComposicao.slice(0, 12) + '...' : '') + '</code></span>';
+      }
+      const pwd = document.getElementById('dtApprovalPassword');
+      if (pwd) pwd.value = '';
+      const fb = document.getElementById('dtApprovalFeedback');
+      if (fb) fb.style.display = 'none';
+
+      const modal = document.getElementById('dtApprovalModal');
+      if (modal) {
+        modal.style.display = 'flex';
+        setTimeout(() => { if (pwd) pwd.focus(); }, 100);
+      }
+    }
+
+    function closeDtApprovalModal() {
+      const modal = document.getElementById('dtApprovalModal');
+      if (modal) modal.style.display = 'none';
+      activePackForDtApproval = null;
+    }
+
+    async function submitDtApproval() {
+      if (!activePackForDtApproval) return;
+      const pwdInput = document.getElementById('dtApprovalPassword');
+      const password = pwdInput ? pwdInput.value : '';
+      const fb = document.getElementById('dtApprovalFeedback');
+      const btn = document.getElementById('btnConfirmDtApproval');
+
+      if (!password) {
+        if (fb) {
+          fb.style.display = 'block';
+          fb.style.background = '#fee2e2';
+          fb.style.color = '#dc2626';
+          fb.textContent = 'Indique a sua palavra-passe de Diretor Técnico para validar.';
+        }
+        return;
+      }
+
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ A assinar digitalmente...';
+      }
+
+      try {
+        const res = await fetch('/api/packs/approve', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-access-code': activeFarmaciaId,
+          },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            dtPassword: password,
+            pack: activePackForDtApproval,
+          }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || 'Erro ao aprovar pack.');
+        }
+
+        if (fb) {
+          fb.style.display = 'block';
+          fb.style.background = '#d1fae5';
+          fb.style.color = '#065f46';
+          fb.textContent = '✅ ' + data.message + ' (3 tarefas geradas na folha semanal)';
+        }
+
+        setTimeout(() => {
+          closeDtApprovalModal();
+          loadClinicalThemePacks();
+          fetchWeeklyTasksFromDb();
+        }, 1200);
+      } catch (err) {
+        if (fb) {
+          fb.style.display = 'block';
+          fb.style.background = '#fee2e2';
+          fb.style.color = '#dc2626';
+          fb.textContent = '❌ ' + err.message;
+        }
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = '✍️ Assinar & Ativar Pack';
+        }
+      }
+    }
+
+    async function rejectPackUi(packId) {
+      if (!confirm('Rejeitar esta proposta determinística de pack promocional? Ela será removida da lista.')) return;
+      try {
+        const res = await fetch('/api/packs/reject', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-access-code': activeFarmaciaId,
+          },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            packId: packId,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Erro ao rejeitar pack.');
+        loadClinicalThemePacks();
+      } catch (err) {
+        alert('Erro ao rejeitar: ' + err.message);
+      }
+    }
+
+    async function deactivatePackUi(packId, campanhaAtivaId) {
+      if (!confirm('Desativar este pack do balcão? As sinaléticas e ecrãs de atendimento serão encerrados.')) return;
+      try {
+        const res = await fetch('/api/packs/deactivate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-access-code': activeFarmaciaId,
+          },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            packId: packId,
+            campanhaAtivaId: campanhaAtivaId,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Erro ao desativar pack.');
+        loadClinicalThemePacks();
+        fetchWeeklyTasksFromDb();
+      } catch (err) {
+        alert('Erro ao desativar: ' + err.message);
+      }
     }
 
     function switchMarketingSubView(mode) {
@@ -12837,7 +13450,7 @@ function getDashboardHtml(): string {
                 '<span>📅 Período: <b>' + c.dataInicio + '</b> até <b>' + dataFim + '</b></span>' +
                 '<span>🏷️ Desconto: <b>-' + c.descontoAplicadoPct + '%</b></span>' +
                 '<span>📦 Produtos em Foco: <b>' + c.totalProdutos + ' SKUs</b></span>' +
-                '<span>⚡ <b>3 Tarefas Criadas para a Equipa no Balcão e Sifarma</b></span>' +
+                '<span>⚡ <b>3 Tarefas Criadas para a Equipa no Balcão e Encomendas</b></span>' +
               '</div>' +
             '</div>' +
             '<div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">' +
@@ -12910,7 +13523,7 @@ function getDashboardHtml(): string {
             '<span class="badge badge-danger">-' + c.descontoAplicadoPct + '% Promo</span>' +
           '</div>' +
           '<div style="font-size: 0.82rem; color: #4c0519; margin-top: 4px;">' +
-            'Ações prioritárias para a equipa cumprir esta semana no balcão e no Sifarma (' + c.totalProdutos + ' produtos em escoamento).' +
+            'Ações prioritárias para a equipa cumprir esta semana no balcão e nas encomendas (' + c.totalProdutos + ' produtos em escoamento).' +
           '</div>' +
         '</div>' +
         '<div style="display: flex; gap: 8px; flex-wrap: wrap;">' +
@@ -13178,7 +13791,7 @@ function getDashboardHtml(): string {
           : 'Saúde Financeira do Inventário — Evolução de Stocks e Liquidez';
         if (descEl) descEl.innerHTML = isMarcoZero
           ? 'Esta é a fotografia patrimonial da farmácia no momento da 1ª importação de existências. Por rigor contabilístico, <b>não se simulam dados passados</b>. A evolução do stock, a redução do imobilizado e a liquidez recuperada serão medidas assim que for importado o fecho do próximo mês.'
-          : 'Monitorização contínua baseada em <b>Vendas Comprovadas e Preços de Custo Reais</b> entre fechos mensais do Sifarma.';
+          : 'Monitorização contínua baseada em <b>Vendas Comprovadas e Preços de Custo Reais</b> entre fechos mensais de faturação.';
 
         // Alternar Caixa de Marco Zero vs Caixa MoM
         const boxZero = document.getElementById('evoMarcoZeroBoxContainer');
@@ -13204,7 +13817,7 @@ function getDashboardHtml(): string {
         if (kpiImobSub) kpiImobSub.textContent = Number(r.taxa_imobilizado_pct || 0).toFixed(1) + '% do capital total em stock (' + Number(r.stock_imobilizado_unidades || 0).toLocaleString('pt-PT') + ' un monos)';
 
         if (kpiPoup) kpiPoup.textContent = isMarcoZero ? '0,00 €' : '+' + Number(r.liquidez_recuperada_comprovada_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
-        if (kpiPoupSub) kpiPoupSub.textContent = isMarcoZero ? 'Medição inicia pós-Marco Zero (comprovado por vendas)' : 'Comprovado por vendas de monos no Sifarma';
+        if (kpiPoupSub) kpiPoupSub.textContent = isMarcoZero ? 'Medição inicia pós-Marco Zero (comprovado por vendas)' : 'Comprovado por vendas registadas de monos';
 
         if (kpiCap) kpiCap.textContent = (r.dias_medios_rotacao || 55) + ' dias';
         if (kpiCapSub) kpiCapSub.textContent = 'Stock Ativo: ' + Number(r.stock_ativo_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € (' + (100 - (r.taxa_imobilizado_pct || 0)).toFixed(1) + '%)';

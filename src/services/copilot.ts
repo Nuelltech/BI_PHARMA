@@ -399,7 +399,7 @@ export async function analyzeStockAdjustment(
         i.acaoRecomendada,
       ],
     })),
-    resumoEstrategico: 'Recomendação: Ajustar os parâmetros de encomenda no ERP (Sifarma/Winphar) para limitar a cobertura máxima a 45 dias em produtos A/B e ativar devoluções a armazenistas dos artigos de classe C parados.',
+    resumoEstrategico: 'Recomendação: Ajustar os parâmetros de encomenda no software de gestão da farmácia para limitar a cobertura máxima a 45 dias em produtos A/B e ativar devoluções a armazenistas dos artigos de classe C parados.',
   };
 }
 
@@ -1281,7 +1281,7 @@ export async function analyzeProductSubstitution(
         e.detalhe,
       ],
     })),
-    resumoEstrategico: 'Recomendação: Confirmar se o produto antigo ainda tem resíduos de gaveta ou encomendas pendentes e inativar o artigo antigo na tabela de compras do Sifarma.',
+    resumoEstrategico: 'Recomendação: Confirmar se o produto antigo ainda tem resíduos de gaveta ou encomendas pendentes e inativar o artigo antigo na tabela de compras do sistema de gestão.',
   };
 }
 

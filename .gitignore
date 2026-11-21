@@ -2,10 +2,15 @@
 node_modules/
 dist/
 
-# Variáveis de Ambiente e Segredos (NUNCA enviar para o GitHub)
+# Chaves, Segredos e Ficheiros de API (NUNCA enviar para o GitHub)
 .env
 .env.*
 !.env.example
+*.txt
+*.zip
+bipharma-enriquecimento/
+calculadora_de_viabilidade_bi_pharma.html
+apresentacao_executiva_ia_saude.html
 
 # Bases de Dados Locais Embebidas
 .pgdata/
