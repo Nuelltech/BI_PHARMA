@@ -481,19 +481,27 @@ export function getMobileStaffHtml(): string {
     .validades-toolbar {
       background: #0f172a;
       border: 1px solid #334155;
-      border-radius: 10px;
-      padding: 8px 10px;
-      margin-bottom: 8px;
+      border-radius: 12px;
+      padding: 10px 10px;
+      margin-bottom: 10px;
       display: flex;
       flex-direction: column;
-      gap: 7px;
+      gap: 8px;
       width: 100%;
       box-sizing: border-box;
-      overflow: hidden;
     }
 
-    .toolbar-row {
-      display: flex;
+    .toolbar-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    .toolbar-row-bottom {
+      display: grid;
+      grid-template-columns: 1fr auto;
       gap: 8px;
       align-items: center;
       width: 100%;
@@ -501,21 +509,26 @@ export function getMobileStaffHtml(): string {
     }
 
     .toolbar-select {
-      flex: 1 1 0;
+      width: 100%;
       min-width: 0;
-      width: 0;
-      box-sizing: border-box;
-      padding: 7px 8px;
+      height: 38px;
+      padding: 0 24px 0 8px;
       background: #1e293b;
       border: 1px solid #475569;
-      border-radius: 6px;
+      border-radius: 8px;
       color: #f8fafc;
-      font-size: 0.74rem;
+      font-size: 0.76rem;
       font-weight: 600;
       outline: none;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      overflow: hidden;
+      box-sizing: border-box;
+      cursor: pointer;
+      -webkit-appearance: none;
+      -moz-appearance: none;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2394a3b8' viewBox='0 0 16 16'%3E%3Cpath d='M7.247 11.14L2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: calc(100% - 8px) center;
+      background-size: 10px;
     }
 
     .toolbar-select:focus {
@@ -523,10 +536,10 @@ export function getMobileStaffHtml(): string {
     }
 
     .filter-counter-badge {
-      font-size: 0.72rem;
+      font-size: 0.74rem;
       color: #94a3b8;
       font-weight: 700;
-      padding: 2px 4px;
+      padding: 4px 6px;
       white-space: nowrap;
       flex-shrink: 0;
     }
@@ -916,7 +929,7 @@ export function getMobileStaffHtml(): string {
       <div class="section-page" id="page0">
         <!-- Toolbar com Filtros de Categoria, Horizonte de Validade e Ordenação -->
         <div class="validades-toolbar">
-          <div class="toolbar-row">
+          <div class="toolbar-grid">
             <select id="cadMacroFilter" class="toolbar-select" onchange="renderSection1()">
               <option value="all">📂 Todas as Áreas</option>
               <option value="MSRM">💊 Receita (MSRM)</option>
@@ -932,7 +945,7 @@ export function getMobileStaffHtml(): string {
               <option value="year">🗓️ 6 a 12 Meses</option>
             </select>
           </div>
-          <div class="toolbar-row">
+          <div class="toolbar-row-bottom">
             <select id="cadSortOrder" class="toolbar-select" onchange="renderSection1()">
               <option value="date_asc">⏱️ Validade Mais Próxima</option>
               <option value="name_asc">🔤 Alfabética (A ➔ Z)</option>
