@@ -5093,17 +5093,14 @@ function getDashboardHtml(): string {
             </p>
           </div>
           <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-            <span id="planoProgressText" onclick="openCompletedTasksModal()" title="Clique para abrir histórico de auditoria de quem picou cada tarefa" style="cursor: pointer; transition: all 0.2s; font-size: 0.86rem; color: #047857; font-weight: 700; background: #d1fae5; padding: 6px 12px; border-radius: 8px; border: 1px solid #a7f3d0;">
+            <button id="planoProgressText" class="btn" onclick="openCompletedTasksModal()" title="Clique para abrir histórico de auditoria e tarefas concluídas" style="cursor: pointer; transition: all 0.2s; font-size: 0.84rem; color: #065f46; font-weight: 700; background: #d1fae5; padding: 7px 14px; border-radius: 8px; border: 1px solid #a7f3d0; box-shadow: 0 1px 2px rgba(0,0,0,0.05); display: inline-flex; align-items: center; gap: 6px;">
               ✅ 0 de 0 tarefas concluídas
-            </span>
+            </button>
             <button class="btn" onclick="printWeeklyActionPlan()" style="background: linear-gradient(135deg, #10b981, #059669); color: #042f2e; font-weight: 700;">
               🖨️ Imprimir Folha A4 para a Equipa
             </button>
             <button class="btn btn-secondary" onclick="resetWeeklyTasksProgress()" style="font-size: 0.8rem; padding: 7px 12px;" title="Limpar vistos marcados">
               🔄 Limpar Vistos
-            </button>
-            <button class="btn" onclick="openCompletedTasksModal()" style="background: linear-gradient(135deg, #059669, #047857); color: #ffffff; font-weight: 700; box-shadow: 0 2px 4px rgba(5, 150, 105, 0.25); display: flex; align-items: center; gap: 6px;" title="Ver histórico de auditoria: o que foi feito, quando e quem fez">
-              <span style="font-size: 1rem;">📋</span> Auditoria & Tarefas Concluídas
             </button>
           </div>
         </div>
