@@ -2728,7 +2728,6 @@ async function startServer() {
             const targetFarmId = (resAuth as any).farmacia ? (resAuth as any).farmacia.id : farmaciaId;
             recordUserSession(prisma, {
               farmaciaId: targetFarmId,
-              userId: (resAuth as any).member ? (resAuth as any).member.id : undefined,
               userName: opName,
               role: opRole,
               ip: clientIp,
