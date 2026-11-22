@@ -486,18 +486,26 @@ export function getMobileStaffHtml(): string {
       margin-bottom: 8px;
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      gap: 7px;
+      width: 100%;
+      box-sizing: border-box;
+      overflow: hidden;
     }
 
     .toolbar-row {
       display: flex;
       gap: 8px;
       align-items: center;
+      width: 100%;
+      box-sizing: border-box;
     }
 
     .toolbar-select {
-      flex: 1;
-      padding: 6px 8px;
+      flex: 1 1 0;
+      min-width: 0;
+      width: 0;
+      box-sizing: border-box;
+      padding: 7px 8px;
       background: #1e293b;
       border: 1px solid #475569;
       border-radius: 6px;
@@ -505,13 +513,22 @@ export function getMobileStaffHtml(): string {
       font-size: 0.74rem;
       font-weight: 600;
       outline: none;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .toolbar-select:focus {
+      border-color: #38bdf8;
     }
 
     .filter-counter-badge {
       font-size: 0.72rem;
       color: #94a3b8;
       font-weight: 700;
-      padding: 2px 0;
+      padding: 2px 4px;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
 
     /* Sub-tabs do Balcão */
@@ -901,25 +918,25 @@ export function getMobileStaffHtml(): string {
         <div class="validades-toolbar">
           <div class="toolbar-row">
             <select id="cadMacroFilter" class="toolbar-select" onchange="renderSection1()">
-              <option value="all">📂 Todas as Áreas / Categorias</option>
-              <option value="MSRM">💊 Medicamentos Sujeitos a Receita (MSRM)</option>
-              <option value="MNSRM_OTC">🌿 Venda Livre (MNSRM / OTC)</option>
-              <option value="DERMOCOSMETICA">🧴 Dermocosmética & Higiene</option>
-              <option value="NUTRICAO_SUPLEMENTOS">🍎 Nutrição & Suplementos</option>
-              <option value="DISPOSITIVOS_SAUDE">🩺 Dispositivos de Saúde</option>
+              <option value="all">📂 Todas as Áreas</option>
+              <option value="MSRM">💊 Receita (MSRM)</option>
+              <option value="MNSRM_OTC">🌿 Venda Livre (OTC)</option>
+              <option value="DERMOCOSMETICA">🧴 Dermocosmética</option>
+              <option value="NUTRICAO_SUPLEMENTOS">🍎 Suplementos</option>
+              <option value="DISPOSITIVOS_SAUDE">🩺 Dispositivos</option>
             </select>
             <select id="cadHorizonFilter" class="toolbar-select" onchange="renderSection1()">
               <option value="all">📅 Todos os Prazos</option>
-              <option value="urgent">🚨 Urgente (≤ 3 Meses)</option>
+              <option value="urgent">🚨 Urgente (≤ 3M)</option>
               <option value="mid">⚠️ 3 a 6 Meses</option>
               <option value="year">🗓️ 6 a 12 Meses</option>
             </select>
           </div>
           <div class="toolbar-row">
             <select id="cadSortOrder" class="toolbar-select" onchange="renderSection1()">
-              <option value="date_asc">⏱️ Validade Mais Próxima (Urgentes 1º)</option>
+              <option value="date_asc">⏱️ Validade Mais Próxima</option>
               <option value="name_asc">🔤 Alfabética (A ➔ Z)</option>
-              <option value="shelf_asc">📍 Por Prateleira / Gaveta</option>
+              <option value="shelf_asc">📍 Prateleira / Gaveta</option>
               <option value="val_desc">💶 Maior Valor em Risco (€)</option>
             </select>
             <div class="filter-counter-badge" id="cadCounterBadge">0 produtos</div>
