@@ -2995,7 +2995,7 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
-      if (pathname === '/icons/icon.svg' || pathname === '/icons/icon-192.png' || pathname === '/icons/icon-512.png') {
+      if (pathname === '/icons/icon.svg' || pathname === '/icons/icon-192.png' || pathname === '/icons/icon-512.png' || pathname === '/favicon.ico') {
         const svgIcon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
     <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -3019,6 +3019,21 @@ self.addEventListener('fetch', (e) => {
         });
         res.end(svgIcon);
         return;
+      }
+
+      // Servir a imagem de fundo do login (Nuelltech Pharmacy Intelligence)
+      if (pathname === '/assets/login-bg.png') {
+        const imgPath = path.resolve(process.cwd(), 'public', 'images', 'login-bg.png');
+        if (fs.existsSync(imgPath)) {
+          const stat = fs.statSync(imgPath);
+          res.writeHead(200, {
+            'Content-Type': 'image/png',
+            'Content-Length': stat.size,
+            'Cache-Control': 'public, max-age=86400',
+          });
+          fs.createReadStream(imgPath).pipe(res);
+          return;
+        }
       }
 
       
@@ -3280,6 +3295,16 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
+      // Rota isolada exclusiva para acesso de Administrador
+      if (pathname === '/admin') {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(getDashboardHtml());
+        return;
+      }
+
       if (pathname === '/' || pathname === '/index.html') {
         const isLogout = String(parsedUrl.query.logout || '') === '1';
         if (isLogout) {
@@ -3335,6 +3360,11 @@ function getDashboardHtml(): string {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>BI Pharma — Inteligência de Stock, Genéricos e Validades</title>
+  <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
+  <link rel="alternate icon" href="/favicon.ico" />
+  <link rel="apple-touch-icon" href="/icons/icon.svg" />
+  <meta name="apple-mobile-web-app-title" content="BI Pharma" />
+  <meta name="application-name" content="BI Pharma" />
   <style>
 
     :root {
@@ -6307,102 +6337,242 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
-  <!-- PORTAL DEDICADO DE LOGIN / ACESSO ISOLADO POR FARMÁCIA OU ADMIN COM PASSWORD -->
-  <div id="authGateModal" style="display: none; position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 999999; background: #0b1329; background-image: radial-gradient(circle at 50% 15%, #1e293b 0%, #0b1329 100%); align-items: center; justify-content: center; padding: 24px; overflow-y: auto;">
-    <div style="max-width: 460px; width: 100%; background: #ffffff; border-radius: 20px; padding: 36px 32px; box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255,255,255,0.08); text-align: center;">
+  <!-- PORTAL SPLIT-SCREEN DE LOGIN / PHARMACY INTELLIGENCE BY NUELLTECH -->
+  <div id="authGateModal" style="display: none; position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 999999; background: #070f1e; overflow-y: auto;">
+    
+    <div class="auth-gate-wrapper" style="position: relative; width: 100%; min-height: 100vh; display: flex; align-items: center; justify-content: space-between; padding: 48px 72px; box-sizing: border-box; background-color: #0b1528; background-image: linear-gradient(to right, rgba(255,255,255,0.96) 0%, rgba(255,255,255,0.92) 42%, rgba(255,255,255,0.45) 68%, rgba(255,255,255,0.88) 100%), url('/assets/login-bg.png'); background-position: center right; background-size: cover; background-repeat: no-repeat;">
       
-      <!-- LOGO E MARCA BI PHARMA -->
-      <div style="display: inline-flex; align-items: center; justify-content: center; width: 56px; height: 56px; border-radius: 14px; background: #e0f2fe; color: #0284c7; font-size: 1.8rem; margin-bottom: 12px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.15);">
-        💊
-      </div>
-      <h1 style="font-size: 1.55rem; font-weight: 900; color: #0f172a; letter-spacing: -0.5px; margin: 0 0 4px 0;">
-        BI Pharma
-      </h1>
-      <p style="font-size: 0.82rem; color: #64748b; margin: 0 0 18px 0; font-weight: 500;">
-        Inteligência de Balcão, Genéricos e Rentabilidade Farmacêutica
-      </p>
-
-      <!-- BANNER DE SESSÃO ENCERRADA (LOGOUT) -->
-      <div id="authGateLogoutBanner" style="display: none; margin-bottom: 18px; padding: 10px 14px; border-radius: 10px; background: #dcfce7; border: 1px solid #86efac; color: #15803d; font-size: 0.84rem; font-weight: 700; text-align: center;">
-        🔒 Sessão terminada com segurança.
-      </div>
-
-      <!-- SELETOR SEGMENTADO (TABS) DE MODO DE ACESSO -->
-      <div style="display: flex; background: #f1f5f9; padding: 4px; border-radius: 10px; margin-bottom: 22px; gap: 4px;">
-        <button type="button" id="tabGatePharmacy" onclick="toggleAuthGateMode('PHARMACY')" style="flex: 1; padding: 9px 12px; border-radius: 8px; border: none; font-size: 0.82rem; font-weight: 700; cursor: pointer; transition: all 0.2s; background: #ffffff; color: #0284c7; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
-          🏥 Farmácia
-        </button>
-        <button type="button" id="tabGateAdmin" onclick="toggleAuthGateMode('ADMIN')" style="flex: 1; padding: 9px 12px; border-radius: 8px; border: none; font-size: 0.82rem; font-weight: 700; cursor: pointer; transition: all 0.2s; background: transparent; color: #64748b;">
-          👑 Administração
-        </button>
-      </div>
-
-      <!-- VISTA A: ACESSO DE CLIENTE DE FARMÁCIA -->
-      <div id="authGatePharmacyView">
-        <form onsubmit="event.preventDefault(); submitPharmacyAccessCode();" style="display: flex; flex-direction: column; gap: 14px; text-align: left;">
-          <div>
-            <label style="font-size: 0.76rem; font-weight: 800; color: #475569; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 6px;">
-              Código da Farmácia:
-            </label>
-            <div style="position: relative;">
-              <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); font-size: 1.1rem; color: #94a3b8;">🔑</span>
-              <input
-                type="text"
-                id="authAccessCodeInput"
-                placeholder="EX: FARM-A-279188"
-                style="width: 100%; font-size: 0.98rem; font-weight: 700; text-align: center; letter-spacing: 1.5px; text-transform: uppercase; padding: 12px 14px 12px 40px; border: 1.5px solid #cbd5e1; border-radius: 10px; outline: none; transition: border-color 0.2s; background: #f8fafc;"
-                onfocus="this.style.borderColor='#0284c7'; this.style.background='#ffffff';"
-                onblur="this.style.borderColor='#cbd5e1'; this.style.background='#f8fafc';"
-                onkeydown="if(event.key==='Enter') submitPharmacyAccessCode()"
-              />
+      <!-- COLUNA ESQUERDA: IDENTIDADE NUELLTECH, TITULO E BENEFICIOS -->
+      <div class="auth-gate-hero" style="max-width: 540px; z-index: 2; display: flex; flex-direction: column; justify-content: space-between; min-height: 560px;">
+        
+        <div>
+          <!-- LOGOTIPO NUELLTECH -->
+          <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 36px;">
+            <svg width="46" height="46" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter: drop-shadow(0 4px 12px rgba(2, 132, 199, 0.35)); flex-shrink: 0;">
+              <path d="M8 40V8C8 6.89543 8.89543 6 10 6H15C16.1046 6 17 6.89543 17 8V26.5L33.5 8.5C34.2 7.7 35.5 8.2 35.5 9.3V40C35.5 41.1 34.6 42 33.5 42H28.5C27.4 42 26.5 41.1 26.5 40V21.5L10 39.5C9.3 40.3 8 39.8 8 38.7V40Z" fill="url(#nuelltechLogoGrad)" />
+              <defs>
+                <linearGradient id="nuelltechLogoGrad" x1="8" y1="6" x2="40" y2="42" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#06b6d4" />
+                  <stop offset="0.5" stop-color="#0284c7" />
+                  <stop offset="1" stop-color="#1e40af" />
+                </linearGradient>
+              </defs>
+            </svg>
+            <div style="display: flex; flex-direction: column;">
+              <span style="font-size: 1.45rem; font-weight: 900; letter-spacing: 1.8px; color: #0f172a; line-height: 1.1;">NUELLTECH</span>
+              <span style="font-size: 0.65rem; font-weight: 800; letter-spacing: 2.2px; color: #0284c7; text-transform: uppercase;">AI & BUSINESS TECHNOLOGY</span>
             </div>
           </div>
 
-          <div id="authGateError" style="display: none; font-size: 0.82rem; color: #dc2626; background: #fee2e2; border: 1px solid #fca5a5; padding: 9px 12px; border-radius: 8px; text-align: center; font-weight: 600;"></div>
+          <!-- TITULO PRINCIPAL -->
+          <h1 style="font-size: 3.3rem; font-weight: 900; line-height: 1.05; letter-spacing: -1.5px; margin: 0 0 16px 0; color: #0f172a;">
+            Pharmacy<br />
+            <span style="color: #0284c7; background: linear-gradient(135deg, #0284c7 0%, #06b6d4 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">Intelligence</span>
+          </h1>
 
-          <button type="submit" class="btn" style="width: 100%; padding: 13px; font-size: 0.96rem; font-weight: 800; justify-content: center; background: #0284c7; color: #ffffff; border-radius: 10px; border: none; cursor: pointer; box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35);">
-            Entrar no Painel da Farmácia →
-          </button>
-        </form>
+          <!-- SUBTITULO -->
+          <p style="font-size: 1.15rem; font-weight: 600; line-height: 1.45; color: #334155; margin: 0 0 36px 0; max-width: 440px;">
+            Transforme os dados da sua farmácia em melhores decisões de negócio.
+          </p>
+
+          <!-- 3 PILLS DE BENEFICIOS -->
+          <div style="display: flex; flex-direction: column; gap: 18px; margin-bottom: 32px;">
+            
+            <div style="display: flex; align-items: center; gap: 14px;">
+              <div style="width: 44px; height: 44px; border-radius: 50%; background: #e0f2fe; display: flex; align-items: center; justify-content: center; color: #0284c7; flex-shrink: 0; box-shadow: 0 3px 10px rgba(2, 132, 199, 0.15);">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#0284c7" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+              </div>
+              <div style="font-size: 0.95rem; font-weight: 700; color: #1e293b; line-height: 1.3;">
+                Otimizar stock e reduzir desperdício<br />
+                <span style="font-size: 0.8rem; font-weight: 500; color: #64748b;">Alertas antecipados de validade e rotação</span>
+              </div>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 14px;">
+              <div style="width: 44px; height: 44px; border-radius: 50%; background: #e0f2fe; display: flex; align-items: center; justify-content: center; color: #0284c7; flex-shrink: 0; box-shadow: 0 3px 10px rgba(2, 132, 199, 0.15);">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#0284c7" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+              </div>
+              <div style="font-size: 0.95rem; font-weight: 700; color: #1e293b; line-height: 1.3;">
+                Aumentar rentabilidade e margens<br />
+                <span style="font-size: 0.8rem; font-weight: 500; color: #64748b;">Substituição inteligente por genéricos de maior margem</span>
+              </div>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 14px;">
+              <div style="width: 44px; height: 44px; border-radius: 50%; background: #e0f2fe; display: flex; align-items: center; justify-content: center; color: #0284c7; flex-shrink: 0; box-shadow: 0 3px 10px rgba(2, 132, 199, 0.15);">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#0284c7" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg>
+              </div>
+              <div style="font-size: 0.95rem; font-weight: 700; color: #1e293b; line-height: 1.3;">
+                Identificar oportunidades e prevenir ruturas<br />
+                <span style="font-size: 0.8rem; font-weight: 500; color: #64748b;">Previsão de consumo e compras com rigor clínico</span>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- FOOTER BRANDING -->
+        <div style="display: flex; align-items: center; gap: 12px; font-size: 0.82rem; font-weight: 600; color: #64748b; margin-top: 16px;">
+          <span>Powered by <strong style="color: #0f172a;">Nuelltech</strong></span>
+          <div style="width: 40px; height: 2px; background: #0284c7; border-radius: 2px;"></div>
+        </div>
+
       </div>
 
-      <!-- VISTA B: ACESSO DE ADMINISTRAÇÃO (PASSWORD OBRIGATÓRIA) -->
-      <div id="authGateAdminView" style="display: none;">
-        <form onsubmit="event.preventDefault(); submitAdminPassword();" style="display: flex; flex-direction: column; gap: 14px; text-align: left;">
-          <input type="text" name="username" value="admin" autocomplete="username" style="display:none;" />
-          <div>
-            <label style="font-size: 0.76rem; font-weight: 800; color: #7c3aed; text-transform: uppercase; letter-spacing: 0.5px; display: block; margin-bottom: 6px;">
-              Palavra-Passe de Administrador:
-            </label>
-            <div style="position: relative;">
-              <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); font-size: 1.1rem; color: #94a3b8;">🛡️</span>
-              <input
-                type="password"
-                id="authAdminPasswordInput"
-                placeholder="••••••••••••"
-                autocomplete="current-password"
-                style="width: 100%; font-size: 1rem; font-weight: 700; text-align: center; letter-spacing: 2px; padding: 12px 14px 12px 40px; border: 1.5px solid #cbd5e1; border-radius: 10px; outline: none; transition: border-color 0.2s; background: #f8fafc;"
-                onfocus="this.style.borderColor='#7c3aed'; this.style.background='#ffffff';"
-                onblur="this.style.borderColor='#cbd5e1'; this.style.background='#f8fafc';"
-                onkeydown="if(event.key==='Enter') submitAdminPassword()"
-              />
-            </div>
+      <!-- COLUNA DIREITA: CARTAO FLUTUANTE DE LOGIN -->
+      <div class="auth-gate-card-wrapper" style="width: 100%; max-width: 440px; z-index: 3;">
+        
+        <!-- CARTAO 1: ACESSO DE CLIENTE DE FARMACIA (PADRÃO E ÚNICO PÚBLICO) -->
+        <div id="authGatePharmacyView" style="background: #ffffff; border-radius: 24px; padding: 40px 36px; box-shadow: 0 25px 60px -10px rgba(15, 23, 42, 0.25), 0 0 0 1px rgba(226, 232, 240, 0.8);">
+          
+          <div style="margin-bottom: 24px;">
+            <h2 style="font-size: 1.85rem; font-weight: 900; color: #0f172a; letter-spacing: -0.6px; margin: 0 0 6px 0;">
+              Bem-vindo
+            </h2>
+            <p style="font-size: 0.88rem; color: #64748b; margin: 0; font-weight: 500;">
+              Aceda à inteligência analítica da sua farmácia
+            </p>
           </div>
 
-          <div id="authGateAdminError" style="display: none; font-size: 0.82rem; color: #dc2626; background: #fee2e2; border: 1px solid #fca5a5; padding: 9px 12px; border-radius: 8px; text-align: center; font-weight: 600;"></div>
+          <!-- BANNER DE SESSAO ENCERRADA (LOGOUT) -->
+          <div id="authGateLogoutBanner" style="display: none; margin-bottom: 20px; padding: 11px 14px; border-radius: 12px; background: #dcfce7; border: 1px solid #86efac; color: #15803d; font-size: 0.84rem; font-weight: 700; text-align: center;">
+            🔒 Sessão terminada com segurança.
+          </div>
 
-          <button type="submit" class="btn" style="width: 100%; padding: 13px; font-size: 0.96rem; font-weight: 800; justify-content: center; background: linear-gradient(135deg, #7c3aed, #6d28d9); color: #ffffff; border-radius: 10px; border: none; cursor: pointer; box-shadow: 0 4px 14px rgba(124, 58, 237, 0.35);">
-            Entrar como Administrador →
-          </button>
-        </form>
-      </div>
+          <form onsubmit="event.preventDefault(); submitPharmacyAccessCode();" style="display: flex; flex-direction: column; gap: 18px; text-align: left;">
+            <div>
+              <label for="authAccessCodeInput" style="font-size: 0.8rem; font-weight: 800; color: #334155; text-transform: uppercase; letter-spacing: 0.6px; display: block; margin-bottom: 8px;">
+                Código da Farmácia
+              </label>
+              <div style="position: relative;">
+                <span style="position: absolute; left: 16px; top: 50%; transform: translateY(-50%); font-size: 1.15rem; color: #94a3b8;">🔑</span>
+                <input
+                  type="text"
+                  id="authAccessCodeInput"
+                  placeholder="EX: FARM-A-279188"
+                  autocomplete="organization"
+                  style="width: 100%; box-sizing: border-box; font-size: 1rem; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; padding: 14px 16px 14px 44px; border: 1.5px solid #cbd5e1; border-radius: 12px; outline: none; transition: all 0.2s; background: #f8fafc; color: #0f172a;"
+                  onfocus="this.style.borderColor='#0284c7'; this.style.background='#ffffff'; this.style.boxShadow='0 0 0 4px rgba(2, 132, 199, 0.1)';"
+                  onblur="this.style.borderColor='#cbd5e1'; this.style.background='#f8fafc'; this.style.boxShadow='none';"
+                  onkeydown="if(event.key==='Enter') submitPharmacyAccessCode()"
+                />
+              </div>
+            </div>
 
-      <!-- RODAPÉ DE SEGURANÇA E CONFORMIDADE -->
-      <div style="margin-top: 24px; padding-top: 18px; border-top: 1px solid #f1f5f9; display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 0.74rem; color: #94a3b8; font-weight: 600;">
-        <span>🔒</span> Ligação Encriptada • Conforme RGPD & Boas Práticas Farmacêuticas
+            <div style="display: flex; align-items: center; justify-content: space-between; font-size: 0.82rem;">
+              <label style="display: flex; align-items: center; gap: 8px; color: #475569; font-weight: 600; cursor: pointer;">
+                <input type="checkbox" id="authRememberPharmacy" checked style="accent-color: #0f172a; width: 16px; height: 16px; border-radius: 4px;" />
+                Lembrar este dispositivo
+              </label>
+            </div>
+
+            <div id="authGateError" style="display: none; font-size: 0.84rem; color: #dc2626; background: #fee2e2; border: 1px solid #fca5a5; padding: 11px 14px; border-radius: 10px; text-align: center; font-weight: 600;"></div>
+
+            <button type="submit" id="btnSubmitPharmacy" style="width: 100%; padding: 15px; font-size: 1rem; font-weight: 800; display: flex; align-items: center; justify-content: center; gap: 8px; background: #0f172a; color: #ffffff; border-radius: 12px; border: none; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.25);">
+              Entrar no Painel <span style="font-size: 1.1rem;">→</span>
+            </button>
+          </form>
+
+          <!-- BADGE DE SEGURANÇA -->
+          <div style="margin-top: 26px; padding-top: 20px; border-top: 1px solid #f1f5f9; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 0.78rem; color: #0284c7; font-weight: 700;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#0284c7" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+              <path d="m9 12 2 2 4-4"></path>
+            </svg>
+            <span>Os seus dados estão seguros e protegidos</span>
+          </div>
+
+        </div>
+
+        <!-- CARTAO 2: ACESSO DE ADMINISTRAÇÃO (ISOLADO - VISIVEL APENAS VIA /admin OU ?admin=1) -->
+        <div id="authGateAdminView" style="display: none; background: #ffffff; border-radius: 24px; padding: 40px 36px; box-shadow: 0 25px 60px -10px rgba(15, 23, 42, 0.25), 0 0 0 1px rgba(226, 232, 240, 0.8);">
+          
+          <div style="margin-bottom: 24px;">
+            <div style="display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: 12px; background: #f3e8ff; color: #7c3aed; font-size: 1.5rem; margin-bottom: 12px;">
+              🛡️
+            </div>
+            <h2 style="font-size: 1.7rem; font-weight: 900; color: #0f172a; letter-spacing: -0.5px; margin: 0 0 4px 0;">
+              Portal de Gestão
+            </h2>
+            <p style="font-size: 0.88rem; color: #64748b; margin: 0; font-weight: 500;">
+              Acesso Restrito da Administração Nuelltech
+            </p>
+          </div>
+
+          <form onsubmit="event.preventDefault(); submitAdminPassword();" style="display: flex; flex-direction: column; gap: 18px; text-align: left;">
+            <input type="text" name="username" value="admin" autocomplete="username" style="display:none;" />
+            <div>
+              <label for="authAdminPasswordInput" style="font-size: 0.8rem; font-weight: 800; color: #7c3aed; text-transform: uppercase; letter-spacing: 0.6px; display: block; margin-bottom: 8px;">
+                Palavra-Passe de Administrador
+              </label>
+              <div style="position: relative;">
+                <span style="position: absolute; left: 16px; top: 50%; transform: translateY(-50%); font-size: 1.15rem; color: #94a3b8;">🔒</span>
+                <input
+                  type="password"
+                  id="authAdminPasswordInput"
+                  placeholder="••••••••••••"
+                  autocomplete="current-password"
+                  style="width: 100%; box-sizing: border-box; font-size: 1.1rem; font-weight: 700; text-align: center; letter-spacing: 3px; padding: 14px 16px 14px 44px; border: 1.5px solid #cbd5e1; border-radius: 12px; outline: none; transition: all 0.2s; background: #f8fafc; color: #0f172a;"
+                  onfocus="this.style.borderColor='#7c3aed'; this.style.background='#ffffff'; this.style.boxShadow='0 0 0 4px rgba(124, 58, 237, 0.1)';"
+                  onblur="this.style.borderColor='#cbd5e1'; this.style.background='#f8fafc'; this.style.boxShadow='none';"
+                  onkeydown="if(event.key==='Enter') submitAdminPassword()"
+                />
+              </div>
+            </div>
+
+            <div id="authGateAdminError" style="display: none; font-size: 0.84rem; color: #dc2626; background: #fee2e2; border: 1px solid #fca5a5; padding: 11px 14px; border-radius: 10px; text-align: center; font-weight: 600;"></div>
+
+            <button type="submit" id="btnSubmitAdmin" style="width: 100%; padding: 15px; font-size: 1rem; font-weight: 800; display: flex; align-items: center; justify-content: center; gap: 8px; background: linear-gradient(135deg, #1e1b4b, #312e81); color: #ffffff; border-radius: 12px; border: none; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 14px rgba(49, 46, 129, 0.35);">
+              Entrar como Administrador <span style="font-size: 1.1rem;">→</span>
+            </button>
+          </form>
+
+          <div style="margin-top: 22px; text-align: center;">
+            <a href="/" style="font-size: 0.82rem; font-weight: 700; color: #64748b; text-decoration: none; transition: color 0.2s;" onmouseover="this.style.color='#0f172a'" onmouseout="this.style.color='#64748b'">
+              ← Voltar ao Acesso de Farmácia
+            </a>
+          </div>
+
+          <div style="margin-top: 24px; padding-top: 18px; border-top: 1px solid #f1f5f9; text-align: center; font-size: 0.74rem; color: #94a3b8; font-weight: 600;">
+            🛡️ Acesso protegido por registo de auditoria & IP
+          </div>
+
+        </div>
+
       </div>
 
     </div>
+
+    <!-- RESPONSIVE CSS INLINE FOR MOBILE DEVICES -->
+    <style>
+      @media (max-width: 960px) {
+        .auth-gate-wrapper {
+          flex-direction: column !important;
+          padding: 32px 20px !important;
+          justify-content: center !important;
+          gap: 36px !important;
+          background-position: center !important;
+        }
+        .auth-gate-hero {
+          min-height: auto !important;
+          max-width: 100% !important;
+          text-align: center !important;
+          align-items: center !important;
+        }
+        .auth-gate-hero h1 {
+          font-size: 2.4rem !important;
+        }
+        .auth-gate-hero p {
+          max-width: 100% !important;
+        }
+        .auth-gate-hero > div {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+        }
+      }
+    </style>
+
   </div>
 
   <!-- MODAL 4: GESTOR ADMIN DE NOMES ANÓNIMOS E LINKS ISOLADOS POR FARMÁCIA -->
@@ -7427,8 +7597,6 @@ function getDashboardHtml(): string {
     function toggleAuthGateMode(mode) {
       const pharmView = document.getElementById('authGatePharmacyView');
       const adminView = document.getElementById('authGateAdminView');
-      const tabPharm = document.getElementById('tabGatePharmacy');
-      const tabAdmin = document.getElementById('tabGateAdmin');
       const errEl = document.getElementById('authGateError');
       const errAdm = document.getElementById('authGateAdminError');
       if (errEl) errEl.style.display = 'none';
@@ -7437,14 +7605,10 @@ function getDashboardHtml(): string {
       if (mode === 'ADMIN') {
         if (pharmView) pharmView.style.display = 'none';
         if (adminView) adminView.style.display = 'block';
-        if (tabPharm) { tabPharm.style.background = 'transparent'; tabPharm.style.color = '#64748b'; tabPharm.style.boxShadow = 'none'; }
-        if (tabAdmin) { tabAdmin.style.background = '#ffffff'; tabAdmin.style.color = '#7c3aed'; tabAdmin.style.boxShadow = '0 1px 3px rgba(0,0,0,0.08)'; }
         setTimeout(() => document.getElementById('authAdminPasswordInput')?.focus(), 50);
       } else {
         if (pharmView) pharmView.style.display = 'block';
         if (adminView) adminView.style.display = 'none';
-        if (tabPharm) { tabPharm.style.background = '#ffffff'; tabPharm.style.color = '#0284c7'; tabPharm.style.boxShadow = '0 1px 3px rgba(0,0,0,0.08)'; }
-        if (tabAdmin) { tabAdmin.style.background = 'transparent'; tabAdmin.style.color = '#64748b'; tabAdmin.style.boxShadow = 'none'; }
         setTimeout(() => document.getElementById('authAccessCodeInput')?.focus(), 50);
       }
     }
@@ -7459,9 +7623,13 @@ function getDashboardHtml(): string {
       const errAdm = document.getElementById('authGateAdminError');
       const logoutBanner = document.getElementById('authGateLogoutBanner');
 
-      toggleAuthGateMode(targetMode);
+      const urlParams = new URLSearchParams(window.location.search);
+      const isAdminRoute = window.location.pathname === '/admin' || urlParams.get('admin') === '1';
+      const effectiveMode = targetMode === 'ADMIN' || isAdminRoute ? 'ADMIN' : 'PHARMACY';
 
-      if (input && activeAuthRole === 'PHARMACY') input.value = activeAccessCode || '';
+      toggleAuthGateMode(effectiveMode);
+
+      if (input && effectiveMode === 'PHARMACY') input.value = activeAccessCode || '';
       
       if (logoutBanner) {
         if (errMsg && (errMsg.includes('terminada') || errMsg.includes('segurança'))) {
@@ -7473,7 +7641,7 @@ function getDashboardHtml(): string {
       }
 
       if (errMsg && !(errMsg.includes('terminada') || errMsg.includes('segurança'))) {
-        if (targetMode === 'ADMIN' && errAdm) {
+        if (effectiveMode === 'ADMIN' && errAdm) {
           errAdm.textContent = errMsg;
           errAdm.style.display = 'block';
         } else if (errEl) {
@@ -7481,7 +7649,7 @@ function getDashboardHtml(): string {
           errEl.style.display = 'block';
         }
       }
-      if (modal) modal.style.display = 'flex';
+      if (modal) modal.style.display = 'block';
     }
 
     function applyRoleUiState(role, lockedFarmacia) {
@@ -7524,7 +7692,7 @@ function getDashboardHtml(): string {
       activeAccessCode = '';
       activeAuthRole = '';
       activeFarmaciaId = '';
-      openAuthGateModal('Sessão de Administrador terminada.', 'ADMIN');
+      window.location.href = '/admin';
     }
 
     async function submitPharmacyAccessCode() {
@@ -7644,10 +7812,14 @@ function getDashboardHtml(): string {
       }
 
       const urlCode = urlParams.get('acesso') || urlParams.get('accessCode');
-      const isAdminFlag = urlParams.get('admin') === '1';
+      const isAdminRoute = window.location.pathname === '/admin' || urlParams.get('admin') === '1';
 
-      // 1. Se abriu com ?admin=1, pede a Password de Administrador diretamente
-      if (isAdminFlag) {
+      // 1. Rota de Administrador (/admin ou ?admin=1)
+      if (isAdminRoute) {
+        if (activeAccessCode && activeAuthRole === 'ADMIN') {
+          const ok = await verifyAndActivateAccessCode({ code: activeAccessCode }, false, 'ADMIN');
+          if (ok) return;
+        }
         openAuthGateModal(null, 'ADMIN');
         return;
       }
@@ -7662,14 +7834,14 @@ function getDashboardHtml(): string {
         }
       }
 
-      // 3. Se já tinha código válido guardado em sessão local
-      if (activeAccessCode) {
-        const ok = await verifyAndActivateAccessCode({ code: activeAccessCode }, false, activeAuthRole === 'ADMIN' ? 'ADMIN' : 'PHARMACY');
+      // 3. Se já tinha código de Farmácia válido guardado em sessão local
+      if (activeAccessCode && activeAuthRole === 'PHARMACY') {
+        const ok = await verifyAndActivateAccessCode({ code: activeAccessCode }, false, 'PHARMACY');
         if (ok) return;
       }
 
-      // 4. Caso contrário, abre a janela de login (NUNCA entra em Admin sem password!)
-      openAuthGateModal();
+      // 4. Caso contrário, abre a janela de login de Farmácia (NUNCA expõe acesso admin)
+      openAuthGateModal(null, 'PHARMACY');
     }
 
     function openAccessManagerModal() {

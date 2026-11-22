@@ -28,6 +28,7 @@ output/
 *.log
 *.mp4
 *.jpg
+Farmacêutica*.png
 .DS_Store
 Thumbs.db
 scratch/
