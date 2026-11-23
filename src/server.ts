@@ -109,6 +109,7 @@ import {
   inspectFilesForInteractiveImport,
   executeInteractiveImport,
 } from './services/interactive_import';
+import { computeAndPersistMarts } from './services/marts_service';
 import {
   transformStagingInventario,
   transformStagingValidades,
@@ -1907,11 +1908,34 @@ async function startServer() {
             }
           );
 
+          const totalErrosImport = stats.detalhesPorFicheiro.filter((d) => !d.sucesso).length;
+          if (stats.filesProcessed > 0) {
+            importProgressStore.set(farm.id, {
+              status: 'PROCESSING',
+              percent: 96,
+              step: 'A recalcular indicadores analíticos (Marts)...',
+              detail: 'A atualizar painel e Copilot com os novos dados...',
+            });
+            try {
+              await computeAndPersistMarts(prisma, farm.id);
+            } catch (martErr: any) {
+              console.error('[Import] Erro ao recalcular marts:', martErr.message);
+            }
+          }
+
           importProgressStore.set(farm.id, {
-            status: 'COMPLETED',
+            status: totalErrosImport > 0 && stats.filesProcessed === 0 ? 'ERROR' : 'COMPLETED',
             percent: 100,
-            step: '🎉 Importação Concluída com Sucesso!',
-            detail: 'Todos os registos foram integrados.',
+            step:
+              totalErrosImport > 0 && stats.filesProcessed === 0
+                ? '❌ Importação falhou'
+                : totalErrosImport > 0
+                  ? '⚠️ Importação concluída com erros'
+                  : '🎉 Importação Concluída com Sucesso!',
+            detail:
+              totalErrosImport > 0 && stats.filesProcessed === 0
+                ? `${totalErrosImport} ficheiro(s) com erro. Consulte os detalhes abaixo.`
+                : 'Todos os registos válidos foram integrados e os indicadores atualizados.',
           });
 
           // Invalida caches
@@ -8985,12 +9009,21 @@ function getDashboardHtml(): string {
 
         var data = await res.json();
         if (data.ok && data.stats) {
-          if (progressIcon) progressIcon.textContent = '🎉';
-          if (progressBar) progressBar.style.width = '100%';
+          var failedCount = (data.stats.detalhesPorFicheiro || []).filter(function(x) { return !x.sucesso; }).length;
+          var allFailed = failedCount > 0 && data.stats.filesProcessed === 0;
+          if (progressIcon) progressIcon.textContent = allFailed ? '❌' : (failedCount > 0 ? '⚠️' : '🎉');
+          if (progressBar) {
+            progressBar.style.width = '100%';
+            progressBar.style.background = allFailed ? '#ef4444' : (failedCount > 0 ? '#f59e0b' : '');
+          }
           if (progressPercent) progressPercent.textContent = '100%';
-          document.getElementById('importProgressTitle').textContent = '🎉 Importação Concluída com Sucesso!';
-          if (progressStep) progressStep.textContent = 'Processamento finalizado com sucesso.';
-          if (progressDetail) progressDetail.textContent = data.stats.filesProcessed + ' ficheiro(s) integrados.';
+          document.getElementById('importProgressTitle').textContent = allFailed
+            ? 'Importação falhou'
+            : (failedCount > 0 ? 'Importação concluída com erros' : 'Importação Concluída com Sucesso!');
+          if (progressStep) progressStep.textContent = allFailed
+            ? 'Nenhum ficheiro foi integrado. Verifique os erros abaixo.'
+            : (failedCount > 0 ? 'Alguns ficheiros apresentaram erro.' : 'Processamento finalizado com sucesso.');
+          if (progressDetail) progressDetail.textContent = data.stats.filesProcessed + ' ficheiro(s) integrados' + (failedCount > 0 ? ' · ' + failedCount + ' com erro.' : '.');
 
           var r = document.getElementById('importStatsReport');
           r.style.display = 'block';

@@ -3,9 +3,24 @@ import { logSecurityAudit } from './audit_service';
 import {
   parseWinpharVendasPdfFile,
   parseWinpharValidadesPdfFile,
+  parseWinpharVendasCsvFile,
   ParsedWinpharVendasPdf,
   ParsedWinpharValidadesPdf,
 } from './ingestion';
+
+function isPdfBuffer(buf: Buffer, fileName: string): boolean {
+  const ext = fileName.toLowerCase();
+  if (ext.endsWith('.csv') || ext.endsWith('.txt')) return false;
+  if (buf.length >= 4 && buf.subarray(0, 4).toString('ascii') === '%PDF') return true;
+  return ext.endsWith('.pdf');
+}
+
+async function parseVendasAnyFormat(buf: Buffer, fileName: string): Promise<ParsedWinpharVendasPdf> {
+  if (isPdfBuffer(buf, fileName)) {
+    return parseWinpharVendasPdfFile(buf);
+  }
+  return parseWinpharVendasCsvFile(buf, fileName);
+}
 import { classifyProduct } from './classifier';
 
 export interface InspectionQuestionOption {
@@ -125,8 +140,8 @@ export async function inspectFilesForInteractiveImport(
         continue;
       }
 
-      // Tenta parse como Vendas
-      const parsedVen = await parseWinpharVendasPdfFile(f.buffer);
+      // Tenta parse como Vendas (PDF Winphar ou CSV multi-formato)
+      const parsedVen = await parseVendasAnyFormat(f.buffer, f.name);
       const questions: InspectionQuestion[] = [];
 
       // 1. Verificação de NIF / Mudança de Sociedade (ex: Galeno III vs Avenida)
@@ -376,9 +391,9 @@ export async function executeInteractiveImport(
       }
 
       // ----------------------------------------------------
-      // CASO B: Ficheiro de Vendas (Diário ou Mensal)
+      // CASO B: Ficheiro de Vendas (PDF Winphar ou CSV multi-formato)
       // ----------------------------------------------------
-      const parsedVen = await parseWinpharVendasPdfFile(f.buffer);
+      const parsedVen = await parseVendasAnyFormat(f.buffer, f.name);
 
       onProgress?.(
         basePct + Math.round(fileSlice * 0.15),
@@ -719,6 +734,13 @@ export async function executeInteractiveImport(
     }
   }
 
-  onProgress?.(100, '🎉 Importação Concluída com Sucesso!', 'Todos os dados foram processados.');
+  const totalErros = stats.detalhesPorFicheiro.filter((d) => !d.sucesso).length;
+  if (totalErros > 0 && stats.filesProcessed === 0) {
+    onProgress?.(100, '❌ Importação falhou', `${totalErros} ficheiro(s) com erro. Consulte os detalhes abaixo.`);
+  } else if (totalErros > 0) {
+    onProgress?.(100, '⚠️ Importação concluída com erros', `${stats.filesProcessed} integrado(s), ${totalErros} com erro.`);
+  } else {
+    onProgress?.(100, '🎉 Importação Concluída com Sucesso!', 'Todos os dados foram processados.');
+  }
   return stats;
 }

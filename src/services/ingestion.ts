@@ -932,6 +932,190 @@ export async function parseWinpharVendasPdfFile(filePathOrBuffer: string | Buffe
   };
 }
 
+/**
+ * Parser universal de ficheiros CSV de vendas (Sifarma / Winphar / formatos matriciais mensais),
+ * suportando:
+ *  - Codificação UTF-8 ou Windows-1252 / Latin-1 automática;
+ *  - Separador `;`, `,` ou `\t`;
+ *  - CSV limpo (ex.: `vendas baptista25-26.csv`) e CSV com espaços da designação partidos em `;` (ex.: `vendas_Out_ate_11Nov_2026.csv`);
+ *  - Qualquer matriz de 1 a 18 meses (ex.: `OUT;NOV` ou `OUT;NOV;DEZ;JAN;...;OUT`), inferindo o ano de cada coluna a partir do nome do ficheiro.
+ */
+export function parseWinpharVendasCsvFile(filePathOrBuffer: string | Buffer, fileName = 'vendas.csv'): ParsedWinpharVendasPdf {
+  const dataBuffer = Buffer.isBuffer(filePathOrBuffer) ? filePathOrBuffer : fs.readFileSync(filePathOrBuffer);
+
+  // 1. Deteção de codificação UTF-8 vs Latin-1 (Windows-1252)
+  let rawText = dataBuffer.toString('utf8');
+  if (rawText.includes('\uFFFD')) {
+    rawText = dataBuffer.toString('latin1');
+  }
+  rawText = rawText.replace(/^\uFEFF/, '');
+
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  if (lines.length < 2) {
+    throw new Error(`O ficheiro CSV "${fileName}" não contém linhas de dados suficientes.`);
+  }
+
+  // 2. Deteção automática de delimitador
+  const headerLine = lines[0];
+  const semiCount = (headerLine.match(/;/g) || []).length;
+  const commaCount = (headerLine.match(/,/g) || []).length;
+  const tabCount = (headerLine.match(/\t/g) || []).length;
+  const delim = semiCount >= commaCount && semiCount >= tabCount ? ';' : commaCount >= tabCount ? ',' : '\t';
+
+  const headerTokens = headerLine
+    .split(delim)
+    .map((h) => h.trim())
+    .filter((h) => h.length > 0);
+
+  const normHeader = (s: string) =>
+    s
+      .toUpperCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^A-Z0-9%]/g, '');
+
+  const MONTH_TOK_MAP: Record<string, number> = {
+    JAN: 1, FEV: 2, MAR: 3, ABR: 4, MAI: 5, JUN: 6,
+    JUL: 7, AGO: 8, SET: 9, OUT: 10, NOV: 11, DEZ: 12,
+    JANEIRO: 1, FEVEREIRO: 2, MARCO: 3, ABRIL: 4, MAIO: 5, JUNHO: 6,
+    JULHO: 7, AGOSTO: 8, SETEMBRO: 9, OUTUBRO: 10, NOVEMBRO: 11, DEZEMBRO: 12,
+  };
+
+  // Identificar as colunas de meses no cabeçalho (depois de PVP/CUSTO/MG ou após coluna 2)
+  const monthCols: Array<{ label: string; monthNum: number; headerIdx: number }> = [];
+  for (let i = 2; i < headerTokens.length; i++) {
+    const nt = normHeader(headerTokens[i]);
+    if (MONTH_TOK_MAP[nt]) {
+      monthCols.push({ label: nt.slice(0, 3), monthNum: MONTH_TOK_MAP[nt], headerIdx: i });
+    }
+  }
+
+  if (monthCols.length === 0) {
+    throw new Error(
+      `Não foram detetadas colunas mensais (JAN..DEZ) no cabeçalho do CSV "${fileName}". Cabeçalho lido: ${headerTokens.slice(0, 12).join(' | ')}`
+    );
+  }
+
+  // Verificar se existe coluna de total de unidades (T / T Uni / TOTAL) após o último mês
+  const lastMonthHeaderIdx = monthCols[monthCols.length - 1].headerIdx;
+  const trailingHeaders = headerTokens.slice(lastMonthHeaderIdx + 1).map(normHeader);
+  const hasTotalCol = trailingHeaders.some((t) => t === 'T' || t === 'UNI' || t === 'TUNI' || t === 'TOTAL' || t === 'TOT');
+
+  // Inferir ano final a partir do nome do ficheiro (ex.: "2026", "25-26", "ate_11Nov_2026")
+  let endYear = new Date().getUTCFullYear();
+  const fullYearMatches = fileName.match(/(20\d{2})/g);
+  if (fullYearMatches && fullYearMatches.length > 0) {
+    endYear = parseInt(fullYearMatches[fullYearMatches.length - 1], 10);
+  } else {
+    const shortRange = fileName.match(/(\d{2})[-_](\d{2})/);
+    if (shortRange) {
+      endYear = 2000 + parseInt(shortRange[2], 10);
+    }
+  }
+
+  // Atribuir (ano, mês) a cada coluna mensal andando de trás para a frente
+  const resolvedMonths: Array<{ year: number; month: number; isoDate: string }> = new Array(monthCols.length);
+  let curYear = endYear;
+  let nextMonthNum = 99;
+  for (let i = monthCols.length - 1; i >= 0; i--) {
+    const mNum = monthCols[i].monthNum;
+    if (i < monthCols.length - 1 && mNum >= nextMonthNum) {
+      curYear -= 1;
+    }
+    resolvedMonths[i] = {
+      year: curYear,
+      month: mNum,
+      isoDate: `${curYear}-${String(mNum).padStart(2, '0')}-01T00:00:00.000Z`,
+    };
+    nextMonthNum = mNum;
+  }
+
+  // Verificar se o nome do ficheiro indica um dia de corte explícito (ex.: "ate_11Nov_2026")
+  const firstM = resolvedMonths[0];
+  const lastM = resolvedMonths[resolvedMonths.length - 1];
+  const dataInicio = `${firstM.year}-${String(firstM.month).padStart(2, '0')}-01T00:00:00.000Z`;
+  let endDay = new Date(Date.UTC(lastM.year, lastM.month, 0)).getUTCDate();
+  const cutDayMatch = fileName.match(/ate[_ -]?(\d{1,2})[_ -]?([a-zA-Zçã]{3,})/i);
+  if (cutDayMatch) {
+    const d = parseInt(cutDayMatch[1], 10);
+    if (d >= 1 && d <= 31) endDay = d;
+  }
+  const dataFim = `${lastM.year}-${String(lastM.month).padStart(2, '0')}-${String(endDay).padStart(2, '0')}T23:59:59.000Z`;
+  const periodo = `${firstM.year}-${String(firstM.month).padStart(2, '0')} a ${lastM.year}-${String(lastM.month).padStart(2, '0')}${cutDayMatch ? ` (até ${String(endDay).padStart(2, '0')}/${String(lastM.month).padStart(2, '0')}/${lastM.year})` : ''}`;
+
+  // Cauda fixa à direita em cada linha (funciona tanto para CSV limpo como para CSV com designação partida em ';'):
+  // [STOCK_TOT, LOCALIZACAO, STOCK, PVP, VALOR_VENDAS, P.CUSTO, MG_%, ...M meses, (T_UNI opcional)]
+  const tailLen = 7 + resolvedMonths.length + (hasTotalCol ? 1 : 0);
+
+  const rows: ParsedWinpharVendasItem[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = lines[i].split(delim).map((c) => c.trim());
+    while (cells.length > 0 && cells[cells.length - 1] === '') {
+      cells.pop();
+    }
+    if (cells.length < tailLen + 2) continue;
+
+    const rawCode = cells[0].replace(/\D/g, '');
+    if (!/^\d{6,7}$/.test(rawCode)) continue;
+    const codigo = rawCode.padStart(7, '0');
+
+    const fixedStart = cells.length - tailLen;
+    const designacao = cells
+      .slice(1, fixedStart)
+      .filter((s) => s.length > 0)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const stock = cells[fixedStart] || '0';
+    const pvp = cells[fixedStart + 3] || '0,00';
+    const pc = cells[fixedStart + 5] || '0,00';
+
+    const vendasMensais: Record<string, number> = {};
+    let totalVendido = 0;
+    const monthsStart = fixedStart + 7;
+    for (let mIdx = 0; mIdx < resolvedMonths.length; mIdx++) {
+      const rawQty = (cells[monthsStart + mIdx] || '0').replace(/\./g, '').replace(',', '.');
+      const qty = Math.round(parseFloat(rawQty));
+      const safeQty = Number.isFinite(qty) ? qty : 0;
+      const iso = resolvedMonths[mIdx].isoDate;
+      // Se o mesmo mês surgir repetido (raro), acumula sem perder; caso normal: atribuição direta
+      vendasMensais[iso] = (vendasMensais[iso] || 0) + safeQty;
+      totalVendido += safeQty;
+    }
+
+    rows.push({
+      codigo,
+      designacao: designacao || `Produto ${codigo}`,
+      pvp,
+      pc,
+      stock,
+      totalVendido,
+      vendasMensais,
+    });
+  }
+
+  if (rows.length === 0) {
+    throw new Error(`Nenhuma linha de produto válida (CNP 7 dígitos) encontrada no CSV "${fileName}".`);
+  }
+
+  return {
+    farmaciaNome: null,
+    farmaciaNif: null,
+    periodo,
+    anoVendas: lastM.year,
+    isDaily: false,
+    dataInicio,
+    dataFim,
+    granularidade: 'MENSAL',
+    rows,
+  };
+}
+
 export async function parseWinpharValidadesPdfFile(filePathOrBuffer: string | Buffer): Promise<ParsedWinpharValidadesPdf> {
   const dataBuffer = Buffer.isBuffer(filePathOrBuffer) ? filePathOrBuffer : fs.readFileSync(filePathOrBuffer);
   let farmaciaNome: any = null;
