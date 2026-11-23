@@ -292,8 +292,16 @@ export function validateCopilotAnswer(
       const num = parseFloat(rawVal);
       if (!isNaN(num) && num > 5) {
         const numFixed2 = num.toFixed(2);
+        const numFixed1 = num.toFixed(1);
+        const numStr = String(num);
         const numInt = Math.round(num).toString();
-        if (!allToolJson.includes(numFixed2) && !allToolJson.includes(numInt) && !allToolJson.includes(rawVal)) {
+        if (
+          !allToolJson.includes(numFixed2) &&
+          !allToolJson.includes(numFixed1) &&
+          !allToolJson.includes(numStr) &&
+          !allToolJson.includes(numInt) &&
+          !allToolJson.includes(rawVal)
+        ) {
           problems.push(
             `[V17] O valor ${m} citado no texto não foi encontrado nos resultados pré-calculados das ferramentas. O modelo não deve calcular nem inventar valores.`
           );
@@ -439,6 +447,7 @@ const COMMON_STOPWORDS = new Set([
   'imobilizado', 'cobertura', 'rotacao', 'faturacao', 'laboratorio', 'laboratorios', 'catalogo',
   'clinico', 'clinica', 'gestao', 'direcao', 'tecnica', 'prioritario', 'prioritaria', 'imediato',
   'imediata', 'seguranca', 'reposicao', 'devolucao', 'auditoria', 'sifarma', 'revisao', 'revisoes',
+  'capital', 'saude', 'doenca', 'receitas', 'controlo', 'controle', 'margens', 'custos', 'precos',
   'calcio', // tratado especificamente via composto ou catálogo
 ]);
 
