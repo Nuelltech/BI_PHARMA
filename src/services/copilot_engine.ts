@@ -168,7 +168,7 @@ const COPILOT_TOOLS = [
   {
     name: 'consultar_vendas',
     description:
-      'Consulta vendas (unidades, valor EUR, VMM, últimos 3 meses, margem estimada e comparação entre períodos) por produto, laboratório, DCI ou mês. Usar para qualquer pergunta sobre vendas, faturação, evolução mensal ou tendências. NÃO devolve planos de encomenda.',
+      'Ferramenta secundária de vendas avançadas (granularidade diária, agrupamento por segmento ou filtros combinados complexos). Para vendas de um laboratório/DCI nos últimos N meses ou comparação entre dois meses, usa SEMPRE consulta_comercial primeiro.',
     input_schema: {
       type: 'object',
       properties: {

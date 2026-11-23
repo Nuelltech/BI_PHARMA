@@ -461,9 +461,15 @@ const COMMON_STOPWORDS = new Set([
 export function collectAllowedNumbers(obj: any, out = new Set<number>()): Set<number> {
   if (obj === null || obj === undefined) return out;
   if (typeof obj === 'number' && Number.isFinite(obj)) {
+    const absVal = Math.abs(obj);
     out.add(Math.round(obj * 100) / 100);
     out.add(Math.round(obj * 10) / 10);
     out.add(Math.round(obj));
+    if (obj < 0) {
+      out.add(Math.round(absVal * 100) / 100);
+      out.add(Math.round(absVal * 10) / 10);
+      out.add(Math.round(absVal));
+    }
     return out;
   }
   if (Array.isArray(obj)) {
