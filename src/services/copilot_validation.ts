@@ -722,27 +722,27 @@ export function validateAndSanitizeLeitura(
 
           const labelRules: Array<{ rx: RegExp; expected: number[]; label: string }> = [
             {
-              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:em\s+|com\s+)?ruturas?\b/i,
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:(?:est[ãa]o|t[êe]m|apresentam)\s+)?(?:em\s+|com\s+)?ruturas?\b/i,
               expected: options.relatorio.em_rutura?.total_contagem != null ? [Number(options.relatorio.em_rutura.total_contagem)] : [],
               label: 'rutura',
             },
             {
-              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?sem\s+(?:qualquer\s+)?vendas?\b/i,
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:(?:est[ãa]o|t[êe]m|ficaram)\s+)?sem\s+(?:qualquer\s+)?vendas?\b/i,
               expected: options.relatorio.sem_vendas?.total_contagem != null ? [Number(options.relatorio.sem_vendas.total_contagem)] : [],
               label: 'sem vendas',
             },
             {
-              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:em\s+|com\s+)?(?:excessos?\s+de\s+cobertura|excessos?|cobertura\s+excessiva)\b/i,
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:(?:est[ãa]o|t[êe]m|apresentam)\s+)?(?:em\s+|com\s+)?(?:excessos?\s+de\s+cobertura|excessos?|cobertura\s+excessiva)\b/i,
               expected: options.relatorio.excessos?.total_contagem != null ? [Number(options.relatorio.excessos.total_contagem)] : [],
               label: 'excesso de cobertura',
             },
             {
-              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:monos?|parados?)\b/i,
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:(?:est[ãa]o|s[ãa]o)\s+)?(?:monos?|parados?)\b/i,
               expected: options.relatorio.monos?.total_contagem != null ? [Number(options.relatorio.monos.total_contagem)] : [],
               label: 'monos',
             },
             {
-              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:perto\s+de\s+|com\s+|em\s+risco\s+de\s+)?(?:validades?|caducidades?)\b/i,
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:(?:est[ãa]o|t[êe]m)\s+)?(?:perto\s+de\s+|com\s+|em\s+risco\s+de\s+)?(?:validades?|caducidades?)\b/i,
               expected: options.relatorio.validades?.total_contagem != null ? [Number(options.relatorio.validades.total_contagem)] : [],
               label: 'validade/caducidade',
             },
