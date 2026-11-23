@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   validateRelatorioData,
   validateAndSanitizeLeitura,
+  postProcessCopilotText,
   CatalogTermEntry,
 } from '../services/copilot_validation';
 import { classifyProductAction } from '../services/copilot_semantic_layer';
@@ -206,5 +207,76 @@ describe('Fase 1 — Validação 1 (D1–D5), Validação 2 (T1–T7), Vocabulá
     });
     expect(pdfSemEur.kpis.every((k) => !k.valor.includes('€'))).toBe(true);
     expect(pdfSemEur.tabela?.colunas.every((c) => !c.includes('€'))).toBe(true);
+  });
+
+  it('Revisão Fase 1 (T1/T3/T5 grupos + verbos proibidos + linhas meta): bloqueia as 5 frases exatas', () => {
+    const fixtureGrupos = {
+      ...FIXTURE_RELATORIO,
+      totais: {
+        ...FIXTURE_RELATORIO.totais,
+        top5_pct_faturacao: 24.8,
+        top10_pct_faturacao: 36.4,
+      },
+      classes_resumo: [
+        { classe: 'MANTER', n_produtos: 62, vendas_un: 2030, vendas_eur: 17926.9, stock_custo_eur: 872.89 },
+        { classe: 'REPOR', n_produtos: 24, vendas_un: 162, vendas_eur: 1718.86, stock_custo_eur: 0 },
+        { classe: 'TRABALHAR_ENCOMENDA', n_produtos: 25, vendas_un: 70, vendas_eur: 1005.62, stock_custo_eur: 117.27 },
+      ],
+      em_rutura: { total_contagem: 39, produtos: [] },
+      monos: { total_contagem: 29, total_valor_custo: 197.23, produtos: [] },
+    };
+
+    // 1. "5 produtos = 45,1 %" (real top 5 = 24,8 %) -> T1
+    const r1 = validateAndSanitizeLeitura(
+      'O core do negócio concentra-se em 5 produtos, responsáveis por 45,1% da faturação.',
+      { relatorio: fixtureGrupos, turnToolResultsJson: [JSON.stringify(fixtureGrupos)], catalogTerms: FIXTURE_CATALOG }
+    );
+    expect(r1.ok).toBe(false);
+    expect(r1.failedRules).toContain('T1');
+    expect(r1.sanitizedText).toBe('');
+
+    // 2. "Repor ruturas (39)" quando só 24 têm REPOR -> T3
+    const r2 = validateAndSanitizeLeitura(
+      'Repor ruturas (39 produtos com stock 0).',
+      { relatorio: fixtureGrupos, turnToolResultsJson: [JSON.stringify(fixtureGrupos)], catalogTerms: FIXTURE_CATALOG }
+    );
+    expect(r2.ok).toBe(false);
+    expect(r2.failedRules).toContain('T3');
+    expect(r2.sanitizedText).toBe('');
+
+    // 3. "Eliminar monos (29)" -> T3
+    const r3 = validateAndSanitizeLeitura(
+      'Eliminar monos parados (29 produtos).',
+      { relatorio: fixtureGrupos, turnToolResultsJson: [JSON.stringify(fixtureGrupos)], catalogTerms: FIXTURE_CATALOG }
+    );
+    expect(r3.ok).toBe(false);
+    expect(r3.failedRules).toContain('T3');
+    expect(r3.sanitizedText).toBe('');
+
+    // 4. "Descartar ... Venlafaxina" -> T3/T5
+    const r4 = validateAndSanitizeLeitura(
+      'Descartar sem vendas (3 produtos): Venlafaxina Mepha.',
+      { relatorio: fixtureGrupos, turnToolResultsJson: [JSON.stringify(fixtureGrupos)], catalogTerms: FIXTURE_CATALOG }
+    );
+    expect(r4.ok).toBe(false);
+    expect(r4.removedSentences.length).toBe(1);
+    expect(r4.sanitizedText).toBe('');
+
+    // 5. "eliminar os monos" -> T3
+    const r5 = validateAndSanitizeLeitura(
+      'Devemos eliminar os monos deste laboratório.',
+      { relatorio: fixtureGrupos, turnToolResultsJson: [JSON.stringify(fixtureGrupos)], catalogTerms: FIXTURE_CATALOG }
+    );
+    expect(r5.ok).toBe(false);
+    expect(r5.failedRules).toContain('T3');
+    expect(r5.sanitizedText).toBe('');
+
+    // 6. Linhas meta removidas em postProcessCopilotText
+    const cleaned = postProcessCopilotText(
+      'Texto válido.\n\n## Relatório Detalhado\n\n[As tabelas de desempenho serão inseridas automaticamente abaixo]',
+      ['relatorio_laboratorio'],
+      []
+    );
+    expect(cleaned).toBe('Texto válido.');
   });
 });

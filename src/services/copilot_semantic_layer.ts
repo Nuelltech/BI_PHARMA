@@ -2452,6 +2452,12 @@ export async function toolRelatorioLaboratorio(
       unidades_em_stock: unStockTotal,
       valor_stock_custo: Math.round(valorStockCusto * 100) / 100,
       produtos_ativos_total: activeLabProds.length,
+      top5_faturacao_eur: allowFaturacao
+        ? Math.round(prods.slice(0, 5).reduce((acc, p) => acc + (p.vendas_eur || 0), 0) * 100) / 100
+        : null,
+      top5_pct_faturacao: allowFaturacao
+        ? Number(((prods.slice(0, 5).reduce((acc, p) => acc + (p.vendas_eur || 0), 0) / Math.max(1, totalEur)) * 100).toFixed(1))
+        : null,
       top10_faturacao_eur: allowFaturacao
         ? Math.round(topList.reduce((acc, p) => acc + (p.vendas_eur || 0), 0) * 100) / 100
         : null,
@@ -2460,6 +2466,46 @@ export async function toolRelatorioLaboratorio(
         : null,
     },
     classes_resumo: classesResumo,
+    acoes_imediatas_por_classe: (() => {
+      const order = ['REPOR', 'DEVOLVER_EXCESSO', 'DEVOLVER_TUDO', 'REVER_DADOS', 'TRABALHAR_ENCOMENDA'];
+      const out: any[] = [];
+      for (const cls of order) {
+        const items = prods.filter((p) => p.classificacao === cls);
+        if (items.length === 0) continue;
+        const unDevolver =
+          cls === 'DEVOLVER_EXCESSO'
+            ? items.reduce((acc, p) => acc + Number(p.unidades_excesso || 0), 0)
+            : cls === 'DEVOLVER_TUDO'
+              ? items.reduce((acc, p) => acc + Number(p.stock || 0), 0)
+              : null;
+        const valDevolver =
+          cls === 'DEVOLVER_EXCESSO'
+            ? Math.round(items.reduce((acc, p) => acc + Number(p.unidades_excesso || 0) * Number(p.custo_unitario || 0), 0) * 100) / 100
+            : cls === 'DEVOLVER_TUDO'
+              ? Math.round(items.reduce((acc, p) => acc + Number(p.valor_custo_stock || 0), 0) * 100) / 100
+              : null;
+        out.push({
+          classe: cls,
+          n_produtos: items.length,
+          unidades_a_devolver: unDevolver,
+          valor_a_devolver_eur: valDevolver,
+          principais: items.slice(0, 5).map((p) => ({
+            cnp: p.cnp,
+            designacao: p.designacao.slice(0, 48),
+            stock: p.stock,
+            vmm: p.vmm,
+            unidades_excesso: p.unidades_excesso,
+            valor_devolver_eur:
+              cls === 'DEVOLVER_EXCESSO'
+                ? Math.round(Number(p.unidades_excesso || 0) * Number(p.custo_unitario || 0) * 100) / 100
+                : cls === 'DEVOLVER_TUDO'
+                  ? p.valor_custo_stock
+                  : null,
+          })),
+        });
+      }
+      return out;
+    })(),
     lacunas,
     top: topList,
     vendas_baixas: {
@@ -2565,7 +2611,7 @@ export async function toolRelatorioLaboratorio(
     imobilizado_produtos_unicos: result.imobilizado_total.total_produtos_unicos,
     lacunas,
     instrucao:
-      'As tabelas completas serão inseridas automaticamente pelo código abaixo da tua resposta. Escreve APENAS a Leitura Executiva (5 a 8 linhas): o que se destaca, o que fazer primeiro e porquê, citando apenas produtos, números e ações presentes neste resumo.',
+      'As tabelas e a secção de Ações Imediatas são geradas e inseridas AUTOMATICAMENTE pelo código abaixo da tua resposta. Escreve APENAS 2 a 4 frases curtas de destaque executivo (sem listas de ações, sem cabeçalhos de relatório, sem notas sobre tabelas), usando exclusivamente os números e produtos exatos deste resumo.',
   };
 
   return {
@@ -2616,8 +2662,33 @@ export function formatRelatorioLaboratorioMarkdown(res: any): string {
     }
   }
 
-  // 1. Top 10
-  md += `### Top 10 Produtos Mais Vendidos\n\n`;
+  // Ações Imediatas 100% geradas pelo código a partir das classes (contagens, unidades, valor a devolver e 3-5 produtos principais)
+  if (Array.isArray(res.acoes_imediatas_por_classe) && res.acoes_imediatas_por_classe.length > 0) {
+    md += `### Ações Imediatas (por classe de decisão)\n\n`;
+    for (const ac of res.acoes_imediatas_por_classe) {
+      let cab = `- **${ac.classe} (${ac.n_produtos} produtos)**`;
+      if (ac.unidades_a_devolver !== null && ac.unidades_a_devolver !== undefined) {
+        cab += ` — ${ac.unidades_a_devolver} un a devolver` + (showEur ? ` (${fmtEur(ac.valor_a_devolver_eur)} a preço de custo)` : '');
+      }
+      const exList = (ac.principais || [])
+        .map((p: any) => {
+          const extra =
+            ac.classe === 'DEVOLVER_EXCESSO' && p.unidades_excesso
+              ? ` [devolver ${p.unidades_excesso} un]`
+              : ac.classe === 'DEVOLVER_TUDO'
+                ? ` [${p.stock} un]`
+                : ` [VMM ${Number(p.vmm || 0).toFixed(2)}]`;
+          return `${p.designacao} (CNP ${p.cnp}${extra})`;
+        })
+        .join('; ');
+      md += `${cab}: ${exList}.\n`;
+    }
+    md += `\n`;
+  }
+
+  // 1. Top N (título = número exato de linhas mostradas)
+  const topShown = Array.isArray(res.top) ? res.top.length : 0;
+  md += `### Top ${topShown} Produtos Mais Vendidos\n\n`;
   if (showEur) {
     md += `| CNP | Designação | DCI | Vendas (€) | Un | VMM | Stock | Cob. | Margem % | Ação |\n`;
     md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n`;
@@ -2638,19 +2709,19 @@ export function formatRelatorioLaboratorioMarkdown(res: any): string {
 
   // 2. Vendas Baixas
   if (res.vendas_baixas && res.vendas_baixas.produtos.length > 0) {
-    md += `### Produtos com Vendas Baixas (VMM < 1.0)\n`;
-    md += `Identificados **${res.vendas_baixas.total_contagem} produtos** com rotação lenta (10 principais referências):\n\n`;
+    const baixasSlice = res.vendas_baixas.produtos.slice(0, 10);
+    md += `### Produtos com Vendas Baixas (VMM < 1.0 — ${baixasSlice.length} de ${res.vendas_baixas.total_contagem} produtos)\n\n`;
     if (showEur) {
       md += `| CNP | Designação | DCI | Vendas (€) | VMM | Stock | Margem % | Ação | Motivo |\n`;
       md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- | :--- |\n`;
-      for (const p of res.vendas_baixas.produtos.slice(0, 10)) {
+      for (const p of baixasSlice) {
         const mrg = p.margem_pct !== null ? `${p.margem_pct.toFixed(1)}%` : '—';
         md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.dci || '—'} | ${fmtEur(p.vendas_eur)} | ${p.vmm.toFixed(2)} | ${p.stock} | ${mrg} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
       }
     } else {
       md += `| CNP | Designação | DCI | VMM | Stock | Ação | Motivo |\n`;
       md += `| :--- | :--- | :--- | :---: | :---: | :--- | :--- |\n`;
-      for (const p of res.vendas_baixas.produtos.slice(0, 10)) {
+      for (const p of baixasSlice) {
         md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.dci || '—'} | ${p.vmm.toFixed(2)} | ${p.stock} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
       }
     }
@@ -2659,8 +2730,7 @@ export function formatRelatorioLaboratorioMarkdown(res: any): string {
 
   // 3. Sem Vendas
   if (res.sem_vendas && res.sem_vendas.produtos.length > 0) {
-    md += `### Produtos Sem Vendas com Stock Imobilizado\n`;
-    md += `Identificados **${res.sem_vendas.total_contagem} produtos** com stock (${fmtEur(res.sem_vendas.total_valor_custo)}) e 0 unidades vendidas no período:\n\n`;
+    md += `### Produtos Sem Vendas com Stock Imobilizado (${res.sem_vendas.produtos.length} produtos — ${fmtEur(res.sem_vendas.total_valor_custo)})\n\n`;
     md += `| CNP | Designação | DCI | Stock | Custo Total | Dias s/ Venda | Ação | Motivo |\n`;
     md += `| :--- | :--- | :--- | :---: | :---: | :---: | :--- | :--- |\n`;
     for (const p of res.sem_vendas.produtos) {
@@ -2672,18 +2742,18 @@ export function formatRelatorioLaboratorioMarkdown(res: any): string {
 
   // 4. Em Rutura
   if (res.em_rutura && res.em_rutura.produtos.length > 0) {
-    md += `### Produtos em Rutura com Procura Registada (Stock = 0)\n`;
-    md += `Identificados **${res.em_rutura.total_contagem} produtos** que venderam no período mas têm stock zero (10 principais referências):\n\n`;
+    const rutSlice = res.em_rutura.produtos.slice(0, 10);
+    md += `### Produtos em Rutura com Procura Registada (Stock = 0 — ${rutSlice.length} de ${res.em_rutura.total_contagem} produtos)\n\n`;
     if (showEur) {
       md += `| CNP | Designação | DCI | Vendas (€) | Un | VMM | Ação | Motivo |\n`;
       md += `| :--- | :--- | :--- | :---: | :---: | :---: | :--- | :--- |\n`;
-      for (const p of res.em_rutura.produtos.slice(0, 10)) {
+      for (const p of rutSlice) {
         md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.dci || '—'} | ${fmtEur(p.vendas_eur)} | ${p.vendas_un} | ${p.vmm.toFixed(2)} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
       }
     } else {
       md += `| CNP | Designação | DCI | Un | VMM | Ação | Motivo |\n`;
       md += `| :--- | :--- | :--- | :---: | :---: | :--- | :--- |\n`;
-      for (const p of res.em_rutura.produtos.slice(0, 10)) {
+      for (const p of rutSlice) {
         md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.dci || '—'} | ${p.vendas_un} | ${p.vmm.toFixed(2)} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
       }
     }
@@ -2692,8 +2762,7 @@ export function formatRelatorioLaboratorioMarkdown(res: any): string {
 
   // 5. Monos (janela 90 dias, regra unificada com o painel)
   if (res.monos && res.monos.produtos.length > 0) {
-    md += `### Monos (sem vendas nos últimos 90 dias; vendas registadas até ${ref})\n`;
-    md += `Identificados **${res.monos.total_contagem} produtos** (${fmtEur(res.monos.total_valor_custo)} em stock a preço de custo):\n\n`;
+    md += `### Monos (sem vendas nos últimos 90 dias; vendas registadas até ${ref} — ${res.monos.produtos.length} de ${res.monos.total_contagem} produtos, ${fmtEur(res.monos.total_valor_custo)})\n\n`;
     md += `| CNP | Designação | DCI | Stock | Custo Total | VMM | Dias s/ Venda | Ação | Motivo |\n`;
     md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- | :--- |\n`;
     for (const p of res.monos.produtos) {

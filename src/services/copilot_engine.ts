@@ -609,10 +609,10 @@ Foco sugerido pelo modo selecionado: ${focoModo} (apenas indicação; a pergunta
 7. Todos os números vêm das ferramentas. Campo nulo = "Sem dados". Nunca estimes, arredondes
    para além do que a ferramenta devolve, nem uses "presumível", "provavelmente" ou equivalentes. NUNCA INVENTES NÚMEROS. NUNCA INVENTES NOMES DE PRODUTOS/MEDICAMENTOS que não constem dos dados devolvidos pela ferramenta (ex.: nunca inventes Ácido Valpróico se não estiver no resultado). SEM ALUCINAÇÕES.
 8. Relatórios de Laboratório (ferramenta relatorio_laboratorio):
-   As tabelas completas e o resumo por classe de ação são inseridos AUTOMATICAMENTE pelo código abaixo da tua resposta.
-   NUNCA escrevas, copies nem reproduzas tabelas Markdown para este relatório.
-   Escreve APENAS a Leitura Executiva (5 a 8 linhas concisas): o que se destaca, o que fazer primeiro e porquê, usando EXCLUSIVAMENTE os produtos, números e ações presentes no resumo recebido.
-   Menciona brevemente as lacunas declaradas (ex.: dados até 31-10 ou produtos REVER_DADOS) quando relevante.
+   As tabelas completas, a distribuição por classe de ação e a secção de Ações Imediatas são geradas e inseridas AUTOMATICAMENTE pelo código abaixo da tua resposta.
+   NUNCA escrevas tabelas, listas de ações, cabeçalhos "Relatório Detalhado" nem notas meta ("[As tabelas...]").
+   Escreve APENAS 2 a 4 frases curtas de destaque executivo (o que se destaca nos totais, concentração do Top 5/Top 10 e principal lacuna de dados), usando EXCLUSIVAMENTE os números exatos do resumo recebido.
+   NUNCA uses verbos proibidos (eliminar, descartar, destruir, abater, liquidar).
 9. Se a consulta devolver 0 linhas ou for fora do âmbito: "Questão Fora de Âmbito" ou "ℹ️ Dados Não Encontrados" + o que foi pesquisado. Sem números.
 10. Se existirem avisos em meta.avisos_dados (ex.: DCI em falta, mês parcial, margem estimada),
    refere-os numa nota curta de uma linha, apenas se afetarem o que mostras.
@@ -998,9 +998,9 @@ export async function askConversationalCopilot(
       tracer.nChamadasApi++;
       if (activeModel.includes('sonnet')) tracer.escalouSonnet = true;
 
-      // Secção 4.1: Quando já temos um relatório estruturado, o modelo escreve apenas a Leitura curta (max_tokens = 900)
+      // Secção 4.1 / Revisão Fase 1: Quando já temos um relatório estruturado, o modelo escreve apenas 2-4 frases (max_tokens = 400)
       const effectiveMaxTokens = activeRelatorio
-        ? 900
+        ? 400
         : useThinking
           ? THINKING_BUDGET + 4096
           : 4096;

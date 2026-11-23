@@ -183,10 +183,13 @@ export function postProcessCopilotText(
     text = text.replace(/\[BOTAO_APLICAR_PLANO\]/g, '');
   }
 
-  // V12: Remover nomes técnicos internos se vazarem no texto visível
+  // V12: Remover nomes técnicos internos e linhas meta sobre inserção automática de tabelas
   text = text
     .replace(/\b(v_metricas|v_vendas_mes|v_grupos_dci|v_catalogo|v_snapshots|v_kpis)\b/g, 'base de dados')
-    .replace(/\b(r_\d{4})\b/g, '');
+    .replace(/\b(r_\d{4})\b/g, '')
+    .replace(/^\s*\[As tabelas[^\]]*\]\s*$/gim, '')
+    .replace(/^\s*##\s*Relat[óo]rio\s+Detalhado\s*$/gim, '')
+    .replace(/\n{3,}/g, '\n\n');
 
   // V14: Qualificação de margem estimada quando mostra margem por mês
   const usedEstimatedMargin = toolResultsJson.some((j) => j.includes('"estimada_custo_medio_atual"'));
@@ -497,7 +500,10 @@ const MSRM_MARKETING_OR_PRICE_RX =
   /\b(campanha(s)?|promo[çc][ãa]o|promo[çc][õo]es|desconto(s)?|pack(s)?|liquidar|liquida[çc][ãa]o|escoar\s+no\s+balc[ãa]o|destaque\s+(de|no)\s+balc[ãa]o|pague\s+\d+\s+leve\s+\d+|(aumentar|subir|alterar|renegociar|reinterpretar|reinterpreta[çc][ãa]o|ajustar)\s+(o\s+|de\s+|do\s+)?(pvp|pre[çc]o))\b/i;
 
 const CHRONIC_FORBIDDEN_RX =
-  /\b(devolver\s+(todo|tudo|a\s+totalidade|todas?\s+as?\s+\d*\s*un)|descontinuar|n[ãa]o\s+manter|deixar\s+de\s+vender|n[ãa]o\s+repor|eliminar\s+do\s+stock|retirar\s+da\s+farm[áa]cia)\b/i;
+  /\b(devolver\s+(todo|tudo|a\s+totalidade|todas?\s+as?\s+\d*\s*un)|descontinuar|descartar|eliminar|abater|destruir|n[ãa]o\s+manter|deixar\s+de\s+vender|n[ãa]o\s+repor|eliminar\s+do\s+stock|retirar\s+da\s+farm[áa]cia)\b/i;
+
+const FORBIDDEN_ACTION_VERBS_RX =
+  /\b(eliminar|descartar|destruir|abater|liquidar)\b/i;
 
 const UNFOUNDED_ESTIMATE_RX =
   /\b(recuperar\s+\d[\d.,\s–-]*€\s+em\s+\d+\s*dias|redu[çc][ãa]o\s+de\s+\d+\s*[–-]\s*\d+\s*%|poupan[çc]a\s+estimada\s+de\s+\d|aumentar\s+vendas\s+em\s+\d+\s*%)\b/i;
@@ -603,7 +609,7 @@ export function validateAndSanitizeLeitura(
         violation = { rule: 'T7', reason: 'Estimativa ou projeção numérica sem base nos dados.' };
       }
 
-      // T1: Números em € e % verificados numericamente (não substring!)
+      // T1: Números em € e % verificados numericamente (incluindo T1 para grupos Top N / N produtos!)
       if (!violation && options.relatorio) {
         const moneyMatches = sentence.match(/\b\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?\s*€/g) || [];
         for (const m of moneyMatches) {
@@ -611,6 +617,89 @@ export function validateAndSanitizeLeitura(
           if (!isNumberAllowed(val, allowedNumbers)) {
             violation = { rule: 'T1', reason: `Valor monetário ${m.trim()} não existe nos dados do relatório.` };
             break;
+          }
+        }
+
+        // T1 para grupos: "5 produtos ... 45,1%" ou "Top 5 ... 45,1%" tem de bater com top5_pct_faturacao
+        if (!violation) {
+          const pctMatches = sentence.match(/\b\d{1,3}(?:[,.]\d{1,2})?\s*%/g) || [];
+          const groupNMatch = sentence.match(/\b(?:top\s*(\d+)|(\d+)\s+produtos?)\b/i);
+          const groupN = groupNMatch ? parseInt(groupNMatch[1] || groupNMatch[2], 10) : null;
+
+          for (const pm of pctMatches) {
+            const pctVal = parsePtNumber(pm.replace('%', ''));
+            if (groupN === 5 && options.relatorio?.totais?.top5_pct_faturacao != null) {
+              const expectedTop5 = Number(options.relatorio.totais.top5_pct_faturacao);
+              if (Math.abs(pctVal - expectedTop5) > 0.5) {
+                violation = {
+                  rule: 'T1',
+                  reason: `Percentagem ${pm.trim()} atribuída a 5 produtos não corresponde ao Top 5 real (${expectedTop5}%).`,
+                };
+                break;
+              }
+            } else if (groupN === 10 && options.relatorio?.totais?.top10_pct_faturacao != null) {
+              const expectedTop10 = Number(options.relatorio.totais.top10_pct_faturacao);
+              if (Math.abs(pctVal - expectedTop10) > 0.5) {
+                violation = {
+                  rule: 'T1',
+                  reason: `Percentagem ${pm.trim()} atribuída a 10 produtos não corresponde ao Top 10 real (${expectedTop10}%).`,
+                };
+                break;
+              }
+            } else if (!isNumberAllowed(pctVal, allowedNumbers)) {
+              violation = {
+                rule: 'T1',
+                reason: `Percentagem ${pm.trim()} não corresponde a nenhum indicador do relatório.`,
+              };
+              break;
+            }
+          }
+        }
+      }
+
+      // T3: Verbos proibidos (eliminar, descartar, destruir, abater, liquidar) -> frase removida sempre
+      if (!violation && FORBIDDEN_ACTION_VERBS_RX.test(sentence)) {
+        const isExplicitProhibition = /\b(proibid[oa]|n[ãa]o\s+se\s+deve|nunca\s+se\s+deve)\b/i.test(sentence);
+        if (!isExplicitProhibition) {
+          violation = {
+            rule: 'T3',
+            reason: 'Verbo de ação não permitido (eliminar/descartar/destruir/abater/liquidar).',
+          };
+        }
+      }
+
+      // T3 para grupos: ação aplicada a um bloco heterogéneo (ex.: "Repor ruturas (39)" quando só 24 têm REPOR)
+      if (!violation && options.relatorio) {
+        const classesArr = Array.isArray(options.relatorio.classes_resumo) ? options.relatorio.classes_resumo : [];
+        const getClassCount = (cls: string) =>
+          Number(classesArr.find((c: any) => c.classe === cls)?.n_produtos ?? 0);
+
+        if (/\brepor\b/i.test(sentence) && /\bruturas?\b/i.test(sentence)) {
+          const totalRuturas = Number(options.relatorio.em_rutura?.total_contagem ?? 0);
+          const reporCount = getClassCount('REPOR');
+          if (totalRuturas > 0 && reporCount < totalRuturas) {
+            const citesTotalRuturas = new RegExp(`\\b${totalRuturas}\\b`).test(sentence);
+            const citesReporCount = reporCount > 0 && new RegExp(`\\b${reporCount}\\b`).test(sentence);
+            if (citesTotalRuturas || !citesReporCount) {
+              violation = {
+                rule: 'T3',
+                reason: `Contradição de grupo: apenas ${reporCount} das ${totalRuturas} ruturas têm ação REPOR (as restantes são TRABALHAR_ENCOMENDA).`,
+              };
+            }
+          }
+        }
+
+        if (!violation && /\bdevolver\b/i.test(sentence) && /\bmonos?\b/i.test(sentence)) {
+          const totalMonos = Number(options.relatorio.monos?.total_contagem ?? 0);
+          const devolverTotal = getClassCount('DEVOLVER_TUDO') + getClassCount('DEVOLVER_EXCESSO');
+          if (totalMonos > 0 && devolverTotal < totalMonos) {
+            const citesTotalMonos = new RegExp(`\\b${totalMonos}\\b`).test(sentence);
+            if (citesTotalMonos) {
+              violation = {
+                rule: 'T3',
+                reason: `Contradição de grupo: nem todos os ${totalMonos} monos têm ação de devolução.`,
+              };
+            }
           }
         }
       }
