@@ -58,7 +58,7 @@ import { getPharmacyCatalog, invalidateCatalog } from './services/product_catalo
 import { processFreeformQuestion } from './services/copilot';
 import { processQuestionWithLlmOrLocal } from './services/llm_router';
 import { askConversationalCopilot, clearCopilotSession, getCopilotSessionHistory } from './services/copilot_engine';
-import { parseMarkdownToExecutiveReport, synthesizeExecutiveReportWithAi, CopilotExecutiveReport } from './services/copilot_reporting';
+import { parseMarkdownToExecutiveReport, buildExecutiveReportFromStructuredData, CopilotExecutiveReport } from './services/copilot_reporting';
 import { addDiscontinuedCnp, removeDiscontinuedCnp, getDiscontinuedList } from './services/discontinued_products';
 import { ToolSecurityContext } from './services/mcp_pharma_tools';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
@@ -2807,12 +2807,16 @@ async function startServer() {
         return;
       }
 
-      // 3.3. Endpoint para Gerar Síntese de Relatório Executivo a partir do Copilot
+      // 3.3. Endpoint para Gerar Síntese de Relatório Executivo a partir do Copilot (Fase 1: determinístico, sem chamada livre à IA)
       if (pathname === '/api/copilot/generate-report' && req.method === 'POST') {
         try {
-          const rawBody = await readRequestBody(req, 128 * 1024);
-          const { farmaciaId, sessionId, rawText, customPrompt, audience, responsavel } = JSON.parse(rawBody || '{}');
+          const rawBody = await readRequestBody(req, 512 * 1024);
+          const { farmaciaId, sessionId, rawText, relatorioEstruturado, responsavel } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          const accessCtx = await resolveAccessContext();
+          const callerRole = accessCtx.role === 'ADMIN' ? 'SUPERADMIN' : 'PROPRIETARIO';
+          const allowFaturacao = canVerFaturacao(callerRole);
+          const emitente = String(responsavel || (accessCtx.role === 'ADMIN' ? 'Administrador' : `Sessão ${activeFarmacia.nome}`)).trim();
 
           let contentToReport = String(rawText || '').trim();
           if (!contentToReport && sessionId) {
@@ -2827,18 +2831,17 @@ async function startServer() {
           }
 
           let reportData: CopilotExecutiveReport;
-          if (customPrompt || Boolean(process.env.ANTHROPIC_API_KEY)) {
-            reportData = await synthesizeExecutiveReportWithAi({
-              text: contentToReport,
+          if (relatorioEstruturado && relatorioEstruturado.totais) {
+            reportData = buildExecutiveReportFromStructuredData(relatorioEstruturado, {
               farmaciaNome: activeFarmacia.nome,
-              responsavel: responsavel || 'Direção Técnica / Gestão',
-              customPrompt,
-              audience: audience === 'EQUIPA' ? 'EQUIPA' : 'GESTAO',
+              responsavel: emitente,
+              verFaturacao: allowFaturacao,
             });
           } else {
             reportData = parseMarkdownToExecutiveReport(contentToReport, {
               farmaciaNome: activeFarmacia.nome,
-              responsavel: responsavel || 'Direção Técnica / Gestão',
+              responsavel: emitente,
+              verFaturacao: allowFaturacao,
             });
           }
 
@@ -7703,7 +7706,7 @@ function getDashboardHtml(): string {
           <!-- Secção 4: Despacho e Assinatura -->
           <div style="margin-bottom: 16px;">
             <div style="font-size: 0.90rem; font-weight: 800; color: #0284c7; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">
-              <span>✍️ 4. Parecer & Despacho da Direção Técnica</span>
+              <span>4. Proposta para validação da Direção Técnica</span>
             </div>
             <div id="reportNotesEl" contenteditable="true" title="Clique para editar as notas ou despacho" style="font-size: 0.84rem; line-height: 1.5; color: #475569; padding: 10px; border: 1px dashed #cbd5e1; border-radius: 6px; background: #fdfdfd; min-height: 48px; outline: none;">
               Documento formal conferido e aprovado para execução física e contacto com fornecedores.
@@ -11749,8 +11752,8 @@ function getDashboardHtml(): string {
             farmaciaId: activeFarmaciaId,
             sessionId: sid,
             rawText: rawText || window.lastCopilotAssistantText || '',
-            customPrompt: customPrompt || '',
-            responsavel: 'Direção Técnica / Gestão'
+            relatorioEstruturado: window.lastCopilotRelatorioEstruturado || undefined,
+            customPrompt: customPrompt || ''
           })
         });
         var data = await res.json();
@@ -11887,7 +11890,7 @@ function getDashboardHtml(): string {
       // 5. Renderizar Notas Farmacêuticas
       var notesEl = document.getElementById('reportNotesEl');
       if (notesEl) {
-        notesEl.innerText = rep.notaFarmaceutica || 'Parecer técnico emitido pela Direção Técnica com recurso ao motor de inteligência analítica BI Pharma AI.';
+        notesEl.innerText = rep.notaFarmaceutica || 'Proposta para validação da Direção Técnica — Nome: ________________________ | Data: ___/___/_____ | Assinatura: ________________________';
       }
     }
 
@@ -12087,11 +12090,12 @@ function getDashboardHtml(): string {
         tableHtml +
         recsHtml +
         '<div style="margin-bottom:20px;page-break-inside:avoid;">' +
-          '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">4. Parecer & Despacho da Direção Técnica</div>' +
+          '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">4. Proposta para validação da Direção Técnica</div>' +
           '<div style="font-size:11px;line-height:1.5;color:#475569;border:1px dashed #cbd5e1;border-radius:6px;padding:8px 10px;background:#fdfdfd;margin-bottom:12px;">' + notesText.split(String.fromCharCode(10)).join('<br/>') + '</div>' +
-          '<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-top:24px;padding-top:14px;border-top:1px solid #e2e8f0;font-size:10.5px;color:#64748b;">' +
-            '<div>Assinatura do Responsável: _________________________________________</div>' +
-            '<div>Carimbo / Visto Farmácia: [ &nbsp; ] Homologado</div>' +
+          '<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-top:24px;padding-top:14px;border-top:1px solid #e2e8f0;font-size:10.5px;color:#64748b;gap:12px;">' +
+            '<div>Nome: ___________________________</div>' +
+            '<div>Data: ___/___/_____</div>' +
+            '<div>Assinatura: ___________________________</div>' +
           '</div>' +
         '</div>' +
         '<div style="border-top:1px solid #e2e8f0;padding-top:8px;margin-top:16px;font-size:9.5px;color:#94a3b8;display:flex;justify-content:space-between;">' +
@@ -12394,6 +12398,9 @@ function getDashboardHtml(): string {
         assistantBubble.dataset.rawText = data.text || data.explicacao || '';
         assistantBubble.dataset.interacaoId = data.interacaoId || '';
         window.lastCopilotAssistantText = data.text || data.explicacao || '';
+        if (data.relatorioEstruturado) {
+          window.lastCopilotRelatorioEstruturado = data.relatorioEstruturado;
+        }
 
         assistantBubble.innerHTML = badgeHtml +
           '<div>' + formattedHtml + '</div>' +

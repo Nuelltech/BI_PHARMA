@@ -188,6 +188,8 @@ export async function computeAndPersistMarts(
   }>();
 
   for (const inv of inventarios) {
+    // 3.4: Mesma regra do painel (analysis.ts): apenas artigos com stock positivo entram no mart de stock ativo
+    if (inv.quantidade <= 0) continue;
     const existing = cnpAgg.get(inv.cnp_codigo) || {
       produto: inv.produto,
       stockTotal: 0,

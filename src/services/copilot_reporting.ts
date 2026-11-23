@@ -46,10 +46,12 @@ export function parseMarkdownToExecutiveReport(
     farmaciaNome?: string;
     responsavel?: string;
     tituloCustom?: string;
+    verFaturacao?: boolean;
   }
 ): CopilotExecutiveReport {
   const farmaciaNome = options?.farmaciaNome || 'Farmácia Comunitária';
-  const responsavel = options?.responsavel || 'Direção Técnica / Gestão';
+  const responsavel = options?.responsavel || 'Utilizador da Sessão';
+  const allowEur = options?.verFaturacao !== false;
   const hoje = new Date();
   const dataEmissao = hoje.toLocaleDateString('pt-PT');
   const horaEmissao = hoje.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
@@ -57,11 +59,11 @@ export function parseMarkdownToExecutiveReport(
   if (!rawText || !rawText.trim()) {
     return {
       titulo: options?.tituloCustom || 'Relatório Executivo da Farmácia',
-      subtitulo: 'Análise Analítica & Apoio à Decisão',
+      subtitulo: 'Proposta de Análise & Apoio à Decisão',
       diagnostico: 'Nenhuma informação analítica detalhada para estruturar neste momento.',
       kpis: [],
       recomendacoes: ['Coloque uma questão ao Copilot para gerar uma análise com dados da farmácia.'],
-      notaFarmaceutica: 'Emitido pelo sistema BI Pharma AI.',
+      notaFarmaceutica: 'Proposta para validação da Direção Técnica | Nome: __________________ | Data: ___/___/_____ | Assinatura: __________________',
       farmaciaNome,
       dataEmissao,
       horaEmissao,
@@ -69,7 +71,12 @@ export function parseMarkdownToExecutiveReport(
     };
   }
 
-  const cleanText = rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  // D5: Se não tiver permissão ver_faturacao, oculta valores monetários em € no texto
+  const effectiveRawText = allowEur
+    ? rawText
+    : rawText.replace(/\b\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?\s*€/g, '[valor oculto]');
+
+  const cleanText = effectiveRawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const lines = cleanText.split('\n');
 
   let extractedTitle = options?.tituloCustom || '';
@@ -260,12 +267,13 @@ export function parseMarkdownToExecutiveReport(
 
   return {
     titulo: extractedTitle,
-    subtitulo: `Relatório de Apoio à Decisão Clínica & Gestão — ${farmaciaNome}`,
+    subtitulo: `Proposta de Apoio à Decisão Clínica & Gestão — ${farmaciaNome}`,
     diagnostico: diagnosticoText,
     kpis,
     tabela: finalTable,
     recomendacoes,
-    notaFarmaceutica: 'Parecer emitido pela Direção Técnica com recurso ao motor de inteligência analítica BI Pharma AI.',
+    notaFarmaceutica:
+      'Proposta para validação da Direção Técnica — Nome: ________________________ | Data: ___/___/_____ | Assinatura: ________________________',
     farmaciaNome,
     dataEmissao,
     horaEmissao,
@@ -274,124 +282,138 @@ export function parseMarkdownToExecutiveReport(
 }
 
 /**
- * Síntese avançada com Inteligência Artificial (Claude) para redigir o relatório formal
- * com fallback imediato para o parser determinístico caso não haja chave de API ou conexão.
+ * Fase 1 (4.5): Constrói o Relatório Executivo / PDF diretamente a partir do objeto
+ * estruturado e validado do chat (mesmos números, classes a 100%, zero chamadas extra ao LLM).
  */
-export async function synthesizeExecutiveReportWithAi(params: {
-  text: string;
-  history?: Array<{ role: string; content: string }>;
-  farmaciaNome: string;
-  responsavel?: string;
-  customPrompt?: string;
-  audience?: 'GESTAO' | 'EQUIPA';
-}): Promise<CopilotExecutiveReport> {
-  const apiKey = (process.env.ANTHROPIC_API_KEY || '').trim();
+export function buildExecutiveReportFromStructuredData(
+  relatorio: any,
+  options: {
+    farmaciaNome: string;
+    responsavel: string;
+    verFaturacao: boolean;
+  }
+): CopilotExecutiveReport {
+  const hoje = new Date();
+  const dataEmissao = hoje.toLocaleDateString('pt-PT');
+  const horaEmissao = hoje.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+  const showEur = options.verFaturacao && !relatorio?.meta?.faturacao_oculta;
+  const fmtEur = (v: number | null | undefined) =>
+    v !== null && v !== undefined ? `${Number(v).toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €` : '—';
 
-  // Fallback imediato se não houver chave de API configurada
-  if (!apiKey) {
-    return parseMarkdownToExecutiveReport(params.text, {
-      farmaciaNome: params.farmaciaNome,
-      responsavel: params.responsavel,
+  const t = relatorio?.totais || {};
+  const lab = relatorio?.meta?.laboratorio || 'Laboratório';
+  const periodo = relatorio?.meta?.periodo_rotulo || `${relatorio?.meta?.ano || 2026} (jan–out)`;
+
+  const kpis: CopilotReportKpi[] = [
+    {
+      label: 'Âmbito Analisado',
+      valor: `${t.produtos_ambito_total ?? 0} produtos (${t.produtos_vendidos ?? 0} c/ vendas)`,
+      tipo: 'info',
+    },
+    {
+      label: 'Volume Vendido',
+      valor: `${Number(t.unidades_vendidas ?? 0).toLocaleString('pt-PT')} un`,
+      tipo: 'success',
+    },
+  ];
+
+  if (showEur) {
+    kpis.push({
+      label: `Faturação ${periodo}`,
+      valor: fmtEur(t.faturacao_eur),
+      tipo: 'success',
     });
   }
 
-  try {
-    const isParaEquipa = params.audience === 'EQUIPA';
+  kpis.push({
+    label: 'Stock Atual',
+    valor: `${t.produtos_em_stock ?? 0} ref. | ${t.unidades_em_stock ?? 0} un` + (showEur ? ` (${fmtEur(t.valor_stock_custo)})` : ''),
+    tipo: 'default',
+  });
 
-    const systemPrompt = `És o Consultor de Gestão e Diretor Técnico Sénior do BI Pharma para a farmácia "${params.farmaciaNome}".
-A tua função é transformar notas exploratórias e conversas de chat num RELATÓRIO EXECUTIVO FORMAL, rigoroso e orientado à tomada de decisão.
+  kpis.push({
+    label: 'Imobilizado Consolidado',
+    valor: `${relatorio?.imobilizado_total?.total_produtos_unicos ?? 0} ref.` + (showEur ? ` (${fmtEur(relatorio?.imobilizado_total?.total_valor_custo)})` : ''),
+    tipo: 'warning',
+  });
 
-DIRETRIZES ESTREITAS:
-1. NÃO incluas saudações, conversas de chat, perguntas do utilizador ("o utilizador perguntou...") ou meta-comentários.
-2. O tom deve ser formal, conciso e profissional (${isParaEquipa ? 'foco operacional e tarefas para a equipa da farmácia' : 'foco executivo em rentabilidade, riscos e decisão da administração'}).
-3. Deves responder EXCLUSIVAMENTE em formato JSON VÁLIDO (sem markdown wrap, sem \`\`\`json) com a seguinte estrutura exata:
-{
-  "titulo": "string com título formal e conciso",
-  "subtitulo": "string com subtítulo contextual",
-  "diagnostico": "string com 2 a 3 parágrafos claros descrevendo a situação detetada nos dados",
-  "kpis": [
-    { "label": "string", "valor": "string", "tipo": "default|warning|danger|success|info" }
-  ],
-  "tabela": {
-    "colunas": ["string", "string"],
-    "linhas": [["col1", "col2"]],
-    "totalRegistos": number
-  },
-  "recomendacoes": [
-    "string com recomendação 1",
-    "string com recomendação 2"
-  ],
-  "notaFarmaceutica": "string com nota formal de fecho"
-}
+  // Tabela unificada de distribuição 100% por classe de ação + total exato
+  const classes = Array.isArray(relatorio?.classes_resumo) ? relatorio.classes_resumo : [];
+  const tableCols = showEur
+    ? ['Ação Recomendada', 'N.º Produtos', 'Unidades Vendidas', 'Vendas (€)', 'Stock Custo (€)']
+    : ['Ação Recomendada', 'N.º Produtos', 'Unidades Vendidas'];
 
-Se a informação de entrada contiver tabelas ou produtos, preserva rigorosamente os códigos CNP, designações e valores. Não inventes dados não presentes na conversa.`;
+  const tableRows: string[][] = classes.map((c: any) =>
+    showEur
+      ? [
+          String(c.classe),
+          String(c.n_produtos),
+          Number(c.vendas_un || 0).toLocaleString('pt-PT'),
+          fmtEur(c.vendas_eur),
+          fmtEur(c.stock_custo_eur),
+        ]
+      : [String(c.classe), String(c.n_produtos), Number(c.vendas_un || 0).toLocaleString('pt-PT')]
+  );
 
-    const userContent = `Conteúdo a transformar em Relatório Executivo Formal:
-${params.text}
-${params.customPrompt ? `\nInstrução Específica de Ajuste do Farmacêutico: ${params.customPrompt}` : ''}`;
+  if (classes.length > 0) {
+    tableRows.push(
+      showEur
+        ? [
+            'TOTAL (100% DO ÂMBITO)',
+            String(t.produtos_ambito_total ?? 0),
+            Number(t.unidades_vendidas ?? 0).toLocaleString('pt-PT'),
+            fmtEur(t.faturacao_eur),
+            fmtEur(t.valor_stock_custo),
+          ]
+        : [
+            'TOTAL (100% DO ÂMBITO)',
+            String(t.produtos_ambito_total ?? 0),
+            Number(t.unidades_vendidas ?? 0).toLocaleString('pt-PT'),
+          ]
+    );
+  }
 
-    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 2500,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userContent }],
-      }),
-    });
-
-    if (!apiRes.ok) {
-      throw new Error(`Anthropic API status ${apiRes.status}`);
+  // Recomendações 100% derivadas das ações calculadas pelo código (sem alucinação nem MSRM em campanha)
+  const recomendacoes: string[] = [];
+  if (relatorio?.validades?.produtos?.length > 0) {
+    for (const v of relatorio.validades.produtos) {
+      recomendacoes.push(`[${v.classificacao}] ${v.designacao} (CNP ${v.cnp}): ${v.motivo_classificacao}`);
     }
-
-    const data = (await apiRes.json()) as any;
-    const contentArr = Array.isArray(data.content) ? data.content : [];
-    const replyText = contentArr
-      .filter((c: any) => c.type === 'text')
-      .map((c: any) => c.text)
-      .join('\n')
-      .trim();
-
-    // Limpar eventuais blocos de código markdown que o modelo possa ter incluído
-    const cleanJson = replyText.replace(/^```(json)?/i, '').replace(/```$/i, '').trim();
-    const parsed = JSON.parse(cleanJson);
-
-    const hoje = new Date();
-    const dataEmissao = hoje.toLocaleDateString('pt-PT');
-    const horaEmissao = hoje.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
-
-    return {
-      titulo: parsed.titulo || 'Relatório Executivo da Farmácia',
-      subtitulo: parsed.subtitulo || `Análise de Gestão — ${params.farmaciaNome}`,
-      diagnostico: parsed.diagnostico || '',
-      kpis: Array.isArray(parsed.kpis) ? parsed.kpis : [],
-      tabela: parsed.tabela && Array.isArray(parsed.tabela.colunas) && Array.isArray(parsed.tabela.linhas)
-        ? {
-            colunas: parsed.tabela.colunas,
-            linhas: parsed.tabela.linhas.slice(0, 30),
-            totalRegistos: parsed.tabela.linhas.length,
-            avisoLimite: parsed.tabela.linhas.length > 30
-              ? `⚠️ A apresentar os 30 registos mais prioritários no PDF. A totalidade dos ${parsed.tabela.linhas.length} registos está disponível em Excel / CSV.`
-              : undefined,
-          }
-        : undefined,
-      recomendacoes: Array.isArray(parsed.recomendacoes) ? parsed.recomendacoes : [],
-      notaFarmaceutica: parsed.notaFarmaceutica || 'Parecer técnico emitido por BI Pharma AI.',
-      farmaciaNome: params.farmaciaNome,
-      dataEmissao,
-      horaEmissao,
-      responsavel: params.responsavel || 'Direção Técnica',
-    };
-  } catch (err) {
-    console.warn('[Copilot Reporting AI Error, a usar fallback determinístico]:', err);
-    return parseMarkdownToExecutiveReport(params.text, {
-      farmaciaNome: params.farmaciaNome,
-      responsavel: params.responsavel,
-    });
   }
+  if (relatorio?.em_rutura?.total_contagem > 0) {
+    recomendacoes.push(
+      `[REPOR / ENCOMENDA] ${relatorio.em_rutura.total_contagem} produto(s) com vendas registadas encontram-se em rutura (stock 0). Repor os de VMM >= 1.0 e crónicos; trabalhar os restantes sob encomenda.`
+    );
+  }
+  if (relatorio?.rever_dados?.total_contagem > 0) {
+    recomendacoes.push(
+      `[REVER_DADOS] ${relatorio.rever_dados.total_contagem} produto(s) com valores anómalos no ERP requerem auditoria no Sifarma antes de decisão comercial.`
+    );
+  }
+  if (Array.isArray(relatorio?.lacunas)) {
+    for (const lac of relatorio.lacunas) {
+      recomendacoes.push(`[NOTA DE DADOS] ${lac}`);
+    }
+  }
+
+  return {
+    titulo: `Relatório de Gestão — Laboratório ${lab} (${periodo})`,
+    subtitulo: `Proposta de Apoio à Decisão Clínica & Gestão — ${options.farmaciaNome}`,
+    diagnostico:
+      relatorio?.leitura_executiva ||
+      `Análise consolidada do laboratório ${lab} para o período ${periodo} (vendas registadas até ${relatorio?.meta?.data_referencia || '2026-10-31'}).`,
+    kpis,
+    tabela: {
+      colunas: tableCols,
+      linhas: tableRows,
+      totalRegistos: t.produtos_ambito_total ?? tableRows.length,
+    },
+    recomendacoes,
+    notaFarmaceutica:
+      'Proposta para validação da Direção Técnica — Nome: ________________________ | Data: ___/___/_____ | Assinatura: ________________________',
+    farmaciaNome: options.farmaciaNome,
+    dataEmissao,
+    horaEmissao,
+    responsavel: options.responsavel,
+  };
 }

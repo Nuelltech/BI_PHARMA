@@ -1,11 +1,16 @@
 import {
   validateCopilotAnswer,
+  validateRelatorioData,
+  validateAndSanitizeLeitura,
+  normalizeTextForMatch,
+  CatalogTermEntry,
   extractCnps,
   classifyQuestionIntent,
   QuestionIntentInfo,
   postProcessCopilotText,
   stripUnsolicitedPurchaseSections,
 } from './copilot_validation';
+import { isTherapeuticChronic } from './copilot_chronic_therapies';
 import {
   validateCopilotInputGuardrails,
   sanitizeCopilotOutput,
@@ -604,11 +609,10 @@ Foco sugerido pelo modo selecionado: ${focoModo} (apenas indicação; a pergunta
 7. Todos os números vêm das ferramentas. Campo nulo = "Sem dados". Nunca estimes, arredondes
    para além do que a ferramenta devolve, nem uses "presumível", "provavelmente" ou equivalentes. NUNCA INVENTES NÚMEROS. NUNCA INVENTES NOMES DE PRODUTOS/MEDICAMENTOS que não constem dos dados devolvidos pela ferramenta (ex.: nunca inventes Ácido Valpróico se não estiver no resultado). SEM ALUCINAÇÕES.
 8. Relatórios de Laboratório (ferramenta relatorio_laboratorio):
-   As tabelas e totais analíticos auditados já se encontram deterministicamente calculados no campo 'relatorio_markdown'.
-   A tua resposta deve conter:
-   (a) Uma síntese executiva estratégica inicial (1 a 2 parágrafos) com as conclusões essenciais;
-   (b) A reprodução integral do bloco 'relatorio_markdown' sem alterar os números ou colunas;
-   (c) Um plano de 3 a 5 ações imediatas recomendadas para o diretor técnico/gerente (ex: devoluções proporcionais de validade, encomendas sob pedido para doentes crónicos e reposição de ruturas).
+   As tabelas completas e o resumo por classe de ação são inseridos AUTOMATICAMENTE pelo código abaixo da tua resposta.
+   NUNCA escrevas, copies nem reproduzas tabelas Markdown para este relatório.
+   Escreve APENAS a Leitura Executiva (5 a 8 linhas concisas): o que se destaca, o que fazer primeiro e porquê, usando EXCLUSIVAMENTE os produtos, números e ações presentes no resumo recebido.
+   Menciona brevemente as lacunas declaradas (ex.: dados até 31-10 ou produtos REVER_DADOS) quando relevante.
 9. Se a consulta devolver 0 linhas ou for fora do âmbito: "Questão Fora de Âmbito" ou "ℹ️ Dados Não Encontrados" + o que foi pesquisado. Sem números.
 10. Se existirem avisos em meta.avisos_dados (ex.: DCI em falta, mês parcial, margem estimada),
    refere-os numa nota curta de uma linha, apenas se afetarem o que mostras.
@@ -761,8 +765,71 @@ export interface CopilotChatResponse {
   toolsUsed: string[];
   sessionId: string;
   interacaoId?: string;
+  relatorioEstruturado?: any;
   shoppingList?: any[];
   usage?: CopilotUsageStats;
+}
+
+// Cache em memória do índice de termos de ProdutoMestre para validação T2/T4 (atualizado a cada 15 min)
+let cachedCatalogTerms: { ts: number; terms: CatalogTermEntry[] } | null = null;
+
+async function getCatalogTermsForValidation(prisma: PrismaClient): Promise<CatalogTermEntry[]> {
+  const now = Date.now();
+  if (cachedCatalogTerms && now - cachedCatalogTerms.ts < 15 * 60 * 1000) {
+    return cachedCatalogTerms.terms;
+  }
+  try {
+    const prods = await prisma.produtoMestre.findMany({
+      select: { designacao: true, dci: true, tipo_venda: true },
+      take: 8000,
+    });
+    const map = new Map<string, CatalogTermEntry>();
+    for (const p of prods) {
+      const isMsrm =
+        String(p.tipo_venda || '').toUpperCase().includes('MSRM') ||
+        String(p.tipo_venda || '').toUpperCase().includes('RECEITA');
+      const isChronic = isTherapeuticChronic(p.dci, p.designacao);
+
+      if (p.dci) {
+        const dciNorm = normalizeTextForMatch(p.dci);
+        if (dciNorm.length >= 5 && !map.has(dciNorm)) {
+          map.set(dciNorm, { termNorm: dciNorm, original: p.dci, isMsrm, isChronic });
+        }
+      }
+      if (p.designacao) {
+        const firstWord = normalizeTextForMatch(p.designacao).split(' ')[0] || '';
+        if (firstWord.length >= 6 && !map.has(firstWord)) {
+          map.set(firstWord, {
+            termNorm: firstWord,
+            original: p.designacao.split(/\s+/)[0] || firstWord,
+            isMsrm,
+            isChronic,
+          });
+        }
+      }
+    }
+    const terms = Array.from(map.values());
+    cachedCatalogTerms = { ts: now, terms };
+    return terms;
+  } catch (err: any) {
+    console.warn('[CopilotValidation] Erro ao carregar índice ProdutoMestre:', err?.message);
+    return cachedCatalogTerms?.terms || [];
+  }
+}
+
+function buildDeterministicSummaryForReport(relatorio: any): string {
+  const t = relatorio?.totais || {};
+  const lab = relatorio?.meta?.laboratorio || 'Laboratório';
+  const per = relatorio?.meta?.periodo_rotulo || '2026 (jan–out)';
+  const showEur = !relatorio?.meta?.faturacao_oculta && t.faturacao_eur !== null;
+  const eurStr = showEur ? ` (${Number(t.faturacao_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €)` : '';
+  return (
+    `Resumo estruturado do laboratório **${lab}** em **${per}**: ` +
+    `${t.produtos_vendidos ?? 0} produtos com vendas (${Number(t.unidades_vendidas ?? 0).toLocaleString('pt-PT')} un${eurStr}), ` +
+    `${t.produtos_em_stock ?? 0} referências em stock (${t.unidades_em_stock ?? 0} un) e ` +
+    `${relatorio?.em_rutura?.total_contagem ?? 0} produtos em rutura. ` +
+    `Consulte abaixo as tabelas oficiais e a distribuição completa por ação recomendada.`
+  );
 }
 
 export function calculateClaudeCostEur(
@@ -886,7 +953,9 @@ export async function askConversationalCopilot(
   const THINKING_BUDGET = Number(process.env.COPILOT_THINKING_BUDGET || 4000);
   let activeModel = model;
   let useThinking = THINKING_BUDGET >= 1024 && !activeModel.includes('haiku');
-  const toolResultsJson: string[] = [[...(sessionKnownCnps.get(sessionId) || [])].join(' ')];
+  // V4 corrigido: apenas os resultados de ferramentas DESTE turno (nunca CNPs de turnos antigos)
+  const turnToolResultsJson: string[] = [];
+  let activeRelatorio: any = null;
   let validationRetries = 0;
 
   const tracer = new CopilotAuditTracer(
@@ -929,6 +998,13 @@ export async function askConversationalCopilot(
       tracer.nChamadasApi++;
       if (activeModel.includes('sonnet')) tracer.escalouSonnet = true;
 
+      // Secção 4.1: Quando já temos um relatório estruturado, o modelo escreve apenas a Leitura curta (max_tokens = 900)
+      const effectiveMaxTokens = activeRelatorio
+        ? 900
+        : useThinking
+          ? THINKING_BUDGET + 4096
+          : 4096;
+
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -939,8 +1015,8 @@ export async function askConversationalCopilot(
         },
         body: JSON.stringify({
           model: activeModel,
-          max_tokens: useThinking ? THINKING_BUDGET + 4096 : 4096,
-          ...(useThinking ? { thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET } } : {}),
+          max_tokens: effectiveMaxTokens,
+          ...(useThinking && !activeRelatorio ? { thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET } } : {}),
           system: systemBlocks,
           tools: scopedTools,
           tool_choice: { type: 'auto' },
@@ -1008,39 +1084,76 @@ export async function askConversationalCopilot(
 
       if (toolUseCalls.length === 0) {
         const textBlocks = content.filter((c: any) => c.type === 'text');
-        let finalText = sanitizeCopilotOutput(textBlocks.map((b: any) => b.text).join('\n\n'));
+        const textoAntesValidacao = sanitizeCopilotOutput(textBlocks.map((b: any) => b.text).join('\n\n'));
+        let finalText = textoAntesValidacao;
 
-        // VALIDAÇÃO EM CÓDIGO (V1-V17)
+        // VALIDAÇÃO 2 — TEXTO FRASE A FRASE (T1–T7 + V4 do turno + regras legadas V1/V5/V6/V12)
         const valStart = Date.now();
-        const validation = validateCopilotAnswer(finalText, toolResultsJson, toolsUsed, intentInfo);
-        if (!validation.ok) {
-          for (const prob of validation.problems) {
-            const match = prob.match(/^\[(V\d+|T\d+|D\d+)\]/);
-            if (match) tracer.markRuleFailed(match[1]);
-          }
+        const catalogTerms = activeRelatorio ? await getCatalogTermsForValidation(prisma) : [];
+        const leituraVal = validateAndSanitizeLeitura(finalText, {
+          relatorio: activeRelatorio,
+          turnToolResultsJson,
+          catalogTerms,
+        });
+        const legacyVal = validateCopilotAnswer(leituraVal.sanitizedText, turnToolResultsJson, toolsUsed, intentInfo);
+
+        const allFailedRules = new Set<string>(leituraVal.failedRules);
+        for (const prob of legacyVal.problems) {
+          const match = prob.match(/^\[(V\d+|T\d+|D\d+)\]/);
+          if (match) allFailedRules.add(match[1]);
         }
+        allFailedRules.forEach((r) => tracer.markRuleFailed(r));
+        tracer.frasesRemovidas += leituraVal.removedSentences.length;
+
+        const hasLegacyBlocking = !legacyVal.ok;
+        const needsRewrite = leituraVal.needsRewrite || hasLegacyBlocking;
+
         tracer.addEtapa({
           etapa: 'validacao_texto',
-          nome: 'validateCopilotAnswer',
+          nome: 'validateAndSanitizeLeitura',
           inicio_ms: valStart - startTime,
           duracao_ms: Date.now() - valStart,
-          estado: validation.ok ? 'ok' : 'aviso',
-          detalhe: { ok: validation.ok, problems: validation.problems },
+          estado: leituraVal.ok && legacyVal.ok ? 'ok' : 'aviso',
+          detalhe: {
+            ok: leituraVal.ok && legacyVal.ok,
+            frases_removidas: leituraVal.removedSentences.length,
+            removidas: leituraVal.removedSentences.map((r) => ({ rule: r.rule, reason: r.reason, frase: r.sentence.slice(0, 120) })),
+            legacy_problems: legacyVal.problems,
+          },
         });
 
-        if (!validation.ok && validationRetries < 1 && maxSteps > 0) {
+        // 1ª falha grave: reescreve 1x indicando as regras que falharam
+        if (needsRewrite && validationRetries < 1 && maxSteps > 0) {
           validationRetries++;
           tracer.reescritas++;
-          console.warn('[Copilot Validation] Resposta rejeitada (tentativa 1):', validation.problems);
+          const motivos = [
+            ...leituraVal.removedSentences.map((r) => `[${r.rule}] ${r.reason}`),
+            ...legacyVal.problems,
+          ];
+          console.warn('[Copilot Validation] Resposta rejeitada (tentativa 1):', motivos);
           currentMessages.push({ role: 'assistant', content });
           currentMessages.push({
             role: 'user',
             content:
               '[VALIDAÇÃO AUTOMÁTICA - a tua resposta violou o contrato] ' +
-              validation.problems.join(' ') +
-              ' Reescreve a resposta final cumprindo estritamente o que foi perguntado, sem mencionar esta validação.',
+              motivos.join(' ') +
+              ' Reescreve APENAS a Leitura curta (5 a 8 linhas) usando estritamente os produtos e números do resumo, sem mencionar esta validação.',
           });
           continue;
+        }
+
+        // Aplica o texto já sanitizado (sem frases violadoras)
+        finalText = leituraVal.sanitizedText;
+
+        // 3.1: NUNCA entregar texto não validado! Se após a 2ª tentativa ainda falhou ou ficou vazio, entrega só as tabelas + resumo fixo
+        let estadoFinal: 'ok' | 'ok_com_correcoes' | 'so_tabelas' =
+          tracer.reescritas > 0 || tracer.frasesRemovidas > 0 || tracer.getRegrasFalhadas().length > 0
+            ? 'ok_com_correcoes'
+            : 'ok';
+
+        if (activeRelatorio && (leituraVal.needsRewrite || hasLegacyBlocking || finalText.trim().length < 20)) {
+          finalText = buildDeterministicSummaryForReport(activeRelatorio);
+          estadoFinal = 'so_tabelas';
         }
 
         // Se na 2ª tentativa ainda houver secção não solicitada (V1), remove-a automaticamente
@@ -1049,14 +1162,12 @@ export async function askConversationalCopilot(
         }
 
         // Pós-processamento determinístico (V8 marcadores UI, V12 fuga técnica, V14 nota de margem estimada)
-        finalText = postProcessCopilotText(finalText, toolsUsed, toolResultsJson, intentInfo);
+        finalText = postProcessCopilotText(finalText, toolsUsed, turnToolResultsJson, intentInfo);
 
-        // Safeguard determinístico: se o relatório de laboratório foi chamado e o modelo omitiu as tabelas, anexa o bloco oficial
-        if (toolsUsed.includes('relatorio_laboratorio') && !finalText.includes('### 🏆 Top 10 Produtos Mais Vendidos')) {
-          const relTool = ferramentasExecutadas.find((f: any) => f.nome === 'relatorio_laboratorio');
-          if (relTool?.resultado?.relatorio_markdown) {
-            finalText = `${finalText}\n\n---\n\n${relTool.resultado.relatorio_markdown}`;
-          }
+        // 4.1: O motor junta SEMPRE: Leitura validada + tabelas oficiais do código (o modelo nunca escreve tabelas)
+        const leituraValidadaParaPdf = finalText;
+        if (activeRelatorio?.relatorio_markdown) {
+          finalText = `${finalText}\n\n---\n\n${activeRelatorio.relatorio_markdown}`;
         }
 
         history.push({ role: 'assistant', content: finalText });
@@ -1073,7 +1184,7 @@ export async function askConversationalCopilot(
 
         const capturedShoppingList = getLatestTurnShoppingList(secContext.farmaciaId, sessionId, turnoAtual);
 
-        // Gravação assíncrona Fase 0 (CopilotInteracao + CopilotEtapa) — fire-and-forget
+        // Gravação assíncrona Fase 0 (CopilotInteracao + CopilotEtapa) — texto_referencias = antes da validação
         tracer.persistAsync(prisma, {
           utilizadorId: (secContext as any).utilizadorId || null,
           perfil: secContext.perfil || null,
@@ -1082,8 +1193,9 @@ export async function askConversationalCopilot(
           pergunta: question,
           intencao: intentInfo.intent,
           parametros: ferramentasExecutadas.length > 0 ? { ferramentas: ferramentasExecutadas.map((f) => ({ nome: f.nome, input: f.input })) } : null,
+          texto_referencias: textoAntesValidacao,
           texto_final: finalText,
-          estado: tracer.reescritas > 0 || tracer.getRegrasFalhadas().length > 0 ? 'ok_com_correcoes' : 'ok',
+          estado: estadoFinal,
           modelo_final: activeModel,
           tokens_in: totalInputTokens,
           tokens_out: totalOutputTokens,
@@ -1118,6 +1230,12 @@ export async function askConversationalCopilot(
           ferramentas: ferramentasExecutadas,
           sessionId,
           interacaoId: tracer.interacaoId,
+          relatorioEstruturado: activeRelatorio
+            ? {
+                ...activeRelatorio,
+                leitura_executiva: leituraValidadaParaPdf,
+              }
+            : undefined,
           mode,
           shoppingList: capturedShoppingList || undefined,
           usage: {
@@ -1181,9 +1299,36 @@ export async function askConversationalCopilot(
             };
           } else if (!resultData) {
             switch (call.name) {
-              case 'relatorio_laboratorio':
-                resultData = await toolRelatorioLaboratorio(prisma, secContext, args);
+              case 'relatorio_laboratorio': {
+                const rawRel: any = await toolRelatorioLaboratorio(prisma, secContext, args);
+                // Guardar no copilot_result_store para gerar result_ref (auditoria Fase 0)
+                if (rawRel && rawRel.ok) {
+                  const storedEnv = saveToolResult({
+                    farmaciaId: secContext.farmaciaId,
+                    sessionId,
+                    turno: turnoAtual,
+                    ferramenta: 'relatorio_laboratorio',
+                    input: args,
+                    meta: rawRel.meta || {},
+                    colunas: ['cnp', 'designacao', 'dci', 'vendas_eur', 'vendas_un', 'vmm', 'stock', 'classificacao'],
+                    linhas: (rawRel.top || []).map((p: any) => [
+                      p.cnp,
+                      p.designacao,
+                      p.dci || '',
+                      p.vendas_eur,
+                      p.vendas_un,
+                      p.vmm,
+                      p.stock,
+                      p.classificacao,
+                    ]),
+                    totais: rawRel.totais || {},
+                    limiteModelo: 10,
+                  });
+                  rawRel.result_ref = storedEnv.result_id;
+                }
+                resultData = rawRel;
                 break;
+              }
 
               case 'consultar_vendas':
                 resultData = await toolConsultarVendas(prisma, secContext, args, sessionId, turnoAtual);
@@ -1358,7 +1503,85 @@ export async function askConversationalCopilot(
         }
 
         ferramentasExecutadas.push({ nome: call.name, input: args, resultado: resultData });
-        const jsonStr = JSON.stringify(resultData);
+
+        // Fase 1 (4.1 & 4.2): Validação 1 de dados para relatorio_laboratorio + envio compacto (resumo_modelo)
+        let modelPayloadObj = resultData;
+        if (call.name === 'relatorio_laboratorio' && resultData?.ok) {
+          const valDadosStart = Date.now();
+          const dataVal = validateRelatorioData(resultData, secContext.verFaturacao !== false);
+          dataVal.failedRules.forEach((r) => tracer.markRuleFailed(r));
+          tracer.addEtapa({
+            etapa: 'validacao_dados',
+            nome: 'validateRelatorioData',
+            inicio_ms: valDadosStart - startTime,
+            duracao_ms: Date.now() - valDadosStart,
+            estado: dataVal.ok ? (dataVal.warnings.length > 0 ? 'aviso' : 'ok') : 'falha',
+            detalhe: {
+              ok: dataVal.ok,
+              blocking_errors: dataVal.blockingErrors,
+              warnings: dataVal.warnings,
+              result_ref: resultData.result_ref || null,
+            },
+          });
+
+          if (!dataVal.ok) {
+            const duracaoMs = Date.now() - startTime;
+            const custoEstimadoEur = calculateClaudeCostEur(
+              activeModel,
+              totalInputTokens,
+              totalOutputTokens,
+              totalCacheCreationTokens,
+              totalCacheReadTokens
+            );
+            const blockedMsg =
+              'Foi detetada uma inconsistência nos dados calculados para este relatório. A análise não foi entregue para garantir rigor; a equipa técnica foi notificada no registo de auditoria.';
+            tracer.persistAsync(prisma, {
+              utilizadorId: (secContext as any).utilizadorId || null,
+              perfil: secContext.perfil || null,
+              sessionId,
+              modo: mode,
+              pergunta: question,
+              intencao: intentInfo.intent,
+              texto_final: blockedMsg,
+              estado: 'bloqueado_dados',
+              erro_codigo: dataVal.failedRules.join(','),
+              erro_mensagem: dataVal.blockingErrors.join(' | '),
+              modelo_final: activeModel,
+              tokens_in: totalInputTokens,
+              tokens_out: totalOutputTokens,
+              tokens_cache_write: totalCacheCreationTokens,
+              tokens_cache_read: totalCacheReadTokens,
+              custo_eur: custoEstimadoEur,
+              duracao_ms: duracaoMs,
+            });
+            return {
+              text: blockedMsg,
+              toolsUsed,
+              sessionId,
+              interacaoId: tracer.interacaoId,
+              mode,
+              usage: {
+                inputTokens: totalInputTokens,
+                outputTokens: totalOutputTokens,
+                cacheCreationTokens: totalCacheCreationTokens,
+                cacheReadTokens: totalCacheReadTokens,
+                custoEstimadoEur,
+                duracaoMs,
+              },
+            };
+          }
+
+          activeRelatorio = resultData;
+          // O modelo recebe APENAS o resumo_modelo compacto (<= 2.5k tokens), nunca as tabelas gigantes!
+          modelPayloadObj = {
+            ok: true,
+            result_ref: resultData.result_ref,
+            ...resultData.resumo_modelo,
+          };
+        }
+
+        const modelJsonStr = JSON.stringify(modelPayloadObj);
+        const fullJsonStr = JSON.stringify(resultData);
 
         tracer.addEtapa({
           etapa: 'ferramenta',
@@ -1368,20 +1591,26 @@ export async function askConversationalCopilot(
           estado: resultData?.ok === false ? 'falha' : 'ok',
           detalhe: {
             args,
-            n_linhas: Array.isArray(resultData?.linhas) ? resultData.linhas.length : (Array.isArray(resultData?.top) ? resultData.top.length : null),
+            n_linhas: Array.isArray(resultData?.linhas)
+              ? resultData.linhas.length
+              : Array.isArray(resultData?.top)
+                ? resultData.top.length
+                : null,
             result_ref: resultData?.result_ref || null,
-            payload_bytes: jsonStr.length,
+            lacunas: resultData?.lacunas || null,
+            payload_modelo_bytes: modelJsonStr.length,
+            payload_completo_bytes: fullJsonStr.length,
           },
         });
 
         toolResults.push({
           type: 'tool_result',
           tool_use_id: call.id,
-          content: jsonStr,
+          content: modelJsonStr,
         });
-        toolResultsJson.push(jsonStr);
+        turnToolResultsJson.push(fullJsonStr);
         const sk = sessionKnownCnps.get(sessionId) || new Set<string>();
-        extractCnps(jsonStr).forEach((x) => sk.add(x));
+        extractCnps(fullJsonStr).forEach((x) => sk.add(x));
         sessionKnownCnps.set(sessionId, sk);
       }
 

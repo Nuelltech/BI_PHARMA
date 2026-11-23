@@ -304,3 +304,410 @@ export function validateCopilotAnswer(
 
   return { ok: problems.length === 0, problems };
 }
+
+// ============================================================================
+// FASE 1 — VALIDAÇÃO 1 (DADOS: D1–D5) E VALIDAÇÃO 2 (TEXTO FRASE A FRASE: T1–T7)
+// ============================================================================
+
+export interface DataValidationResult {
+  ok: boolean;
+  blockingErrors: string[];
+  warnings: string[];
+  failedRules: string[];
+}
+
+export function validateRelatorioData(relatorio: any, verFaturacao: boolean): DataValidationResult {
+  const blockingErrors: string[] = [];
+  const warnings: string[] = [];
+  const failedRules: string[] = [];
+
+  if (!relatorio || !relatorio.totais) {
+    return {
+      ok: false,
+      blockingErrors: ['[D1] Relatório sem bloco de totais.'],
+      warnings: [],
+      failedRules: ['D1'],
+    };
+  }
+
+  // D1: Soma das classes = total de produtos do âmbito; soma dos € = total de vendas (tol 0,02 €)
+  const classes = Array.isArray(relatorio.classes_resumo) ? relatorio.classes_resumo : [];
+  const sumProds = classes.reduce((acc: number, c: any) => acc + Number(c.n_produtos || 0), 0);
+  const expectedProds = Number(relatorio.totais.produtos_ambito_total ?? 0);
+  if (classes.length === 0 || sumProds !== expectedProds) {
+    blockingErrors.push(`[D1] Soma das classes (${sumProds}) difere do total de produtos do âmbito (${expectedProds}).`);
+    failedRules.push('D1');
+  }
+
+  if (verFaturacao && relatorio.totais.faturacao_eur !== null) {
+    const sumEur = classes.reduce((acc: number, c: any) => acc + Number(c.vendas_eur || 0), 0);
+    const expectedEur = Number(relatorio.totais.faturacao_eur || 0);
+    if (Math.abs(sumEur - expectedEur) > 0.05) {
+      blockingErrors.push(
+        `[D1] Soma dos € por classe (${sumEur.toFixed(2)} €) difere do total faturado (${expectedEur.toFixed(2)} €).`
+      );
+      if (!failedRules.includes('D1')) failedRules.push('D1');
+    }
+  }
+
+  // D2: Imobilizado sem duplicados
+  if (relatorio.imobilizado_total && Array.isArray(relatorio.imobilizado_total.produtos)) {
+    const cnps = relatorio.imobilizado_total.produtos.map((p: any) => p.cnp);
+    if (new Set(cnps).size !== cnps.length) {
+      blockingErrors.push('[D2] Detetada contagem dupla de CNPs no bloco de imobilizado.');
+      failedRules.push('D2');
+    }
+  }
+
+  // D3: Rótulo de período coerente com o ano pedido
+  const anoPedido = String(relatorio.meta?.ano || '');
+  const rotulo = String(relatorio.meta?.periodo_rotulo || '');
+  if (anoPedido && !rotulo.includes(anoPedido)) {
+    blockingErrors.push(`[D3] Rótulo de período (${rotulo}) não corresponde ao ano pedido (${anoPedido}).`);
+    failedRules.push('D3');
+  }
+
+  // D4: Valores anómalos marcados como REVER_DADOS (aviso não bloqueante)
+  const reverCount = Number(relatorio.rever_dados?.total_contagem || 0);
+  if (reverCount > 0) {
+    warnings.push(`[D4] ${reverCount} produto(s) assinalado(s) como REVER_DADOS por anomalia de custo/margem/stock.`);
+  }
+
+  // D5: Permissões — sem verFaturacao não pode existir faturação em €
+  if (!verFaturacao) {
+    const hasEurLeak =
+      relatorio.totais.faturacao_eur !== null ||
+      (relatorio.resumo_modelo?.totais?.faturacao_eur !== null &&
+        relatorio.resumo_modelo?.totais?.faturacao_eur !== undefined);
+    if (hasEurLeak) {
+      blockingErrors.push('[D5] Valores de faturação em € presentes sem permissão ver_faturacao.');
+      failedRules.push('D5');
+    }
+  }
+
+  return {
+    ok: blockingErrors.length === 0,
+    blockingErrors,
+    warnings,
+    failedRules,
+  };
+}
+
+export interface CatalogTermEntry {
+  termNorm: string;
+  original: string;
+  isMsrm: boolean;
+  isChronic: boolean;
+}
+
+export interface SentenceValidationRemoval {
+  sentence: string;
+  rule: string;
+  reason: string;
+}
+
+export interface LeituraValidationResult {
+  ok: boolean;
+  sanitizedText: string;
+  removedSentences: SentenceValidationRemoval[];
+  failedRules: string[];
+  needsRewrite: boolean;
+}
+
+export function normalizeTextForMatch(str: string): string {
+  return (str || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s/+-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const COMMON_STOPWORDS = new Set([
+  'teva', 'ratiopharm', 'bial', 'generis', 'sandoz', 'cinfa', 'krka', 'viatris', 'mylan', 'bluepharma',
+  'farmacia', 'stock', 'vendas', 'venda', 'euros', 'unidades', 'meses', 'mes', 'ano', 'anos', 'dias',
+  'produto', 'produtos', 'medicamento', 'medicamentos', 'comp', 'caps', 'blister', 'frasco', 'spray',
+  'nasal', 'creme', 'gel', 'solucao', 'oral', 'susp', 'pulv', 'revest', 'pelic', 'dose', 'doses',
+  'para', 'como', 'mais', 'menos', 'muito', 'pouco', 'com', 'sem', 'pelo', 'pela', 'este', 'esta',
+  'estes', 'estas', 'isso', 'total', 'media', 'margem', 'custo', 'preco', 'valor', 'valores', 'dados',
+  'rutura', 'mono', 'monos', 'excesso', 'validade', 'validades', 'acao', 'acoes', 'manter', 'repor',
+  'devolver', 'encomenda', 'transferir', 'campanha', 'promocao', 'desconto', 'balcao', 'fornecedor',
+  'cronico', 'cronicos', 'doente', 'doentes', 'receita', 'msrm', 'mnsrm', 'livre', 'relatorio',
+  'periodo', 'outubro', 'setembro', 'janeiro', 'dezembro', 'referencia', 'referencias', 'lista',
+  'top', 'baixo', 'baixa', 'baixas', 'alto', 'alta', 'altas', 'ativo', 'ativos', 'atual', 'atuais',
+  'imobilizado', 'cobertura', 'rotacao', 'faturacao', 'laboratorio', 'laboratorios', 'catalogo',
+  'clinico', 'clinica', 'gestao', 'direcao', 'tecnica', 'prioritario', 'prioritaria', 'imediato',
+  'imediata', 'seguranca', 'reposicao', 'devolucao', 'auditoria', 'sifarma', 'revisao', 'revisoes',
+  'calcio', // tratado especificamente via composto ou catálogo
+]);
+
+/**
+ * Extrai todos os valores numéricos reais de um objeto de dados (excluindo strings de CNP/IDs)
+ * para validação numérica T1 rigorosa (nunca substring sobre JSON!).
+ */
+export function collectAllowedNumbers(obj: any, out = new Set<number>()): Set<number> {
+  if (obj === null || obj === undefined) return out;
+  if (typeof obj === 'number' && Number.isFinite(obj)) {
+    out.add(Math.round(obj * 100) / 100);
+    out.add(Math.round(obj * 10) / 10);
+    out.add(Math.round(obj));
+    return out;
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) collectAllowedNumbers(item, out);
+    return out;
+  }
+  if (typeof obj === 'object') {
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === 'cnp' || k === 'cnp_codigo' || k === 'farmaciaId' || k === 'id' || k === 'relatorio_markdown') continue;
+      collectAllowedNumbers(v, out);
+    }
+  }
+  return out;
+}
+
+function parsePtNumber(raw: string): number {
+  const cleaned = raw.replace(/\s/g, '').replace(/\.(?=\d{3}(?:[,\s]|$))/g, '').replace(',', '.');
+  return parseFloat(cleaned);
+}
+
+function isNumberAllowed(val: number, allowed: Set<number>): boolean {
+  if (!Number.isFinite(val)) return true;
+  if (allowed.has(val) || allowed.has(Math.round(val * 100) / 100) || allowed.has(Math.round(val * 10) / 10)) {
+    return true;
+  }
+  for (const a of allowed) {
+    const tol = Math.max(0.06, Math.abs(a) * 0.002); // tolerância para arredondamento de apresentação
+    if (Math.abs(val - a) <= tol) return true;
+  }
+  return false;
+}
+
+const MSRM_MARKETING_OR_PRICE_RX =
+  /\b(campanha(s)?|promo[çc][ãa]o|promo[çc][õo]es|desconto(s)?|pack(s)?|liquidar|liquida[çc][ãa]o|escoar\s+no\s+balc[ãa]o|destaque\s+(de|no)\s+balc[ãa]o|pague\s+\d+\s+leve\s+\d+|(aumentar|subir|alterar|renegociar|reinterpretar|reinterpreta[çc][ãa]o|ajustar)\s+(o\s+|de\s+|do\s+)?(pvp|pre[çc]o))\b/i;
+
+const CHRONIC_FORBIDDEN_RX =
+  /\b(devolver\s+(todo|tudo|a\s+totalidade|todas?\s+as?\s+\d*\s*un)|descontinuar|n[ãa]o\s+manter|deixar\s+de\s+vender|n[ãa]o\s+repor|eliminar\s+do\s+stock|retirar\s+da\s+farm[áa]cia)\b/i;
+
+const UNFOUNDED_ESTIMATE_RX =
+  /\b(recuperar\s+\d[\d.,\s–-]*€\s+em\s+\d+\s*dias|redu[çc][ãa]o\s+de\s+\d+\s*[–-]\s*\d+\s*%|poupan[çc]a\s+estimada\s+de\s+\d|aumentar\s+vendas\s+em\s+\d+\s*%)\b/i;
+
+export function validateAndSanitizeLeitura(
+  rawText: string,
+  options: {
+    relatorio?: any;
+    turnToolResultsJson: string[];
+    catalogTerms?: CatalogTermEntry[];
+  }
+): LeituraValidationResult {
+  const removedSentences: SentenceValidationRemoval[] = [];
+  const failedRulesSet = new Set<string>();
+
+  const turnCnps = new Set<string>();
+  for (const j of options.turnToolResultsJson) {
+    extractCnps(j).forEach((c) => turnCnps.add(c));
+  }
+
+  // Números permitidos extraídos rigorosamente do resumo_modelo / relatorio (nunca CNPs!)
+  const allowedNumbers = new Set<number>([2024, 2025, 2026, 2027, 1, 2, 3, 4, 5, 6, 10, 12, 30, 60, 90, 180, 365, 100]);
+  if (options.relatorio) {
+    collectAllowedNumbers(options.relatorio.resumo_modelo || options.relatorio, allowedNumbers);
+    collectAllowedNumbers(options.relatorio.totais, allowedNumbers);
+    collectAllowedNumbers(options.relatorio.classes_resumo, allowedNumbers);
+    collectAllowedNumbers(options.relatorio.top, allowedNumbers);
+    collectAllowedNumbers(options.relatorio.validades, allowedNumbers);
+    collectAllowedNumbers(options.relatorio.monos, allowedNumbers);
+    collectAllowedNumbers(options.relatorio.em_rutura, allowedNumbers);
+    collectAllowedNumbers(options.relatorio.sem_vendas, allowedNumbers);
+    collectAllowedNumbers(options.relatorio.imobilizado_total, allowedNumbers);
+  }
+
+  // Índice de produtos presentes no relatório atual (para T2, T4, T5)
+  const relProds: Array<{
+    cnp: string;
+    normName: string;
+    normDci: string;
+    firstWord: string;
+    isMsrm: boolean;
+    isChronic: boolean;
+    classificacao: string;
+  }> = [];
+
+  const rawProdList =
+    options.relatorio?.todos_produtos_indice ||
+    [
+      ...(options.relatorio?.top || []),
+      ...(options.relatorio?.monos?.produtos || []),
+      ...(options.relatorio?.validades?.produtos || []),
+      ...(options.relatorio?.em_rutura?.produtos || []),
+      ...(options.relatorio?.sem_vendas?.produtos || []),
+      ...(options.relatorio?.vendas_baixas?.produtos || []),
+    ];
+
+  for (const p of rawProdList) {
+    const normName = normalizeTextForMatch(p.designacao || p.nome || '');
+    const normDci = normalizeTextForMatch(p.dci || '');
+    const firstWord = normName.split(' ')[0] || '';
+    const tipo = String(p.tipo_venda || p.tipo || '').toUpperCase();
+    relProds.push({
+      cnp: String(p.cnp || ''),
+      normName,
+      normDci,
+      firstWord,
+      isMsrm: tipo.includes('MSRM') || tipo.includes('RECEITA'),
+      isChronic: Boolean(p.eh_terapeutica_cronica ?? isTherapeuticChronic(p.dci, p.designacao || p.nome)),
+      classificacao: String(p.classificacao || p.acao || ''),
+    });
+  }
+
+  // Divide em linhas e frases preservando parágrafos/bullets
+  const lines = (rawText || '').split('\n');
+  const keptLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      keptLines.push(line);
+      continue;
+    }
+
+    // Divide a linha em frases (mantendo bullets como unidade ou dividindo por ". ")
+    const sentences = trimmed.split(/(?<=[.!?])\s+(?=[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ0-9\-•*])/).filter(Boolean);
+    const keptSentences: string[] = [];
+
+    for (const sentence of sentences) {
+      const sNorm = normalizeTextForMatch(sentence);
+      let violation: { rule: string; reason: string } | null = null;
+
+      // V4: CNPs apenas deste turno
+      const citedCnps = extractCnps(sentence);
+      for (const cnp of citedCnps) {
+        if (!turnCnps.has(cnp)) {
+          violation = { rule: 'V4', reason: `CNP ${cnp} não consta nos resultados deste turno.` };
+          break;
+        }
+      }
+
+      // T7: Estimativas sem base
+      if (!violation && UNFOUNDED_ESTIMATE_RX.test(sentence)) {
+        violation = { rule: 'T7', reason: 'Estimativa ou projeção numérica sem base nos dados.' };
+      }
+
+      // T1: Números em € e % verificados numericamente (não substring!)
+      if (!violation && options.relatorio) {
+        const moneyMatches = sentence.match(/\b\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?\s*€/g) || [];
+        for (const m of moneyMatches) {
+          const val = parsePtNumber(m.replace('€', ''));
+          if (!isNumberAllowed(val, allowedNumbers)) {
+            violation = { rule: 'T1', reason: `Valor monetário ${m.trim()} não existe nos dados do relatório.` };
+            break;
+          }
+        }
+      }
+
+      // T2: Produtos/DCIs do catálogo ProdutoMestre que NÃO estão no relatório
+      if (!violation && options.relatorio && options.catalogTerms && options.catalogTerms.length > 0) {
+        for (const entry of options.catalogTerms) {
+          if (entry.termNorm.length < 5 || COMMON_STOPWORDS.has(entry.termNorm)) continue;
+          const rx = new RegExp(`\\b${entry.termNorm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+          if (rx.test(sNorm)) {
+            // Verifica se este termo existe em algum produto do relatório
+            const inReport = relProds.some(
+              (rp) =>
+                rp.normName.includes(entry.termNorm) ||
+                rp.normDci.includes(entry.termNorm) ||
+                (rp.firstWord.length >= 5 && entry.termNorm.includes(rp.firstWord))
+            );
+            if (!inReport) {
+              violation = {
+                rule: 'T2',
+                reason: `Produto/substância "${entry.original}" citado na frase não consta no relatório deste laboratório.`,
+              };
+              break;
+            }
+          }
+        }
+      }
+
+      // T4: MSRM sem marketing nem alteração/reinterpretação de preço (sem depender da palavra literal "MSRM")
+      if (!violation && MSRM_MARKETING_OR_PRICE_RX.test(sentence)) {
+        const isExplicitProhibition = /\b(proibid[oa]|n[ãa]o\s+podem?|nunca\s+podem?|vedad[oa])\b/i.test(sentence);
+        if (!isExplicitProhibition) {
+          const citesLiteralMsrm = /\bMSRM\b/i.test(sentence);
+          const citesMsrmProduct =
+            relProds.some(
+              (rp) =>
+                rp.isMsrm &&
+                ((rp.cnp && sentence.includes(rp.cnp)) ||
+                  (rp.firstWord.length >= 5 && !COMMON_STOPWORDS.has(rp.firstWord) && sNorm.includes(rp.firstWord)))
+            ) ||
+            (options.catalogTerms || []).some(
+              (ct) =>
+                ct.isMsrm &&
+                ct.termNorm.length >= 5 &&
+                !COMMON_STOPWORDS.has(ct.termNorm) &&
+                sNorm.includes(ct.termNorm)
+            );
+
+          if (citesLiteralMsrm || citesMsrmProduct) {
+            violation = {
+              rule: 'T4',
+              reason: 'Proibição legal: frase associa medicamento MSRM a campanha, promoção, desconto, pack ou alteração/reinterpretação de preço.',
+            };
+          }
+        }
+      }
+
+      // T5: Terapêutica crónica nunca pode receber devolver tudo / descontinuar / não manter / não repor
+      if (!violation && CHRONIC_FORBIDDEN_RX.test(sentence)) {
+        const citesChronic =
+          isTherapeuticChronic(null, sentence) ||
+          relProds.some(
+            (rp) =>
+              rp.isChronic &&
+              ((rp.cnp && sentence.includes(rp.cnp)) ||
+                (rp.firstWord.length >= 5 && !COMMON_STOPWORDS.has(rp.firstWord) && sNorm.includes(rp.firstWord)))
+          );
+        if (citesChronic) {
+          violation = {
+            rule: 'T5',
+            reason: 'Violação clínica: terapêutica crónica não pode receber recomendação de devolver tudo, descontinuar ou não manter.',
+          };
+        }
+      }
+
+      if (violation) {
+        failedRulesSet.add(violation.rule);
+        removedSentences.push({
+          sentence,
+          rule: violation.rule,
+          reason: violation.reason,
+        });
+      } else {
+        keptSentences.push(sentence);
+      }
+    }
+
+    if (keptSentences.length > 0) {
+      keptLines.push(keptSentences.join(' '));
+    }
+  }
+
+  const sanitizedText = keptLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  const remainingSentenceCount = sanitizedText
+    .split(/[.!?\n]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 15).length;
+
+  const failedRules = Array.from(failedRulesSet);
+  const needsRewrite = removedSentences.length > 0 && remainingSentenceCount < 2;
+
+  return {
+    ok: removedSentences.length === 0,
+    sanitizedText,
+    removedSentences,
+    failedRules,
+    needsRewrite,
+  };
+}

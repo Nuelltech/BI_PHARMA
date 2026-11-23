@@ -91,17 +91,22 @@ export function computeSafeMarginPct(
 }
 
 export type AcaoRecomendada =
+  | 'REPOR'
   | 'MANTER'
-  | 'REPOR_STOCK'
-  | 'MANTER_STOCK_MINIMO'
-  | 'TRABALHAR_SOB_ENCOMENDA'
-  | 'DEVOLVER_OU_TRANSFERIR'
+  | 'STOCK_MINIMO'
+  | 'TRABALHAR_ENCOMENDA'
+  | 'DEVOLVER_EXCESSO'
+  | 'DEVOLVER_TUDO'
+  | 'TRANSFERIR'
   | 'ESCOAMENTO_BALCAO'
-  | 'DESCONTINUAR';
+  | 'DESCONTINUAR'
+  | 'REVER_DADOS';
 
 export interface ClassificacaoProduto {
   classificacao: AcaoRecomendada;
   motivo: string;
+  motivo_codigo: string;
+  unidades_excesso?: number;
 }
 
 export function classifyProductAction(item: {
@@ -116,21 +121,59 @@ export function classifyProductAction(item: {
   ehExcesso: boolean;
   ehRiscoCaducidade: boolean;
   mesesAteValidade?: number | null;
+  custoUnit?: number | null;
+  pvp?: number | null;
+  dadoSuspeito?: boolean;
+  janelaMonoDias?: number; // Preparado para Fase 2
 }): ClassificacaoProduto {
   const isMsrm =
     (item.tipoVenda || '').toUpperCase().includes('MSRM') ||
     (item.tipoVenda || '').toUpperCase().includes('RECEITA');
   const isChronic = isTherapeuticChronic(item.dci, item.designacao);
 
-  // 1. Em rutura com histórico de vendas comprovado (P1.5)
-  if (item.vendasUn > 0 && item.stock === 0) {
+  // 0. D4: Valores anómalos / dados suspeitos -> REVER_DADOS (fora das recomendações comerciais)
+  const custoAnomalo =
+    item.custoUnit !== null &&
+    item.custoUnit !== undefined &&
+    item.custoUnit > 0 &&
+    item.custoUnit <= 0.20 &&
+    item.pvp !== null &&
+    item.pvp !== undefined &&
+    item.pvp >= 2.0;
+  const margemAnomala = item.margemPct !== null && item.margemPct > 90;
+  const stockNegativo = item.stock < 0;
+
+  if (item.dadoSuspeito || custoAnomalo || margemAnomala || stockNegativo) {
+    const razoes: string[] = [];
+    if (stockNegativo) razoes.push(`stock negativo (${item.stock} un)`);
+    if (custoAnomalo) razoes.push(`custo unitário anómalo (${Number(item.custoUnit).toFixed(2)} € vs PVP ${Number(item.pvp).toFixed(2)} €)`);
+    if (margemAnomala) razoes.push(`margem > 90% (${item.margemPct}%)`);
     return {
-      classificacao: 'REPOR_STOCK',
-      motivo: 'Produto com procura ativa em rutura de stock. Repor unidades de acordo com o VMM.',
+      classificacao: 'REVER_DADOS',
+      motivo_codigo: 'dado_suspeito',
+      motivo: `Dado suspeito no ERP (${razoes.join('; ') || 'anomalia de registo'}). Auditar ficha no Sifarma antes de tomar decisão comercial.`,
     };
   }
 
-  // 2. Validades em risco iminente (< 6 meses) com devolução proporcional
+  // 1. Em rutura com histórico de vendas comprovado (4.4: REPOR se VMM >= 1 ou crónico; caso contrário TRABALHAR_ENCOMENDA)
+  if (item.vendasUn > 0 && item.stock === 0) {
+    if (item.vmm >= 1.0 || isChronic) {
+      return {
+        classificacao: 'REPOR',
+        motivo_codigo: isChronic ? 'cronico' : 'rutura_com_procura',
+        motivo: isChronic
+          ? 'Terapêutica crónica em rutura de stock. Repor imediatamente para assegurar continuidade clínica.'
+          : 'Produto com procura ativa (VMM >= 1.0) em rutura de stock. Repor unidades de acordo com o VMM.',
+      };
+    }
+    return {
+      classificacao: 'TRABALHAR_ENCOMENDA',
+      motivo_codigo: 'rutura_com_procura',
+      motivo: 'Produto em rutura com procura pontual (VMM < 1.0, não crónico). Trabalhar sob encomenda diária.',
+    };
+  }
+
+  // 2. Validades em risco iminente (< 6 meses) com devolução proporcional (DEVOLVER_EXCESSO)
   if (item.ehRiscoCaducidade && item.stock > 0) {
     const meses = item.mesesAteValidade && item.mesesAteValidade > 0 ? item.mesesAteValidade : 4;
     const unidadesVendaEsperada = Math.ceil(item.vmm * meses);
@@ -138,27 +181,47 @@ export function classifyProductAction(item: {
 
     if (unidadesDevolver > 0 && unidadesVendaEsperada > 0) {
       return {
-        classificacao: 'DEVOLVER_OU_TRANSFERIR',
-        motivo: `Validade próxima (${meses} meses). Devolver ${unidadesDevolver} un em excesso ao fornecedor; manter ${unidadesVendaEsperada} un para venda normal até à caducidade.`,
+        classificacao: 'DEVOLVER_EXCESSO',
+        motivo_codigo: `validade_${meses}_meses`,
+        unidades_excesso: unidadesDevolver,
+        motivo: `Validade próxima (${meses} meses). Devolver apenas ${unidadesDevolver} un em excesso ao fornecedor; manter ${unidadesVendaEsperada} un para venda normal até à caducidade.`,
       };
     }
     if (unidadesDevolver === 0 && item.vmm > 0) {
       return {
         classificacao: 'MANTER',
+        motivo_codigo: `validade_${meses}_meses`,
         motivo: `Validade próxima (${meses} meses), mas rotação ativa (VMM ${item.vmm.toFixed(2)}) escoará todo o stock atual (${item.stock} un) antes da caducidade.`,
       };
     }
+    // Crónico nunca recebe DEVOLVER_TUDO
+    if (isChronic) {
+      if (item.stock > 1) {
+        return {
+          classificacao: 'DEVOLVER_EXCESSO',
+          motivo_codigo: 'cronico',
+          unidades_excesso: item.stock - 1,
+          motivo: `Terapêutica crónica com validade próxima (${meses} meses). Devolver ${item.stock - 1} un em excesso e manter 1 un de segurança.`,
+        };
+      }
+      return {
+        classificacao: 'STOCK_MINIMO',
+        motivo_codigo: 'cronico',
+        motivo: `Terapêutica crónica com 1 un em stock e validade próxima (${meses} meses). Monitorizar dispensa ao doente habitual.`,
+      };
+    }
+    // MSRM nunca recebe ESCOAMENTO_BALCAO
     if (isMsrm) {
       return {
-        classificacao: 'DEVOLVER_OU_TRANSFERIR',
-        motivo:
-          'MSRM com validade próxima (< 6 meses) sem rotação suficiente. Devolução prioritária ao fornecedor ou transferência entre lojas. (MSRM: proibida liquidação promocional)',
+        classificacao: 'DEVOLVER_TUDO',
+        motivo_codigo: `validade_${meses}_meses`,
+        motivo: `MSRM com validade próxima (${meses} meses) sem procura suficiente. Devolução total ao fornecedor ou transferência entre farmácias.`,
       };
     }
     return {
       classificacao: 'ESCOAMENTO_BALCAO',
-      motivo:
-        'MNSRM com validade próxima. Devolver ao armazém ou colocar em destaque imediato de balcão para escoamento rápido.',
+      motivo_codigo: `validade_${meses}_meses`,
+      motivo: `MNSRM/Venda Livre com validade próxima (${meses} meses). Colocar em destaque imediato de balcão para escoamento ou devolver ao armazém.`,
     };
   }
 
@@ -166,31 +229,42 @@ export function classifyProductAction(item: {
   if (item.vmm >= 2.0 && item.vendasUn > 0) {
     return {
       classificacao: 'MANTER',
-      motivo:
-        'Locomotiva de faturação (VMM >= 2.0). Manter stock permanente e níveis de segurança ajustados.',
+      motivo_codigo: 'alta_rotacao',
+      motivo: 'Locomotiva de faturação (VMM >= 2.0). Manter stock permanente e níveis de segurança ajustados.',
     };
   }
 
   // 4. Sem vendas ou Mono com excesso de stock
   if (item.stock > 0 && (item.vendasUn === 0 || (item.ehMono && item.ehExcesso))) {
-    if (isMsrm) {
-      if (isChronic) {
-        return {
-          classificacao: 'TRABALHAR_SOB_ENCOMENDA',
-          motivo:
-            'MSRM de terapêutica crónica sem rotação recente. Manter 1 un de segurança ou trabalhar sob encomenda para doente crónico habitual.',
-        };
-      }
+    // Crónico nunca recebe DEVOLVER_TUDO
+    if (isChronic) {
       return {
-        classificacao: 'DEVOLVER_OU_TRANSFERIR',
-        motivo:
-          'MSRM sem vendas ou mono em excesso. Devolver ao fornecedor ou transferir para outra farmácia. (MSRM: proibida liquidação promocional)',
+        classificacao: 'TRABALHAR_ENCOMENDA',
+        motivo_codigo: 'cronico',
+        motivo: 'Terapêutica crónica sem rotação recente. Manter no máximo 1 un de segurança ou trabalhar sob encomenda para doente crónico habitual.',
+      };
+    }
+    if (item.ehMono && item.ehExcesso && item.vendasUn > 0 && item.stock > 1) {
+      const alvo = Math.max(1, Math.ceil(item.vmm * 4));
+      const excUn = Math.max(1, item.stock - alvo);
+      return {
+        classificacao: 'DEVOLVER_EXCESSO',
+        motivo_codigo: 'excesso_cobertura',
+        unidades_excesso: excUn,
+        motivo: `Stock em excesso sem vendas recentes. Devolver ${excUn} un excedentes ao fornecedor e manter ${Math.max(1, item.stock - excUn)} un.`,
+      };
+    }
+    if (isMsrm) {
+      return {
+        classificacao: 'DEVOLVER_TUDO',
+        motivo_codigo: item.vendasUn === 0 ? 'sem_vendas' : 'mono_90_dias',
+        motivo: 'MSRM sem vendas no período. Devolver ao fornecedor ou transferir para outra farmácia do grupo.',
       };
     }
     return {
-      classificacao: 'DEVOLVER_OU_TRANSFERIR',
-      motivo:
-        'Stock imobilizado sem vendas. Devolver ao fornecedor, transferir ou colocar em destaque/promoção no balcão.',
+      classificacao: 'DEVOLVER_TUDO',
+      motivo_codigo: item.vendasUn === 0 ? 'sem_vendas' : 'mono_90_dias',
+      motivo: 'Stock imobilizado sem vendas no período. Devolver ao fornecedor ou transferir.',
     };
   }
 
@@ -198,34 +272,36 @@ export function classifyProductAction(item: {
   if (item.vmm < 1.0 && item.vendasUn > 0) {
     if (isChronic) {
       return {
-        classificacao: 'MANTER_STOCK_MINIMO',
-        motivo:
-          'Terapêutica crónica com procura pontual. Manter stock mínimo de 1 unidade para assegurar continuidade ao doente crónico.',
+        classificacao: 'STOCK_MINIMO',
+        motivo_codigo: 'cronico',
+        motivo: 'Terapêutica crónica com procura pontual. Manter stock mínimo de 1 unidade para assegurar continuidade ao doente crónico.',
       };
     }
     if (isMsrm) {
       if (item.margemPct !== null && item.margemPct < 30) {
         return {
-          classificacao: 'TRABALHAR_SOB_ENCOMENDA',
-          motivo:
-            'MSRM com rotação baixa (VMM < 1.0) e margem reduzida (< 30%). Trabalhar sob encomenda diária.',
+          classificacao: 'TRABALHAR_ENCOMENDA',
+          motivo_codigo: 'margem_baixa',
+          motivo: 'MSRM com rotação baixa (VMM < 1.0) e margem reduzida (< 30%). Trabalhar sob encomenda diária.',
         };
       }
       return {
-        classificacao: 'MANTER_STOCK_MINIMO',
+        classificacao: 'STOCK_MINIMO',
+        motivo_codigo: 'alta_rotacao',
         motivo: 'MSRM com rotação lenta. Manter stock estritamente mínimo (1 un).',
       };
     }
-    // MNSRM
+    // MNSRM / Venda Livre (MSRM nunca recebe DESCONTINUAR)
     if (item.margemPct !== null && item.margemPct < 30) {
       return {
         classificacao: 'DESCONTINUAR',
-        motivo:
-          'MNSRM com margem < 30% e baixa procura. Descontinuar e substituir por alternativa de maior rotação/margem.',
+        motivo_codigo: 'margem_baixa',
+        motivo: 'MNSRM com margem < 30% e baixa procura. Descontinuar e substituir por alternativa de maior rotação/margem.',
       };
     }
     return {
-      classificacao: 'MANTER_STOCK_MINIMO',
+      classificacao: 'STOCK_MINIMO',
+      motivo_codigo: 'alta_rotacao',
       motivo: 'Manter stock mínimo de segurança.',
     };
   }
@@ -233,6 +309,7 @@ export function classifyProductAction(item: {
   // 6. Rotação moderada padrão (1.0 <= VMM < 2.0)
   return {
     classificacao: 'MANTER',
+    motivo_codigo: 'alta_rotacao',
     motivo: 'Procura regular e stock ajustado. Manter reposição normal.',
   };
 }
@@ -2213,6 +2290,8 @@ export async function toolRelatorioLaboratorio(
     const isChronic = isTherapeuticChronic(dciVal, c.designacao);
     const mesesAteValidade = m?.meses_ate_validade ? Number(m.meses_ate_validade) : null;
 
+    const pvpNum = c.pvp ? Number(c.pvp) : (m?.pvp ? Number(m.pvp) : null);
+
     const action = classifyProductAction({
       tipoVenda: c.tipo_venda || (m ? m.tipo_venda : null),
       dci: dciVal,
@@ -2225,13 +2304,11 @@ export async function toolRelatorioLaboratorio(
       ehExcesso: isExcesso,
       ehRiscoCaducidade: isCaducidade,
       mesesAteValidade,
+      custoUnit,
+      pvp: pvpNum,
     });
 
-    let alertaDados: string | null = null;
-    const pvpNum = c.pvp ? Number(c.pvp) : (m?.pvp ? Number(m.pvp) : null);
-    if (custoUnit > 0 && custoUnit <= 0.20 && pvpNum && pvpNum >= 2.0) {
-      alertaDados = `⚠️ Custo unitário de ${custoUnit.toFixed(2)} € anormalmente baixo face ao PVP de ${pvpNum.toFixed(2)} € (possível bonificação comercial ou amostra).`;
-    }
+    const alertaDados = action.classificacao === 'REVER_DADOS' ? action.motivo : null;
 
     if (s.un > 0 || s.eur > 0) {
       nVendidos++;
@@ -2265,7 +2342,9 @@ export async function toolRelatorioLaboratorio(
       validade: m?.data_validade_mais_proxima ? m.data_validade_mais_proxima.toISOString().slice(0, 10) : null,
       dias_sem_vendas: m ? m.dias_sem_vendas : null,
       classificacao: action.classificacao,
+      motivo_codigo: action.motivo_codigo,
       motivo_classificacao: action.motivo,
+      unidades_excesso: action.unidades_excesso ?? null,
       alerta_dados: alertaDados,
     });
   }
@@ -2288,6 +2367,43 @@ export async function toolRelatorioLaboratorio(
     }
   }
 
+  // Cobertura 100% por classe de ação (D1: soma das contagens = total âmbito; soma dos € = total vendas)
+  const classesMap = new Map<string, { classe: string; n_produtos: number; vendas_un: number; vendas_eur: number | null; stock_custo_eur: number }>();
+  for (const p of prods) {
+    const cur = classesMap.get(p.classificacao) || {
+      classe: p.classificacao,
+      n_produtos: 0,
+      vendas_un: 0,
+      vendas_eur: allowFaturacao ? 0 : null,
+      stock_custo_eur: 0,
+    };
+    cur.n_produtos += 1;
+    cur.vendas_un += p.vendas_un;
+    if (allowFaturacao && cur.vendas_eur !== null && p.vendas_eur !== null) {
+      cur.vendas_eur = Math.round((cur.vendas_eur + p.vendas_eur) * 100) / 100;
+    }
+    cur.stock_custo_eur = Math.round((cur.stock_custo_eur + p.valor_custo_stock) * 100) / 100;
+    classesMap.set(p.classificacao, cur);
+  }
+  const classesResumo = Array.from(classesMap.values()).sort((a, b) => b.n_produtos - a.n_produtos);
+
+  // Lacunas explícitas (Secção 2.3)
+  const lacunas: string[] = [];
+  const semDciCount = prods.filter((p) => !p.dci).length;
+  if (semDciCount > 0) {
+    lacunas.push(`${semDciCount} produtos do laboratório não têm DCI catalogada no ProdutoMestre.`);
+  }
+  const reverDadosProds = prods.filter((p) => p.classificacao === 'REVER_DADOS');
+  if (reverDadosProds.length > 0) {
+    lacunas.push(
+      `${reverDadosProds.length} produto(s) marcados como REVER_DADOS por valores anómalos no ERP (${reverDadosProds
+        .slice(0, 3)
+        .map((p) => `${p.designacao.slice(0, 30)} [CNP ${p.cnp}]`)
+        .join(', ')}).`
+    );
+  }
+  lacunas.push(`Dados de vendas registados até 31-10-${ano} (período ${ano} jan-out).`);
+
   // Blocos analíticos pré-calculados
   const vendasBaixas = prods.filter((p) => p.vendas_un > 0 && p.vmm < 1.0);
   const semVendas = prods.filter((p) => p.stock > 0 && p.vendas_un === 0);
@@ -2309,6 +2425,8 @@ export async function toolRelatorioLaboratorio(
     }
   }
 
+  const periodoRotulo = `${ano} (jan–out)`;
+
   const result = {
     farmaciaId: ctx.farmaciaId,
     ferramenta: 'relatorio_laboratorio',
@@ -2316,6 +2434,7 @@ export async function toolRelatorioLaboratorio(
       tipo: 'relatorio_laboratorio',
       laboratorio: labQuery,
       ano,
+      periodo_rotulo: periodoRotulo,
       data_referencia: '2026-10-31',
       faturacao_oculta: !allowFaturacao,
       regras_aplicadas: {
@@ -2325,6 +2444,7 @@ export async function toolRelatorioLaboratorio(
       },
     },
     totais: {
+      produtos_ambito_total: prods.length,
       produtos_vendidos: nVendidos,
       faturacao_eur: allowFaturacao ? Math.round(totalEur * 100) / 100 : null,
       unidades_vendidas: totalUn,
@@ -2332,7 +2452,15 @@ export async function toolRelatorioLaboratorio(
       unidades_em_stock: unStockTotal,
       valor_stock_custo: Math.round(valorStockCusto * 100) / 100,
       produtos_ativos_total: activeLabProds.length,
+      top10_faturacao_eur: allowFaturacao
+        ? Math.round(topList.reduce((acc, p) => acc + (p.vendas_eur || 0), 0) * 100) / 100
+        : null,
+      top10_pct_faturacao: allowFaturacao
+        ? Number(((topList.reduce((acc, p) => acc + (p.vendas_eur || 0), 0) / Math.max(1, totalEur)) * 100).toFixed(1))
+        : null,
     },
+    classes_resumo: classesResumo,
+    lacunas,
     top: topList,
     vendas_baixas: {
       total_contagem: vendasBaixas.length,
@@ -2362,15 +2490,83 @@ export async function toolRelatorioLaboratorio(
       total_valor_custo: Math.round(validadesRisco.reduce((acc, p) => acc + p.valor_custo_stock, 0) * 100) / 100,
       produtos: validadesRisco,
     },
+    rever_dados: {
+      total_contagem: reverDadosProds.length,
+      produtos: reverDadosProds,
+    },
     imobilizado_total: {
       total_produtos_unicos: imobilizadoSet.size,
       total_valor_custo: Math.round(valorImobilizadoTotal * 100) / 100,
       produtos: produtosImobilizados.slice(0, 20),
     },
+    todos_produtos_indice: prods.map((p) => ({
+      cnp: p.cnp,
+      designacao: p.designacao,
+      dci: p.dci,
+      tipo_venda: p.tipo_venda,
+      eh_terapeutica_cronica: p.eh_terapeutica_cronica,
+      classificacao: p.classificacao,
+      unidades_excesso: p.unidades_excesso,
+    })),
     relatorio_markdown: '',
+    resumo_modelo: {} as any,
   };
 
   result.relatorio_markdown = formatRelatorioLaboratorioMarkdown(result);
+
+  // Secção 4.1: Resumo compacto (<= 2.5k tokens) enviado ao modelo — o modelo NUNCA recebe as tabelas completas
+  const compactItem = (p: any) => ({
+    cnp: p.cnp,
+    nome: p.designacao.slice(0, 48),
+    tipo: p.tipo_venda,
+    cronico: p.eh_terapeutica_cronica,
+    ...(allowFaturacao ? { eur: p.vendas_eur } : {}),
+    un: p.vendas_un,
+    vmm: p.vmm,
+    stock: p.stock,
+    custo_stock: p.valor_custo_stock,
+    acao: p.classificacao,
+    ...(p.unidades_excesso ? { devolver_un: p.unidades_excesso } : {}),
+  });
+
+  result.resumo_modelo = {
+    meta: {
+      laboratorio: labQuery,
+      periodo: periodoRotulo,
+      dados_ate: '2026-10-31',
+      faturacao_oculta: !allowFaturacao,
+    },
+    totais: result.totais,
+    classes_resumo: classesResumo,
+    top_5: topList.slice(0, 5).map(compactItem),
+    em_rutura_top_5: {
+      total: emRutura.length,
+      exemplos: emRutura.slice(0, 5).map(compactItem),
+    },
+    monos_top_5: {
+      total: monos.length,
+      valor_custo: result.monos.total_valor_custo,
+      exemplos: monos.slice(0, 5).map(compactItem),
+    },
+    validades: {
+      total: validadesRisco.length,
+      produtos: validadesRisco.map(compactItem),
+    },
+    sem_vendas: {
+      total: semVendas.length,
+      valor_custo: result.sem_vendas.total_valor_custo,
+      produtos: semVendas.slice(0, 5).map(compactItem),
+    },
+    rever_dados: {
+      total: reverDadosProds.length,
+      produtos: reverDadosProds.slice(0, 5).map(compactItem),
+    },
+    imobilizado_total_eur: result.imobilizado_total.total_valor_custo,
+    imobilizado_produtos_unicos: result.imobilizado_total.total_produtos_unicos,
+    lacunas,
+    instrucao:
+      'As tabelas completas serão inseridas automaticamente pelo código abaixo da tua resposta. Escreve APENAS a Leitura Executiva (5 a 8 linhas): o que se destaca, o que fazer primeiro e porquê, citando apenas produtos, números e ações presentes neste resumo.',
+  };
 
   return {
     ok: true,
@@ -2383,108 +2579,158 @@ export function formatRelatorioLaboratorioMarkdown(res: any): string {
   const ano = res.meta?.ano || 2026;
   const lab = res.meta?.laboratorio || 'Laboratório';
   const ref = res.meta?.data_referencia || '2026-10-31';
+  const periodoRotulo = res.meta?.periodo_rotulo || `${ano} (jan–out)`;
+  const showEur = !res.meta?.faturacao_oculta && t.faturacao_eur !== null;
+  const fmtEur = (v: number | null) =>
+    v !== null && v !== undefined ? `${v.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €` : '—';
 
-  let md = `## 📊 Relatório do Laboratório ${lab} | Ano ${ano}\n`;
-  md += `**Período analisado:** Ano de ${ano} (Jan–Out ${ano}) | **Data de referência:** ${ref}\n\n`;
+  let md = `## Relatório do Laboratório ${lab} — ${periodoRotulo}\n`;
+  md += `**Período analisado:** ${periodoRotulo} | **Vendas registadas até:** ${ref}\n\n`;
 
-  md += `### 🔎 Visão Geral\n`;
-  md += `O laboratório **${lab}** possui **${t.produtos_ativos_total} produtos ativos** no catálogo, dos quais **${t.produtos_vendidos} registaram vendas** em ${ano}.\n\n`;
-  md += `- **Faturação total:** ${t.faturacao_eur !== null ? t.faturacao_eur.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €' : 'Oculta por perfil'}\n`;
+  md += `### Visão Geral\n`;
+  md += `Âmbito analisado: **${t.produtos_ambito_total} produtos ativos** (${t.produtos_vendidos} com vendas no período e ${t.produtos_em_stock} com stock atual).\n\n`;
+  if (showEur) {
+    md += `- **Faturação total:** ${fmtEur(t.faturacao_eur)}\n`;
+  }
   md += `- **Unidades vendidas:** ${t.unidades_vendidas.toLocaleString('pt-PT')} un\n`;
-  md += `- **Produtos com stock:** ${t.produtos_em_stock} referências | ${t.unidades_em_stock} unidades | ${t.valor_stock_custo.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} € imobilizados a preço de custo\n\n`;
+  md += `- **Stock atual:** ${t.produtos_em_stock} referências | ${t.unidades_em_stock} unidades | ${fmtEur(t.valor_stock_custo)} a preço de custo\n`;
+  md += `- **Imobilizado consolidado (união sem duplicados):** ${res.imobilizado_total?.total_produtos_unicos ?? 0} referências | ${fmtEur(res.imobilizado_total?.total_valor_custo ?? 0)}\n\n`;
+
+  // Distribuição 100% por Classe de Ação (D1)
+  if (Array.isArray(res.classes_resumo) && res.classes_resumo.length > 0) {
+    md += `### Distribuição por Ação Recomendada (100% do âmbito: ${t.produtos_ambito_total} produtos)\n\n`;
+    if (showEur) {
+      md += `| Ação | N.º Produtos | Unidades Vendidas | Vendas (€) | Stock Custo (€) |\n`;
+      md += `| :--- | :---: | :---: | :---: | :---: |\n`;
+      for (const c of res.classes_resumo) {
+        md += `| **${c.classe}** | ${c.n_produtos} | ${c.vendas_un.toLocaleString('pt-PT')} | ${fmtEur(c.vendas_eur)} | ${fmtEur(c.stock_custo_eur)} |\n`;
+      }
+      md += `| **TOTAL** | **${t.produtos_ambito_total}** | **${t.unidades_vendidas.toLocaleString('pt-PT')}** | **${fmtEur(t.faturacao_eur)}** | **${fmtEur(t.valor_stock_custo)}** |\n\n`;
+    } else {
+      md += `| Ação | N.º Produtos | Unidades Vendidas |\n`;
+      md += `| :--- | :---: | :---: |\n`;
+      for (const c of res.classes_resumo) {
+        md += `| **${c.classe}** | ${c.n_produtos} | ${c.vendas_un.toLocaleString('pt-PT')} |\n`;
+      }
+      md += `| **TOTAL** | **${t.produtos_ambito_total}** | **${t.unidades_vendidas.toLocaleString('pt-PT')}** |\n\n`;
+    }
+  }
 
   // 1. Top 10
-  md += `### 🏆 Top 10 Produtos Mais Vendidos\n`;
-  md += `Estes são os motores de faturação do laboratório:\n\n`;
-  md += `| CNP | Designação | DCI | Vendas (€) | Un | VMM | Stock | Cob. | Margem % | Classificação |\n`;
-  md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n`;
-  for (const p of res.top) {
-    const vEur = p.vendas_eur !== null ? `${p.vendas_eur.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €` : '—';
-    const cob = p.cobertura_meses !== null ? `${p.cobertura_meses.toFixed(2)} m` : '—';
-    const mrg = p.margem_pct !== null ? `${p.margem_pct.toFixed(1)}%` : '—';
-    md += `| ${p.cnp} | ${p.designacao.slice(0, 48)} | ${p.dci || '—'} | ${vEur} | ${p.vendas_un} | ${p.vmm.toFixed(2)} | ${p.stock} | ${cob} | ${mrg} | **${p.classificacao}** |\n`;
+  md += `### Top 10 Produtos Mais Vendidos\n\n`;
+  if (showEur) {
+    md += `| CNP | Designação | DCI | Vendas (€) | Un | VMM | Stock | Cob. | Margem % | Ação |\n`;
+    md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |\n`;
+    for (const p of res.top) {
+      const cob = p.cobertura_meses !== null ? `${p.cobertura_meses.toFixed(2)} m` : '—';
+      const mrg = p.margem_pct !== null ? `${p.margem_pct.toFixed(1)}%` : '—';
+      md += `| ${p.cnp} | ${p.designacao.slice(0, 48)} | ${p.dci || '—'} | ${fmtEur(p.vendas_eur)} | ${p.vendas_un} | ${p.vmm.toFixed(2)} | ${p.stock} | ${cob} | ${mrg} | **${p.classificacao}** |\n`;
+    }
+  } else {
+    md += `| CNP | Designação | DCI | Un | VMM | Stock | Cob. | Ação |\n`;
+    md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |\n`;
+    for (const p of res.top) {
+      const cob = p.cobertura_meses !== null ? `${p.cobertura_meses.toFixed(2)} m` : '—';
+      md += `| ${p.cnp} | ${p.designacao.slice(0, 48)} | ${p.dci || '—'} | ${p.vendas_un} | ${p.vmm.toFixed(2)} | ${p.stock} | ${cob} | **${p.classificacao}** |\n`;
+    }
   }
-  md += `\n> **Recomendação executiva:** Locomotivas de faturação (VMM ≥ 2.0). Assegurar stock permanente de segurança e monitorizar reposições automáticas.\n\n`;
+  md += `\n`;
 
   // 2. Vendas Baixas
   if (res.vendas_baixas && res.vendas_baixas.produtos.length > 0) {
-    md += `### ⚠️ Produtos com Vendas Baixas (VMM < 1.0)\n`;
-    md += `Identificados **${res.vendas_baixas.total_contagem} produtos** com rotação lenta (apresentando as 10 principais referências):\n\n`;
-    md += `| CNP | Designação | DCI | Vendas (€) | VMM | Stock | Margem % | Ação Recomendada |\n`;
-    md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |\n`;
-    for (const p of res.vendas_baixas.produtos.slice(0, 10)) {
-      const vEur = p.vendas_eur !== null ? `${p.vendas_eur.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €` : '—';
-      const mrg = p.margem_pct !== null ? `${p.margem_pct.toFixed(1)}%` : '—';
-      md += `| ${p.cnp} | ${p.designacao.slice(0, 45)} | ${p.dci || '—'} | ${vEur} | ${p.vmm.toFixed(2)} | ${p.stock} | ${mrg} | ${p.motivo_classificacao} |\n`;
+    md += `### Produtos com Vendas Baixas (VMM < 1.0)\n`;
+    md += `Identificados **${res.vendas_baixas.total_contagem} produtos** com rotação lenta (10 principais referências):\n\n`;
+    if (showEur) {
+      md += `| CNP | Designação | DCI | Vendas (€) | VMM | Stock | Margem % | Ação | Motivo |\n`;
+      md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- | :--- |\n`;
+      for (const p of res.vendas_baixas.produtos.slice(0, 10)) {
+        const mrg = p.margem_pct !== null ? `${p.margem_pct.toFixed(1)}%` : '—';
+        md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.dci || '—'} | ${fmtEur(p.vendas_eur)} | ${p.vmm.toFixed(2)} | ${p.stock} | ${mrg} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
+      }
+    } else {
+      md += `| CNP | Designação | DCI | VMM | Stock | Ação | Motivo |\n`;
+      md += `| :--- | :--- | :--- | :---: | :---: | :--- | :--- |\n`;
+      for (const p of res.vendas_baixas.produtos.slice(0, 10)) {
+        md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.dci || '—'} | ${p.vmm.toFixed(2)} | ${p.stock} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
+      }
     }
     md += `\n`;
   }
 
   // 3. Sem Vendas
   if (res.sem_vendas && res.sem_vendas.produtos.length > 0) {
-    md += `### 🚫 Produtos Sem Vendas com Stock Imobilizado\n`;
-    md += `Identificados **${res.sem_vendas.total_contagem} produtos** com stock (${res.sem_vendas.total_valor_custo.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €) e 0 unidades vendidas no período:\n\n`;
-    md += `| CNP | Designação | DCI | Stock | Custo Total | Dias s/ Venda | Classificação | Ação |\n`;
-    md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |\n`;
+    md += `### Produtos Sem Vendas com Stock Imobilizado\n`;
+    md += `Identificados **${res.sem_vendas.total_contagem} produtos** com stock (${fmtEur(res.sem_vendas.total_valor_custo)}) e 0 unidades vendidas no período:\n\n`;
+    md += `| CNP | Designação | DCI | Stock | Custo Total | Dias s/ Venda | Ação | Motivo |\n`;
+    md += `| :--- | :--- | :--- | :---: | :---: | :---: | :--- | :--- |\n`;
     for (const p of res.sem_vendas.produtos) {
-      const cTot = p.valor_custo_stock !== null ? `${p.valor_custo_stock.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €` : '—';
       const dsv = p.dias_sem_vendas !== null ? `${p.dias_sem_vendas} d` : '—';
-      md += `| ${p.cnp} | ${p.designacao.slice(0, 45)} | ${p.dci || '—'} | ${p.stock} | ${cTot} | ${dsv} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
+      md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.dci || '—'} | ${p.stock} | ${fmtEur(p.valor_custo_stock)} | ${dsv} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
     }
     md += `\n`;
   }
 
   // 4. Em Rutura
   if (res.em_rutura && res.em_rutura.produtos.length > 0) {
-    md += `### 📉 Produtos em Rutura com Procura Registada (Stock = 0)\n`;
-    md += `Identificados **${res.em_rutura.total_contagem} produtos** que venderam no período mas têm atualmente stock zero (apresentando as 10 principais referências):\n\n`;
-    md += `| CNP | Designação | DCI | Vendas (€) | Un | VMM | Margem % | Ação Recomendada |\n`;
-    md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |\n`;
-    for (const p of res.em_rutura.produtos.slice(0, 10)) {
-      const vEur = p.vendas_eur !== null ? `${p.vendas_eur.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €` : '—';
-      const mrg = p.margem_pct !== null ? `${p.margem_pct.toFixed(1)}%` : '—';
-      md += `| ${p.cnp} | ${p.designacao.slice(0, 45)} | ${p.dci || '—'} | ${vEur} | ${p.vendas_un} | ${p.vmm.toFixed(2)} | ${mrg} | **${p.classificacao}** (${p.motivo_classificacao}) |\n`;
+    md += `### Produtos em Rutura com Procura Registada (Stock = 0)\n`;
+    md += `Identificados **${res.em_rutura.total_contagem} produtos** que venderam no período mas têm stock zero (10 principais referências):\n\n`;
+    if (showEur) {
+      md += `| CNP | Designação | DCI | Vendas (€) | Un | VMM | Ação | Motivo |\n`;
+      md += `| :--- | :--- | :--- | :---: | :---: | :---: | :--- | :--- |\n`;
+      for (const p of res.em_rutura.produtos.slice(0, 10)) {
+        md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.dci || '—'} | ${fmtEur(p.vendas_eur)} | ${p.vendas_un} | ${p.vmm.toFixed(2)} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
+      }
+    } else {
+      md += `| CNP | Designação | DCI | Un | VMM | Ação | Motivo |\n`;
+      md += `| :--- | :--- | :--- | :---: | :---: | :--- | :--- |\n`;
+      for (const p of res.em_rutura.produtos.slice(0, 10)) {
+        md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.dci || '—'} | ${p.vendas_un} | ${p.vmm.toFixed(2)} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
+      }
     }
     md += `\n`;
   }
 
-  // 5. Monos Reais
+  // 5. Monos (janela 90 dias, regra unificada com o painel)
   if (res.monos && res.monos.produtos.length > 0) {
-    md += `### 🧊 Monos Clínicos Reais (VMM < 0.5 e sem vendas há ≥ 90 dias)\n`;
-    md += `Identificados **${res.monos.total_contagem} produtos** estritamente sem rotação (${res.monos.total_valor_custo.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} € imobilizados):\n\n`;
-    md += `| CNP | Designação | DCI | Stock | Custo Total | VMM | Dias s/ Venda | Classificação | Ação |\n`;
-    md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |\n`;
+    md += `### Monos (sem vendas nos últimos 90 dias; vendas registadas até ${ref})\n`;
+    md += `Identificados **${res.monos.total_contagem} produtos** (${fmtEur(res.monos.total_valor_custo)} em stock a preço de custo):\n\n`;
+    md += `| CNP | Designação | DCI | Stock | Custo Total | VMM | Dias s/ Venda | Ação | Motivo |\n`;
+    md += `| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- | :--- |\n`;
     for (const p of res.monos.produtos) {
-      const cTot = p.valor_custo_stock !== null ? `${p.valor_custo_stock.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €` : '—';
       const dsv = p.dias_sem_vendas !== null ? `${p.dias_sem_vendas} d` : '—';
-      const alerta = p.alerta_dados ? ` <br/>${p.alerta_dados}` : '';
-      md += `| ${p.cnp} | ${p.designacao.slice(0, 40)} | ${p.dci || '—'} | ${p.stock} | ${cTot} | ${p.vmm.toFixed(2)} | ${dsv} | **${p.classificacao}** | ${p.motivo_classificacao}${alerta} |\n`;
+      md += `| ${p.cnp} | ${p.designacao.slice(0, 38)} | ${p.dci || '—'} | ${p.stock} | ${fmtEur(p.valor_custo_stock)} | ${p.vmm.toFixed(2)} | ${dsv} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
     }
     md += `\n`;
   }
 
-  // 6. Excessos de Cobertura
-  if (res.excessos && res.excessos.produtos.length > 0) {
-    md += `### 📦 Excessos de Cobertura (> 4 meses)\n`;
-    md += `Identificados **${res.excessos.total_contagem} produtos** com stock excessivo face ao ritmo de venda:\n\n`;
-    md += `| CNP | Designação | Stock | VMM | Cobertura | Custo Imobilizado | Ação |\n`;
-    md += `| :--- | :--- | :---: | :---: | :---: | :--- |\n`;
-    for (const p of res.excessos.produtos.slice(0, 10)) {
-      const cTot = p.valor_custo_stock !== null ? `${p.valor_custo_stock.toLocaleString('pt-PT', { minimumFractionDigits: 2 })} €` : '—';
-      const cob = p.cobertura_meses !== null ? `${p.cobertura_meses.toFixed(1)} m` : '—';
-      md += `| ${p.cnp} | ${p.designacao.slice(0, 45)} | ${p.stock} | ${p.vmm.toFixed(2)} | ${cob} | ${cTot} | Reduzir reposição e ajustar stock de segurança |\n`;
-    }
-    md += `\n`;
-  }
-
-  // 7. Validades Próximas
+  // 6. Validades Próximas
   if (res.validades && res.validades.produtos.length > 0) {
-    md += `### ⏳ Validades em Risco Próximo (< 6 meses)\n`;
+    md += `### Validades em Risco Próximo (< 6 meses)\n`;
     md += `Identificados **${res.validades.total_contagem} produtos** com caducidade próxima:\n\n`;
-    md += `| CNP | Designação | Validade | Stock | VMM | Ação Proporcional Recomendada |\n`;
-    md += `| :--- | :--- | :---: | :---: | :---: | :--- |\n`;
+    md += `| CNP | Designação | Validade | Stock | VMM | Ação | Detalhe |\n`;
+    md += `| :--- | :--- | :---: | :---: | :---: | :--- | :--- |\n`;
     for (const p of res.validades.produtos) {
-      md += `| ${p.cnp} | ${p.designacao.slice(0, 45)} | ${p.validade || '—'} | ${p.stock} | ${p.vmm.toFixed(2)} | ${p.motivo_classificacao} |\n`;
+      md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.validade || '—'} | ${p.stock} | ${p.vmm.toFixed(2)} | **${p.classificacao}** | ${p.motivo_classificacao} |\n`;
+    }
+    md += `\n`;
+  }
+
+  // 7. Rever Dados (valores anómalos)
+  if (res.rever_dados && res.rever_dados.produtos.length > 0) {
+    md += `### Produtos Marcados como REVER_DADOS (Auditoria Sifarma)\n\n`;
+    md += `| CNP | Designação | Stock | Custo Unit. | Ação | Anomalia Detetada |\n`;
+    md += `| :--- | :--- | :---: | :---: | :--- | :--- |\n`;
+    for (const p of res.rever_dados.produtos) {
+      md += `| ${p.cnp} | ${p.designacao.slice(0, 42)} | ${p.stock} | ${fmtEur(p.custo_unitario)} | **REVER_DADOS** | ${p.motivo_classificacao} |\n`;
+    }
+    md += `\n`;
+  }
+
+  // 8. Lacunas explícitas
+  if (Array.isArray(res.lacunas) && res.lacunas.length > 0) {
+    md += `### Notas e Lacunas de Dados\n`;
+    for (const lac of res.lacunas) {
+      md += `- ${lac}\n`;
     }
     md += `\n`;
   }

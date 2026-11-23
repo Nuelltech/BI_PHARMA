@@ -141,7 +141,7 @@ describe('Bi-Pharma Copilot v2 — Bateria de Testes do Roadmap (P0 a P5)', () =
       ehExcesso: false,
       ehRiscoCaducidade: false,
     });
-    expect(actRutura.classificacao).toBe('REPOR_STOCK');
+    expect(actRutura.classificacao).toBe('REPOR');
 
     // 2. VMM >= 2.0 -> Manter
     const actLocomotiva = classifyProductAction({
@@ -171,7 +171,7 @@ describe('Bi-Pharma Copilot v2 — Bateria de Testes do Roadmap (P0 a P5)', () =
       ehExcesso: false,
       ehRiscoCaducidade: false,
     });
-    expect(actCronicoLento.classificacao).toBe('MANTER_STOCK_MINIMO');
+    expect(actCronicoLento.classificacao).toBe('STOCK_MINIMO');
     expect(actCronicoLento.classificacao).not.toBe('DESCONTINUAR');
 
     // 4. MSRM crónico sem vendas (mono) -> Trabalhar sob encomenda
@@ -187,7 +187,7 @@ describe('Bi-Pharma Copilot v2 — Bateria de Testes do Roadmap (P0 a P5)', () =
       ehExcesso: false,
       ehRiscoCaducidade: false,
     });
-    expect(actCronicoMono.classificacao).toBe('TRABALHAR_SOB_ENCOMENDA');
+    expect(actCronicoMono.classificacao).toBe('TRABALHAR_ENCOMENDA');
     expect(actCronicoMono.classificacao).not.toBe('DESCONTINUAR');
 
     // 5. MNSRM com margem baixa (< 30%) e vendas fracas -> Descontinuar

@@ -3,8 +3,8 @@
  * 
  * Regra: O código verifica PERMISSÕES, nunca nomes de cargos soltos.
  * A permissão 'ver_faturacao' está estritamente restrita aos perfis de gestão:
- * DIRETOR, GESTOR, PROPRIETARIO, SUPERADMIN e COMPRADOR.
- * Perfis operacionais (AUXILIAR, OPERADOR_BALCAO) NÃO têm acesso a valores faturados em €.
+ * DIRETOR, GESTOR, PROPRIETARIO, DIRETOR_TECNICO, SUPERADMIN e conector COMPLETO.
+ * Perfis operacionais (AUXILIAR, OPERADOR_BALCAO) e acessos sem perfil NÃO têm acesso a valores faturados em €.
  */
 
 export type RolePlataforma =
