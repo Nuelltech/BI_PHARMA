@@ -54,7 +54,8 @@ import { classifyAllExistingProducts, classifyProduct } from './services/classif
 import { getPharmacyCatalog, invalidateCatalog } from './services/product_catalog';
 import { processFreeformQuestion } from './services/copilot';
 import { processQuestionWithLlmOrLocal } from './services/llm_router';
-import { askConversationalCopilot, clearCopilotSession } from './services/copilot_engine';
+import { askConversationalCopilot, clearCopilotSession, getCopilotSessionHistory } from './services/copilot_engine';
+import { parseMarkdownToExecutiveReport, synthesizeExecutiveReportWithAi, CopilotExecutiveReport } from './services/copilot_reporting';
 import { addDiscontinuedCnp, removeDiscontinuedCnp, getDiscontinuedList } from './services/discontinued_products';
 import { ToolSecurityContext } from './services/mcp_pharma_tools';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
@@ -2699,6 +2700,52 @@ async function startServer() {
           res.end(JSON.stringify({ success: true, message: 'Histórico da sessão reiniciado com sucesso.' }));
         } catch (e: any) {
           const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 3.3. Endpoint para Gerar Síntese de Relatório Executivo a partir do Copilot
+      if (pathname === '/api/copilot/generate-report' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 128 * 1024);
+          const { farmaciaId, sessionId, rawText, customPrompt, audience, responsavel } = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+
+          let contentToReport = String(rawText || '').trim();
+          if (!contentToReport && sessionId) {
+            const cleanSid = String(sessionId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+            const history = getCopilotSessionHistory(`${activeFarmacia.id}:${cleanSid}`);
+            if (history && history.length > 0) {
+              contentToReport = history
+                .filter((h) => h.role === 'assistant' && typeof h.content === 'string')
+                .map((h) => h.content)
+                .join('\n\n---\n\n');
+            }
+          }
+
+          let reportData: CopilotExecutiveReport;
+          if (customPrompt || Boolean(process.env.ANTHROPIC_API_KEY)) {
+            reportData = await synthesizeExecutiveReportWithAi({
+              text: contentToReport,
+              farmaciaNome: activeFarmacia.nome,
+              responsavel: responsavel || 'Direção Técnica / Gestão',
+              customPrompt,
+              audience: audience === 'EQUIPA' ? 'EQUIPA' : 'GESTAO',
+            });
+          } else {
+            reportData = parseMarkdownToExecutiveReport(contentToReport, {
+              farmaciaNome: activeFarmacia.nome,
+              responsavel: responsavel || 'Direção Técnica / Gestão',
+            });
+          }
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: true, report: reportData }));
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          console.error('[API /api/copilot/generate-report Error]:', e);
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ success: false, error: e.message }));
         }
@@ -5650,6 +5697,9 @@ function getDashboardHtml(): string {
             <button class="btn btn-secondary" onclick="resetCopilotConversation()" style="font-size: 0.80rem; padding: 7px 14px; border-color: #cbd5e1; color: #0f172a;" title="Limpar memória e iniciar nova conversa">
               🔄 Nova Conversa
             </button>
+            <button class="btn" onclick="openCopilotReportModalCurrentSession()" style="font-size: 0.80rem; padding: 7px 14px; background: #0284c7; color: #fff; font-weight: 700; border: none; border-radius: 8px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; box-shadow: 0 1px 3px rgba(2,132,199,0.3);" title="Estruturar e pré-visualizar relatório executivo em PDF">
+              📑 Relatório da Análise
+            </button>
           </div>
         </div>
 
@@ -7400,6 +7450,156 @@ function getDashboardHtml(): string {
 
 
   
+  <!-- MODAL DE RELATÓRIO EXECUTIVO DO COPILOT (PREVIEW & EDIÇÃO INTERATIVA WYSIWYG) -->
+  <div id="copilotReportModal" style="display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.78); backdrop-filter: blur(5px); z-index: 100000; align-items: center; justify-content: center; padding: 16px;">
+    <div style="background: #ffffff; border-radius: 14px; width: 100%; max-width: 1040px; max-height: 94vh; display: flex; flex-direction: column; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35); overflow: hidden; border: 1px solid #cbd5e1;">
+      
+      <!-- Top Action Toolbar -->
+      <div style="padding: 14px 20px; background: #0f172a; color: #ffffff; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; border-bottom: 1px solid #1e293b;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <div style="width: 34px; height: 34px; border-radius: 8px; background: #0284c7; display: flex; align-items: center; justify-content: center; font-size: 18px;">📑</div>
+          <div>
+            <div style="font-size: 1.05rem; font-weight: 800; display: flex; align-items: center; gap: 8px;">
+              Relatório Executivo da Farmácia
+              <span id="reportModalFarmBadge" style="background: rgba(255,255,255,0.15); color: #38bdf8; font-size: 0.72rem; padding: 2px 8px; border-radius: 6px; font-weight: 700;">Farmácia</span>
+            </div>
+            <div style="font-size: 0.76rem; color: #94a3b8;">
+              Pré-visualização oficial A4. Pode editar diretamente o título, textos ou remover produtos antes de imprimir.
+            </div>
+          </div>
+        </div>
+        
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <button class="btn btn-sm" id="btnReportExportCsv" onclick="exportReportCsv()" style="background: #334155; color: #f8fafc; font-weight: 700; padding: 8px 13px; border-radius: 7px; border: 1px solid #475569; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; font-size: 0.78rem;">
+            📊 Exportar Excel / CSV
+          </button>
+          <button class="btn btn-sm" onclick="exportReportPdf()" style="background: #0284c7; color: #ffffff; font-weight: 800; padding: 8px 16px; border-radius: 7px; border: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; font-size: 0.82rem; box-shadow: 0 2px 4px rgba(2, 132, 199, 0.3);">
+            🖨️ Emitir / Guardar em PDF
+          </button>
+          <button onclick="closeCopilotReportModal()" style="background: rgba(255,255,255,0.1); border: none; color: #cbd5e1; width: 32px; height: 32px; border-radius: 6px; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: background 0.15s;">✕</button>
+        </div>
+      </div>
+
+      <!-- Barra de Refinamento com IA -->
+      <div style="background: #f8fafc; border-bottom: 1px solid #e2e8f0; padding: 9px 20px; display: flex; align-items: center; gap: 10px; font-size: 0.82rem;">
+        <span style="font-weight: 700; color: #475569; display: flex; align-items: center; gap: 4px; white-space: nowrap;">🪄 Ajustar com IA:</span>
+        <input type="text" id="reportRefinePromptInput" placeholder="Ex: 'Foca apenas em perdas financeiras', 'Muda o tom para a equipa de balcão', 'Resume em 2 parágrafos'..." style="flex: 1; padding: 7px 12px; font-size: 0.82rem; border: 1px solid #cbd5e1; border-radius: 6px; outline: none; background: #ffffff;" onkeydown="if(event.key==='Enter') refineReportWithAi()" />
+        <button class="btn btn-sm" id="btnReportRefineSubmit" onclick="refineReportWithAi()" style="background: #6366f1; color: #fff; font-weight: 700; padding: 7px 14px; font-size: 0.78rem; border-radius: 6px; border: none; cursor: pointer; white-space: nowrap;">
+          Atualizar Relatório
+        </button>
+      </div>
+
+      <!-- Canvas Scrollável Simulador de Folha A4 Timbrada -->
+      <div style="flex: 1; overflow-y: auto; background: #f1f5f9; padding: 24px 16px;">
+        <div id="reportA4Sheet" style="background: #ffffff; max-width: 820px; margin: 0 auto; padding: 36px 42px; border-radius: 8px; border: 1px solid #cbd5e1; box-shadow: 0 4px 12px rgba(0,0,0,0.06); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a;">
+          
+          <!-- Cabeçalho Timbrado Oficial -->
+          <div style="display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2.5px solid #0284c7; padding-bottom: 14px; margin-bottom: 20px;">
+            <div>
+              <div style="font-size: 1.35rem; font-weight: 900; color: #0f172a; letter-spacing: -0.5px; display: flex; align-items: center; gap: 6px;">
+                <span>💊 BI PHARMA</span>
+                <span style="font-size: 0.82rem; font-weight: 700; color: #0284c7; background: #e0f2fe; padding: 2px 8px; border-radius: 4px; margin-left: 6px;">RELATÓRIO EXECUTIVO</span>
+              </div>
+              <div id="reportFarmName" style="font-size: 0.95rem; font-weight: 700; color: #334155; margin-top: 4px;">Farmácia Demo</div>
+            </div>
+            <div style="text-align: right; font-size: 0.76rem; color: #64748b; line-height: 1.45;">
+              <div><b>Data de Emissão:</b> <span id="reportIssueDate">--/--/----</span> às <span id="reportIssueTime">--:--</span></div>
+              <div><b>Responsável / Emitido por:</b> <span id="reportResponsible">Direção Técnica</span></div>
+              <div><b>Sistema:</b> BI Pharma Intelligent Core</div>
+            </div>
+          </div>
+
+          <!-- Título e Subtítulo Editáveis -->
+          <div style="margin-bottom: 20px;">
+            <div id="reportTitleEl" contenteditable="true" title="Clique para editar o título" style="font-size: 1.35rem; font-weight: 800; color: #0f172a; line-height: 1.25; padding: 4px 6px; border: 1px dashed transparent; border-radius: 4px; outline: none;">
+              Relatório Executivo de Diagnóstico Farmacêutico
+            </div>
+            <div id="reportSubtitleEl" contenteditable="true" title="Clique para editar o subtítulo" style="font-size: 0.88rem; color: #64748b; font-weight: 600; padding: 2px 6px; border: 1px dashed transparent; border-radius: 4px; outline: none; margin-top: 2px;">
+              Análise Estratégica & Plano de Decisão
+            </div>
+          </div>
+
+          <!-- Cartões de KPIs Chave -->
+          <div id="reportKpiContainer" style="display: flex; gap: 12px; margin-bottom: 22px; flex-wrap: wrap;">
+            <!-- Injetado dinamicamente -->
+          </div>
+
+          <!-- Secção 1: Diagnóstico e Contexto -->
+          <div style="margin-bottom: 24px;">
+            <div style="font-size: 0.90rem; font-weight: 800; color: #0284c7; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">
+              <span>📌 1. Diagnóstico Analítico & Contexto</span>
+            </div>
+            <div id="reportDiagnosisEl" contenteditable="true" title="Clique para editar o diagnóstico" style="font-size: 0.88rem; line-height: 1.6; color: #334155; padding: 10px; border: 1px dashed #e2e8f0; border-radius: 6px; outline: none; background: #fafafa; min-height: 60px;">
+              A carregar diagnóstico...
+            </div>
+          </div>
+
+          <!-- Secção 2: Tabela Estruturada de Artigos / Dados -->
+          <div id="reportTableSection" style="margin-bottom: 24px;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 8px;">
+              <div style="font-size: 0.90rem; font-weight: 800; color: #0284c7; text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; gap: 6px;">
+                <span>📊 2. Quadro Estruturado de Artigos & Indicadores</span>
+              </div>
+              <span id="reportTableCountBadge" style="font-size: 0.74rem; font-weight: 700; color: #64748b; background: #f1f5f9; padding: 2px 8px; border-radius: 4px;">0 produtos</span>
+            </div>
+            
+            <div id="reportTableLimitNotice" style="display: none; margin-bottom: 8px; padding: 8px 12px; background: #fffbeb; border: 1px solid #fef3c7; border-radius: 6px; font-size: 0.78rem; color: #b45309; line-height: 1.4;">
+              <!-- Injetado se > 25 produtos -->
+            </div>
+
+            <div style="overflow-x: auto; border: 1px solid #cbd5e1; border-radius: 6px;">
+              <table id="reportDataTable" style="width: 100%; border-collapse: collapse; font-size: 0.80rem; text-align: left;">
+                <thead id="reportTableHead" style="background: #f8fafc; border-bottom: 2px solid #cbd5e1; font-weight: 800; color: #475569; text-transform: uppercase; font-size: 0.72rem;">
+                  <!-- Injetado dinamicamente -->
+                </thead>
+                <tbody id="reportTableBody">
+                  <!-- Injetado dinamicamente -->
+                </tbody>
+              </table>
+            </div>
+            <div style="font-size: 0.72rem; color: #64748b; margin-top: 6px; display: flex; justify-content: space-between;">
+              <span>💡 Pode editar diretamente valores na tabela ou clicar no <b>✕</b> para remover produtos indesejados.</span>
+              <span id="reportTableTotalFooter" style="font-weight: 700; color: #0f172a;"></span>
+            </div>
+          </div>
+
+          <!-- Secção 3: Recomendações e Plano de Ação -->
+          <div style="margin-bottom: 24px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <div style="font-size: 0.90rem; font-weight: 800; color: #0284c7; text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; gap: 6px;">
+                <span>🎯 3. Recomendações & Plano de Ação Imediato</span>
+              </div>
+              <button class="btn btn-sm" onclick="addReportRecommendation()" style="font-size: 0.72rem; padding: 3px 8px; background: #f1f5f9; border: 1px solid #cbd5e1; color: #0f172a; border-radius: 4px; cursor: pointer;">
+                + Adicionar Ação
+              </button>
+            </div>
+            <div id="reportRecsList" style="display: flex; flex-direction: column; gap: 8px;">
+              <!-- Injetado dinamicamente -->
+            </div>
+          </div>
+
+          <!-- Secção 4: Despacho e Assinatura -->
+          <div style="margin-bottom: 16px;">
+            <div style="font-size: 0.90rem; font-weight: 800; color: #0284c7; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">
+              <span>✍️ 4. Parecer & Despacho da Direção Técnica</span>
+            </div>
+            <div id="reportNotesEl" contenteditable="true" title="Clique para editar as notas ou despacho" style="font-size: 0.84rem; line-height: 1.5; color: #475569; padding: 10px; border: 1px dashed #cbd5e1; border-radius: 6px; background: #fdfdfd; min-height: 48px; outline: none;">
+              Documento formal conferido e aprovado para execução física e contacto com fornecedores.
+            </div>
+          </div>
+
+          <!-- Rodapé de Auditoria e Confidencialidade -->
+          <div style="border-top: 1px solid #e2e8f0; padding-top: 12px; margin-top: 24px; font-size: 0.70rem; color: #94a3b8; display: flex; justify-content: space-between; align-items: center;">
+            <span>🔒 Documento Confidencial para Uso Interno Exclusivo da Farmácia</span>
+            <span>Gerado por BI Pharma AI • Página 1 de 1</span>
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+  </div>
+
   <!-- GAVETA LATERAL DIREITA (SLIDE DRAWER) -->
   <div id="slideDrawerBackdrop" class="drawer-backdrop" onclick="closeSlideDrawer()"></div>
   <aside id="slideDrawer" class="slide-drawer" aria-label="Detalhes e Protocolo Operacional">
@@ -11352,6 +11552,435 @@ function getDashboardHtml(): string {
       setTimeout(function() { win.print(); }, 350);
     }
 
+    // =========================================================================
+    // MÓDULO DE RELATÓRIOS EXECUTIVOS DO COPILOT (PREVIEW, EDIÇÃO & EXPORTAÇÃO)
+    // =========================================================================
+    window.currentCopilotReportData = null;
+
+    function openCopilotReportModalFromBubble(btn) {
+      if (!btn) return;
+      var assistantBubble = btn.closest('.chat-bubble-assistant');
+      var rawText = (assistantBubble && assistantBubble.dataset.rawText) 
+        ? assistantBubble.dataset.rawText 
+        : (assistantBubble ? assistantBubble.innerText : (window.lastCopilotAssistantText || ''));
+      loadAndOpenCopilotReport(rawText, null);
+    }
+
+    function openCopilotReportModalCurrentSession() {
+      var sid = (typeof getCopilotSessionId === 'function') ? getCopilotSessionId() : '';
+      loadAndOpenCopilotReport(window.lastCopilotAssistantText || '', sid);
+    }
+
+    function closeCopilotReportModal() {
+      var modal = document.getElementById('copilotReportModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    async function loadAndOpenCopilotReport(rawText, sid, customPrompt) {
+      var modal = document.getElementById('copilotReportModal');
+      var sel = document.getElementById('farmaciaSelector');
+      var farmNome = (sel && sel.options && sel.selectedIndex >= 0) ? sel.options[sel.selectedIndex].text : 'Farmácia Demo';
+      
+      var badge = document.getElementById('reportModalFarmBadge');
+      if (badge) badge.textContent = farmNome;
+
+      if (modal) modal.style.display = 'flex';
+
+      // Mostra placeholders de carregamento
+      var titleEl = document.getElementById('reportTitleEl');
+      var diagEl = document.getElementById('reportDiagnosisEl');
+      if (titleEl) titleEl.innerText = 'A estruturar Relatório Executivo...';
+      if (diagEl) diagEl.innerText = 'A inteligência analítica está a processar os dados e a formatar a minuta formal...';
+
+      try {
+        var res = await fetch('/api/copilot/generate-report', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            sessionId: sid,
+            rawText: rawText || window.lastCopilotAssistantText || '',
+            customPrompt: customPrompt || '',
+            responsavel: 'Direção Técnica / Gestão'
+          })
+        });
+        var data = await res.json();
+        if (!data.success || !data.report) {
+          throw new Error(data.error || 'Não foi possível gerar a estrutura do relatório.');
+        }
+
+        window.currentCopilotReportData = data.report;
+        renderReportPreview(data.report);
+      } catch (err) {
+        console.error('Erro ao gerar relatório do Copilot:', err);
+        if (titleEl) titleEl.innerText = 'Relatório Executivo da Farmácia';
+        if (diagEl) diagEl.innerText = 'Ocorreu um erro ao carregar a síntese do relatório: ' + err.message;
+      }
+    }
+
+    function renderReportPreview(rep) {
+      if (!rep) return;
+      
+      var farmEl = document.getElementById('reportFarmName');
+      if (farmEl) farmEl.textContent = rep.farmaciaNome || 'Farmácia';
+
+      var dateEl = document.getElementById('reportIssueDate');
+      if (dateEl) dateEl.textContent = rep.dataEmissao || new Date().toLocaleDateString('pt-PT');
+
+      var timeEl = document.getElementById('reportIssueTime');
+      if (timeEl) timeEl.textContent = rep.horaEmissao || new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+
+      var respEl = document.getElementById('reportResponsible');
+      if (respEl) respEl.textContent = rep.responsavel || 'Direção Técnica';
+
+      var titleEl = document.getElementById('reportTitleEl');
+      if (titleEl) titleEl.innerText = rep.titulo || 'Relatório Executivo de Diagnóstico Farmacêutico';
+
+      var subEl = document.getElementById('reportSubtitleEl');
+      if (subEl) subEl.innerText = rep.subtitulo || 'Análise Estratégica & Decisão Operacional';
+
+      // 1. Renderizar KPIs
+      var kpiContainer = document.getElementById('reportKpiContainer');
+      if (kpiContainer) {
+        kpiContainer.innerHTML = '';
+        if (rep.kpis && rep.kpis.length > 0) {
+          rep.kpis.forEach(function(k) {
+            var bg = '#f8fafc';
+            var border = '#cbd5e1';
+            var textCol = '#0f172a';
+            if (k.tipo === 'danger') { bg = '#fef2f2'; border = '#fecaca'; textCol = '#dc2626'; }
+            else if (k.tipo === 'warning') { bg = '#fffbeb'; border = '#fef3c7'; textCol = '#b45309'; }
+            else if (k.tipo === 'success') { bg = '#f0fdf4'; border = '#bbf7d0'; textCol = '#16a34a'; }
+            else if (k.tipo === 'info') { bg = '#f0f9ff'; border = '#bae6fd'; textCol = '#0284c7'; }
+
+            var card = document.createElement('div');
+            card.style.cssText = 'flex: 1; min-width: 140px; background: ' + bg + '; border: 1px solid ' + border + '; border-radius: 6px; padding: 10px 12px;';
+            card.innerHTML = '<div style="font-size: 0.68rem; text-transform: uppercase; font-weight: 700; color: #64748b; margin-bottom: 2px;">' + k.label + '</div>' +
+                             '<div style="font-size: 1.15rem; font-weight: 800; color: ' + textCol + ';">' + k.valor + '</div>';
+            kpiContainer.appendChild(card);
+          });
+          kpiContainer.style.display = 'flex';
+        } else {
+          kpiContainer.style.display = 'none';
+        }
+      }
+
+      // 2. Renderizar Diagnóstico
+      var diagEl = document.getElementById('reportDiagnosisEl');
+      if (diagEl) diagEl.innerText = rep.diagnostico || '';
+
+      // 3. Renderizar Tabela Estruturada de Artigos
+      var tableSection = document.getElementById('reportTableSection');
+      var btnCsv = document.getElementById('btnReportExportCsv');
+      var thead = document.getElementById('reportTableHead');
+      var tbody = document.getElementById('reportTableBody');
+      var countBadge = document.getElementById('reportTableCountBadge');
+      var limitNotice = document.getElementById('reportTableLimitNotice');
+
+      if (rep.tabela && rep.tabela.colunas && rep.tabela.colunas.length > 0 && rep.tabela.linhas && rep.tabela.linhas.length > 0) {
+        if (tableSection) tableSection.style.display = 'block';
+        if (btnCsv) btnCsv.style.display = 'inline-flex';
+        if (countBadge) countBadge.textContent = rep.tabela.totalRegistos + ' produtos';
+
+        if (rep.tabela.avisoLimite && limitNotice) {
+          limitNotice.style.display = 'block';
+          limitNotice.innerHTML = rep.tabela.avisoLimite;
+        } else if (limitNotice) {
+          limitNotice.style.display = 'none';
+        }
+
+        // Cabeçalho da Tabela
+        var headHtml = '<tr><th style="padding: 7px 8px; width: 32px; text-align: center;">#</th>';
+        rep.tabela.colunas.forEach(function(col) {
+          headHtml += '<th style="padding: 7px 8px; border-left: 1px solid #e2e8f0;">' + col + '</th>';
+        });
+        headHtml += '<th class="no-print" style="padding: 7px 8px; width: 44px; text-align: center; color: #94a3b8;">Ação</th></tr>';
+        if (thead) thead.innerHTML = headHtml;
+
+        // Linhas da Tabela
+        var bodyHtml = '';
+        rep.tabela.linhas.forEach(function(row, idx) {
+          bodyHtml += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+                      '<td style="padding: 6px 8px; text-align: center; color: #94a3b8; font-size: 0.72rem;">' + (idx + 1) + '</td>';
+          row.forEach(function(cell) {
+            bodyHtml += '<td contenteditable="true" style="padding: 6px 8px; border-left: 1px solid #f1f5f9; outline: none;">' + cell + '</td>';
+          });
+          bodyHtml += '<td class="no-print" style="padding: 6px 8px; text-align: center;">' +
+                      '<button onclick="removeReportTableRow(this)" style="background: none; border: none; color: #ef4444; font-weight: bold; cursor: pointer; font-size: 13px;" title="Remover produto deste relatório">✕</button>' +
+                      '</td></tr>';
+        });
+        if (tbody) tbody.innerHTML = bodyHtml;
+
+      } else {
+        if (tableSection) tableSection.style.display = 'none';
+        if (btnCsv) btnCsv.style.display = 'none';
+      }
+
+      // 4. Renderizar Recomendações
+      var recsList = document.getElementById('reportRecsList');
+      if (recsList) {
+        recsList.innerHTML = '';
+        var recs = (rep.recomendacoes && rep.recomendacoes.length > 0) 
+          ? rep.recomendacoes 
+          : ['Proceder à verificação física dos produtos identificados nas prateleiras.', 'Validar prazos de devolução com fornecedores.'];
+        
+        recs.forEach(function(recText) {
+          var item = document.createElement('div');
+          item.className = 'report-rec-item';
+          item.style.cssText = 'display: flex; align-items: flex-start; gap: 8px; background: #f8fafc; padding: 7px 10px; border-radius: 6px; border: 1px solid #e2e8f0;';
+          item.innerHTML = '<span style="color: #0284c7; font-weight: 800; font-size: 0.85rem; line-height: 1.4;">✔</span>' +
+                           '<div contenteditable="true" style="flex: 1; outline: none; font-size: 0.84rem; line-height: 1.4; color: #1e293b;">' + recText + '</div>' +
+                           '<button class="no-print" onclick="removeReportRecommendation(this)" style="background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 13px; line-height: 1;">✕</button>';
+          recsList.appendChild(item);
+        });
+      }
+
+      // 5. Renderizar Notas Farmacêuticas
+      var notesEl = document.getElementById('reportNotesEl');
+      if (notesEl) {
+        notesEl.innerText = rep.notaFarmaceutica || 'Parecer técnico emitido pela Direção Técnica com recurso ao motor de inteligência analítica BI Pharma AI.';
+      }
+    }
+
+    function removeReportTableRow(btn) {
+      if (!btn) return;
+      var tr = btn.closest('tr');
+      if (tr && tr.parentNode) {
+        tr.parentNode.removeChild(tr);
+        var remaining = document.querySelectorAll('#reportTableBody tr').length;
+        var badge = document.getElementById('reportTableCountBadge');
+        if (badge) badge.textContent = remaining + ' produtos';
+      }
+    }
+
+    function addReportRecommendation() {
+      var recsList = document.getElementById('reportRecsList');
+      if (!recsList) return;
+      var item = document.createElement('div');
+      item.className = 'report-rec-item';
+      item.style.cssText = 'display: flex; align-items: flex-start; gap: 8px; background: #f8fafc; padding: 7px 10px; border-radius: 6px; border: 1px solid #e2e8f0;';
+      item.innerHTML = '<span style="color: #0284c7; font-weight: 800; font-size: 0.85rem; line-height: 1.4;">✔</span>' +
+                       '<div contenteditable="true" style="flex: 1; outline: none; font-size: 0.84rem; line-height: 1.4; color: #1e293b;">Nova ação prioritária a definir pela Direção Técnica...</div>' +
+                       '<button class="no-print" onclick="removeReportRecommendation(this)" style="background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 13px; line-height: 1;">✕</button>';
+      recsList.appendChild(item);
+      var editEl = item.querySelector('[contenteditable="true"]');
+      if (editEl) editEl.focus();
+    }
+
+    function removeReportRecommendation(btn) {
+      if (!btn) return;
+      var item = btn.closest('.report-rec-item');
+      if (item && item.parentNode) item.parentNode.removeChild(item);
+    }
+
+    function exportReportCsv() {
+      var thead = document.getElementById('reportTableHead');
+      var tbody = document.getElementById('reportTableBody');
+      if (!thead || !tbody) {
+        alert('Nenhuma tabela de dados presente neste relatório para exportar.');
+        return;
+      }
+
+      var ths = thead.querySelectorAll('th');
+      var cols = [];
+      for (var i = 1; i < ths.length; i++) {
+        if (!ths[i].classList.contains('no-print')) {
+          cols.push('"' + ths[i].innerText.trim().replace(/"/g, '""') + '"');
+        }
+      }
+
+      var trs = tbody.querySelectorAll('tr');
+      if (trs.length === 0) {
+        alert('A tabela de dados está vazia.');
+        return;
+      }
+
+      var NL = String.fromCharCode(13) + String.fromCharCode(10);
+      var csvContent = 'data:text/csv;charset=utf-8,%EF%BB%BF';
+      csvContent += cols.join(';') + NL;
+
+      trs.forEach(function(tr) {
+        var tds = tr.querySelectorAll('td');
+        var rowCells = [];
+        for (var j = 1; j < tds.length; j++) {
+          if (!tds[j].classList.contains('no-print')) {
+            rowCells.push('"' + tds[j].innerText.trim().replace(/"/g, '""') + '"');
+          }
+        }
+        if (rowCells.length > 0) {
+          csvContent += rowCells.join(';') + NL;
+        }
+      });
+
+      var titleText = (document.getElementById('reportTitleEl') ? document.getElementById('reportTitleEl').innerText : 'relatorio')
+        .toLowerCase().replace(/[^a-z0-9]/gi, '_').slice(0, 30);
+      var encodedUri = encodeURI(csvContent);
+      var link = document.createElement('a');
+      link.setAttribute('href', encodedUri);
+      link.setAttribute('download', (titleText || 'relatorio') + '_' + new Date().toISOString().slice(0, 10) + '.csv');
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+
+    function exportReportPdf() {
+      var farmNome = (document.getElementById('reportFarmName') ? document.getElementById('reportFarmName').innerText : 'Farmácia Comunitária');
+      var dataHoje = (document.getElementById('reportIssueDate') ? document.getElementById('reportIssueDate').innerText : new Date().toLocaleDateString('pt-PT'));
+      var horaHoje = (document.getElementById('reportIssueTime') ? document.getElementById('reportIssueTime').innerText : new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }));
+      var respNome = (document.getElementById('reportResponsible') ? document.getElementById('reportResponsible').innerText : 'Direção Técnica');
+      var titleText = (document.getElementById('reportTitleEl') ? document.getElementById('reportTitleEl').innerText : 'Relatório Executivo');
+      var subtitleText = (document.getElementById('reportSubtitleEl') ? document.getElementById('reportSubtitleEl').innerText : '');
+      var diagText = (document.getElementById('reportDiagnosisEl') ? document.getElementById('reportDiagnosisEl').innerText : '');
+      var notesText = (document.getElementById('reportNotesEl') ? document.getElementById('reportNotesEl').innerText : '');
+
+      // Extrai KPIs
+      var kpisHtml = '';
+      var kpiCards = document.querySelectorAll('#reportKpiContainer > div');
+      if (kpiCards.length > 0) {
+        kpisHtml = '<div style="display:flex;gap:10px;margin-bottom:16px;">';
+        kpiCards.forEach(function(card) {
+          kpisHtml += '<div style="flex:1;background:#f8fafc;border:1px solid #cbd5e1;border-radius:6px;padding:8px 10px;">' + card.innerHTML + '</div>';
+        });
+        kpisHtml += '</div>';
+      }
+
+      // Extrai Tabela
+      var tableHtml = '';
+      var thead = document.getElementById('reportTableHead');
+      var tbody = document.getElementById('reportTableBody');
+      if (thead && tbody && tbody.querySelectorAll('tr').length > 0) {
+        tableHtml += '<div style="margin-bottom:18px;">' +
+                     '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">2. Quadro Estruturado de Artigos & Indicadores</div>' +
+                     '<table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:6px;">' +
+                     '<thead><tr style="background:#f8fafc;border-bottom:2px solid #cbd5e1;color:#475569;font-weight:700;font-size:10px;text-transform:uppercase;">';
+        
+        var ths = thead.querySelectorAll('th');
+        for (var i = 0; i < ths.length; i++) {
+          if (!ths[i].classList.contains('no-print')) {
+            tableHtml += '<th style="padding:6px 8px;text-align:left;border-bottom:2px solid #cbd5e1;">' + ths[i].innerText.trim() + '</th>';
+          }
+        }
+        tableHtml += '</tr></thead><tbody>';
+
+        var trs = tbody.querySelectorAll('tr');
+        trs.forEach(function(tr) {
+          tableHtml += '<tr style="border-bottom:1px solid #e2e8f0;page-break-inside:avoid;">';
+          var tds = tr.querySelectorAll('td');
+          for (var j = 0; j < tds.length; j++) {
+            if (!tds[j].classList.contains('no-print')) {
+              tableHtml += '<td style="padding:6px 8px;">' + tds[j].innerText.trim() + '</td>';
+            }
+          }
+          tableHtml += '</tr>';
+        });
+        tableHtml += '</tbody></table></div>';
+      }
+
+      // Extrai Recomendações
+      var recsHtml = '';
+      var recItems = document.querySelectorAll('#reportRecsList .report-rec-item');
+      if (recItems.length > 0) {
+        recsHtml = '<div style="margin-bottom:18px;">' +
+                   '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">3. Recomendações & Plano de Ação Imediato</div>' +
+                   '<div style="display:flex;flex-direction:column;gap:6px;">';
+        recItems.forEach(function(item) {
+          var t = item.querySelector('[contenteditable="true"]');
+          if (t && t.innerText.trim()) {
+            recsHtml += '<div style="display:flex;align-items:flex-start;gap:6px;font-size:11px;color:#1e293b;page-break-inside:avoid;">' +
+                        '<span style="color:#0284c7;font-weight:800;">✔</span><div>' + t.innerText.trim() + '</div></div>';
+          }
+        });
+        recsHtml += '</div></div>';
+      }
+
+      var win = window.open('', '_blank');
+      if (!win) {
+        alert('O navegador bloqueou a janela pop-up. Por favor permita pop-ups para gerar o PDF.');
+        return;
+      }
+
+      var docHtml = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+        '<title>' + titleText + ' — ' + farmNome + '</title>' +
+        '<style>' +
+          '@page { size: A4 portrait; margin: 12mm 14mm 14mm 14mm; }' +
+          'body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #0f172a; margin: 0; padding: 15px; font-size: 11.5px; line-height: 1.5; }' +
+          '.no-print { margin-bottom: 15px; padding: 10px 14px; background: #f1f5f9; border-radius: 8px; display: flex; gap: 10px; align-items: center; }' +
+          '@media print { .no-print { display: none !important; } body { padding: 0; } }' +
+          'table { width: 100%; border-collapse: collapse; }' +
+          'tr { page-break-inside: avoid; }' +
+        '</style>' +
+        '</head><body>' +
+        '<div class="no-print">' +
+          '<button onclick="window.print()" style="background:#0284c7;color:#fff;border:none;padding:9px 18px;border-radius:6px;font-weight:800;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;gap:6px;">🖨️ Imprimir / Guardar como PDF</button>' +
+          '<button onclick="window.close()" style="background:#64748b;color:#fff;border:none;padding:9px 14px;border-radius:6px;font-weight:600;cursor:pointer;font-size:13px;">Fechar</button>' +
+          '<span style="font-size:11.5px;color:#475569;margin-left:auto;">💡 No diálogo do sistema, selecione <b>Guardar como PDF</b> para gerar o ficheiro oficial.</span>' +
+        '</div>' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2.5px solid #0284c7;padding-bottom:10px;margin-bottom:16px;">' +
+          '<div>' +
+            '<div style="font-size:18px;font-weight:900;color:#0f172a;letter-spacing:-0.5px;">BI PHARMA — RELATÓRIO EXECUTIVO</div>' +
+            '<div style="font-size:13px;font-weight:700;color:#0284c7;margin-top:2px;">' + farmNome + '</div>' +
+          '</div>' +
+          '<div style="text-align:right;font-size:10.5px;color:#64748b;line-height:1.4;">' +
+            '<div><b>Data de Emissão:</b> ' + dataHoje + ' às ' + horaHoje + '</div>' +
+            '<div><b>Responsável:</b> ' + respNome + '</div>' +
+            '<div><b>Sistema:</b> BI Pharma Intelligent Core</div>' +
+          '</div>' +
+        '</div>' +
+        '<div style="margin-bottom:16px;">' +
+          '<div style="font-size:16px;font-weight:800;color:#0f172a;line-height:1.3;">' + titleText + '</div>' +
+          (subtitleText ? '<div style="font-size:12px;color:#64748b;font-weight:600;margin-top:2px;">' + subtitleText + '</div>' : '') +
+        '</div>' +
+        kpisHtml +
+        '<div style="margin-bottom:18px;">' +
+          '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">1. Diagnóstico Analítico & Contexto</div>' +
+          '<div style="font-size:11.5px;line-height:1.6;color:#334155;background:#fafafa;border:1px solid #f1f5f9;border-radius:6px;padding:8px 10px;">' + diagText.replace(/\n/g, '<br/>') + '</div>' +
+        '</div>' +
+        tableHtml +
+        recsHtml +
+        '<div style="margin-bottom:20px;page-break-inside:avoid;">' +
+          '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">4. Parecer & Despacho da Direção Técnica</div>' +
+          '<div style="font-size:11px;line-height:1.5;color:#475569;border:1px dashed #cbd5e1;border-radius:6px;padding:8px 10px;background:#fdfdfd;margin-bottom:12px;">' + notesText.replace(/\n/g, '<br/>') + '</div>' +
+          '<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-top:24px;padding-top:14px;border-top:1px solid #e2e8f0;font-size:10.5px;color:#64748b;">' +
+            '<div>Assinatura do Responsável: _________________________________________</div>' +
+            '<div>Carimbo / Visto Farmácia: [ &nbsp; ] Homologado</div>' +
+          '</div>' +
+        '</div>' +
+        '<div style="border-top:1px solid #e2e8f0;padding-top:8px;margin-top:16px;font-size:9.5px;color:#94a3b8;display:flex;justify-content:space-between;">' +
+          '<span>🔒 Documento Confidencial para Uso Interno Exclusivo da Farmácia</span>' +
+          '<span>Gerado por BI Pharma AI</span>' +
+        '</div>' +
+        '</body></html>';
+
+      win.document.open();
+      win.document.write(docHtml);
+      win.document.close();
+      win.focus();
+      setTimeout(function() { win.print(); }, 350);
+    }
+
+    async function refineReportWithAi() {
+      var input = document.getElementById('reportRefinePromptInput');
+      var prompt = input ? input.value.trim() : '';
+      if (!prompt) {
+        alert('Por favor introduza uma instrução de ajuste (ex: "Foca em perdas financeiras", "Resume em 2 tópicos").');
+        return;
+      }
+      var submitBtn = document.getElementById('btnReportRefineSubmit');
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<span class="spinner-sm"></span> A sintetizar...';
+      }
+
+      var sid = (typeof getCopilotSessionId === 'function') ? getCopilotSessionId() : '';
+      await loadAndOpenCopilotReport(window.lastCopilotAssistantText || '', sid, prompt);
+
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = 'Atualizar Relatório';
+      }
+      if (input) input.value = '';
+    }
+
     function copyShoppingListToClipboard() {
       var list = window.lastCopilotShoppingList;
       if (!list || list.length === 0) {
@@ -11598,7 +12227,13 @@ function getDashboardHtml(): string {
           '<span>Esta resposta foi útil?</span>' +
           '<button class="chat-feedback-btn" onclick="sendCopilotFeedback(&quot;UP&quot;, this)">👍 Sim, assertiva</button>' +
           '<button class="chat-feedback-btn" onclick="sendCopilotFeedback(&quot;DOWN&quot;, this)">👎 Pouco clara</button>' +
+          '<button class="chat-feedback-btn" onclick="openCopilotReportModalFromBubble(this)" style="margin-left: auto; background: #e0f2fe; color: #0369a1; border-color: #7dd3fc; font-weight: 700; display: inline-flex; align-items: center; gap: 5px; cursor: pointer;" title="Estruturar esta resposta num Relatório Executivo timbrado A4 com Preview">' +
+            '<span>📑 Gerar Relatório Executivo</span>' +
+          '</button>' +
         '</div>';
+
+        assistantBubble.dataset.rawText = data.text || data.explicacao || '';
+        window.lastCopilotAssistantText = data.text || data.explicacao || '';
 
         assistantBubble.innerHTML = badgeHtml +
           '<div>' + formattedHtml + '</div>' +

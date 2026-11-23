@@ -86,6 +86,10 @@ export function clearCopilotSession(sessionId: string) {
   sessionTurnCounter.delete(sessionId);
 }
 
+export function getCopilotSessionHistory(sessionId: string): Array<{ role: 'user' | 'assistant'; content: any }> {
+  return sessionHistory.get(sessionId) || [];
+}
+
 // ============================================================================
 // CONJUNTO CONSOLIDADO DE 15 FERRAMENTAS (DADOS, DECISÃO, AÇÃO)
 // ============================================================================
