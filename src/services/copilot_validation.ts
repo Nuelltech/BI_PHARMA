@@ -510,7 +510,13 @@ export function trimTruncatedText(text: string, stopReason?: string | null): str
   if (stopReason !== 'max_tokens' && endsWithPunct) {
     return cleaned;
   }
-  const lastEnd = Math.max(cleaned.lastIndexOf('.'), cleaned.lastIndexOf('!'), cleaned.lastIndexOf('?'));
+  // Encontra o último fim de frase real (. ! ? seguido de espaço ou fim de string, ignorando pontos decimais/milhares como 22.443)
+  let lastEnd = -1;
+  const rx = /[.!?](?=\s|$)/g;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(cleaned)) !== null) {
+    lastEnd = m.index;
+  }
   if (lastEnd === -1) return '';
   return cleaned.slice(0, lastEnd + 1).trim();
 }
