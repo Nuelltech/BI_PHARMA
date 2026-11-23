@@ -8785,7 +8785,7 @@ function getDashboardHtml(): string {
       var progressBar = document.getElementById('importProgressBar');
       if (progressBar) {
         progressBar.style.width = '5%';
-        progressBar.style.background = '';
+        progressBar.style.background = 'linear-gradient(90deg, #38bdf8, #10b981)';
       }
       var statsReport = document.getElementById('importStatsReport');
       if (statsReport) statsReport.style.display = 'none';
@@ -9096,7 +9096,7 @@ function getDashboardHtml(): string {
           if (progressIcon) progressIcon.textContent = allFailed ? '❌' : (failedCount > 0 ? '⚠️' : '🎉');
           if (progressBar) {
             progressBar.style.width = '100%';
-            progressBar.style.background = allFailed ? '#ef4444' : (failedCount > 0 ? '#f59e0b' : '');
+            progressBar.style.background = allFailed ? '#ef4444' : (failedCount > 0 ? '#f59e0b' : 'linear-gradient(90deg, #38bdf8, #10b981)');
           }
           if (progressPercent) progressPercent.textContent = '100%';
           document.getElementById('importProgressTitle').textContent = allFailed
