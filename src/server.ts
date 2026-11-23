@@ -723,7 +723,7 @@ async function startServer() {
           } catch {}
         }
 
-        const rawCode = String(
+        const rawCodeOriginal = String(
           explicitCode ||
             headerToken ||
             authBearer ||
@@ -732,9 +732,9 @@ async function startServer() {
             cookieCode ||
             refererCode ||
             ''
-        )
-          .trim()
-          .toUpperCase();
+        ).trim();
+        const rawCode = rawCodeOriginal.toUpperCase();
+        const rawCodeLower = rawCodeOriginal.toLowerCase();
 
         if (rawCode.length > 0) {
           const matchedFarm = await prisma.farmacia.findFirst({
@@ -746,7 +746,8 @@ async function startServer() {
                     mode: 'insensitive',
                   },
                 },
-                { id: rawCode },
+                { id: rawCodeOriginal },
+                { id: rawCodeLower },
               ],
             },
           });
