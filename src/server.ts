@@ -568,7 +568,28 @@ function maskNif(rawNif: string): string {
   return clean;
 }
 
-const importProgressStore = new Map<string, { status: string; percent: number; step: string; detail: string; error?: string }>();
+const importProgressStore = new Map<string, { status: string; percent: number; step: string; detail: string; error?: string; stats?: any }>();
+const importJobQueue: Array<() => Promise<void>> = [];
+let activeImportJobs = 0;
+const MAX_CONCURRENT_IMPORTS = 2;
+
+function enqueueControlledImport(job: () => Promise<void>) {
+  importJobQueue.push(job);
+  drainImportQueue();
+}
+
+function drainImportQueue() {
+  while (activeImportJobs < MAX_CONCURRENT_IMPORTS && importJobQueue.length > 0) {
+    const nextJob = importJobQueue.shift()!;
+    activeImportJobs++;
+    nextJob()
+      .catch((err: any) => console.error('[Import Queue] Erro inesperado no job:', err?.message || err))
+      .finally(() => {
+        activeImportJobs--;
+        drainImportQueue();
+      });
+  }
+}
 
 const LEGACY_PREDICTABLE_CODES = new Set([
   'FARM-A-7842',
@@ -1885,66 +1906,94 @@ async function startServer() {
             }
           }
 
+          const queuedPos = activeImportJobs >= MAX_CONCURRENT_IMPORTS ? importJobQueue.length + 1 : 0;
           importProgressStore.set(farm.id, {
-            status: 'PROCESSING',
-            percent: 5,
-            step: 'A preparar ficheiros para importação...',
-            detail: fileBuffers.length + ' ficheiro(s) em processamento',
+            status: queuedPos > 0 ? 'QUEUED' : 'PROCESSING',
+            percent: 2,
+            step: queuedPos > 0 ? `Na fila de importação (posição ${queuedPos})...` : 'A preparar ficheiros para importação...',
+            detail: fileBuffers.length + ' ficheiro(s) selecionados',
           });
 
           const decisions = body.decisions || {};
-          const stats = await executeInteractiveImport(
-            fileBuffers,
-            decisions,
-            farm.id,
-            prisma,
-            (percent, step, detail) => {
+          const jobStartMs = Date.now();
+
+          enqueueControlledImport(async () => {
+            try {
               importProgressStore.set(farm.id, {
-                status: percent >= 100 ? 'COMPLETED' : 'PROCESSING',
-                percent,
-                step,
-                detail,
+                status: 'PROCESSING',
+                percent: 5,
+                step: 'A iniciar importação em lote...',
+                detail: fileBuffers.length + ' ficheiro(s) em processamento',
+              });
+
+              const stats = await executeInteractiveImport(
+                fileBuffers,
+                decisions,
+                farm.id,
+                prisma,
+                (percent, step, detail) => {
+                  importProgressStore.set(farm.id, {
+                    status: 'PROCESSING',
+                    percent: Math.min(94, percent),
+                    step,
+                    detail,
+                  });
+                }
+              );
+
+              const totalErrosImport = stats.detalhesPorFicheiro.filter((d) => !d.sucesso).length;
+              if (stats.filesProcessed > 0) {
+                importProgressStore.set(farm.id, {
+                  status: 'PROCESSING',
+                  percent: 96,
+                  step: 'A recalcular indicadores analíticos (Marts)...',
+                  detail: 'A atualizar painel e Copilot com os novos dados...',
+                });
+                try {
+                  await computeAndPersistMarts(prisma, farm.id);
+                } catch (martErr: any) {
+                  console.error('[Import] Erro ao recalcular marts:', martErr.message);
+                }
+              }
+
+              stats.duracaoMs = Date.now() - jobStartMs;
+              const durSeg = (stats.duracaoMs / 1000).toFixed(1).replace('.', ',');
+
+              // Invalida caches
+              invalidateAllPharmacyCaches(farm.id);
+              getCachedOrComputeAnalysis(prisma, farm.id, 90, 4, 12).catch(() => {});
+              getCachedOrComputeCampaignsPayload(prisma, farm).catch(() => {});
+
+              importProgressStore.set(farm.id, {
+                status: totalErrosImport > 0 && stats.filesProcessed === 0 ? 'ERROR' : 'COMPLETED',
+                percent: 100,
+                step:
+                  totalErrosImport > 0 && stats.filesProcessed === 0
+                    ? '❌ Importação falhou'
+                    : totalErrosImport > 0
+                      ? `⚠️ Importação concluída com erros (${durSeg} s)`
+                      : `🎉 Importação Concluída em ${durSeg} s!`,
+                detail:
+                  totalErrosImport > 0 && stats.filesProcessed === 0
+                    ? `${totalErrosImport} ficheiro(s) com erro. Consulte os detalhes abaixo.`
+                    : `Todos os registos válidos foram integrados e os indicadores atualizados em ${durSeg} s.`,
+                stats,
+              });
+            } catch (bgErr: any) {
+              console.error('[Import Background Error]:', bgErr?.message || bgErr);
+              importProgressStore.set(farm.id, {
+                status: 'ERROR',
+                percent: 100,
+                step: '❌ Erro no Processamento',
+                detail: bgErr?.message || 'Erro interno durante a importação.',
+                error: bgErr?.message || String(bgErr),
               });
             }
-          );
-
-          const totalErrosImport = stats.detalhesPorFicheiro.filter((d) => !d.sucesso).length;
-          if (stats.filesProcessed > 0) {
-            importProgressStore.set(farm.id, {
-              status: 'PROCESSING',
-              percent: 96,
-              step: 'A recalcular indicadores analíticos (Marts)...',
-              detail: 'A atualizar painel e Copilot com os novos dados...',
-            });
-            try {
-              await computeAndPersistMarts(prisma, farm.id);
-            } catch (martErr: any) {
-              console.error('[Import] Erro ao recalcular marts:', martErr.message);
-            }
-          }
-
-          importProgressStore.set(farm.id, {
-            status: totalErrosImport > 0 && stats.filesProcessed === 0 ? 'ERROR' : 'COMPLETED',
-            percent: 100,
-            step:
-              totalErrosImport > 0 && stats.filesProcessed === 0
-                ? '❌ Importação falhou'
-                : totalErrosImport > 0
-                  ? '⚠️ Importação concluída com erros'
-                  : '🎉 Importação Concluída com Sucesso!',
-            detail:
-              totalErrosImport > 0 && stats.filesProcessed === 0
-                ? `${totalErrosImport} ficheiro(s) com erro. Consulte os detalhes abaixo.`
-                : 'Todos os registos válidos foram integrados e os indicadores atualizados.',
           });
 
-          // Invalida caches
-          invalidateAllPharmacyCaches(farm.id);
-          getCachedOrComputeAnalysis(prisma, farm.id, 90, 4, 12).catch(() => {});
-          getCachedOrComputeCampaignsPayload(prisma, farm).catch(() => {});
-
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, stats }));
+          // Responde imediatamente (202 Accepted) — zero risco de timeout HTTP do proxy!
+          res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, async: true, farmaciaId: farm.id }));
         } catch (e: any) {
           const status = e.statusCode || 400;
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -9005,12 +9054,34 @@ function getDashboardHtml(): string {
           })
         });
 
+        var data = await res.json();
+        if (data.ok && data.async) {
+          // Aguarda conclusão em segundo plano via polling (sem timeout HTTP!)
+          var finalProg = await new Promise(function(resolve) {
+            var waitTimer = setInterval(async function() {
+              try {
+                var pRes = await fetch('/api/admin/import-progress?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+                var pData = await pRes.json();
+                if (pData.ok && pData.progress && (pData.progress.status === 'COMPLETED' || pData.progress.status === 'ERROR')) {
+                  clearInterval(waitTimer);
+                  resolve(pData.progress);
+                }
+              } catch (e) {}
+            }, 700);
+          });
+          data = {
+            ok: finalProg.status === 'COMPLETED' || Boolean(finalProg.stats),
+            stats: finalProg.stats || null,
+            error: finalProg.error || finalProg.detail || 'Erro na importação'
+          };
+        }
+
         clearInterval(pollTimer);
 
-        var data = await res.json();
         if (data.ok && data.stats) {
           var failedCount = (data.stats.detalhesPorFicheiro || []).filter(function(x) { return !x.sucesso; }).length;
           var allFailed = failedCount > 0 && data.stats.filesProcessed === 0;
+          var durTxt = data.stats.duracaoMs ? (' em ' + (data.stats.duracaoMs / 1000).toFixed(1).replace('.', ',') + ' s') : '';
           if (progressIcon) progressIcon.textContent = allFailed ? '❌' : (failedCount > 0 ? '⚠️' : '🎉');
           if (progressBar) {
             progressBar.style.width = '100%';
@@ -9019,10 +9090,10 @@ function getDashboardHtml(): string {
           if (progressPercent) progressPercent.textContent = '100%';
           document.getElementById('importProgressTitle').textContent = allFailed
             ? 'Importação falhou'
-            : (failedCount > 0 ? 'Importação concluída com erros' : 'Importação Concluída com Sucesso!');
+            : (failedCount > 0 ? 'Importação concluída com erros' + durTxt : 'Importação Concluída com Sucesso' + durTxt + '!');
           if (progressStep) progressStep.textContent = allFailed
             ? 'Nenhum ficheiro foi integrado. Verifique os erros abaixo.'
-            : (failedCount > 0 ? 'Alguns ficheiros apresentaram erro.' : 'Processamento finalizado com sucesso.');
+            : (failedCount > 0 ? 'Alguns ficheiros apresentaram erro.' : 'Processamento finalizado com sucesso' + durTxt + '.');
           if (progressDetail) progressDetail.textContent = data.stats.filesProcessed + ' ficheiro(s) integrados' + (failedCount > 0 ? ' · ' + failedCount + ' com erro.' : '.');
 
           var r = document.getElementById('importStatsReport');

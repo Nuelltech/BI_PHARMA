@@ -69,6 +69,7 @@ export interface ImportExecutionStats {
   totalInventarioAtivoAtualizado: number;
   totalValidadesCruzadas: number;
   totalProdutosNovos: number;
+  duracaoMs?: number;
   detalhesPorFicheiro: Array<{
     fileName: string;
     sucesso: boolean;
@@ -78,6 +79,139 @@ export interface ImportExecutionStats {
     validades?: number;
     mensagem?: string;
   }>;
+}
+
+function parsePtDecimal(raw: string | null | undefined): number {
+  const s = String(raw ?? '').trim();
+  if (!s) return NaN;
+  if (s.includes(',')) {
+    return parseFloat(s.replace(/\./g, '').replace(',', '.'));
+  }
+  return parseFloat(s);
+}
+
+const BULK_BATCH_SIZE = 1000;
+
+async function bulkUpsertVendas(
+  prisma: PrismaClient,
+  rows: Array<{ farmaciaId: string; cnp_codigo: string; quantidade: number; valor_total: number; data_venda: Date; granularidade: string }>,
+  onBatch?: (done: number, total: number) => void
+) {
+  // Deduplicar por chave única (farmaciaId, cnp_codigo, data_venda, granularidade)
+  const dedup = new Map<string, (typeof rows)[number]>();
+  for (const r of rows) {
+    dedup.set(`${r.farmaciaId}|${r.cnp_codigo}|${r.data_venda.toISOString()}|${r.granularidade}`, r);
+  }
+  const uniqueRows = Array.from(dedup.values());
+  for (let i = 0; i < uniqueRows.length; i += BULK_BATCH_SIZE) {
+    const chunk = uniqueRows.slice(i, i + BULK_BATCH_SIZE);
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO "Venda" ("id", "farmaciaId", "cnp_codigo", "quantidade", "valor_total", "data_venda", "granularidade")
+       SELECT gen_random_uuid()::text, u.fid, u.cnp, u.qtd, u.val, u.dt, u.gran
+       FROM unnest($1::text[], $2::text[], $3::int[], $4::numeric[], $5::timestamptz[], $6::text[])
+         AS u(fid, cnp, qtd, val, dt, gran)
+       ON CONFLICT ("farmaciaId", "cnp_codigo", "data_venda", "granularidade")
+       DO UPDATE SET "quantidade" = EXCLUDED."quantidade", "valor_total" = EXCLUDED."valor_total"`,
+      chunk.map((r) => r.farmaciaId),
+      chunk.map((r) => r.cnp_codigo),
+      chunk.map((r) => r.quantidade),
+      chunk.map((r) => Number(r.valor_total.toFixed(2))),
+      chunk.map((r) => r.data_venda),
+      chunk.map((r) => r.granularidade)
+    );
+    onBatch?.(Math.min(i + chunk.length, uniqueRows.length), uniqueRows.length);
+  }
+  return uniqueRows.length;
+}
+
+async function bulkUpsertSnapshots(
+  prisma: PrismaClient,
+  rows: Array<{ farmaciaId: string; cnp_codigo: string; data_snapshot: Date; quantidade: number; custo_unitario: number; valor_total: number }>,
+  onBatch?: (done: number, total: number) => void
+) {
+  const dedup = new Map<string, (typeof rows)[number]>();
+  for (const r of rows) {
+    dedup.set(`${r.farmaciaId}|${r.cnp_codigo}|${r.data_snapshot.toISOString()}`, r);
+  }
+  const uniqueRows = Array.from(dedup.values());
+  for (let i = 0; i < uniqueRows.length; i += BULK_BATCH_SIZE) {
+    const chunk = uniqueRows.slice(i, i + BULK_BATCH_SIZE);
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO "InventarioSnapshot" ("id", "farmaciaId", "cnp_codigo", "data_snapshot", "quantidade", "custo_unitario", "valor_total", "data_extracao")
+       SELECT gen_random_uuid()::text, u.fid, u.cnp, u.dt, u.qtd, u.custo, u.val, NOW()
+       FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::int[], $5::numeric[], $6::numeric[])
+         AS u(fid, cnp, dt, qtd, custo, val)
+       ON CONFLICT ("farmaciaId", "cnp_codigo", "data_snapshot")
+       DO UPDATE SET "quantidade" = EXCLUDED."quantidade", "custo_unitario" = EXCLUDED."custo_unitario", "valor_total" = EXCLUDED."valor_total", "data_extracao" = NOW()`,
+      chunk.map((r) => r.farmaciaId),
+      chunk.map((r) => r.cnp_codigo),
+      chunk.map((r) => r.data_snapshot),
+      chunk.map((r) => r.quantidade),
+      chunk.map((r) => Number(r.custo_unitario.toFixed(2))),
+      chunk.map((r) => Number(r.valor_total.toFixed(2)))
+    );
+    onBatch?.(Math.min(i + chunk.length, uniqueRows.length), uniqueRows.length);
+  }
+  return uniqueRows.length;
+}
+
+async function bulkUpsertInventario(
+  prisma: PrismaClient,
+  rows: Array<{ farmaciaId: string; cnp_codigo: string; lote: string; quantidade: number; custo_unitario: number }>,
+  onBatch?: (done: number, total: number) => void
+) {
+  const dedup = new Map<string, (typeof rows)[number]>();
+  for (const r of rows) {
+    dedup.set(`${r.farmaciaId}|${r.cnp_codigo}|${r.lote}`, r);
+  }
+  const uniqueRows = Array.from(dedup.values());
+  for (let i = 0; i < uniqueRows.length; i += BULK_BATCH_SIZE) {
+    const chunk = uniqueRows.slice(i, i + BULK_BATCH_SIZE);
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO "Inventario" ("id", "farmaciaId", "cnp_codigo", "lote", "quantidade", "custo_unitario", "data_extracao")
+       SELECT gen_random_uuid()::text, u.fid, u.cnp, u.lote, u.qtd, u.custo, NOW()
+       FROM unnest($1::text[], $2::text[], $3::text[], $4::int[], $5::numeric[])
+         AS u(fid, cnp, lote, qtd, custo)
+       ON CONFLICT ("farmaciaId", "cnp_codigo", "lote")
+       DO UPDATE SET "quantidade" = EXCLUDED."quantidade", "custo_unitario" = EXCLUDED."custo_unitario", "data_extracao" = NOW()`,
+      chunk.map((r) => r.farmaciaId),
+      chunk.map((r) => r.cnp_codigo),
+      chunk.map((r) => r.lote),
+      chunk.map((r) => r.quantidade),
+      chunk.map((r) => Number(r.custo_unitario.toFixed(2)))
+    );
+    onBatch?.(Math.min(i + chunk.length, uniqueRows.length), uniqueRows.length);
+  }
+  return uniqueRows.length;
+}
+
+async function bulkUpsertPrecos(
+  prisma: PrismaClient,
+  rows: Array<{ farmaciaId: string; cnp_codigo: string; pvp: number; custo_ref: number }>,
+  onBatch?: (done: number, total: number) => void
+) {
+  const dedup = new Map<string, (typeof rows)[number]>();
+  for (const r of rows) {
+    dedup.set(`${r.farmaciaId}|${r.cnp_codigo}`, r);
+  }
+  const uniqueRows = Array.from(dedup.values());
+  for (let i = 0; i < uniqueRows.length; i += BULK_BATCH_SIZE) {
+    const chunk = uniqueRows.slice(i, i + BULK_BATCH_SIZE);
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO "PrecoFarmacia" ("farmaciaId", "cnp_codigo", "pvp", "custo_ref", "atualizadoEm")
+       SELECT u.fid, u.cnp, u.pvp, u.custo, NOW()
+       FROM unnest($1::text[], $2::text[], $3::numeric[], $4::numeric[])
+         AS u(fid, cnp, pvp, custo)
+       ON CONFLICT ("farmaciaId", "cnp_codigo")
+       DO UPDATE SET "pvp" = EXCLUDED."pvp", "custo_ref" = EXCLUDED."custo_ref", "atualizadoEm" = NOW()`,
+      chunk.map((r) => r.farmaciaId),
+      chunk.map((r) => r.cnp_codigo),
+      chunk.map((r) => Number(r.pvp.toFixed(2))),
+      chunk.map((r) => Number(r.custo_ref.toFixed(2)))
+    );
+    onBatch?.(Math.min(i + chunk.length, uniqueRows.length), uniqueRows.length);
+  }
+  return uniqueRows.length;
 }
 
 /**
@@ -295,6 +429,7 @@ export async function executeInteractiveImport(
   prisma: PrismaClient,
   onProgress?: (percent: number, step: string, detail: string) => void
 ): Promise<ImportExecutionStats> {
+  const importStartTime = Date.now();
   const stats: ImportExecutionStats = {
     filesProcessed: 0,
     totalVendasCriadas: 0,
@@ -486,65 +621,43 @@ export async function executeInteractiveImport(
         stats.totalProdutosNovos += res.count;
       }
 
-      // 2. Inserir Vendas
+      // 2. Inserir Vendas em Bulk SQL (lotes de 1.000 linhas — ~100x mais rápido que upsert individual)
       const vendasToInsert: Array<{
         farmaciaId: string;
         cnp_codigo: string;
         quantidade: number;
-        valor_total: Prisma.Decimal;
+        valor_total: number;
         data_venda: Date;
         granularidade: string;
       }> = [];
 
       for (const r of parsedVen.rows) {
         const cnp = normalizeCnp(r.codigo);
-        const pvpNum = parseFloat(r.pvp.replace('.', '').replace(',', '.'));
+        const pvpNum = parsePtDecimal(r.pvp);
         const unitPvp = !Number.isNaN(pvpNum) ? pvpNum : 0;
 
         for (const [isoDate, qtd] of Object.entries(r.vendasMensais)) {
           if (qtd === 0) continue;
-          const valorTotal = new Prisma.Decimal((qtd * unitPvp).toFixed(2));
           vendasToInsert.push({
             farmaciaId: targetFarmaciaId,
             cnp_codigo: cnp,
             quantidade: qtd,
-            valor_total: valorTotal,
+            valor_total: Number((qtd * unitPvp).toFixed(2)),
             data_venda: new Date(isoDate),
             granularidade: parsedVen.granularidade,
           });
         }
       }
 
-      for (let i = 0; i < vendasToInsert.length; i += 500) {
-        const chunk = vendasToInsert.slice(i, i + 500);
-        await prisma.$transaction(
-          chunk.map((v) =>
-            prisma.venda.upsert({
-              where: {
-                farmaciaId_cnp_codigo_data_venda_granularidade: {
-                  farmaciaId: v.farmaciaId,
-                  cnp_codigo: v.cnp_codigo,
-                  data_venda: v.data_venda,
-                  granularidade: v.granularidade,
-                },
-              },
-              update: {
-                quantidade: v.quantidade,
-                valor_total: v.valor_total,
-              },
-              create: v,
-            })
-          )
-        );
-        stats.totalVendasCriadas += chunk.length;
-
-        const salesProgress = (i + chunk.length) / Math.max(1, vendasToInsert.length);
+      const vendasGravadas = await bulkUpsertVendas(prisma, vendasToInsert, (done, total) => {
+        const salesProgress = done / Math.max(1, total);
         onProgress?.(
-          basePct + Math.round(fileSlice * (0.25 + 0.45 * salesProgress)),
-          `A gravar vendas na base de dados...`,
-          `${i + chunk.length} de ${vendasToInsert.length} vendas gravadas`
+          basePct + Math.round(fileSlice * (0.25 + 0.30 * salesProgress)),
+          `A gravar vendas em lote na base de dados...`,
+          `${done} de ${total} vendas gravadas`
         );
-      }
+      });
+      stats.totalVendasCriadas += vendasGravadas;
 
       // 3. Gestão de Stock (Snapshot Histórico vs Atual)
       const stockAction = fileDecisions.stockAction || (parsedVen.anoVendas < 2026 ? 'snapshot_only' : 'update_active');
@@ -559,83 +672,59 @@ export async function executeInteractiveImport(
           cnp_codigo: string;
           data_snapshot: Date;
           quantidade: number;
-          custo_unitario: Prisma.Decimal;
-          valor_total: Prisma.Decimal;
+          custo_unitario: number;
+          valor_total: number;
         }> = [];
 
         for (const r of parsedVen.rows) {
           const cnp = normalizeCnp(r.codigo);
           const stockNum = parseInt(r.stock, 10);
-          const pcNum = parseFloat(r.pc.replace('.', '').replace(',', '.'));
+          const pcNum = parsePtDecimal(r.pc);
           if (Number.isNaN(stockNum) || Number.isNaN(pcNum)) continue;
 
-          const totalCusto = new Prisma.Decimal((stockNum * pcNum).toFixed(2));
           snapshotsData.push({
             farmaciaId: targetFarmaciaId,
             cnp_codigo: cnp,
             data_snapshot: snapshotDate,
             quantidade: stockNum,
-            custo_unitario: new Prisma.Decimal(pcNum.toFixed(2)),
-            valor_total: totalCusto,
+            custo_unitario: Number(pcNum.toFixed(2)),
+            valor_total: Number((stockNum * pcNum).toFixed(2)),
           });
         }
 
-        for (let i = 0; i < snapshotsData.length; i += 500) {
-          const chunk = snapshotsData.slice(i, i + 500);
-          await prisma.$transaction(
-            chunk.map((s) =>
-              prisma.inventarioSnapshot.upsert({
-                where: {
-                  farmaciaId_cnp_codigo_data_snapshot: {
-                    farmaciaId: s.farmaciaId,
-                    cnp_codigo: s.cnp_codigo,
-                    data_snapshot: s.data_snapshot,
-                  },
-                },
-                update: {
-                  quantidade: s.quantidade,
-                  custo_unitario: s.custo_unitario,
-                  valor_total: s.valor_total,
-                },
-                create: s,
-              })
-            )
-          );
-          snapshotsCount += chunk.length;
-
-          const snapProgress = (i + chunk.length) / Math.max(1, snapshotsData.length);
+        snapshotsCount = await bulkUpsertSnapshots(prisma, snapshotsData, (done, total) => {
+          const snapProgress = done / Math.max(1, total);
           onProgress?.(
-            basePct + Math.round(fileSlice * (0.7 + 0.25 * snapProgress)),
+            basePct + Math.round(fileSlice * (0.55 + 0.18 * snapProgress)),
             `A criar snapshots de stock histórico (${parsedVen.anoVendas})...`,
-            `${i + chunk.length} de ${snapshotsData.length} posições de stock registadas`
+            `${done} de ${total} posições de stock registadas`
           );
-        }
+        });
         stats.totalSnapshotsStockCriados += snapshotsCount;
       }
 
       if (stockAction === 'update_active') {
-        // Atualiza a tabela Inventario e PrecoFarmacia com os valores deste ficheiro
+        // Atualiza Inventario e PrecoFarmacia em Bulk SQL
         const invRows: Array<{
           farmaciaId: string;
           cnp_codigo: string;
           lote: string;
           quantidade: number;
-          custo_unitario: Prisma.Decimal;
+          custo_unitario: number;
         }> = [];
 
         const precosRows: Array<{
           farmaciaId: string;
           cnp_codigo: string;
-          pvp: Prisma.Decimal;
-          custo_ref: Prisma.Decimal;
-          margem?: Prisma.Decimal;
+          pvp: number;
+          custo_ref: number;
         }> = [];
 
         for (const r of parsedVen.rows) {
           const cnp = normalizeCnp(r.codigo);
           const stockNum = parseInt(r.stock, 10);
-          const pcNum = parseFloat(r.pc.replace('.', '').replace(',', '.'));
-          const pvpNum = parseFloat(r.pvp.replace('.', '').replace(',', '.'));
+          const pcNum = parsePtDecimal(r.pc);
+          const pvpNum = parsePtDecimal(r.pvp);
 
           if (!Number.isNaN(stockNum) && !Number.isNaN(pcNum)) {
             invRows.push({
@@ -643,7 +732,7 @@ export async function executeInteractiveImport(
               cnp_codigo: cnp,
               lote: 'LOTE ÚNICO',
               quantidade: stockNum,
-              custo_unitario: new Prisma.Decimal(pcNum.toFixed(2)),
+              custo_unitario: Number(pcNum.toFixed(2)),
             });
           }
 
@@ -651,68 +740,30 @@ export async function executeInteractiveImport(
             precosRows.push({
               farmaciaId: targetFarmaciaId,
               cnp_codigo: cnp,
-              pvp: new Prisma.Decimal(pvpNum.toFixed(2)),
-              custo_ref: new Prisma.Decimal(pcNum.toFixed(2)),
+              pvp: Number(pvpNum.toFixed(2)),
+              custo_ref: Number(pcNum.toFixed(2)),
             });
           }
         }
 
-        for (let i = 0; i < invRows.length; i += 250) {
-          const chunk = invRows.slice(i, i + 250);
-          await prisma.$transaction(
-            chunk.map((inv) =>
-              prisma.inventario.upsert({
-                where: {
-                  farmaciaId_cnp_codigo_lote: {
-                    farmaciaId: inv.farmaciaId,
-                    cnp_codigo: inv.cnp_codigo,
-                    lote: inv.lote,
-                  },
-                },
-                update: {
-                  quantidade: inv.quantidade,
-                  custo_unitario: inv.custo_unitario,
-                  data_extracao: new Date(),
-                },
-                create: {
-                  ...inv,
-                  data_extracao: new Date(),
-                },
-              })
-            )
+        activeStockCount = await bulkUpsertInventario(prisma, invRows, (done, total) => {
+          const invProgress = done / Math.max(1, total);
+          onProgress?.(
+            basePct + Math.round(fileSlice * (0.73 + 0.14 * invProgress)),
+            `A atualizar inventário ativo em lote...`,
+            `${done} de ${total} artigos atualizados`
           );
-          activeStockCount += chunk.length;
-        }
+        });
         stats.totalInventarioAtivoAtualizado += activeStockCount;
 
-        // Precos
-        for (let i = 0; i < precosRows.length; i += 500) {
-          const chunk = precosRows.slice(i, i + 500);
-          await prisma.$transaction(
-            chunk.map((p) =>
-              prisma.precoFarmacia.upsert({
-                where: {
-                  farmaciaId_cnp_codigo: {
-                    farmaciaId: p.farmaciaId,
-                    cnp_codigo: p.cnp_codigo,
-                  },
-                },
-                update: {
-                  pvp: p.pvp,
-                  custo_ref: p.custo_ref,
-                  atualizadoEm: new Date(),
-                },
-                create: {
-                  farmaciaId: p.farmaciaId,
-                  cnp_codigo: p.cnp_codigo,
-                  pvp: p.pvp,
-                  custo_ref: p.custo_ref,
-                  atualizadoEm: new Date(),
-                },
-              })
-            )
+        await bulkUpsertPrecos(prisma, precosRows, (done, total) => {
+          const pProgress = done / Math.max(1, total);
+          onProgress?.(
+            basePct + Math.round(fileSlice * (0.87 + 0.08 * pProgress)),
+            `A atualizar preços e custos em lote...`,
+            `${done} de ${total} preços atualizados`
           );
-        }
+        });
       }
 
       stats.filesProcessed++;
@@ -734,6 +785,7 @@ export async function executeInteractiveImport(
     }
   }
 
+  stats.duracaoMs = Date.now() - importStartTime;
   const totalErros = stats.detalhesPorFicheiro.filter((d) => !d.sucesso).length;
   if (totalErros > 0 && stats.filesProcessed === 0) {
     onProgress?.(100, '❌ Importação falhou', `${totalErros} ficheiro(s) com erro. Consulte os detalhes abaixo.`);
