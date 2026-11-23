@@ -2611,7 +2611,7 @@ export async function toolRelatorioLaboratorio(
     imobilizado_produtos_unicos: result.imobilizado_total.total_produtos_unicos,
     lacunas,
     instrucao:
-      'Escreve no máximo 4 frases corridas em texto simples. Não escrevas títulos (#), listas nem secções por classe; essas partes e as tabelas são geradas automaticamente pelo código. Não caracterizes grupos (ex.: "concentram-se em…") se essa informação não estiver explícita neste resumo. Usa apenas os números exatos deste resumo.',
+      'Escreve 2 a 3 frases corridas em texto simples. Cita apenas os totais gerais (faturação, unidades, produtos com vendas), o Top 5 com a sua % exata, e 1 a 2 produtos concretos de destaque. NÃO repitas contagens de classes nem de blocos (rutura, excesso, monos, sem vendas, manter, repor, etc.); essas contagens e as tabelas são inseridas automaticamente abaixo. Não escrevas títulos nem listas.',
   };
 
   return {

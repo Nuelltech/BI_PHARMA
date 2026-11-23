@@ -8,7 +8,7 @@ import {
   CatalogTermEntry,
 } from '../services/copilot_validation';
 import { classifyProductAction } from '../services/copilot_semantic_layer';
-import { buildExecutiveReportFromStructuredData } from '../services/copilot_reporting';
+import { buildExecutiveReportFromStructuredData, markdownInlineToHtml } from '../services/copilot_reporting';
 
 // Dados congelados (fixtures) — sem dependência da BD de produção
 const FIXTURE_CATALOG: CatalogTermEntry[] = [
@@ -311,5 +311,57 @@ describe('Fase 1 — Validação 1 (D1–D5), Validação 2 (T1–T7), Vocabulá
 
     // Caso extremo: 1 única frase cortada sem ponto final -> devolve "" para acionar fallback so_tabelas
     expect(trimTruncatedText('A Teva faturou 22.443,79 € com reposição nos li', 'max_tokens')).toBe('');
+  });
+
+  it('T1 dicionário de rótulos (grupos): bloqueia "24 em rutura", "7 com excesso de cobertura" e "5 sem qualquer venda"', () => {
+    const fixtureBlocoVsClasse = {
+      ...FIXTURE_RELATORIO,
+      classes_resumo: [
+        { classe: 'MANTER', n_produtos: 62, vendas_un: 2030, vendas_eur: 17926.9, stock_custo_eur: 872.89 },
+        { classe: 'REPOR', n_produtos: 24, vendas_un: 162, vendas_eur: 1718.86, stock_custo_eur: 0 },
+        { classe: 'DEVOLVER_EXCESSO', n_produtos: 7, vendas_un: 39, vendas_eur: 278.11, stock_custo_eur: 82.53 },
+        { classe: 'DEVOLVER_TUDO', n_produtos: 5, vendas_un: 4, vendas_eur: 26.03, stock_custo_eur: 19.31 },
+      ],
+      em_rutura: { total_contagem: 39, produtos: [] },
+      excessos: { total_contagem: 24, total_valor_custo: 187.4, produtos: [] },
+      sem_vendas: { total_contagem: 3, total_valor_custo: 11.95, produtos: [] },
+      monos: { total_contagem: 29, total_valor_custo: 197.23, produtos: [] },
+      validades: { total_contagem: 3, total_valor_custo: 70.0, produtos: [] },
+    };
+
+    const r1 = validateAndSanitizeLeitura('O portfólio conta com 24 em rutura.', {
+      relatorio: fixtureBlocoVsClasse,
+      turnToolResultsJson: [JSON.stringify(fixtureBlocoVsClasse)],
+      catalogTerms: FIXTURE_CATALOG,
+    });
+    expect(r1.ok).toBe(false);
+    expect(r1.failedRules).toContain('T1');
+
+    const r2 = validateAndSanitizeLeitura('Existem ainda 7 produtos com excesso de cobertura.', {
+      relatorio: fixtureBlocoVsClasse,
+      turnToolResultsJson: [JSON.stringify(fixtureBlocoVsClasse)],
+      catalogTerms: FIXTURE_CATALOG,
+    });
+    expect(r2.ok).toBe(false);
+    expect(r2.failedRules).toContain('T1');
+
+    const r3 = validateAndSanitizeLeitura('Temos 5 sem qualquer venda no período.', {
+      relatorio: fixtureBlocoVsClasse,
+      turnToolResultsJson: [JSON.stringify(fixtureBlocoVsClasse)],
+      catalogTerms: FIXTURE_CATALOG,
+    });
+    expect(r3.ok).toBe(false);
+    expect(r3.failedRules).toContain('T1');
+
+    // PDF: sem "Clínica", título sem parênteses duplicados, negrito convertido
+    const pdf = buildExecutiveReportFromStructuredData(fixtureBlocoVsClasse, {
+      farmaciaNome: 'Farmácia A',
+      responsavel: 'Sessão Farmácia A',
+      verFaturacao: true,
+    });
+    expect(pdf.subtitulo).toBe('Relatório de apoio à gestão — Farmácia A');
+    expect(pdf.subtitulo).not.toMatch(/cl[íi]nica/i);
+    expect(pdf.titulo).not.toContain('))');
+    expect(markdownInlineToHtml('A Teva faturou **22.443,79 €**.')).toBe('A Teva faturou <strong>22.443,79 €</strong>.');
   });
 });

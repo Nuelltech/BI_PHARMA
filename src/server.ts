@@ -5058,7 +5058,7 @@ function getDashboardHtml(): string {
       <div style="height: 38px; width: 1.5px; background: #334155;"></div>
       <div style="display: flex; flex-direction: column;">
         <span style="font-size: 0.7rem; font-weight: 800; letter-spacing: 2px; color: #38bdf8; text-transform: uppercase;">AI & PHARMACY INTELLIGENCE</span>
-        <span style="font-size: 0.75rem; font-weight: 600; color: #94a3b8;">Decisões Clínicas e Gestão de Stock</span>
+        <span style="font-size: 0.75rem; font-weight: 600; color: #94a3b8;">Gestão de Stock e Inteligência de Farmácia</span>
       </div>
     </div>
     <div style="display: flex; align-items: center; gap: 12px; color: #f8fafc; font-weight: 700; font-size: 1.1rem; margin-bottom: 8px;">

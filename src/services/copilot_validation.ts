@@ -713,6 +713,76 @@ export function validateAndSanitizeLeitura(
             }
           }
         }
+
+        // T1 para grupos com dicionário de rótulos (bloco vs classe — impede "24 em rutura", "7 com excesso de cobertura", "5 sem qualquer venda")
+        if (!violation) {
+          const classesArr = Array.isArray(options.relatorio.classes_resumo) ? options.relatorio.classes_resumo : [];
+          const clsCount = (cls: string) =>
+            Number(classesArr.find((c: any) => c.classe === cls)?.n_produtos ?? -1);
+
+          const labelRules: Array<{ rx: RegExp; expected: number[]; label: string }> = [
+            {
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:em\s+|com\s+)?ruturas?\b/i,
+              expected: options.relatorio.em_rutura?.total_contagem != null ? [Number(options.relatorio.em_rutura.total_contagem)] : [],
+              label: 'rutura',
+            },
+            {
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?sem\s+(?:qualquer\s+)?vendas?\b/i,
+              expected: options.relatorio.sem_vendas?.total_contagem != null ? [Number(options.relatorio.sem_vendas.total_contagem)] : [],
+              label: 'sem vendas',
+            },
+            {
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:em\s+|com\s+)?(?:excessos?\s+de\s+cobertura|excessos?|cobertura\s+excessiva)\b/i,
+              expected: options.relatorio.excessos?.total_contagem != null ? [Number(options.relatorio.excessos.total_contagem)] : [],
+              label: 'excesso de cobertura',
+            },
+            {
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:monos?|parados?)\b/i,
+              expected: options.relatorio.monos?.total_contagem != null ? [Number(options.relatorio.monos.total_contagem)] : [],
+              label: 'monos',
+            },
+            {
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:perto\s+de\s+|com\s+|em\s+risco\s+de\s+)?(?:validades?|caducidades?)\b/i,
+              expected: options.relatorio.validades?.total_contagem != null ? [Number(options.relatorio.validades.total_contagem)] : [],
+              label: 'validade/caducidade',
+            },
+            {
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:a\s+|para\s+|em\s+)?manter\b/i,
+              expected: clsCount('MANTER') >= 0 ? [clsCount('MANTER')] : [],
+              label: 'MANTER',
+            },
+            {
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:a\s+|para\s+|em\s+)?repor\b/i,
+              expected: clsCount('REPOR') >= 0 ? [clsCount('REPOR')] : [],
+              label: 'REPOR',
+            },
+            {
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:para\s+trabalhar\s+(?:por|sob)\s+|sob\s+|por\s+)encomenda\b/i,
+              expected: clsCount('TRABALHAR_ENCOMENDA') >= 0 ? [clsCount('TRABALHAR_ENCOMENDA')] : [],
+              label: 'TRABALHAR_ENCOMENDA',
+            },
+            {
+              rx: /\b(\d+)\s+(?:produtos?\s+|refer[êe]ncias?\s+)?(?:que\s+requerem\s+|em\s+|com\s+)?stock\s+m[ií]nimo\b/i,
+              expected: clsCount('STOCK_MINIMO') >= 0 ? [clsCount('STOCK_MINIMO')] : [],
+              label: 'STOCK_MINIMO',
+            },
+          ];
+
+          for (const rule of labelRules) {
+            if (rule.expected.length === 0) continue;
+            const m = sentence.match(rule.rx);
+            if (m && m[1]) {
+              const citedN = parseInt(m[1], 10);
+              if (!rule.expected.includes(citedN)) {
+                violation = {
+                  rule: 'T1',
+                  reason: `Contagem incorreta para "${rule.label}": citado ${citedN}, esperado ${rule.expected.join(' ou ')}.`,
+                };
+                break;
+              }
+            }
+          }
+        }
       }
 
       // T3: Verbos proibidos (eliminar, descartar, destruir, abater, liquidar) -> frase removida sempre

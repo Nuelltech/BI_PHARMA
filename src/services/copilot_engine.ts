@@ -612,9 +612,10 @@ Foco sugerido pelo modo selecionado: ${focoModo} (apenas indicação; a pergunta
    para além do que a ferramenta devolve, nem uses "presumível", "provavelmente" ou equivalentes. NUNCA INVENTES NÚMEROS. NUNCA INVENTES NOMES DE PRODUTOS/MEDICAMENTOS que não constem dos dados devolvidos pela ferramenta (ex.: nunca inventes Ácido Valpróico se não estiver no resultado). SEM ALUCINAÇÕES.
 8. Relatórios de Laboratório (ferramenta relatorio_laboratorio):
    As tabelas completas, a distribuição por classe de ação e a secção de Ações Imediatas são geradas e inseridas AUTOMATICAMENTE pelo código abaixo da tua resposta.
-   Escreve no máximo 4 frases corridas em texto simples. Não escrevas títulos (#), listas nem secções por classe; essas partes são geradas automaticamente.
-   Não caracterizes grupos (ex.: "concentram-se em estatinas…") se essa informação não estiver explícita no resumo recebido.
-   NUNCA uses verbos proibidos (eliminar, descartar, destruir, abater, liquidar) nem associes MSRM a escoamento, promoção ou alteração de preço.
+   Escreve 2 a 3 frases corridas em texto simples. Não escrevas títulos (#), listas nem secções por classe.
+   Cita apenas os totais gerais (faturação, unidades, n.º de produtos com vendas), o Top 5 com a sua %, e produtos concretos de destaque.
+   NÃO repitas contagens de classes nem de blocos (rutura, excesso, monos, sem vendas, manter, repor, etc.); essas contagens já estão nas tabelas.
+   Não caracterizes grupos (ex.: "concentram-se em…") nem uses verbos proibidos (eliminar, descartar, destruir, abater, liquidar).
 9. Se a consulta devolver 0 linhas ou for fora do âmbito: "Questão Fora de Âmbito" ou "ℹ️ Dados Não Encontrados" + o que foi pesquisado. Sem números.
 10. Se existirem avisos em meta.avisos_dados (ex.: DCI em falta, mês parcial, margem estimada),
    refere-os numa nota curta de uma linha, apenas se afetarem o que mostras.

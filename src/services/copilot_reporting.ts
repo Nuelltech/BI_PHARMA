@@ -28,12 +28,29 @@ export interface CopilotExecutiveReport {
   diagnostico: string;
   kpis: CopilotReportKpi[];
   tabela?: CopilotReportTable;
+  topTabela?: CopilotReportTable;
+  acoesPorClasse?: Array<{
+    classe: string;
+    n_produtos: number;
+    resumo: string;
+    produtos: string[];
+  }>;
   recomendacoes: string[];
   notaFarmaceutica: string;
   farmaciaNome: string;
   dataEmissao: string;
   horaEmissao: string;
   responsavel: string;
+}
+
+export function markdownInlineToHtml(text: string): string {
+  return (text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\n/g, '<br/>');
 }
 
 /**
@@ -267,7 +284,7 @@ export function parseMarkdownToExecutiveReport(
 
   return {
     titulo: extractedTitle,
-    subtitulo: `Proposta de Apoio à Decisão Clínica & Gestão — ${farmaciaNome}`,
+    subtitulo: `Relatório de apoio à gestão — ${farmaciaNome}`,
     diagnostico: diagnosticoText,
     kpis,
     tabela: finalTable,
@@ -283,7 +300,7 @@ export function parseMarkdownToExecutiveReport(
 
 /**
  * Fase 1 (4.5): Constrói o Relatório Executivo / PDF diretamente a partir do objeto
- * estruturado e validado do chat (mesmos números, classes a 100%, zero chamadas extra ao LLM).
+ * estruturado e validado do chat (mesmos números, classes a 100%, Top 10, 3-5 produtos por classe, zero chamadas extra ao LLM).
  */
 export function buildExecutiveReportFromStructuredData(
   relatorio: any,
@@ -337,7 +354,7 @@ export function buildExecutiveReportFromStructuredData(
     tipo: 'warning',
   });
 
-  // Tabela unificada de distribuição 100% por classe de ação + total exato
+  // 1. Tabela unificada de distribuição 100% por classe de ação + total exato
   const classes = Array.isArray(relatorio?.classes_resumo) ? relatorio.classes_resumo : [];
   const tableCols = showEur
     ? ['Ação Recomendada', 'N.º Produtos', 'Unidades Vendidas', 'Vendas (€)', 'Stock Custo (€)']
@@ -373,32 +390,82 @@ export function buildExecutiveReportFromStructuredData(
     );
   }
 
-  // Recomendações 100% derivadas das ações calculadas pelo código (sem alucinação nem MSRM em campanha)
+  // 2. Top 10 de vendas (mesma tabela do chat)
+  const topArr = Array.isArray(relatorio?.top) ? relatorio.top : [];
+  let topTabela: CopilotReportTable | undefined = undefined;
+  if (topArr.length > 0) {
+    const topCols = showEur
+      ? ['CNP', 'Designação', 'Vendas (€)', 'Un', 'VMM', 'Stock', 'Margem %', 'Ação']
+      : ['CNP', 'Designação', 'Un', 'VMM', 'Stock', 'Ação'];
+    const topRows = topArr.map((p: any) =>
+      showEur
+        ? [
+            String(p.cnp),
+            String(p.designacao || '').slice(0, 48),
+            fmtEur(p.vendas_eur),
+            String(p.vendas_un ?? 0),
+            Number(p.vmm || 0).toFixed(2),
+            String(p.stock ?? 0),
+            p.margem_pct !== null && p.margem_pct !== undefined ? `${Number(p.margem_pct).toFixed(1)}%` : '—',
+            String(p.classificacao || ''),
+          ]
+        : [
+            String(p.cnp),
+            String(p.designacao || '').slice(0, 48),
+            String(p.vendas_un ?? 0),
+            Number(p.vmm || 0).toFixed(2),
+            String(p.stock ?? 0),
+            String(p.classificacao || ''),
+          ]
+    );
+    topTabela = {
+      colunas: topCols,
+      linhas: topRows,
+      totalRegistos: topArr.length,
+    };
+  }
+
+  // 3. Produtos principais (3-5) de cada classe de ação (mesmo conteúdo do chat)
+  const acoesPorClasse: Array<{ classe: string; n_produtos: number; resumo: string; produtos: string[] }> = [];
   const recomendacoes: string[] = [];
-  if (relatorio?.validades?.produtos?.length > 0) {
-    for (const v of relatorio.validades.produtos) {
-      recomendacoes.push(`[${v.classificacao}] ${v.designacao} (CNP ${v.cnp}): ${v.motivo_classificacao}`);
+
+  if (Array.isArray(relatorio?.acoes_imediatas_por_classe) && relatorio.acoes_imediatas_por_classe.length > 0) {
+    for (const ac of relatorio.acoes_imediatas_por_classe) {
+      let resumo = `${ac.n_produtos} produtos`;
+      if (ac.unidades_a_devolver !== null && ac.unidades_a_devolver !== undefined) {
+        resumo += ` — ${ac.unidades_a_devolver} un a devolver` + (showEur ? ` (${fmtEur(ac.valor_a_devolver_eur)} a custo)` : '');
+      }
+      const produtosFmt = (ac.principais || []).map((p: any) => {
+        const extra =
+          ac.classe === 'DEVOLVER_EXCESSO' && p.unidades_excesso
+            ? `devolver ${p.unidades_excesso} un`
+            : ac.classe === 'DEVOLVER_TUDO'
+              ? `${p.stock} un`
+              : `VMM ${Number(p.vmm || 0).toFixed(2)}`;
+        return `${p.designacao} (CNP ${p.cnp} · ${extra})`;
+      });
+      acoesPorClasse.push({
+        classe: ac.classe,
+        n_produtos: ac.n_produtos,
+        resumo,
+        produtos: produtosFmt,
+      });
+      recomendacoes.push(`[${ac.classe}] ${resumo}: ${produtosFmt.join('; ')}.`);
     }
   }
-  if (relatorio?.em_rutura?.total_contagem > 0) {
-    recomendacoes.push(
-      `[REPOR / ENCOMENDA] ${relatorio.em_rutura.total_contagem} produto(s) com vendas registadas encontram-se em rutura (stock 0). Repor os de VMM >= 1.0 e crónicos; trabalhar os restantes sob encomenda.`
-    );
-  }
-  if (relatorio?.rever_dados?.total_contagem > 0) {
-    recomendacoes.push(
-      `[REVER_DADOS] ${relatorio.rever_dados.total_contagem} produto(s) com valores anómalos no ERP requerem auditoria no Sifarma antes de decisão comercial.`
-    );
-  }
+
+  // Notas e lacunas (sem duplicar REVER_DADOS / Olfenex se já listado acima!)
+  const hasReverInAcoes = acoesPorClasse.some((a) => a.classe === 'REVER_DADOS');
   if (Array.isArray(relatorio?.lacunas)) {
     for (const lac of relatorio.lacunas) {
+      if (hasReverInAcoes && /REVER_DADOS/i.test(lac)) continue; // evita duplicar nota do Olfenex
       recomendacoes.push(`[NOTA DE DADOS] ${lac}`);
     }
   }
 
   return {
-    titulo: `Relatório de Gestão — Laboratório ${lab} (${periodo})`,
-    subtitulo: `Proposta de Apoio à Decisão Clínica & Gestão — ${options.farmaciaNome}`,
+    titulo: `Relatório de Gestão — Laboratório ${lab} · ${periodo}`,
+    subtitulo: `Relatório de apoio à gestão — ${options.farmaciaNome}`,
     diagnostico:
       relatorio?.leitura_executiva ||
       `Análise consolidada do laboratório ${lab} para o período ${periodo} (vendas registadas até ${relatorio?.meta?.data_referencia || '2026-10-31'}).`,
@@ -408,6 +475,8 @@ export function buildExecutiveReportFromStructuredData(
       linhas: tableRows,
       totalRegistos: t.produtos_ambito_total ?? tableRows.length,
     },
+    topTabela,
+    acoesPorClasse,
     recomendacoes,
     notaFarmaceutica:
       'Proposta para validação da Direção Técnica — Nome: ________________________ | Data: ___/___/_____ | Assinatura: ________________________',
