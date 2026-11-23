@@ -3068,13 +3068,16 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
-      // Servir a imagem de fundo do login (Nuelltech Pharmacy Intelligence)
-      if (pathname === '/assets/login-bg.png') {
-        const imgPath = path.resolve(process.cwd(), 'public', 'images', 'login-bg.png');
+      // Servir ficheiros estáticos de imagens públicas (/assets/*)
+      if (pathname && pathname.startsWith('/assets/')) {
+        const filename = path.basename(pathname);
+        const imgPath = path.resolve(process.cwd(), 'public', 'images', filename);
         if (fs.existsSync(imgPath)) {
           const stat = fs.statSync(imgPath);
+          const ext = path.extname(imgPath).toLowerCase();
+          const contentType = ext === '.svg' ? 'image/svg+xml' : (ext === '.jpg' || ext === '.jpeg') ? 'image/jpeg' : 'image/png';
           res.writeHead(200, {
-            'Content-Type': 'image/png',
+            'Content-Type': contentType,
             'Content-Length': stat.size,
             'Cache-Control': 'public, max-age=86400',
           });
@@ -6396,21 +6399,13 @@ function getDashboardHtml(): string {
       <div class="auth-gate-hero" style="max-width: 540px; z-index: 2; display: flex; flex-direction: column; justify-content: space-between; min-height: 560px;">
         
         <div>
-          <!-- LOGOTIPO NUELLTECH -->
-          <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 36px;">
-            <svg width="46" height="46" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter: drop-shadow(0 4px 12px rgba(2, 132, 199, 0.35)); flex-shrink: 0;">
-              <path d="M8 40V8C8 6.89543 8.89543 6 10 6H15C16.1046 6 17 6.89543 17 8V26.5L33.5 8.5C34.2 7.7 35.5 8.2 35.5 9.3V40C35.5 41.1 34.6 42 33.5 42H28.5C27.4 42 26.5 41.1 26.5 40V21.5L10 39.5C9.3 40.3 8 39.8 8 38.7V40Z" fill="url(#nuelltechLogoGrad)" />
-              <defs>
-                <linearGradient id="nuelltechLogoGrad" x1="8" y1="6" x2="40" y2="42" gradientUnits="userSpaceOnUse">
-                  <stop stop-color="#06b6d4" />
-                  <stop offset="0.5" stop-color="#0284c7" />
-                  <stop offset="1" stop-color="#1e40af" />
-                </linearGradient>
-              </defs>
-            </svg>
+          <!-- LOGOTIPO OFICIAL NUELLTECH -->
+          <div style="display: flex; align-items: center; gap: 16px; margin-bottom: 32px;">
+            <img src="/assets/nuelltech-logo-dark.png" alt="Nuelltech" style="height: 48px; width: auto; object-fit: contain;" />
+            <div style="height: 38px; width: 1.5px; background: #cbd5e1;"></div>
             <div style="display: flex; flex-direction: column;">
-              <span style="font-size: 1.45rem; font-weight: 900; letter-spacing: 1.8px; color: #0f172a; line-height: 1.1;">NUELLTECH</span>
-              <span style="font-size: 0.65rem; font-weight: 800; letter-spacing: 2.2px; color: #0284c7; text-transform: uppercase;">AI & BUSINESS TECHNOLOGY</span>
+              <span style="font-size: 0.7rem; font-weight: 800; letter-spacing: 2px; color: #0284c7; text-transform: uppercase;">AI & BUSINESS TECHNOLOGY</span>
+              <span style="font-size: 0.75rem; font-weight: 600; color: #64748b;">Enterprise Healthcare Solutions</span>
             </div>
           </div>
 
@@ -6462,9 +6457,10 @@ function getDashboardHtml(): string {
         </div>
 
         <!-- FOOTER BRANDING -->
-        <div style="display: flex; align-items: center; gap: 12px; font-size: 0.82rem; font-weight: 600; color: #64748b; margin-top: 16px;">
-          <span>Powered by <strong style="color: #0f172a;">Nuelltech</strong></span>
-          <div style="width: 40px; height: 2px; background: #0284c7; border-radius: 2px;"></div>
+        <div style="display: flex; align-items: center; gap: 12px; font-size: 0.84rem; font-weight: 600; color: #64748b; margin-top: 16px;">
+          <span>Powered by</span>
+          <img src="/assets/nuelltech-logo-dark.png" alt="Nuelltech" style="height: 24px; width: auto; object-fit: contain;" />
+          <div style="width: 36px; height: 2px; background: #0284c7; border-radius: 2px;"></div>
         </div>
 
       </div>
@@ -11933,13 +11929,13 @@ function getDashboardHtml(): string {
         kpisHtml +
         '<div style="margin-bottom:18px;">' +
           '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">1. Diagnóstico Analítico & Contexto</div>' +
-          '<div style="font-size:11.5px;line-height:1.6;color:#334155;background:#fafafa;border:1px solid #f1f5f9;border-radius:6px;padding:8px 10px;">' + diagText.replace(/\n/g, '<br/>') + '</div>' +
+          '<div style="font-size:11.5px;line-height:1.6;color:#334155;background:#fafafa;border:1px solid #f1f5f9;border-radius:6px;padding:8px 10px;">' + diagText.replace(/\\n/g, '<br/>') + '</div>' +
         '</div>' +
         tableHtml +
         recsHtml +
         '<div style="margin-bottom:20px;page-break-inside:avoid;">' +
           '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">4. Parecer & Despacho da Direção Técnica</div>' +
-          '<div style="font-size:11px;line-height:1.5;color:#475569;border:1px dashed #cbd5e1;border-radius:6px;padding:8px 10px;background:#fdfdfd;margin-bottom:12px;">' + notesText.replace(/\n/g, '<br/>') + '</div>' +
+          '<div style="font-size:11px;line-height:1.5;color:#475569;border:1px dashed #cbd5e1;border-radius:6px;padding:8px 10px;background:#fdfdfd;margin-bottom:12px;">' + notesText.replace(/\\n/g, '<br/>') + '</div>' +
           '<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-top:24px;padding-top:14px;border-top:1px solid #e2e8f0;font-size:10.5px;color:#64748b;">' +
             '<div>Assinatura do Responsável: _________________________________________</div>' +
             '<div>Carimbo / Visto Farmácia: [ &nbsp; ] Homologado</div>' +
