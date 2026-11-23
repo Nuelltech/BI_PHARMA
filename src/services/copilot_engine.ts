@@ -42,6 +42,7 @@ import {
   createPrismaComercialRepo,
   buildComercialCfg,
 } from './comercial_repo';
+import { CopilotAuditTracer } from './copilot_audit';
 
 import { PrismaClient } from '@prisma/client';
 import dotenv from 'dotenv';
@@ -759,6 +760,7 @@ export interface CopilotChatResponse {
   text: string;
   toolsUsed: string[];
   sessionId: string;
+  interacaoId?: string;
   shoppingList?: any[];
   usage?: CopilotUsageStats;
 }
@@ -879,7 +881,7 @@ export async function askConversationalCopilot(
     };
   }
 
-  const model = (process.env.COPILOT_MODEL || 'claude-3-5-haiku-20241022').trim();
+  const model = (process.env.COPILOT_MODEL || 'claude-haiku-4-5-20251001').trim();
   const FALLBACK_MODEL = 'claude-haiku-4-5-20251001';
   const THINKING_BUDGET = Number(process.env.COPILOT_THINKING_BUDGET || 4000);
   let activeModel = model;
@@ -887,7 +889,13 @@ export async function askConversationalCopilot(
   const toolResultsJson: string[] = [[...(sessionKnownCnps.get(sessionId) || [])].join(' ')];
   let validationRetries = 0;
 
-  const startTime = Date.now();
+  const tracer = new CopilotAuditTracer(
+    secContext.farmaciaId,
+    sessionId,
+    question,
+    (secContext as any).utilizadorId || null
+  );
+  const startTime = tracer.startTime;
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
   let totalCacheCreationTokens = 0;
@@ -917,6 +925,10 @@ export async function askConversationalCopilot(
         });
       }
 
+      const apiCallStart = Date.now();
+      tracer.nChamadasApi++;
+      if (activeModel.includes('sonnet')) tracer.escalouSonnet = true;
+
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -939,6 +951,14 @@ export async function askConversationalCopilot(
       if (!response.ok) {
         const errText = await response.text();
         console.error('[Copilot Engine] Erro na API Claude:', response.status, errText);
+        tracer.addEtapa({
+          etapa: toolsUsed.length === 0 ? 'interpretacao' : 'leitura',
+          nome: activeModel,
+          inicio_ms: apiCallStart - startTime,
+          duracao_ms: Date.now() - apiCallStart,
+          estado: 'falha',
+          detalhe: { http_status: response.status, erro: errText.slice(0, 500) },
+        });
         if ((response.status === 404 || response.status === 400) && activeModel !== FALLBACK_MODEL) {
           console.warn(`[Copilot Engine] A recuar de ${activeModel} para ${FALLBACK_MODEL}`);
           activeModel = FALLBACK_MODEL;
@@ -946,27 +966,71 @@ export async function askConversationalCopilot(
           maxSteps++;
           continue;
         }
-        throw new Error(`Erro na API Claude (${response.status})`);
+        const apiErr: any = new Error(`Erro na API Claude (${response.status})`);
+        apiErr.erroCodigo = `HTTP_${response.status}`;
+        apiErr.erroDetalhe = errText.slice(0, 1000);
+        throw apiErr;
       }
 
       const data = (await response.json()) as any;
+      const apiDurMs = Date.now() - apiCallStart;
       const usage = data.usage || {};
-      totalInputTokens += usage.input_tokens || 0;
-      totalOutputTokens += usage.output_tokens || 0;
-      totalCacheCreationTokens += usage.cache_creation_input_tokens || 0;
-      totalCacheReadTokens += usage.cache_read_input_tokens || 0;
+      const stepIn = usage.input_tokens || 0;
+      const stepOut = usage.output_tokens || 0;
+      const stepCacheW = usage.cache_creation_input_tokens || 0;
+      const stepCacheR = usage.cache_read_input_tokens || 0;
+      const stepCost = calculateClaudeCostEur(activeModel, stepIn, stepOut, stepCacheW, stepCacheR);
+
+      totalInputTokens += stepIn;
+      totalOutputTokens += stepOut;
+      totalCacheCreationTokens += stepCacheW;
+      totalCacheReadTokens += stepCacheR;
 
       const content = data.content || [];
       const toolUseCalls = content.filter((c: any) => c.type === 'tool_use');
+
+      tracer.addEtapa({
+        etapa: validationRetries > 0 ? 'reescrita' : toolUseCalls.length > 0 ? 'interpretacao' : 'leitura',
+        nome: activeModel,
+        inicio_ms: apiCallStart - startTime,
+        duracao_ms: apiDurMs,
+        estado: 'ok',
+        tokens_in: stepIn,
+        tokens_out: stepOut,
+        tokens_cache_write: stepCacheW,
+        tokens_cache_read: stepCacheR,
+        custo_eur: stepCost,
+        detalhe: {
+          intencao: intentInfo.intent,
+          tool_calls: toolUseCalls.map((c: any) => c.name),
+        },
+      });
 
       if (toolUseCalls.length === 0) {
         const textBlocks = content.filter((c: any) => c.type === 'text');
         let finalText = sanitizeCopilotOutput(textBlocks.map((b: any) => b.text).join('\n\n'));
 
-        // VALIDAÇÃO EM CÓDIGO (V1-V14)
+        // VALIDAÇÃO EM CÓDIGO (V1-V17)
+        const valStart = Date.now();
         const validation = validateCopilotAnswer(finalText, toolResultsJson, toolsUsed, intentInfo);
+        if (!validation.ok) {
+          for (const prob of validation.problems) {
+            const match = prob.match(/^\[(V\d+|T\d+|D\d+)\]/);
+            if (match) tracer.markRuleFailed(match[1]);
+          }
+        }
+        tracer.addEtapa({
+          etapa: 'validacao_texto',
+          nome: 'validateCopilotAnswer',
+          inicio_ms: valStart - startTime,
+          duracao_ms: Date.now() - valStart,
+          estado: validation.ok ? 'ok' : 'aviso',
+          detalhe: { ok: validation.ok, problems: validation.problems },
+        });
+
         if (!validation.ok && validationRetries < 1 && maxSteps > 0) {
           validationRetries++;
+          tracer.reescritas++;
           console.warn('[Copilot Validation] Resposta rejeitada (tentativa 1):', validation.problems);
           currentMessages.push({ role: 'assistant', content });
           currentMessages.push({
@@ -1009,6 +1073,26 @@ export async function askConversationalCopilot(
 
         const capturedShoppingList = getLatestTurnShoppingList(secContext.farmaciaId, sessionId, turnoAtual);
 
+        // Gravação assíncrona Fase 0 (CopilotInteracao + CopilotEtapa) — fire-and-forget
+        tracer.persistAsync(prisma, {
+          utilizadorId: (secContext as any).utilizadorId || null,
+          perfil: secContext.perfil || null,
+          sessionId,
+          modo: mode,
+          pergunta: question,
+          intencao: intentInfo.intent,
+          parametros: ferramentasExecutadas.length > 0 ? { ferramentas: ferramentasExecutadas.map((f) => ({ nome: f.nome, input: f.input })) } : null,
+          texto_final: finalText,
+          estado: tracer.reescritas > 0 || tracer.getRegrasFalhadas().length > 0 ? 'ok_com_correcoes' : 'ok',
+          modelo_final: activeModel,
+          tokens_in: totalInputTokens,
+          tokens_out: totalOutputTokens,
+          tokens_cache_write: totalCacheCreationTokens,
+          tokens_cache_read: totalCacheReadTokens,
+          custo_eur: custoEstimadoEur,
+          duracao_ms: duracaoMs,
+        });
+
         prisma.copilotUsageLog
           .create({
             data: {
@@ -1023,6 +1107,7 @@ export async function askConversationalCopilot(
               custo_estimado_eur: custoEstimadoEur,
               ferramentas_executadas: toolsUsed,
               duracao_ms: duracaoMs,
+              status: 'SUCCESS',
             },
           })
           .catch((err: any) => console.error('[Copilot FinOps] Erro ao gravar log:', err.message));
@@ -1032,6 +1117,7 @@ export async function askConversationalCopilot(
           toolsUsed,
           ferramentas: ferramentasExecutadas,
           sessionId,
+          interacaoId: tracer.interacaoId,
           mode,
           shoppingList: capturedShoppingList || undefined,
           usage: {
@@ -1053,6 +1139,7 @@ export async function askConversationalCopilot(
       for (const call of toolUseCalls) {
         toolsUsed.push(call.name);
         const args = call.input || {};
+        const toolStart = Date.now();
         let resultData: any;
 
         try {
@@ -1272,6 +1359,21 @@ export async function askConversationalCopilot(
 
         ferramentasExecutadas.push({ nome: call.name, input: args, resultado: resultData });
         const jsonStr = JSON.stringify(resultData);
+
+        tracer.addEtapa({
+          etapa: 'ferramenta',
+          nome: call.name,
+          inicio_ms: toolStart - startTime,
+          duracao_ms: Date.now() - toolStart,
+          estado: resultData?.ok === false ? 'falha' : 'ok',
+          detalhe: {
+            args,
+            n_linhas: Array.isArray(resultData?.linhas) ? resultData.linhas.length : (Array.isArray(resultData?.top) ? resultData.top.length : null),
+            result_ref: resultData?.result_ref || null,
+            payload_bytes: jsonStr.length,
+          },
+        });
+
         toolResults.push({
           type: 'tool_result',
           tool_use_id: call.id,
@@ -1298,10 +1400,32 @@ export async function askConversationalCopilot(
       totalCacheReadTokens
     );
 
+    const limitText = 'Foram analisados os dados da farmácia, mas a resposta excedeu o limite de passos. Por favor tente especificar mais a sua pergunta.';
+    tracer.persistAsync(prisma, {
+      utilizadorId: (secContext as any).utilizadorId || null,
+      perfil: secContext.perfil || null,
+      sessionId,
+      modo: mode,
+      pergunta: question,
+      intencao: intentInfo.intent,
+      texto_final: limitText,
+      estado: 'erro_interno',
+      erro_codigo: 'MAX_STEPS_EXCEEDED',
+      erro_mensagem: 'Limite de 12 passos atingido.',
+      modelo_final: activeModel,
+      tokens_in: totalInputTokens,
+      tokens_out: totalOutputTokens,
+      tokens_cache_write: totalCacheCreationTokens,
+      tokens_cache_read: totalCacheReadTokens,
+      custo_eur: custoEstimadoEur,
+      duracao_ms: duracaoMs,
+    });
+
     return {
-      text: 'Foram analisados os dados da farmácia, mas a resposta excedeu o limite de passos. Por favor tente especificar mais a sua pergunta.',
+      text: limitText,
       toolsUsed,
       sessionId,
+      interacaoId: tracer.interacaoId,
       mode,
       usage: {
         inputTokens: totalInputTokens,
@@ -1323,6 +1447,27 @@ export async function askConversationalCopilot(
       totalCacheReadTokens
     );
 
+    const isApiError = Boolean(err?.erroCodigo) || /API Claude/i.test(String(err?.message || ''));
+    tracer.persistAsync(prisma, {
+      utilizadorId: (secContext as any).utilizadorId || null,
+      perfil: secContext.perfil || null,
+      sessionId,
+      modo: mode,
+      pergunta: question,
+      intencao: intentInfo.intent,
+      texto_final: `❌ Ocorreu um erro ao comunicar com a inteligência analítica: ${err.message}`,
+      estado: isApiError ? 'erro_api' : 'erro_interno',
+      erro_codigo: err?.erroCodigo || (isApiError ? 'CLAUDE_API_ERROR' : 'INTERNAL_ERROR'),
+      erro_mensagem: err?.erroDetalhe || err?.message || 'Erro desconhecido',
+      modelo_final: activeModel,
+      tokens_in: totalInputTokens,
+      tokens_out: totalOutputTokens,
+      tokens_cache_write: totalCacheCreationTokens,
+      tokens_cache_read: totalCacheReadTokens,
+      custo_eur: custoEstimadoEur,
+      duracao_ms: duracaoMs,
+    });
+
     // P3.11: Registar tentativas falhadas no FinOps log
     prisma.copilotUsageLog
       .create({
@@ -1338,6 +1483,8 @@ export async function askConversationalCopilot(
           custo_estimado_eur: custoEstimadoEur,
           ferramentas_executadas: { ferramentas: toolsUsed, erro: err.message, status: 'ERROR' },
           duracao_ms: duracaoMs,
+          status: 'ERROR',
+          erro_mensagem: String(err?.erroDetalhe || err?.message || '').slice(0, 1000),
         },
       })
       .catch((logErr: any) => console.error('[Copilot FinOps] Erro ao gravar log de falha:', logErr.message));
@@ -1346,6 +1493,7 @@ export async function askConversationalCopilot(
       text: `❌ Ocorreu um erro ao comunicar com a inteligência analítica: ${err.message}`,
       toolsUsed,
       sessionId,
+      interacaoId: tracer.interacaoId,
       mode,
       usage: {
         inputTokens: totalInputTokens,

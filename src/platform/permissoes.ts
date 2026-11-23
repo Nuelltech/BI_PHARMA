@@ -40,7 +40,7 @@ const ROLES_COM_ACESSO_FATURACAO = new Set<string>([
   'GESTOR',
   'DIRETOR',
   'DIRETOR_TECNICO',
-  'COMPRADOR',
+  'COMPLETO', // Conector MCP com perfil completo
 ]);
 
 const ROLE_PERMISSOES_MAP: Record<string, PermissaoPlataforma[]> = {
@@ -145,7 +145,7 @@ export function canVerFaturacao(perfilOrRole?: string | null, customPermissions?
     if (customPermissions instanceof Set && customPermissions.has('ver_faturacao')) return true;
     if (Array.isArray(customPermissions) && customPermissions.includes('ver_faturacao')) return true;
   }
-  if (!perfilOrRole) return true; // Default permissivo para backward compatibility se perfil não for passado
+  if (!perfilOrRole) return false; // C4: fail-closed para API ou conectores sem perfil definido
   const normalized = perfilOrRole.toUpperCase().trim();
   return ROLES_COM_ACESSO_FATURACAO.has(normalized);
 }

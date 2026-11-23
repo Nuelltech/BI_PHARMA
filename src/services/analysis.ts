@@ -444,7 +444,7 @@ export async function analyzePharmacyInventory(
       atual.totalUnidades += venda.quantidade;
     }
 
-    if (venda.data_venda >= dataCorteMonos && venda.data_venda <= dataReferencia) {
+    if (venda.data_venda >= dataCorteMonos && venda.data_venda <= dataReferencia && venda.quantidade > 0) {
       atual.unidadesRecentesMonos += venda.quantidade;
     }
     if (venda.quantidade > 0 && (!atual.ultimaDataVenda || venda.data_venda > atual.ultimaDataVenda)) {
@@ -675,8 +675,8 @@ export async function analyzePharmacyInventory(
       });
     }
 
-    // 2. Monos (Artigos sem vendas recentes e sem rotação relevante vmm < 0.5)
-    if (statsVenda.unidadesRecentesMonos === 0 && vmm < 0.5) {
+    // 2. Monos (Regra canónica unificada: stock > 0 e sem vendas nos últimos N dias; por defeito N=90)
+    if (statsVenda.unidadesRecentesMonos === 0) {
       valorTotalMonos += valorStockItem;
       const acaoMono = buildSmartItemRecommendation({
         contexto: 'MONO',

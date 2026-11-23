@@ -2206,7 +2206,7 @@ export async function toolRelatorioLaboratorio(
       c.taxa_iva
     );
 
-    const isMono = m ? Boolean(m.eh_mono && vmm < 0.5) : false;
+    const isMono = m ? Boolean(m.eh_mono) : false;
     const isExcesso = m ? Boolean(m.eh_excesso_cobertura || cobertura > 4) : false;
     const isCaducidade = m ? Boolean(m.eh_risco_caducidade) : false;
     const dciVal = c.dci || (m ? m.molecula_dci : null);

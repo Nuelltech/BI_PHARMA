@@ -40,6 +40,7 @@ import crypto from 'crypto';
 import zlib from 'zlib';
 import { ensureDatabaseReady } from './db';
 import { canVerFaturacao } from './platform/permissoes';
+import { recordCopilotFeedback } from './services/copilot_audit';
 
 process.on('uncaughtException', (err) => {
   console.error('[Server] Uncaught Exception:', err);
@@ -2754,14 +2755,32 @@ async function startServer() {
       }
 
       
-      // 3.2. Endpoint para Feedback de Auditoria da Resposta do Copilot
+      // 3.2. Endpoint para Feedback de Auditoria da Resposta do Copilot (Fase 0: persistido em CopilotInteracao)
       if (pathname === '/api/copilot/feedback' && req.method === 'POST') {
         try {
           const rawBody = await readRequestBody(req, 32 * 1024);
-          const { sessionId, feedback, question, comment, farmaciaId } = JSON.parse(rawBody || '{}');
-          console.log(`[Copilot Feedback] Farmácia: ${farmaciaId} | Sessão: ${sessionId} | Voto: ${feedback} | Questão: ${question}`);
+          const { sessionId, interacaoId, feedback, comment, comentario, farmaciaId } = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          const voteNum =
+            feedback === 1 || feedback === '1' || String(feedback || '').toUpperCase() === 'UP'
+              ? 1
+              : -1;
+          const resultFb = await recordCopilotFeedback(prisma, {
+            interacaoId: interacaoId || null,
+            farmaciaId: activeFarmacia.id,
+            sessionId: sessionId || null,
+            feedback: voteNum,
+            comentario: comentario || comment || null,
+          });
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ success: true, message: 'Feedback registado para melhoria contínua do modelo.' }));
+          res.end(
+            JSON.stringify({
+              success: true,
+              persisted: resultFb.ok,
+              interacaoId: resultFb.interacaoId || interacaoId || null,
+              message: 'Feedback registado na auditoria do Copilot.',
+            })
+          );
         } catch (e: any) {
           const status = e.statusCode || 400;
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -12248,12 +12267,15 @@ function getDashboardHtml(): string {
     async function sendCopilotFeedback(vote, btn) {
       if (!btn || btn.classList.contains('voted')) return;
       try {
+        const bubble = btn.closest('.chat-bubble-assistant');
+        const interacaoId = bubble ? (bubble.dataset.interacaoId || '') : '';
         await fetch('/api/copilot/feedback', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             sessionId: getCopilotSessionId(),
-            feedback: vote,
+            interacaoId: interacaoId || undefined,
+            feedback: vote === 'UP' ? 1 : -1,
             farmaciaId: activeFarmaciaId,
           }),
         });
@@ -12344,11 +12366,18 @@ function getDashboardHtml(): string {
 
         let telemetryHtml = '';
         if (data.usage) {
-          const totTok = (data.usage.inputTokens || 0) + (data.usage.outputTokens || 0);
+          const inTok = data.usage.inputTokens || 0;
+          const outTok = data.usage.outputTokens || 0;
+          const cacheW = data.usage.cacheCreationTokens || 0;
+          const cacheR = data.usage.cacheReadTokens || 0;
+          const totTok = inTok + outTok + cacheW + cacheR;
+          const cacheLabel = (cacheW > 0 || cacheR > 0)
+            ? ' (in: ' + inTok.toLocaleString('pt-PT') + ' · out: ' + outTok.toLocaleString('pt-PT') + ' · cache W/R: ' + cacheW.toLocaleString('pt-PT') + '/' + cacheR.toLocaleString('pt-PT') + ')'
+            : ' (in: ' + inTok.toLocaleString('pt-PT') + ' · out: ' + outTok.toLocaleString('pt-PT') + ')';
           const durSec = ((data.usage.duracaoMs || 0) / 1000).toFixed(1);
           const costStr = Number(data.usage.custoEstimadoEur || 0).toFixed(4);
           telemetryHtml = '<div style="margin-top: 10px; padding-top: 8px; border-top: 1px dashed #e2e8f0; font-size: 0.73rem; color: #64748b; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">' +
-            '<span>⚡ ' + durSec + 's · ' + totTok.toLocaleString('pt-PT') + ' tokens</span>' +
+            '<span>⚡ ' + durSec + 's · ' + totTok.toLocaleString('pt-PT') + ' tokens' + cacheLabel + '</span>' +
             '<span style="color:#059669; font-weight:700;">💰 Custo estimado: ~€ ' + costStr + '</span>' +
           '</div>';
         }
@@ -12363,6 +12392,7 @@ function getDashboardHtml(): string {
         '</div>';
 
         assistantBubble.dataset.rawText = data.text || data.explicacao || '';
+        assistantBubble.dataset.interacaoId = data.interacaoId || '';
         window.lastCopilotAssistantText = data.text || data.explicacao || '';
 
         assistantBubble.innerHTML = badgeHtml +

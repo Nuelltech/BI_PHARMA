@@ -147,10 +147,12 @@ export async function computeAndPersistMarts(
     const d = v.data_venda;
     if (d > dataRef) continue;
 
-    // Acompanhar a data da última venda histórica
-    const curLatest = ultimaVendaPorCnp.get(v.cnp_codigo);
-    if (!curLatest || d > curLatest) {
-      ultimaVendaPorCnp.set(v.cnp_codigo, d);
+    // Acompanhar a data da última venda histórica real (apenas quantidade > 0)
+    if (v.quantidade > 0) {
+      const curLatest = ultimaVendaPorCnp.get(v.cnp_codigo);
+      if (!curLatest || d > curLatest) {
+        ultimaVendaPorCnp.set(v.cnp_codigo, d);
+      }
     }
 
     if (d >= data3MesesAtras && v.quantidade > 0) {
@@ -227,8 +229,7 @@ export async function computeAndPersistMarts(
       diasSemVendasReal = 999;
     }
 
-    // P0.3: Um produto só é mono se tiver stock, sem vendas há >= 90 dias, zero vendas nos últimos 3 meses E VMM insignificante (< 0.5)
-    // Produtos com rotação moderada ou alta (ex: Escitalopram VMM 1.75, Pravastatina VMM 1.0) nunca são monos
+    // C1: Regra canónica única de mono igual ao painel (stock > 0 e 0 vendas nos últimos N dias)
     const ehMonoReal = Boolean(mono);
 
     productRows.push({

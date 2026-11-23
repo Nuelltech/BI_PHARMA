@@ -598,6 +598,71 @@ model CopilotUsageLog {
 }
 
 // ==========================================
+// FASE 0: AUDITORIA E RASTREIO COMPLETO DO COPILOT
+// ==========================================
+model CopilotInteracao {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  farmaciaId          String
+  utilizadorId        String?
+  perfil              String?
+  sessionId           String
+  modo                String?
+  pergunta            String?  @db.Text
+  intencao            String?
+  parametros          Json?
+  pergunta_de_volta   Boolean  @default(false)
+  texto_referencias   String?  @db.Text
+  texto_final         String?  @db.Text
+  estado              String   // ok | ok_com_correcoes | so_tabelas | bloqueado_dados | erro_api | erro_interno
+  erro_codigo         String?
+  erro_mensagem       String?  @db.Text
+  modelo_final        String?
+  escalou_sonnet      Boolean  @default(false)
+  n_chamadas_api      Int?
+  tokens_in           Int?
+  tokens_out          Int?
+  tokens_cache_write  Int?
+  tokens_cache_read   Int?
+  custo_eur           Decimal? @db.Decimal(10, 5)
+  duracao_ms          Int?
+  frases_removidas    Int      @default(0)
+  reescritas          Int      @default(0)
+  regras_falhadas     String[] @default([])
+  indice_qualidade    Int?
+  feedback            Int?     @db.SmallInt
+  feedback_comentario String?  @db.Text
+  repetida_10min      Boolean  @default(false)
+  criadoEm            DateTime @default(now()) @db.Timestamptz(6)
+
+  etapas              CopilotEtapa[]
+
+  @@index([farmaciaId, criadoEm(sort: Desc)])
+  @@index([estado, criadoEm(sort: Desc)])
+}
+
+model CopilotEtapa {
+  id                 BigInt   @id @default(autoincrement())
+  interacaoId        String   @db.Uuid
+  farmaciaId         String
+  ordem              Int      @db.SmallInt
+  etapa              String   // interpretacao | ferramenta | validacao_dados | leitura | validacao_texto | reescrita | renderizacao | entrega
+  nome               String?
+  inicio_ms          Int
+  duracao_ms         Int
+  estado             String   // ok | aviso | falha
+  tokens_in          Int?
+  tokens_out         Int?
+  tokens_cache_write Int?
+  tokens_cache_read  Int?
+  custo_eur          Decimal? @db.Decimal(10, 5)
+  detalhe            Json?
+
+  interacao          CopilotInteracao @relation(fields: [interacaoId], references: [id], onDelete: Cascade)
+
+  @@index([interacaoId, ordem])
+}
+
+// ==========================================
 // GOVERNANÇA DE CONECTORES & AGENTES IA (MCP)
 // ==========================================
 model McpConnector {
