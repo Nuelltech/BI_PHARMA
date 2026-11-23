@@ -330,7 +330,7 @@ export async function inspectFilesForInteractiveImport(
             },
             {
               value: 'ignore',
-              label: 'Ignorar ficheiro e manter os dados que já estão na base de dados',
+              label: 'Manter vendas existentes na base de dados (ignora apenas vendas; respeita a opção de stock abaixo)',
               isRecommended: false,
             },
           ],
@@ -576,20 +576,23 @@ export async function executeInteractiveImport(
         }
       }
 
-      // Decisão 2: Conflito de Período Existente
-      if (fileDecisions.conflictAction === 'ignore') {
+      // Decisão 2: Conflito de Período Existente e Política de Stock
+      const stockAction = fileDecisions.stockAction || (parsedVen.anoVendas < 2026 ? 'snapshot_only' : 'update_active');
+      const skipSales = fileDecisions.conflictAction === 'ignore';
+
+      if (skipSales && stockAction === 'none') {
         stats.filesProcessed++;
         stats.detalhesPorFicheiro.push({
           fileName: f.name,
           sucesso: true,
           tipo: parsedVen.granularidade,
           vendas: 0,
-          mensagem: 'Ignorado conforme instrução do utilizador (dados já existentes mantidos).',
+          mensagem: 'Ignorado conforme instrução do utilizador (vendas e stock mantidos).',
         });
         continue;
       }
 
-      if (fileDecisions.conflictAction === 'overwrite' && parsedVen.dataInicio && parsedVen.dataFim) {
+      if (!skipSales && fileDecisions.conflictAction === 'overwrite' && parsedVen.dataInicio && parsedVen.dataFim) {
         onProgress?.(
           basePct + Math.round(fileSlice * 0.2),
           `A limpar dados existentes do período para reescrita limpa...`,
@@ -640,36 +643,38 @@ export async function executeInteractiveImport(
         granularidade: string;
       }> = [];
 
-      for (const r of parsedVen.rows) {
-        const cnp = normalizeCnp(r.codigo);
-        const pvpNum = parsePtDecimal(r.pvp);
-        const unitPvp = !Number.isNaN(pvpNum) ? pvpNum : 0;
+      let vendasGravadas = 0;
+      if (!skipSales) {
+        for (const r of parsedVen.rows) {
+          const cnp = normalizeCnp(r.codigo);
+          const pvpNum = parsePtDecimal(r.pvp);
+          const unitPvp = !Number.isNaN(pvpNum) ? pvpNum : 0;
 
-        for (const [isoDate, qtd] of Object.entries(r.vendasMensais)) {
-          if (qtd === 0) continue;
-          vendasToInsert.push({
-            farmaciaId: targetFarmaciaId,
-            cnp_codigo: cnp,
-            quantidade: qtd,
-            valor_total: Number((qtd * unitPvp).toFixed(2)),
-            data_venda: new Date(isoDate),
-            granularidade: parsedVen.granularidade,
-          });
+          for (const [isoDate, qtd] of Object.entries(r.vendasMensais)) {
+            if (qtd === 0) continue;
+            vendasToInsert.push({
+              farmaciaId: targetFarmaciaId,
+              cnp_codigo: cnp,
+              quantidade: qtd,
+              valor_total: Number((qtd * unitPvp).toFixed(2)),
+              data_venda: new Date(isoDate),
+              granularidade: parsedVen.granularidade,
+            });
+          }
         }
+
+        vendasGravadas = await bulkUpsertVendas(prisma, vendasToInsert, (done, total) => {
+          const salesProgress = done / Math.max(1, total);
+          onProgress?.(
+            basePct + Math.round(fileSlice * (0.25 + 0.30 * salesProgress)),
+            `A gravar vendas em lote na base de dados...`,
+            `${done} de ${total} vendas gravadas`
+          );
+        });
+        stats.totalVendasCriadas += vendasGravadas;
       }
 
-      const vendasGravadas = await bulkUpsertVendas(prisma, vendasToInsert, (done, total) => {
-        const salesProgress = done / Math.max(1, total);
-        onProgress?.(
-          basePct + Math.round(fileSlice * (0.25 + 0.30 * salesProgress)),
-          `A gravar vendas em lote na base de dados...`,
-          `${done} de ${total} vendas gravadas`
-        );
-      });
-      stats.totalVendasCriadas += vendasGravadas;
-
       // 3. Gestão de Stock (Snapshot Histórico vs Atual)
-      const stockAction = fileDecisions.stockAction || (parsedVen.anoVendas < 2026 ? 'snapshot_only' : 'update_active');
       let snapshotsCount = 0;
       let activeStockCount = 0;
 

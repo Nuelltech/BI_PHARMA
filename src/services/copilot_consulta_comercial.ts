@@ -246,12 +246,14 @@ export async function toolConsultaComercial(
   const allowEur = canVerFaturacao(ctx.perfil);
   const limite = Math.min(Math.max(Number(args.limite) || 15, 3), 50);
   const ultimoMesYm = await getLatestSalesMonth(prisma, ctx.farmaciaId);
-  const dataUltimosDadosIso = getMonthEndIso(ultimoMesYm);
-  const dataUltimosDadosPt = formatDatePt(dataUltimosDadosIso);
   const hojeIso =
     dataHojeIso && /^\d{4}-\d{2}-\d{2}$/.test(dataHojeIso)
       ? dataHojeIso
       : new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Lisbon' }).format(new Date());
+  // Nunca apresentar uma data futura como "vendas registadas até": limitar sempre à data de hoje
+  const rawMonthEndIso = getMonthEndIso(ultimoMesYm);
+  const dataUltimosDadosIso = rawMonthEndIso > hojeIso ? hojeIso : rawMonthEndIso;
+  const dataUltimosDadosPt = formatDatePt(dataUltimosDadosIso);
 
   // ==========================================================================
   // FOCO 1: MONOS (com janela livre C2 e paridade 100% com o painel)
@@ -282,16 +284,51 @@ export async function toolConsultaComercial(
       };
     }
 
-    // Paridade exata com o painel: usa analyzePharmacyInventory com periodoMonosDias = janela.dias
-    const [analysis, d6UltimoMes] = await Promise.all([
-      analyzePharmacyInventory(prisma, ctx.farmaciaId, {
+    // Paridade exata com o painel:
+    //  - Para a janela padrão de 90 dias, usa MartProdutoMetricas pré-calculado (< 0,3s em vez de 37s) com fallback para analyzePharmacyInventory.
+    //  - Para outras janelas (180d, desde X, etc.), chama analyzePharmacyInventory(periodoMonosDias = janela.dias).
+    const d6UltimoMes = await checkMonthCompletenessD6(prisma, ctx.farmaciaId, ultimoMesYm);
+
+    let monosList: Array<{
+      cnp_codigo: string;
+      designacao: string;
+      tipo_venda: string;
+      stock_atual: number;
+      capital_imobilizado: number;
+      ultima_venda: string | null;
+      data_validade: string | null;
+      laboratorio_titular?: string | null;
+      grupo_equivalencia_dci?: string | null;
+      categoria?: string | null;
+    }> = [];
+
+    if (janela.dias === 90) {
+      const martsMonos = await prisma.martProdutoMetricas.findMany({
+        where: { farmaciaId: ctx.farmaciaId, eh_mono: true, stock_total_unidades: { gt: 0 } },
+      });
+      if (martsMonos.length > 0) {
+        monosList = martsMonos.map((m) => ({
+          cnp_codigo: m.cnp_codigo,
+          designacao: m.designacao,
+          tipo_venda: m.tipo_venda || 'VENDA_LIVRE',
+          stock_atual: Number(m.stock_total_unidades || 0),
+          capital_imobilizado: round2(Number(m.stock_total_valor_custo || 0)),
+          ultima_venda: m.data_ultima_venda ? new Date(m.data_ultima_venda).toISOString().slice(0, 10) : null,
+          data_validade: m.data_validade_mais_proxima ? new Date(m.data_validade_mais_proxima).toISOString().slice(0, 10) : null,
+          laboratorio_titular: m.laboratorio_titular,
+          grupo_equivalencia_dci: m.molecula_dci,
+          categoria: m.categoria,
+        }));
+      }
+    }
+
+    if (monosList.length === 0) {
+      const analysis = await analyzePharmacyInventory(prisma, ctx.farmaciaId, {
         periodoMonosDias: janela.dias,
         dataReferencia: parseIsoUtc(hojeIso),
-      }),
-      checkMonthCompletenessD6(prisma, ctx.farmaciaId, ultimoMesYm),
-    ]);
-
-    let monosList = analysis.monos || [];
+      });
+      monosList = analysis.monos || [];
+    }
     const filtrosTexto: string[] = [];
     if (args.laboratorio) {
       const cnpsMonos = monosList.map((m) => m.cnp_codigo);
@@ -329,9 +366,12 @@ export async function toolConsultaComercial(
     const nNaoMsrm = totalMonos - nMsrm;
     const topSlice = monosList.slice(0, limite);
 
+    const dadosRefRotulo = d6UltimoMes.incompleto
+      ? `${d6UltimoMes.mesRotuloPt} (parcial; referência ${dataUltimosDadosPt})`
+      : dataUltimosDadosPt;
     const notaJanela = janela.desdePt
-      ? `sem vendas desde ${janela.desdePt} (${janela.dias} dias); vendas registadas até ${dataUltimosDadosPt}`
-      : `sem vendas nos últimos ${janela.dias} dias; vendas registadas até ${dataUltimosDadosPt}`;
+      ? `sem vendas desde ${janela.desdePt} (${janela.dias} dias); vendas registadas até ${dadosRefRotulo}`
+      : `sem vendas nos últimos ${janela.dias} dias; vendas registadas até ${dadosRefRotulo}`;
 
     const tituloFiltro = filtrosTexto.length > 0 ? ` (${filtrosTexto.join(' · ')})` : '';
     let md = `## Monos — ${janela.rotulo}${tituloFiltro}\n`;

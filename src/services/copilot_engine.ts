@@ -1064,7 +1064,7 @@ export async function askConversationalCopilot(
   let useThinking = THINKING_BUDGET >= 1024 && !activeModel.includes('haiku');
   // V4 corrigido: apenas os resultados de ferramentas DESTE turno (nunca CNPs de turnos antigos)
   const turnToolResultsJson: string[] = [];
-  let activeRelatorio: any = null;
+  const activeRelatorios: any[] = [];
   let validationRetries = 0;
 
   const tracer = new CopilotAuditTracer(
@@ -1107,12 +1107,15 @@ export async function askConversationalCopilot(
       tracer.nChamadasApi++;
       if (activeModel.includes('sonnet')) tracer.escalouSonnet = true;
 
-      // Secção 4.1 / Fase 1+2: Quando já temos dados estruturados, a Leitura fica limitada a 2-3 frases (max_tokens = 280) e pára antes de tabelas/títulos
-      const effectiveMaxTokens = activeRelatorio
-        ? 280
-        : useThinking
-          ? THINKING_BUDGET + 4096
-          : 4096;
+      // Secção 4.1 / Fase 1+2: Quando já temos dados estruturados, a Leitura fica limitada a 2-3 frases (ou até 380 tokens em perguntas compostas) e pára antes de tabelas/títulos
+      const hasActiveRelatorio = activeRelatorios.length > 0;
+      const effectiveMaxTokens = activeRelatorios.length > 1
+        ? 380
+        : hasActiveRelatorio
+          ? 280
+          : useThinking
+            ? THINKING_BUDGET + 4096
+            : 4096;
 
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -1125,8 +1128,8 @@ export async function askConversationalCopilot(
         body: JSON.stringify({
           model: activeModel,
           max_tokens: effectiveMaxTokens,
-          ...(activeRelatorio ? { stop_sequences: ['\n\n---', '\n#', '\n|'] } : {}),
-          ...(useThinking && !activeRelatorio ? { thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET } } : {}),
+          ...(hasActiveRelatorio ? { stop_sequences: ['\n\n---', '\n#', '\n|'] } : {}),
+          ...(useThinking && !hasActiveRelatorio ? { thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET } } : {}),
           system: systemBlocks,
           tools: scopedTools,
           tool_choice: { type: 'auto' },
@@ -1195,8 +1198,20 @@ export async function askConversationalCopilot(
       if (toolUseCalls.length === 0) {
         const textBlocks = content.filter((c: any) => c.type === 'text');
         const textoAntesValidacao = sanitizeCopilotOutput(textBlocks.map((b: any) => b.text).join('\n\n'));
+        const primaryRelatorio = activeRelatorios[0] || null;
+        // Combina todos os relatórios/consultas do turno para validação T1-T7 sem perder a 1.ª ferramenta em perguntas compostas
+        const mergedRelatorioForValidation =
+          activeRelatorios.length > 1
+            ? {
+                ...primaryRelatorio,
+                resumo_modelo: activeRelatorios.map((r) => r.resumo_modelo || r),
+                totais: activeRelatorios.map((r) => r.totais || {}),
+                todos_produtos_indice: activeRelatorios.flatMap((r) => r.todos_produtos_indice || []),
+              }
+            : primaryRelatorio;
+
         // Impõe formato de prosa corrida (sem títulos/listas) + proteção contra truncamento (stop_reason = max_tokens)
-        let finalText = activeRelatorio
+        let finalText = hasActiveRelatorio
           ? enforcePlainProseLeitura(textoAntesValidacao, data.stop_reason)
           : data.stop_reason === 'max_tokens'
             ? trimTruncatedText(textoAntesValidacao, data.stop_reason)
@@ -1204,9 +1219,9 @@ export async function askConversationalCopilot(
 
         // VALIDAÇÃO 2 — TEXTO FRASE A FRASE (T1–T7 + V4 do turno + regras legadas V1/V5/V6/V12)
         const valStart = Date.now();
-        const catalogTerms = activeRelatorio ? await getCatalogTermsForValidation(prisma) : [];
+        const catalogTerms = hasActiveRelatorio ? await getCatalogTermsForValidation(prisma) : [];
         const leituraVal = validateAndSanitizeLeitura(finalText, {
-          relatorio: activeRelatorio,
+          relatorio: mergedRelatorioForValidation,
           turnToolResultsJson,
           catalogTerms,
         });
@@ -1266,8 +1281,8 @@ export async function askConversationalCopilot(
             ? 'ok_com_correcoes'
             : 'ok';
 
-        if (activeRelatorio && (leituraVal.needsRewrite || hasLegacyBlocking || finalText.trim().length < 20)) {
-          finalText = buildDeterministicSummaryForReport(activeRelatorio);
+        if (hasActiveRelatorio && (leituraVal.needsRewrite || hasLegacyBlocking || finalText.trim().length < 20)) {
+          finalText = activeRelatorios.map((r) => buildDeterministicSummaryForReport(r)).join('\n\n');
           estadoFinal = 'so_tabelas';
         }
 
@@ -1279,10 +1294,11 @@ export async function askConversationalCopilot(
         // Pós-processamento determinístico (V8 marcadores UI, V12 fuga técnica, V14 nota de margem estimada)
         finalText = postProcessCopilotText(finalText, toolsUsed, turnToolResultsJson, intentInfo);
 
-        // 4.1: O motor junta SEMPRE: Leitura validada + tabelas oficiais do código (o modelo nunca escreve tabelas)
+        // 4.1: O motor junta SEMPRE: Leitura validada + TODAS as tabelas oficiais do turno na ordem pedida
         const leituraValidadaParaPdf = finalText;
-        if (activeRelatorio?.relatorio_markdown) {
-          finalText = `${finalText}\n\n---\n\n${activeRelatorio.relatorio_markdown}`;
+        const markdownBlocks = activeRelatorios.map((r) => r?.relatorio_markdown).filter(Boolean);
+        if (markdownBlocks.length > 0) {
+          finalText = `${finalText}\n\n---\n\n${markdownBlocks.join('\n\n---\n\n')}`;
         }
 
         history.push({ role: 'assistant', content: finalText });
@@ -1345,9 +1361,9 @@ export async function askConversationalCopilot(
           ferramentas: ferramentasExecutadas,
           sessionId,
           interacaoId: tracer.interacaoId,
-          relatorioEstruturado: activeRelatorio
+          relatorioEstruturado: primaryRelatorio
             ? {
-                ...activeRelatorio,
+                ...primaryRelatorio,
                 leitura_executiva: leituraValidadaParaPdf,
               }
             : undefined,
@@ -1690,7 +1706,7 @@ export async function askConversationalCopilot(
             };
           }
 
-          activeRelatorio = resultData;
+          activeRelatorios.push(resultData);
           // O modelo recebe APENAS o resumo_modelo compacto (<= 2.5k tokens), nunca as tabelas gigantes!
           modelPayloadObj = {
             ok: true,
@@ -1756,7 +1772,7 @@ export async function askConversationalCopilot(
             };
           }
 
-          activeRelatorio = resultData;
+          activeRelatorios.push(resultData);
           modelPayloadObj = {
             ok: true,
             result_ref: resultData.result_ref,
