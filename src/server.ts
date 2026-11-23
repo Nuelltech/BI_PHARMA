@@ -736,7 +736,20 @@ async function startServer() {
         const rawCode = rawCodeOriginal.toUpperCase();
         const rawCodeLower = rawCodeOriginal.toLowerCase();
 
+        const LEGACY_CODE_MAP: Record<string, string> = {
+          'FARM-A-7842': '3ac42c32-87a8-4afe-98cc-4ca61ac64aca', // Farmácia A
+          'FARM-B-7843': '8c34599d-9597-45a3-b122-8ffed62a5375', // Farmácia B
+          'FARM-C-7844': '594bdf27-151b-49f7-be71-18660b745d84', // Farmácia Demo
+          'FARMACIA-A': '3ac42c32-87a8-4afe-98cc-4ca61ac64aca',
+          'FARMACIA-B': '8c34599d-9597-45a3-b122-8ffed62a5375',
+          'FARMACIA-C': '594bdf27-151b-49f7-be71-18660b745d84',
+          'FARM-A': '3ac42c32-87a8-4afe-98cc-4ca61ac64aca',
+          'FARM-B': '8c34599d-9597-45a3-b122-8ffed62a5375',
+          'FARM-C': '594bdf27-151b-49f7-be71-18660b745d84',
+        };
+
         if (rawCode.length > 0) {
+          const legacyTargetId = LEGACY_CODE_MAP[rawCode] || LEGACY_CODE_MAP[rawCodeOriginal];
           const matchedFarm = await prisma.farmacia.findFirst({
             where: {
               OR: [
@@ -748,6 +761,7 @@ async function startServer() {
                 },
                 { id: rawCodeOriginal },
                 { id: rawCodeLower },
+                ...(legacyTargetId ? [{ id: legacyTargetId }] : []),
               ],
             },
           });
@@ -5015,6 +5029,26 @@ function getDashboardHtml(): string {
   </style>
 </head>
 <body>
+  <!-- ECRÃ DE PRÉ-CARREGAMENTO PROFISSIONAL NUELLTECH (PREVINE ECRÃ EM BRANCO) -->
+  <div id="appInitLoader" style="position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 1000000; background: #070f1e; display: flex; flex-direction: column; align-items: center; justify-content: center; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; transition: opacity 0.25s ease;">
+    <div style="display: flex; align-items: center; gap: 16px; margin-bottom: 24px;">
+      <img src="/assets/nuelltech-logo-dark.png" alt="Nuelltech" style="height: 48px; width: auto; object-fit: contain;" />
+      <div style="height: 38px; width: 1.5px; background: #334155;"></div>
+      <div style="display: flex; flex-direction: column;">
+        <span style="font-size: 0.7rem; font-weight: 800; letter-spacing: 2px; color: #38bdf8; text-transform: uppercase;">AI & PHARMACY INTELLIGENCE</span>
+        <span style="font-size: 0.75rem; font-weight: 600; color: #94a3b8;">Decisões Clínicas e Gestão de Stock</span>
+      </div>
+    </div>
+    <div style="display: flex; align-items: center; gap: 12px; color: #f8fafc; font-weight: 700; font-size: 1.1rem; margin-bottom: 8px;">
+      <div style="width: 20px; height: 20px; border: 2.5px solid rgba(56, 189, 248, 0.25); border-top-color: #38bdf8; border-radius: 50%; animation: initLoaderSpin 0.75s linear infinite;"></div>
+      <span>A carregar BI Pharma...</span>
+    </div>
+    <div id="appInitLoaderSub" style="color: #64748b; font-size: 0.82rem; font-weight: 500;">A validar credenciais seguras e inteligência da farmácia...</div>
+  </div>
+  <style>
+    @keyframes initLoaderSpin { to { transform: rotate(360deg); } }
+  </style>
+
   <div class="app-layout" id="mainAppLayout" style="display: none;">
     <!-- BARRA LATERAL DE NAVEGAÇÃO CLÍNICA (SIDEBAR) -->
     <aside class="sidebar">
@@ -7863,6 +7897,15 @@ function getDashboardHtml(): string {
       return _origFetch(input, init);
     };
 
+    function dismissInitLoader() {
+      const loader = document.getElementById('appInitLoader');
+      if (loader) {
+        loader.style.opacity = '0';
+        loader.style.pointerEvents = 'none';
+        setTimeout(() => { if (loader) loader.style.display = 'none'; }, 260);
+      }
+    }
+
     function toggleAuthGateMode(mode) {
       const pharmView = document.getElementById('authGatePharmacyView');
       const adminView = document.getElementById('authGateAdminView');
@@ -7918,6 +7961,7 @@ function getDashboardHtml(): string {
           errEl.style.display = 'block';
         }
       }
+      dismissInitLoader();
       if (modal) modal.style.display = 'block';
     }
 
@@ -8001,6 +8045,7 @@ function getDashboardHtml(): string {
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
+          dismissInitLoader();
           if (showErrors) {
             openAuthGateModal(data.error || 'Credenciais inválidas.', targetMode);
           } else {
@@ -8018,6 +8063,7 @@ function getDashboardHtml(): string {
         if (gate) gate.style.display = 'none';
         const appLayout = document.getElementById('mainAppLayout');
         if (appLayout) appLayout.style.display = 'flex';
+        dismissInitLoader();
         if (window.location.pathname === '/login' || window.location.search) {
           window.history.replaceState({}, document.title, '/');
         }
@@ -8032,6 +8078,7 @@ function getDashboardHtml(): string {
         return true;
       } catch (e) {
         console.error('Erro ao validar acesso:', e);
+        dismissInitLoader();
         return false;
       }
     }
@@ -8107,11 +8154,20 @@ function getDashboardHtml(): string {
       if (activeAccessCode && activeAuthRole === 'PHARMACY') {
         const ok = await verifyAndActivateAccessCode({ code: activeAccessCode }, false, 'PHARMACY');
         if (ok) return;
+        localStorage.removeItem('bi_pharma_access_code');
+        localStorage.removeItem('bi_pharma_auth_role');
+        activeAccessCode = '';
+        activeAuthRole = '';
       }
 
       // 4. Caso contrário, abre a janela de login de Farmácia (NUNCA expõe acesso admin)
       openAuthGateModal(null, 'PHARMACY');
     }
+
+    window.addEventListener('error', function(e) {
+      console.warn('Erro global na interface:', e ? e.message : e);
+      dismissInitLoader();
+    });
 
     function openAccessManagerModal() {
       const modal = document.getElementById('accessManagerModal');

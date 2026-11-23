@@ -601,11 +601,17 @@ Foco sugerido pelo modo selecionado: ${focoModo} (apenas indicação; a pergunta
    APENAS a tabela corrigida com uma linha de enquadramento. Não repitas introduções nem totais já dados.
 6. Se houver algo relevante que não foi pedido, no máximo UMA linha final: "Posso também ver X."
 7. Todos os números vêm das ferramentas. Campo nulo = "Sem dados". Nunca estimes, arredondes
-   para além do que a ferramenta devolve, nem uses "presumível", "provavelmente" ou equivalentes. NUNCA INVENTES NÚMEROS. SEM ALUCINAÇÕES.
-8. Se a consulta devolver 0 linhas ou for fora do âmbito: "Questão Fora de Âmbito" ou "ℹ️ Dados Não Encontrados" + o que foi pesquisado. Sem números.
-9. Se existirem avisos em meta.avisos_dados (ex.: DCI em falta, mês parcial, margem estimada),
+   para além do que a ferramenta devolve, nem uses "presumível", "provavelmente" ou equivalentes. NUNCA INVENTES NÚMEROS. NUNCA INVENTES NOMES DE PRODUTOS/MEDICAMENTOS que não constem dos dados devolvidos pela ferramenta (ex.: nunca inventes Ácido Valpróico se não estiver no resultado). SEM ALUCINAÇÕES.
+8. Relatórios de Laboratório (ferramenta relatorio_laboratorio):
+   As tabelas e totais analíticos auditados já se encontram deterministicamente calculados no campo 'relatorio_markdown'.
+   A tua resposta deve conter:
+   (a) Uma síntese executiva estratégica inicial (1 a 2 parágrafos) com as conclusões essenciais;
+   (b) A reprodução integral do bloco 'relatorio_markdown' sem alterar os números ou colunas;
+   (c) Um plano de 3 a 5 ações imediatas recomendadas para o diretor técnico/gerente (ex: devoluções proporcionais de validade, encomendas sob pedido para doentes crónicos e reposição de ruturas).
+9. Se a consulta devolver 0 linhas ou for fora do âmbito: "Questão Fora de Âmbito" ou "ℹ️ Dados Não Encontrados" + o que foi pesquisado. Sem números.
+10. Se existirem avisos em meta.avisos_dados (ex.: DCI em falta, mês parcial, margem estimada),
    refere-os numa nota curta de uma linha, apenas se afetarem o que mostras.
-10. Antes de responder, confirma: (a) o que foi pedido, (b) cada secção da resposta responde a algo
+11. Antes de responder, confirma: (a) o que foi pedido, (b) cada secção da resposta responde a algo
     pedido, (c) cada número está nos resultados.
 </contrato_de_resposta>
 
@@ -873,7 +879,7 @@ export async function askConversationalCopilot(
     };
   }
 
-  const model = (process.env.COPILOT_MODEL || 'claude-sonnet-4-5').trim();
+  const model = (process.env.COPILOT_MODEL || 'claude-3-5-haiku-20241022').trim();
   const FALLBACK_MODEL = 'claude-haiku-4-5-20251001';
   const THINKING_BUDGET = Number(process.env.COPILOT_THINKING_BUDGET || 4000);
   let activeModel = model;
@@ -980,6 +986,14 @@ export async function askConversationalCopilot(
 
         // Pós-processamento determinístico (V8 marcadores UI, V12 fuga técnica, V14 nota de margem estimada)
         finalText = postProcessCopilotText(finalText, toolsUsed, toolResultsJson, intentInfo);
+
+        // Safeguard determinístico: se o relatório de laboratório foi chamado e o modelo omitiu as tabelas, anexa o bloco oficial
+        if (toolsUsed.includes('relatorio_laboratorio') && !finalText.includes('### 🏆 Top 10 Produtos Mais Vendidos')) {
+          const relTool = ferramentasExecutadas.find((f: any) => f.nome === 'relatorio_laboratorio');
+          if (relTool?.resultado?.relatorio_markdown) {
+            finalText = `${finalText}\n\n---\n\n${relTool.resultado.relatorio_markdown}`;
+          }
+        }
 
         history.push({ role: 'assistant', content: finalText });
         sessionHistory.set(sessionId, history);

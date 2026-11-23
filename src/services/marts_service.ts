@@ -227,9 +227,9 @@ export async function computeAndPersistMarts(
       diasSemVendasReal = 999;
     }
 
-    const vnd3m = vendasUltimos3MesesPorCnp.get(cnp) || 0;
-    // Nenhum mono pode ter vendas nos últimos 3 meses
-    const ehMonoReal = item.stockTotal > 0 && (diasSemVendasReal === null || diasSemVendasReal >= 90) && vnd3m === 0;
+    // P0.3: Um produto só é mono se tiver stock, sem vendas há >= 90 dias, zero vendas nos últimos 3 meses E VMM insignificante (< 0.5)
+    // Produtos com rotação moderada ou alta (ex: Escitalopram VMM 1.75, Pravastatina VMM 1.0) nunca são monos
+    const ehMonoReal = Boolean(mono);
 
     productRows.push({
       farmaciaId,

@@ -58,9 +58,9 @@ describe('Bi-Pharma Copilot v2 — Bateria de Testes do Roadmap (P0 a P5)', () =
     expect(report.totais.unidades_vendidas).toBe(2456);
     expect(report.totais.faturacao_eur).toBeCloseTo(22443.79, 1);
 
-    // Monos verificados
-    expect(report.monos.total_contagem).toBe(30);
-    expect(report.monos.total_valor_custo).toBeCloseTo(199.82, 1);
+    // Monos verificados (sem falsos monos com rotação ativa VMM >= 0.5)
+    expect(report.monos.total_contagem).toBe(18);
+    expect(report.monos.total_valor_custo).toBeCloseTo(124.33, 1);
 
     // Excessos verificados
     expect(report.excessos.total_contagem).toBe(24);
@@ -73,8 +73,8 @@ describe('Bi-Pharma Copilot v2 — Bateria de Testes do Roadmap (P0 a P5)', () =
     expect(nomesValidades.some((n: string) => n.includes('Aelardis'))).toBe(true);
     expect(nomesValidades.some((n: string) => n.includes('Irbesartan'))).toBe(true);
 
-    // Imobilizado consolidado sem duplicados (~281 €)
-    expect(report.imobilizado_total.total_valor_custo).toBeCloseTo(281.06, 1);
+    // Imobilizado consolidado sem duplicados (~221.38 €)
+    expect(report.imobilizado_total.total_valor_custo).toBeCloseTo(221.38, 1);
 
     // Produtos em rutura com histórico de vendas
     expect(report.em_rutura.total_contagem).toBe(39);

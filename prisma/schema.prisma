@@ -587,6 +587,8 @@ model CopilotUsageLog {
   custo_estimado_eur          Decimal   @db.Decimal(10, 5)
   ferramentas_executadas      Json?     // Lista de ferramentas executadas
   duracao_ms                  Int?
+  status                      String?   @default("SUCCESS") // "SUCCESS" | "ERROR"
+  erro_mensagem               String?   @db.Text
   criadoEm                    DateTime  @default(now())
 
   farmacia                    Farmacia  @relation(fields: [farmaciaId], references: [id], onDelete: Cascade)

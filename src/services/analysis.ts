@@ -675,8 +675,8 @@ export async function analyzePharmacyInventory(
       });
     }
 
-    // 2. Monos
-    if (statsVenda.unidadesRecentesMonos === 0) {
+    // 2. Monos (Artigos sem vendas recentes e sem rotação relevante vmm < 0.5)
+    if (statsVenda.unidadesRecentesMonos === 0 && vmm < 0.5) {
       valorTotalMonos += valorStockItem;
       const acaoMono = buildSmartItemRecommendation({
         contexto: 'MONO',
