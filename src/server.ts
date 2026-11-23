@@ -37,7 +37,9 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import zlib from 'zlib';
 import { ensureDatabaseReady } from './db';
+import { canVerFaturacao } from './platform/permissoes';
 
 process.on('uncaughtException', (err) => {
   console.error('[Server] Uncaught Exception:', err);
@@ -356,12 +358,53 @@ function readRequestBody(req: http.IncomingMessage, maxBytes = 2 * 1024 * 1024):
 }
 
 // ============================================================================
-// CACHE EM MEMÓRIA DO SERVIDOR + DEDUPLICAÇÃO DE PEDIDOS + PRÉ-AQUECIMENTO
+// CACHE EM MEMÓRIA DO SERVIDOR + DEDUPLICAÇÃO DE PEDIDOS + COMPRESSÃO GZIP
 // ============================================================================
-const analysisCache = new Map<string, any>();
-const analysisInFlight = new Map<string, Promise<any>>();
+interface CachedAnalysisEntry {
+  report: PharmacyAnalysisReport;
+  jsonBuf: Buffer;
+  gzipBuf: Buffer;
+  timestamp: number;
+}
+
+const analysisCache = new Map<string, CachedAnalysisEntry>();
+const analysisInFlight = new Map<string, Promise<CachedAnalysisEntry>>();
 const campaignsCache = new Map<string, any>();
 const campaignsInFlight = new Map<string, Promise<any>>();
+
+function sendOptimizedJson(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  status: number,
+  dataObj: any,
+  cachedJsonBuf?: Buffer,
+  cachedGzipBuf?: Buffer
+) {
+  const acceptEncoding = String(req.headers['accept-encoding'] || '').toLowerCase();
+  const supportsGzip = acceptEncoding.includes('gzip');
+
+  if (supportsGzip) {
+    const gzipBuf = cachedGzipBuf || zlib.gzipSync(cachedJsonBuf || Buffer.from(JSON.stringify(dataObj)));
+    res.writeHead(status, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Encoding': 'gzip',
+      'Content-Length': String(gzipBuf.length),
+      'Vary': 'Accept-Encoding',
+      'Cache-Control': 'no-cache',
+    });
+    res.end(gzipBuf);
+    return;
+  }
+
+  const jsonBuf = cachedJsonBuf || Buffer.from(JSON.stringify(dataObj));
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': String(jsonBuf.length),
+    'Vary': 'Accept-Encoding',
+    'Cache-Control': 'no-cache',
+  });
+  res.end(jsonBuf);
+}
 
 function invalidateAllPharmacyCaches(farmaciaId?: string) {
   invalidateCatalog(farmaciaId);
@@ -383,10 +426,10 @@ async function getCachedOrComputeAnalysis(
   cobertura: number,
   mesesVmm: number,
   forceRefresh = false
-): Promise<PharmacyAnalysisReport> {
+): Promise<CachedAnalysisEntry> {
   const key = `${farmaciaId}:${diasMonos}:${cobertura}:${mesesVmm}`;
   if (!forceRefresh && analysisCache.has(key)) {
-    return analysisCache.get(key);
+    return analysisCache.get(key)!;
   }
   if (!forceRefresh && analysisInFlight.has(key)) {
     return analysisInFlight.get(key)!;
@@ -397,9 +440,17 @@ async function getCachedOrComputeAnalysis(
     mesesHistoricoVMM: mesesVmm,
   })
     .then((rep) => {
-      analysisCache.set(key, rep);
+      const jsonBuf = Buffer.from(JSON.stringify(rep));
+      const gzipBuf = zlib.gzipSync(jsonBuf);
+      const entry: CachedAnalysisEntry = {
+        report: rep,
+        jsonBuf,
+        gzipBuf,
+        timestamp: Date.now(),
+      };
+      analysisCache.set(key, entry);
       analysisInFlight.delete(key);
-      return rep;
+      return entry;
     })
     .catch((err) => {
       analysisInFlight.delete(key);
@@ -488,13 +539,20 @@ async function getCachedOrComputeCampaignsPayload(
 async function warmUpAllPharmacyCaches(prisma: any) {
   try {
     const farms = await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } });
-    for (const f of farms) {
-      await getCachedOrComputeAnalysis(prisma, f.id, 90, 4, 12);
-      await getCachedOrComputeCampaignsPayload(prisma, f);
+    if (farms.length > 0) {
+      // 1. Pré-aquecimento prioritário da primeira farmácia (disponibilidade imediata < 5s)
+      await getCachedOrComputeAnalysis(prisma, farms[0].id, 90, 4, 12);
+      await getCachedOrComputeCampaignsPayload(prisma, farms[0]);
+      console.log(`⚡ [Cache Warm-Up] Farmácia principal (${farms[0].nome}) pré-aquecida em memória RAM!`);
+
+      // 2. Aquecimento gradual em background das restantes farmácias sem saturar o event loop
+      for (let i = 1; i < farms.length; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        await getCachedOrComputeAnalysis(prisma, farms[i].id, 90, 4, 12);
+        await getCachedOrComputeCampaignsPayload(prisma, farms[i]);
+      }
+      console.log(`⚡ [Cache Warm-Up] Todas as ${farms.length} farmácias pré-aquecidas com sucesso.`);
     }
-    console.log(
-      `⚡ [Cache Warm-Up] ${farms.length} farmácia(s) pré-calculadas em memória RAM (Dashboard & Campanhas instantâneos < 10ms)!`
-    );
   } catch (err: any) {
     console.warn('[Cache Warm-Up] Aviso ao pré-aquecer cache:', err.message);
   }
@@ -681,10 +739,15 @@ async function startServer() {
         if (rawCode.length > 0) {
           const matchedFarm = await prisma.farmacia.findFirst({
             where: {
-              codigo_acesso: {
-                equals: rawCode,
-                mode: 'insensitive',
-              },
+              OR: [
+                {
+                  codigo_acesso: {
+                    equals: rawCode,
+                    mode: 'insensitive',
+                  },
+                },
+                { id: rawCode },
+              ],
             },
           });
           if (matchedFarm) {
@@ -1881,14 +1944,14 @@ async function startServer() {
               id: f.id,
               nome: f.nome,
               nif: maskNif(f.nif),
-              codigo_acesso: ctx.role === 'ADMIN' ? (f.codigo_acesso || f.id) : undefined,
+              codigo_acesso: (ctx.role === 'ADMIN' || ctx.role === 'PHARMACY') ? (f.codigo_acesso || f.id) : undefined,
             }))
           )
         );
         return;
       }
 
-      // 1. Endpoint de Análise Parametrizável (Multi-Tenant + Cache Instantânea)
+      // 1. Endpoint de Análise Parametrizável (Multi-Tenant + Cache Instantânea + Compressão Gzip)
       if (pathname === '/api/analysis' && req.method === 'GET') {
         const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
         const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
@@ -1898,7 +1961,7 @@ async function startServer() {
         const mesesVmm = parseInt(String(parsedUrl.query.mesesVmm || '12'), 10);
         const forceRefresh = String(parsedUrl.query.refresh || '') === '1';
 
-        const report = await getCachedOrComputeAnalysis(
+        const cached = await getCachedOrComputeAnalysis(
           prisma,
           activeFarmacia.id,
           Number.isNaN(diasMonos) ? 90 : diasMonos,
@@ -1907,8 +1970,7 @@ async function startServer() {
           forceRefresh
         );
 
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify(report));
+        sendOptimizedJson(req, res, 200, cached.report, cached.jsonBuf, cached.gzipBuf);
         return;
       }
 
@@ -2630,6 +2692,7 @@ async function startServer() {
           const rawBody = await readRequestBody(req, 256 * 1024);
           const { question, farmaciaId, sessionId, mode } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          const ctx = await resolveAccessContext();
           const q = String(question || '').trim();
 
           if (!q) {
@@ -2639,10 +2702,14 @@ async function startServer() {
           }
 
           // Contexto de Segurança Multi-Tenant Estrito & Anonimização para LLM
+          const accessCtx = await resolveAccessContext();
+          const callerRole = accessCtx.role === 'ADMIN' ? 'SUPERADMIN' : 'PROPRIETARIO';
           const secContext: ToolSecurityContext = {
             farmaciaId: activeFarmacia.id,
             farmaciaNome: 'Farmácia Comunitária',
             nif: '',
+            perfil: callerRole,
+            verFaturacao: canVerFaturacao(callerRole),
           };
 
           // Isola estritamente o sessionId por farmácia para impedir leitura cruzada de conversas em RAM
@@ -3390,11 +3457,16 @@ self.addEventListener('fetch', (e) => {
     // Pré-aquecimento em background para o servidor responder logo às verificações de saúde do Render
     (async () => {
       try {
-        console.log('[Classificador] A verificar e atualizar estatuto (VENDA_LIVRE / MNSRM / MSRM) e segmento (GENERICO_MG / MARCA)...');
-        const statsClass = await classifyAllExistingProducts(prisma);
-        console.log(
-          `[Classificador] ${statsClass.total} produtos caracterizados -> PSBE: ${statsClass.vendaLivre} | Genéricos MG: ${statsClass.genericosMg} | Marca: ${statsClass.marca}`
-        );
+        const unclassifiedCount = await prisma.produtoMestre.count({ where: { tipo_venda: null } });
+        if (unclassifiedCount > 0) {
+          console.log(`[Classificador] A classificar ${unclassifiedCount} produtos pendentes...`);
+          const statsClass = await classifyAllExistingProducts(prisma);
+          console.log(
+            `[Classificador] ${statsClass.total} produtos caracterizados -> PSBE: ${statsClass.vendaLivre} | Genéricos MG: ${statsClass.genericosMg} | Marca: ${statsClass.marca}`
+          );
+        } else {
+          console.log('⚡ [Classificador] Todos os produtos mestre já se encontram classificados.');
+        }
         await warmUpAllPharmacyCaches(prisma);
       } catch (err: any) {
         console.warn('⚠️ Aviso durante background startup warm-up:', err.message);
@@ -9007,9 +9079,14 @@ function getDashboardHtml(): string {
       const btn = document.getElementById('btnRecalcular');
       const feedback = document.getElementById('calcFeedback');
 
+      const tenantBadge = document.getElementById('tenantBadge');
+      if (tenantBadge && (!currentReport || !currentReport.farmacia)) {
+        tenantBadge.textContent = '⏳ A carregar inteligência de stock e indicadores da farmácia...';
+      }
+
       if (btn) {
         btn.disabled = true;
-        btn.innerHTML = '⏳ A calcular...';
+        btn.innerHTML = '⏳ A carregar...';
       }
 
       try {
@@ -9653,7 +9730,7 @@ function getDashboardHtml(): string {
         ? cachedAdminPharmacies
         : ((typeof currentReport !== 'undefined' && currentReport?.farmacia) ? [currentReport.farmacia] : []);
       const f = activeFarmaciaId && farmsList ? farmsList.find(x => x.id === activeFarmaciaId) : ((typeof currentReport !== 'undefined' && currentReport?.farmacia) ? currentReport.farmacia : null);
-      const code = f?.codigo_acesso || (activeFarmaciaId ? activeFarmaciaId : '');
+      const code = f?.codigo_acesso || (typeof activeAccessCode !== 'undefined' && activeAccessCode ? activeAccessCode : '') || (activeFarmaciaId ? activeFarmaciaId : '');
       const farmIdParam = f?.id || activeFarmaciaId || '';
       const fullUrl = window.location.origin + '/mobile?acesso=' + encodeURIComponent(code) + (farmIdParam ? '&farmaciaId=' + encodeURIComponent(farmIdParam) : '');
       const inp = document.getElementById('mobileDirectUrl');

@@ -30,6 +30,7 @@ import {
   toolConsultarTarefasECampanhas,
   toolConsultarDesempenhoCampanhas,
   toolPlanearComprasLaboratorio,
+  toolRelatorioLaboratorio,
 } from './copilot_semantic_layer';
 import {
   sugerirVendasCruzadas,
@@ -95,6 +96,29 @@ export function getCopilotSessionHistory(sessionId: string): Array<{ role: 'user
 // ============================================================================
 const COPILOT_TOOLS = [
   // --- CLASSE 1: DADOS (NEUTRAS — CONSULTA) ---
+  {
+    name: 'relatorio_laboratorio',
+    description:
+      'Gera um relatório executivo exaustivo e 100% pré-calculado sobre o desempenho de um laboratório (ex: "Teva", "Bial", "Generis"). Devolve blocos pré-calculados de totais, top de vendas, produtos com vendas baixas, sem vendas, em rutura com vendas, monos, excessos, validades próximas e capital imobilizado consolidado, com classificação calculada em código (manter, repor, trabalhar por encomenda, devolver). Use sempre que o utilizador pedir relatório de laboratório ou avaliação do que manter/não manter por laboratório.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        laboratorio: {
+          type: 'string',
+          description: 'Nome do laboratório (ex: "Teva", "Bial", "Generis").',
+        },
+        ano: {
+          type: 'string',
+          description: 'Ano de análise (padrão: "2026").',
+        },
+        limiteTop: {
+          type: 'number',
+          description: 'Número de produtos no bloco TOP mais vendidos (padrão: 10).',
+        },
+      },
+      required: ['laboratorio'],
+    },
+  },
   {
     name: 'consultar_vendas',
     description:
@@ -457,6 +481,7 @@ const COPILOT_TOOLS = [
 export type CopilotMode = 'STOCKS' | 'FINANCE' | 'MARKETING' | 'CLINICAL' | 'GENERAL';
 
 const DATA_TOOL_NAMES = new Set([
+  'relatorio_laboratorio',
   'consultar_vendas',
   'consultar_produtos',
   'consultar_grupos_dci',
@@ -576,8 +601,8 @@ Foco sugerido pelo modo selecionado: ${focoModo} (apenas indicação; a pergunta
    APENAS a tabela corrigida com uma linha de enquadramento. Não repitas introduções nem totais já dados.
 6. Se houver algo relevante que não foi pedido, no máximo UMA linha final: "Posso também ver X."
 7. Todos os números vêm das ferramentas. Campo nulo = "Sem dados". Nunca estimes, arredondes
-   para além do que a ferramenta devolve, nem uses "presumível", "provavelmente" ou equivalentes.
-8. Se a consulta devolver 0 linhas: "ℹ️ Dados Não Encontrados" + o que foi pesquisado. Sem números.
+   para além do que a ferramenta devolve, nem uses "presumível", "provavelmente" ou equivalentes. NUNCA INVENTES NÚMEROS. SEM ALUCINAÇÕES.
+8. Se a consulta devolver 0 linhas ou for fora do âmbito: "Questão Fora de Âmbito" ou "ℹ️ Dados Não Encontrados" + o que foi pesquisado. Sem números.
 9. Se existirem avisos em meta.avisos_dados (ex.: DCI em falta, mês parcial, margem estimada),
    refere-os numa nota curta de uma linha, apenas se afetarem o que mostras.
 10. Antes de responder, confirma: (a) o que foi pedido, (b) cada secção da resposta responde a algo
@@ -739,24 +764,28 @@ export function calculateClaudeCostEur(
   cacheCreationTokens = 0,
   cacheReadTokens = 0
 ): number {
-  const USD_TO_EUR = 0.92;
+  const usdToEur = process.env.COPILOT_USD_TO_EUR ? Number(process.env.COPILOT_USD_TO_EUR) : 0.92;
 
-  let inputPerMillion = 0.8;
-  let outputPerMillion = 4.0;
-  let cacheWritePerMillion = 1.0;
-  let cacheReadPerMillion = 0.08;
+  // P3.12: Tabela de preços oficiais Anthropic por Model ID
+  // Haiku 4.5 / 3.5: $1.00 / $5.00 (Cache escrita: $1.25, leitura: $0.10)
+  let inputPerMillion = 1.0;
+  let outputPerMillion = 5.0;
+  let cacheWritePerMillion = 1.25;
+  let cacheReadPerMillion = 0.10;
 
   const m = (model || '').toLowerCase();
   if (m.includes('sonnet')) {
+    // Sonnet 3.7 / 3.5: $3.00 / $15.00 (Cache escrita: $3.75, leitura: $0.30)
     inputPerMillion = 3.0;
     outputPerMillion = 15.0;
     cacheWritePerMillion = 3.75;
-    cacheReadPerMillion = 0.3;
+    cacheReadPerMillion = 0.30;
   } else if (m.includes('opus')) {
+    // Opus: $15.00 / $75.00 (Cache escrita: $18.75, leitura: $1.50)
     inputPerMillion = 15.0;
     outputPerMillion = 75.0;
     cacheWritePerMillion = 18.75;
-    cacheReadPerMillion = 1.5;
+    cacheReadPerMillion = 1.50;
   }
 
   const costUsd =
@@ -765,7 +794,7 @@ export function calculateClaudeCostEur(
     (cacheCreationTokens / 1_000_000) * cacheWritePerMillion +
     (cacheReadTokens / 1_000_000) * cacheReadPerMillion;
 
-  return Number((costUsd * USD_TO_EUR).toFixed(5));
+  return Number((costUsd * usdToEur).toFixed(5));
 }
 
 export async function askConversationalCopilot(
@@ -1051,6 +1080,10 @@ export async function askConversationalCopilot(
             };
           } else if (!resultData) {
             switch (call.name) {
+              case 'relatorio_laboratorio':
+                resultData = await toolRelatorioLaboratorio(prisma, secContext, args);
+                break;
+
               case 'consultar_vendas':
                 resultData = await toolConsultarVendas(prisma, secContext, args, sessionId, turnoAtual);
                 break;
@@ -1267,11 +1300,47 @@ export async function askConversationalCopilot(
     };
   } catch (err: any) {
     console.error('[Copilot Engine Error]:', err.message);
+    const duracaoMs = Date.now() - startTime;
+    const custoEstimadoEur = calculateClaudeCostEur(
+      activeModel,
+      totalInputTokens,
+      totalOutputTokens,
+      totalCacheCreationTokens,
+      totalCacheReadTokens
+    );
+
+    // P3.11: Registar tentativas falhadas no FinOps log
+    prisma.copilotUsageLog
+      .create({
+        data: {
+          farmaciaId: secContext.farmaciaId,
+          sessionId,
+          modelo: activeModel,
+          pergunta: question.slice(0, 1000),
+          input_tokens: totalInputTokens,
+          output_tokens: totalOutputTokens,
+          cache_creation_input_tokens: totalCacheCreationTokens,
+          cache_read_input_tokens: totalCacheReadTokens,
+          custo_estimado_eur: custoEstimadoEur,
+          ferramentas_executadas: { ferramentas: toolsUsed, erro: err.message, status: 'ERROR' },
+          duracao_ms: duracaoMs,
+        },
+      })
+      .catch((logErr: any) => console.error('[Copilot FinOps] Erro ao gravar log de falha:', logErr.message));
+
     return {
       text: `❌ Ocorreu um erro ao comunicar com a inteligência analítica: ${err.message}`,
       toolsUsed,
       sessionId,
       mode,
+      usage: {
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        cacheCreationTokens: totalCacheCreationTokens,
+        cacheReadTokens: totalCacheReadTokens,
+        custoEstimadoEur,
+        duracaoMs,
+      },
     };
   }
 }

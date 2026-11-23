@@ -136,13 +136,32 @@ export async function computeAndPersistMarts(
   const dataRef = new Date(p.data_referencia || '2026-10-31T23:59:59.999Z');
   // Janela histórica dos últimos 13 meses (mês homólogo anterior até ao mês de referência)
   const dataInicioJanela = new Date(Date.UTC(dataRef.getUTCFullYear() - 1, dataRef.getUTCMonth(), 1));
+  const data3MesesAtras = new Date(dataRef.getTime() - 90 * 24 * 60 * 60 * 1000);
 
   const vendasTotaisPorCnp = new Map<string, number>();
+  const ultimaVendaPorCnp = new Map<string, Date>();
+  const vendasUltimos3MesesPorCnp = new Map<string, number>();
   const mesMap = new Map<string, { cnp: string; mes: string; qtd: number; valor: number }>();
+
   for (const v of vendas) {
     const d = v.data_venda;
+    if (d > dataRef) continue;
+
+    // Acompanhar a data da última venda histórica
+    const curLatest = ultimaVendaPorCnp.get(v.cnp_codigo);
+    if (!curLatest || d > curLatest) {
+      ultimaVendaPorCnp.set(v.cnp_codigo, d);
+    }
+
+    if (d >= data3MesesAtras && v.quantidade > 0) {
+      vendasUltimos3MesesPorCnp.set(
+        v.cnp_codigo,
+        (vendasUltimos3MesesPorCnp.get(v.cnp_codigo) || 0) + v.quantidade
+      );
+    }
+
     // Ignora movimentos históricos antigos fora do ciclo de 12-13 meses (ex: dados legados de 2022)
-    if (d < dataInicioJanela || d > dataRef) continue;
+    if (d < dataInicioJanela) continue;
 
     if (v.granularidade !== 'DIARIO') {
       vendasTotaisPorCnp.set(v.cnp_codigo, (vendasTotaisPorCnp.get(v.cnp_codigo) || 0) + v.quantidade);
@@ -199,6 +218,19 @@ export async function computeAndPersistMarts(
     const cobFinal = exc?.cobertura_meses !== undefined ? Number(exc.cobertura_meses) : (cad?.cobertura_meses !== undefined ? Number(cad.cobertura_meses) : cobFallback);
     const rutFinal = Boolean(rut) || (item.stockTotal === 0 && vendasTot >= 6) || (vmmFinal >= 1.0 && cobFinal < 0.7);
 
+    // P0.3: Cálculo de dias_sem_vendas real a partir da última venda e regra estrita de mono
+    const lastSaleDate = ultimaVendaPorCnp.get(cnp) || (mono?.ultima_venda ? new Date(mono.ultima_venda) : null);
+    let diasSemVendasReal: number | null = null;
+    if (lastSaleDate) {
+      diasSemVendasReal = Math.max(0, Math.floor((dataRef.getTime() - lastSaleDate.getTime()) / (1000 * 60 * 60 * 24)));
+    } else if (item.stockTotal > 0) {
+      diasSemVendasReal = 999;
+    }
+
+    const vnd3m = vendasUltimos3MesesPorCnp.get(cnp) || 0;
+    // Nenhum mono pode ter vendas nos últimos 3 meses
+    const ehMonoReal = item.stockTotal > 0 && (diasSemVendasReal === null || diasSemVendasReal >= 90) && vnd3m === 0;
+
     productRows.push({
       farmaciaId,
       cnp_codigo: cnp,
@@ -221,9 +253,9 @@ export async function computeAndPersistMarts(
       total_unidades_vendidas: vendasTot,
       vmm: vmmFinal,
       cobertura_meses: cobFinal,
-      data_ultima_venda: mono?.ultima_venda ? new Date(mono.ultima_venda) : null,
-      dias_sem_vendas: mono ? 90 : null,
-      eh_mono: Boolean(mono),
+      data_ultima_venda: lastSaleDate,
+      dias_sem_vendas: diasSemVendasReal,
+      eh_mono: ehMonoReal,
       eh_excesso_cobertura: Boolean(exc),
       unidades_excesso: exc ? Math.max(0, exc.stock_atual - Math.ceil(exc.vmm * 4)) : 0,
       capital_excesso: exc ? Math.max(0, (exc.stock_atual - Math.ceil(exc.vmm * 4)) * exc.custo_unitario) : 0,

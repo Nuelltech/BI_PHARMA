@@ -13,6 +13,9 @@ export interface ToolSecurityContext {
   farmaciaId: string;
   farmaciaNome: string;
   nif: string;
+  perfil?: string;
+  permissions?: Set<string> | string[];
+  verFaturacao?: boolean;
 }
 
 /**

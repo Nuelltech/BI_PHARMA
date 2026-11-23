@@ -1,6 +1,8 @@
 // ============================================================================
-// ROUTER DE INTENÇÃO, GATING DE FERRAMENTAS E VALIDADOR DETERMINÍSTICO (V1-V14)
+// ROUTER DE INTENÇÃO, GATING DE FERRAMENTAS E VALIDADOR DETERMINÍSTICO (V1-V20)
 // ============================================================================
+
+import { isTherapeuticChronic } from './copilot_chronic_therapies';
 
 const CNP_REGEX = /\b\d{7}\b/g;
 
@@ -259,6 +261,44 @@ export function validateCopilotAnswer(
           ' | '
         )}. Remove todas as secções de encomendas, proibições, alertas de tesouraria e recomendações estratégicas; responde apenas ao que foi perguntado.`
       );
+    }
+  }
+
+  // V15: Proibição legal de sugerir campanhas, packs, descontos ou promoções para MSRM (P2.10)
+  if (/\bMSRM\b/i.test(finalText) && /\b(campanha(s)?|pack(s)?|promo[çc][ãa]o|desconto(s)?|pague\s+\d+\s+leve\s+\d+)\b/i.test(finalText)) {
+    problems.push(
+      '[V15] Proibição legal estrita: Medicamentos Sujeitos a Receita Médica (MSRM) NÃO podem ser objeto de campanhas, descontos, packs ou promoções. As únicas ações permitidas são: devolver ao fornecedor, transferir entre farmácias, trabalhar sob encomenda ou repor stock.'
+    );
+  }
+
+  // V16: Proteção de continuidade clínica para terapêutica crónica (P2.10)
+  const lines = finalText.split('\n');
+  for (const line of lines) {
+    if (/\b(n[aã]o\s+manter|descontinuar|retirar\s+da\s+farm[áa]cia|eliminar\s+do\s+stock)\b/i.test(line)) {
+      if (isTherapeuticChronic(null, line)) {
+        problems.push(
+          `[V16] Violação de continuidade clínica na linha "${line.trim().slice(0, 80)}...": Medicamentos de terapêutica crónica (anticoagulantes, antidiabéticos, antiepiléticos, antidepressivos, cardiovasculares) NUNCA podem ter recomendação de "não manter" ou descontinuar. No máximo, trabalhar sob encomenda ou stock mínimo de 1 unidade.`
+        );
+      }
+    }
+  }
+
+  // V17: Verificação de números citados (P2.6)
+  if (toolResultsJson.length > 0) {
+    const allToolJson = toolResultsJson.join(' ');
+    const moneyMatches = finalText.match(/\b\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?\s*€/g) || [];
+    for (const m of moneyMatches) {
+      const rawVal = m.replace('€', '').trim().replace(/\./g, '').replace(',', '.');
+      const num = parseFloat(rawVal);
+      if (!isNaN(num) && num > 5) {
+        const numFixed2 = num.toFixed(2);
+        const numInt = Math.round(num).toString();
+        if (!allToolJson.includes(numFixed2) && !allToolJson.includes(numInt) && !allToolJson.includes(rawVal)) {
+          problems.push(
+            `[V17] O valor ${m} citado no texto não foi encontrado nos resultados pré-calculados das ferramentas. O modelo não deve calcular nem inventar valores.`
+          );
+        }
+      }
     }
   }
 
