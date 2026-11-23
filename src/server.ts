@@ -8778,6 +8778,17 @@ function getDashboardHtml(): string {
     let currentInspectionResults = [];
 
     function openInteractiveImportModal() {
+      selectedImportFiles = [];
+      currentInspectionResults = [];
+      var fileInput = document.getElementById('impCustomFilesInput');
+      if (fileInput) fileInput.value = '';
+      var progressBar = document.getElementById('importProgressBar');
+      if (progressBar) {
+        progressBar.style.width = '5%';
+        progressBar.style.background = '';
+      }
+      var statsReport = document.getElementById('importStatsReport');
+      if (statsReport) statsReport.style.display = 'none';
       var modal = document.getElementById('interactiveImportModal');
       if (modal) modal.style.display = 'flex';
       backToImportStep1();

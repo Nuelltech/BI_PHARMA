@@ -483,6 +483,8 @@ export async function executeInteractiveImport(
           invMap.set(inv.cnp_codigo, l);
         }
 
+        // Calcular todas as atualizações FEFO em memória e executar em Bulk SQL (100x mais rápido)
+        const updatesById = new Map<string, Date>();
         for (let rIdx = 0; rIdx < parsedVal.rows.length; rIdx++) {
           const r = parsedVal.rows[rIdx];
           const cnp = normalizeCnp(r.codigo);
@@ -495,22 +497,29 @@ export async function executeInteractiveImport(
 
           const matches = invMap.get(cnp) || [];
           for (const inv of matches) {
-            // Regra FEFO: se já tiver validade, escolhe a mais próxima (menor)
-            const bestDate = inv.data_validade && inv.data_validade < novaDataValidade ? inv.data_validade : novaDataValidade;
-            await prisma.inventario.update({
-              where: { id: inv.id },
-              data: { data_validade: bestDate },
-            });
-            valUpdatedCount++;
+            const prevBest = updatesById.get(inv.id) || inv.data_validade;
+            const bestDate = prevBest && prevBest < novaDataValidade ? prevBest : novaDataValidade;
+            updatesById.set(inv.id, bestDate);
           }
+        }
 
-          if (rIdx % 10 === 0 || rIdx === parsedVal.rows.length - 1) {
-            onProgress?.(
-              basePct + Math.round(fileSlice * (0.3 + (0.6 * (rIdx + 1)) / parsedVal.rows.length)),
-              `A atualizar prazos de validade (FEFO)...`,
-              `${rIdx + 1} de ${parsedVal.rows.length} artigos verificados`
-            );
-          }
+        const updateEntries = Array.from(updatesById.entries());
+        for (let i = 0; i < updateEntries.length; i += BULK_BATCH_SIZE) {
+          const chunk = updateEntries.slice(i, i + BULK_BATCH_SIZE);
+          await prisma.$executeRawUnsafe(
+            `UPDATE "Inventario" AS i
+             SET "data_validade" = u.dt
+             FROM unnest($1::text[], $2::timestamptz[]) AS u(id, dt)
+             WHERE i."id" = u.id`,
+            chunk.map(([id]) => id),
+            chunk.map(([, dt]) => dt)
+          );
+          valUpdatedCount += chunk.length;
+          onProgress?.(
+            basePct + Math.round(fileSlice * (0.3 + (0.6 * Math.min(i + chunk.length, updateEntries.length)) / Math.max(1, updateEntries.length))),
+            `A atualizar prazos de validade em lote (FEFO)...`,
+            `${Math.min(i + chunk.length, updateEntries.length)} de ${updateEntries.length} inventários atualizados`
+          );
         }
 
         stats.totalValidadesCruzadas += valUpdatedCount;
