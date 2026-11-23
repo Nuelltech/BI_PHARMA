@@ -496,8 +496,60 @@ function isNumberAllowed(val: number, allowed: Set<number>): boolean {
   return false;
 }
 
-const MSRM_MARKETING_OR_PRICE_RX =
-  /\b(campanha(s)?|promo[çc][ãa]o|promo[çc][õo]es|desconto(s)?|pack(s)?|liquidar|liquida[çc][ãa]o|escoar\s+no\s+balc[ãa]o|destaque\s+(de|no)\s+balc[ãa]o|pague\s+\d+\s+leve\s+\d+|(aumentar|subir|alterar|renegociar|reinterpretar|reinterpreta[çc][ãa]o|ajustar)\s+(o\s+|de\s+|do\s+)?(pvp|pre[çc]o))\b/i;
+const MSRM_MARKETING_OR_PRICE_NORM_RX =
+  /\b(escoa\w*|liquida\w*|promov\w*|promoc\w*|descont\w*|campanh\w*|pack\w*|destaqu\w*|montr\w*|ofert\w*|pague\s+\d+\s+leve\s+\d+|leve\s+\d+\s+pague\s+\d+|(aument|sub|alter|renegoci|reinterpret|ajust)\w*\s+(o\s+|a\s+|de\s+|do\s+|da\s+)?(pvp|prec\w*))\b/i;
+
+/**
+ * Garante que uma Leitura nunca é entregue cortada a meio (stop_reason = max_tokens).
+ * Corta na última frase completa (. ! ?); se não houver frase completa, devolve "".
+ */
+export function trimTruncatedText(text: string, stopReason?: string | null): string {
+  const cleaned = (text || '').trim();
+  if (!cleaned) return '';
+  const endsWithPunct = /[.!?]["»”)]?$/.test(cleaned);
+  if (stopReason !== 'max_tokens' && endsWithPunct) {
+    return cleaned;
+  }
+  const lastEnd = Math.max(cleaned.lastIndexOf('.'), cleaned.lastIndexOf('!'), cleaned.lastIndexOf('?'));
+  if (lastEnd === -1) return '';
+  return cleaned.slice(0, lastEnd + 1).trim();
+}
+
+/**
+ * Impõe o formato de Leitura em prosa corrida (máx. 4 frases, sem títulos #, sem listas, sem secções).
+ * Tudo o que vier a partir do primeiro título (após o parágrafo inicial), separador (---) ou lista é descartado.
+ */
+export function enforcePlainProseLeitura(rawText: string, stopReason?: string | null): string {
+  const lines = (rawText || '').replace(/\r\n/g, '\n').split('\n');
+  const proseLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // Ignorar título isolado apenas se ainda não recolhemos nenhuma frase de prosa
+    if (/^#{1,6}\s+/.test(trimmed)) {
+      if (proseLines.length === 0) continue;
+      break; // Qualquer título depois da prosa inicia uma secção -> descartar tudo daqui para a frente
+    }
+
+    // Separador ou item de lista -> descartar tudo daqui para a frente
+    if (/^(---+|\*\*\*+|[-*•]\s+|\d+[.)]\s+|\[As tabelas)/i.test(trimmed)) {
+      if (proseLines.length === 0) continue;
+      break;
+    }
+
+    proseLines.push(trimmed);
+  }
+
+  let joined = proseLines.join(' ').replace(/\s+/g, ' ').trim();
+  joined = trimTruncatedText(joined, stopReason);
+  if (!joined) return '';
+
+  // Limitar estritamente a no máximo 4 frases corridas
+  const sentences = joined.split(/(?<=[.!?])\s+(?=[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ0-9*])/).filter(Boolean);
+  return sentences.slice(0, 4).join(' ').trim();
+}
 
 const CHRONIC_FORBIDDEN_RX =
   /\b(devolver\s+(todo|tudo|a\s+totalidade|todas?\s+as?\s+\d*\s*un)|descontinuar|descartar|eliminar|abater|destruir|n[ãa]o\s+manter|deixar\s+de\s+vender|n[ãa]o\s+repor|eliminar\s+do\s+stock|retirar\s+da\s+farm[áa]cia)\b/i;
@@ -728,11 +780,11 @@ export function validateAndSanitizeLeitura(
         }
       }
 
-      // T4: MSRM sem marketing nem alteração/reinterpretação de preço (sem depender da palavra literal "MSRM")
-      if (!violation && MSRM_MARKETING_OR_PRICE_RX.test(sentence)) {
-        const isExplicitProhibition = /\b(proibid[oa]|n[ãa]o\s+podem?|nunca\s+podem?|vedad[oa])\b/i.test(sentence);
+      // T4: MSRM sem marketing nem escoamento nem alteração/reinterpretação de preço (comparação sem acentos por raiz)
+      if (!violation && MSRM_MARKETING_OR_PRICE_NORM_RX.test(sNorm)) {
+        const isExplicitProhibition = /\b(proibid[oa]|nao\s+podem?|nunca\s+podem?|vedad[oa])\b/i.test(sNorm);
         if (!isExplicitProhibition) {
-          const citesLiteralMsrm = /\bMSRM\b/i.test(sentence);
+          const citesLiteralMsrm = /\bmsrm\b/i.test(sNorm);
           const citesMsrmProduct =
             relProds.some(
               (rp) =>
@@ -751,7 +803,7 @@ export function validateAndSanitizeLeitura(
           if (citesLiteralMsrm || citesMsrmProduct) {
             violation = {
               rule: 'T4',
-              reason: 'Proibição legal: frase associa medicamento MSRM a campanha, promoção, desconto, pack ou alteração/reinterpretação de preço.',
+              reason: 'Proibição legal: frase associa medicamento MSRM a escoamento, liquidação, campanha, promoção, desconto, pack, destaque ou alteração/reinterpretação de preço.',
             };
           }
         }

@@ -2,6 +2,8 @@ import {
   validateCopilotAnswer,
   validateRelatorioData,
   validateAndSanitizeLeitura,
+  enforcePlainProseLeitura,
+  trimTruncatedText,
   normalizeTextForMatch,
   CatalogTermEntry,
   extractCnps,
@@ -610,9 +612,9 @@ Foco sugerido pelo modo selecionado: ${focoModo} (apenas indicação; a pergunta
    para além do que a ferramenta devolve, nem uses "presumível", "provavelmente" ou equivalentes. NUNCA INVENTES NÚMEROS. NUNCA INVENTES NOMES DE PRODUTOS/MEDICAMENTOS que não constem dos dados devolvidos pela ferramenta (ex.: nunca inventes Ácido Valpróico se não estiver no resultado). SEM ALUCINAÇÕES.
 8. Relatórios de Laboratório (ferramenta relatorio_laboratorio):
    As tabelas completas, a distribuição por classe de ação e a secção de Ações Imediatas são geradas e inseridas AUTOMATICAMENTE pelo código abaixo da tua resposta.
-   NUNCA escrevas tabelas, listas de ações, cabeçalhos "Relatório Detalhado" nem notas meta ("[As tabelas...]").
-   Escreve APENAS 2 a 4 frases curtas de destaque executivo (o que se destaca nos totais, concentração do Top 5/Top 10 e principal lacuna de dados), usando EXCLUSIVAMENTE os números exatos do resumo recebido.
-   NUNCA uses verbos proibidos (eliminar, descartar, destruir, abater, liquidar).
+   Escreve no máximo 4 frases corridas em texto simples. Não escrevas títulos (#), listas nem secções por classe; essas partes são geradas automaticamente.
+   Não caracterizes grupos (ex.: "concentram-se em estatinas…") se essa informação não estiver explícita no resumo recebido.
+   NUNCA uses verbos proibidos (eliminar, descartar, destruir, abater, liquidar) nem associes MSRM a escoamento, promoção ou alteração de preço.
 9. Se a consulta devolver 0 linhas ou for fora do âmbito: "Questão Fora de Âmbito" ou "ℹ️ Dados Não Encontrados" + o que foi pesquisado. Sem números.
 10. Se existirem avisos em meta.avisos_dados (ex.: DCI em falta, mês parcial, margem estimada),
    refere-os numa nota curta de uma linha, apenas se afetarem o que mostras.
@@ -1085,7 +1087,12 @@ export async function askConversationalCopilot(
       if (toolUseCalls.length === 0) {
         const textBlocks = content.filter((c: any) => c.type === 'text');
         const textoAntesValidacao = sanitizeCopilotOutput(textBlocks.map((b: any) => b.text).join('\n\n'));
-        let finalText = textoAntesValidacao;
+        // Impõe formato de prosa corrida (sem títulos/listas) + proteção contra truncamento (stop_reason = max_tokens)
+        let finalText = activeRelatorio
+          ? enforcePlainProseLeitura(textoAntesValidacao, data.stop_reason)
+          : data.stop_reason === 'max_tokens'
+            ? trimTruncatedText(textoAntesValidacao, data.stop_reason)
+            : textoAntesValidacao;
 
         // VALIDAÇÃO 2 — TEXTO FRASE A FRASE (T1–T7 + V4 do turno + regras legadas V1/V5/V6/V12)
         const valStart = Date.now();

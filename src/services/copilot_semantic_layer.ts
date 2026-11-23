@@ -2611,7 +2611,7 @@ export async function toolRelatorioLaboratorio(
     imobilizado_produtos_unicos: result.imobilizado_total.total_produtos_unicos,
     lacunas,
     instrucao:
-      'As tabelas e a secção de Ações Imediatas são geradas e inseridas AUTOMATICAMENTE pelo código abaixo da tua resposta. Escreve APENAS 2 a 4 frases curtas de destaque executivo (sem listas de ações, sem cabeçalhos de relatório, sem notas sobre tabelas), usando exclusivamente os números e produtos exatos deste resumo.',
+      'Escreve no máximo 4 frases corridas em texto simples. Não escrevas títulos (#), listas nem secções por classe; essas partes e as tabelas são geradas automaticamente pelo código. Não caracterizes grupos (ex.: "concentram-se em…") se essa informação não estiver explícita neste resumo. Usa apenas os números exatos deste resumo.',
   };
 
   return {

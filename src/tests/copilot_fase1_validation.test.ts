@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   validateRelatorioData,
   validateAndSanitizeLeitura,
+  enforcePlainProseLeitura,
+  trimTruncatedText,
   postProcessCopilotText,
   CatalogTermEntry,
 } from '../services/copilot_validation';
@@ -278,5 +280,36 @@ describe('Fase 1 — Validação 1 (D1–D5), Validação 2 (T1–T7), Vocabulá
       []
     );
     expect(cleaned).toBe('Texto válido.');
+  });
+
+  it('T4 (raízes sem acentos): bloqueia "Fluticasona, Aelardis e Irbesartan requerem devolução parcial ou escoamento urgente"', () => {
+    const res = validateAndSanitizeLeitura(
+      'A Teva faturou 8.163,00 € em 2026. Fluticasona, Aelardis e Irbesartan requerem devolução parcial ou escoamento urgente.',
+      {
+        relatorio: FIXTURE_RELATORIO,
+        turnToolResultsJson: [JSON.stringify(FIXTURE_RELATORIO)],
+        catalogTerms: FIXTURE_CATALOG,
+      }
+    );
+    expect(res.ok).toBe(false);
+    expect(res.failedRules).toContain('T4');
+    expect(res.sanitizedText).not.toContain('escoamento');
+    expect(res.sanitizedText).toContain('8.163,00 €');
+  });
+
+  it('Truncamento (stop_reason=max_tokens) e formato da Leitura: descarta títulos/listas e corta na última frase completa', () => {
+    const rawTruncated =
+      '## Relatório Executivo — Teva\n\n' +
+      'A Teva faturou 22.443,79 € em 2.456 unidades. O Top 5 representa 24,8% do total.\n\n' +
+      '### Produtos a MANTER (62 referências)\n' +
+      'Rotação robusta, manter presença plena com reposição automática nos li';
+
+    const clean = enforcePlainProseLeitura(rawTruncated, 'max_tokens');
+    expect(clean).toBe('A Teva faturou 22.443,79 € em 2.456 unidades. O Top 5 representa 24,8% do total.');
+    expect(clean).not.toContain('###');
+    expect(clean).not.toContain('nos li');
+
+    // Caso extremo: 1 única frase cortada sem ponto final -> devolve "" para acionar fallback so_tabelas
+    expect(trimTruncatedText('A Teva faturou 22.443,79 € com reposição nos li', 'max_tokens')).toBe('');
   });
 });
