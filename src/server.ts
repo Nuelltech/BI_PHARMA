@@ -11929,13 +11929,13 @@ function getDashboardHtml(): string {
         kpisHtml +
         '<div style="margin-bottom:18px;">' +
           '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">1. Diagnóstico Analítico & Contexto</div>' +
-          '<div style="font-size:11.5px;line-height:1.6;color:#334155;background:#fafafa;border:1px solid #f1f5f9;border-radius:6px;padding:8px 10px;">' + diagText.replace(/\\n/g, '<br/>') + '</div>' +
+          '<div style="font-size:11.5px;line-height:1.6;color:#334155;background:#fafafa;border:1px solid #f1f5f9;border-radius:6px;padding:8px 10px;">' + diagText.split(String.fromCharCode(10)).join('<br/>') + '</div>' +
         '</div>' +
         tableHtml +
         recsHtml +
         '<div style="margin-bottom:20px;page-break-inside:avoid;">' +
           '<div style="font-size:11px;font-weight:800;color:#0284c7;text-transform:uppercase;margin-bottom:6px;">4. Parecer & Despacho da Direção Técnica</div>' +
-          '<div style="font-size:11px;line-height:1.5;color:#475569;border:1px dashed #cbd5e1;border-radius:6px;padding:8px 10px;background:#fdfdfd;margin-bottom:12px;">' + notesText.replace(/\\n/g, '<br/>') + '</div>' +
+          '<div style="font-size:11px;line-height:1.5;color:#475569;border:1px dashed #cbd5e1;border-radius:6px;padding:8px 10px;background:#fdfdfd;margin-bottom:12px;">' + notesText.split(String.fromCharCode(10)).join('<br/>') + '</div>' +
           '<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-top:24px;padding-top:14px;border-top:1px solid #e2e8f0;font-size:10.5px;color:#64748b;">' +
             '<div>Assinatura do Responsável: _________________________________________</div>' +
             '<div>Carimbo / Visto Farmácia: [ &nbsp; ] Homologado</div>' +
@@ -14933,7 +14933,9 @@ function getDashboardHtml(): string {
 </html>`;
 }
 
-startServer().catch((err) => {
-  console.error('❌ Erro ao iniciar servidor:', err);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== 'test' && !process.env.SKIP_SERVER_START) {
+  startServer().catch((err) => {
+    console.error('❌ Erro ao iniciar servidor:', err);
+    process.exit(1);
+  });
+}
