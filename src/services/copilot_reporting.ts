@@ -35,6 +35,7 @@ export interface CopilotExecutiveReport {
     resumo: string;
     produtos: string[];
   }>;
+  validadesCurtas?: CopilotReportTable;
   recomendacoes: string[];
   notaFarmaceutica: string;
   farmaciaNome: string;
@@ -431,7 +432,7 @@ export function buildExecutiveReportFromStructuredData(
 
   if (Array.isArray(relatorio?.acoes_imediatas_por_classe) && relatorio.acoes_imediatas_por_classe.length > 0) {
     for (const ac of relatorio.acoes_imediatas_por_classe) {
-      let resumo = `${ac.n_produtos} produtos`;
+      let resumo = `${ac.n_produtos} ${ac.n_produtos === 1 ? 'produto' : 'produtos'}`;
       if (ac.unidades_a_devolver !== null && ac.unidades_a_devolver !== undefined) {
         resumo += ` — ${ac.unidades_a_devolver} un a devolver` + (showEur ? ` (${fmtEur(ac.valor_a_devolver_eur)} a custo)` : '');
       }
@@ -452,6 +453,35 @@ export function buildExecutiveReportFromStructuredData(
       });
       recomendacoes.push(`[${ac.classe}] ${resumo}: ${produtosFmt.join('; ')}.`);
     }
+  }
+
+  // 4. Secção dedicada de Validades Curtas (< 6 meses) com todos os produtos (ex.: Fluticasona, Aelardis, Irbesartan)
+  const valArr = Array.isArray(relatorio?.validades?.produtos) ? relatorio.validades.produtos : [];
+  let validadesCurtas: CopilotReportTable | undefined = undefined;
+  if (valArr.length > 0) {
+    const valCols = ['CNP', 'Designação', 'Validade', 'Stock', 'Devolver', 'Manter', 'Ação', 'Detalhe'];
+    const valRows = valArr.map((p: any) => {
+      const stk = Number(p.stock ?? 0);
+      const dev = p.classificacao === 'DEVOLVER_TUDO'
+        ? stk
+        : Number(p.unidades_excesso ?? 0);
+      const manter = Math.max(0, stk - dev);
+      return [
+        String(p.cnp),
+        String(p.designacao || '').slice(0, 48),
+        String(p.validade || '—'),
+        `${stk} un`,
+        `${dev} un`,
+        `${manter} un`,
+        String(p.classificacao || ''),
+        String(p.motivo_classificacao || ''),
+      ];
+    });
+    validadesCurtas = {
+      colunas: valCols,
+      linhas: valRows,
+      totalRegistos: valArr.length,
+    };
   }
 
   // Notas e lacunas (sem duplicar REVER_DADOS / Olfenex se já listado acima!)
@@ -477,6 +507,7 @@ export function buildExecutiveReportFromStructuredData(
     },
     topTabela,
     acoesPorClasse,
+    validadesCurtas,
     recomendacoes,
     notaFarmaceutica:
       'Proposta para validação da Direção Técnica — Nome: ________________________ | Data: ___/___/_____ | Assinatura: ________________________',

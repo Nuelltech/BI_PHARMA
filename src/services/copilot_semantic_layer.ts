@@ -2489,7 +2489,8 @@ export async function toolRelatorioLaboratorio(
           n_produtos: items.length,
           unidades_a_devolver: unDevolver,
           valor_a_devolver_eur: valDevolver,
-          principais: items.slice(0, 5).map((p) => ({
+          // Listas de DEVOLVER_EXCESSO / DEVOLVER_TUDO completas quando <= 10 produtos (inclui Irbesartan!)
+          principais: items.slice(0, items.length <= 10 ? items.length : 5).map((p) => ({
             cnp: p.cnp,
             designacao: p.designacao.slice(0, 48),
             stock: p.stock,
@@ -2575,6 +2576,12 @@ export async function toolRelatorioLaboratorio(
     ...(p.unidades_excesso ? { devolver_un: p.unidades_excesso } : {}),
   });
 
+  // Destaques pré-calculados pelo código para a Leitura (o modelo escolhe 2-3 e explica sem somar nem contar)
+  const top1Prod = topList[0] || null;
+  const ruturaTop = emRutura[0] || null;
+  const maiorImob = [...produtosImobilizados].sort((a, b) => (b.valor_custo_stock || 0) - (a.valor_custo_stock || 0))[0] || null;
+  const valMaisProxima = [...validadesRisco].sort((a, b) => String(a.validade || '9999').localeCompare(String(b.validade || '9999')))[0] || null;
+
   result.resumo_modelo = {
     meta: {
       laboratorio: labQuery,
@@ -2583,35 +2590,49 @@ export async function toolRelatorioLaboratorio(
       faturacao_oculta: !allowFaturacao,
     },
     totais: result.totais,
-    classes_resumo: classesResumo,
-    top_5: topList.slice(0, 5).map(compactItem),
-    em_rutura_top_5: {
-      total: emRutura.length,
-      exemplos: emRutura.slice(0, 5).map(compactItem),
+    destaques: {
+      top1_produto: top1Prod
+        ? {
+            nome: top1Prod.designacao.slice(0, 48),
+            cnp: top1Prod.cnp,
+            ...(allowFaturacao ? { vendas_eur: top1Prod.vendas_eur, quota_pct: top1Prod.pct_faturacao_acumulada } : {}),
+            vendas_un: top1Prod.vendas_un,
+          }
+        : null,
+      quota_top5_pct: result.totais.top5_pct_faturacao,
+      produto_rutura_mais_vendido: ruturaTop
+        ? {
+            nome: ruturaTop.designacao.slice(0, 48),
+            cnp: ruturaTop.cnp,
+            ...(allowFaturacao ? { vendas_eur: ruturaTop.vendas_eur } : {}),
+            vendas_un: ruturaTop.vendas_un,
+            vmm: ruturaTop.vmm,
+            acao: ruturaTop.classificacao,
+          }
+        : null,
+      produto_maior_imobilizado: maiorImob
+        ? {
+            nome: maiorImob.designacao.slice(0, 48),
+            cnp: maiorImob.cnp,
+            valor_custo_stock: maiorImob.valor_custo_stock,
+            stock: maiorImob.stock,
+            acao: maiorImob.classificacao,
+          }
+        : null,
+      produto_validade_mais_proxima: valMaisProxima
+        ? {
+            nome: valMaisProxima.designacao.slice(0, 48),
+            cnp: valMaisProxima.cnp,
+            validade: valMaisProxima.validade,
+            stock: valMaisProxima.stock,
+            devolver_un: valMaisProxima.unidades_excesso,
+            acao: valMaisProxima.classificacao,
+          }
+        : null,
     },
-    monos_top_5: {
-      total: monos.length,
-      valor_custo: result.monos.total_valor_custo,
-      exemplos: monos.slice(0, 5).map(compactItem),
-    },
-    validades: {
-      total: validadesRisco.length,
-      produtos: validadesRisco.map(compactItem),
-    },
-    sem_vendas: {
-      total: semVendas.length,
-      valor_custo: result.sem_vendas.total_valor_custo,
-      produtos: semVendas.slice(0, 5).map(compactItem),
-    },
-    rever_dados: {
-      total: reverDadosProds.length,
-      produtos: reverDadosProds.slice(0, 5).map(compactItem),
-    },
-    imobilizado_total_eur: result.imobilizado_total.total_valor_custo,
-    imobilizado_produtos_unicos: result.imobilizado_total.total_produtos_unicos,
     lacunas,
     instrucao:
-      'Escreve 2 a 3 frases corridas em texto simples. Cita apenas os totais gerais (faturação, unidades, produtos com vendas), o Top 5 com a sua % exata, e 1 a 2 produtos concretos de destaque. NÃO repitas contagens de classes nem de blocos (rutura, excesso, monos, sem vendas, manter, repor, etc.); essas contagens e as tabelas são inseridas automaticamente abaixo. Não escrevas títulos nem listas.',
+      'Escreve 2 a 3 frases corridas em texto simples. Escolhe 2 ou 3 itens do bloco "destaques" e explica o que fazer primeiro e porquê. Não somes, não contes, não calcules, não repitas contagens de classes nem de blocos; usa apenas os valores exatos de "totais" e "destaques". Não escrevas títulos nem tabelas.',
   };
 
   return {
@@ -2662,11 +2683,11 @@ export function formatRelatorioLaboratorioMarkdown(res: any): string {
     }
   }
 
-  // Ações Imediatas 100% geradas pelo código a partir das classes (contagens, unidades, valor a devolver e 3-5 produtos principais)
+  // Ações Imediatas 100% geradas pelo código a partir das classes (contagens, unidades, valor a devolver e produtos principais)
   if (Array.isArray(res.acoes_imediatas_por_classe) && res.acoes_imediatas_por_classe.length > 0) {
     md += `### Ações Imediatas (por classe de decisão)\n\n`;
     for (const ac of res.acoes_imediatas_por_classe) {
-      let cab = `- **${ac.classe} (${ac.n_produtos} produtos)**`;
+      let cab = `- **${ac.classe} (${ac.n_produtos} ${ac.n_produtos === 1 ? 'produto' : 'produtos'})**`;
       if (ac.unidades_a_devolver !== null && ac.unidades_a_devolver !== undefined) {
         cab += ` — ${ac.unidades_a_devolver} un a devolver` + (showEur ? ` (${fmtEur(ac.valor_a_devolver_eur)} a preço de custo)` : '');
       }

@@ -40,6 +40,10 @@ import {
   toolRelatorioLaboratorio,
 } from './copilot_semantic_layer';
 import {
+  toolConsultaComercial,
+  detectAmbiguousBareQuery,
+} from './copilot_consulta_comercial';
+import {
   sugerirVendasCruzadas,
   sugerirPacksPromocionais,
   parseDia,
@@ -125,6 +129,40 @@ const COPILOT_TOOLS = [
         },
       },
       required: ['laboratorio'],
+    },
+  },
+  {
+    name: 'consulta_comercial',
+    description:
+      'Ferramenta principal e unificada de consulta comercial com parâmetros simples e planos. Usar SEMPRE para: (1) monos / stock parado com qualquer janela temporal ("últimos 3 meses", "meio ano", "desde setembro", "última semana", etc.) — extrai apenas janela_mono_qtd+janela_mono_unidade ou janela_mono_desde, o código converte os dias; (2) comparação de vendas entre dois meses ("outubro vs setembro, o que subiu"); (3) vendas de um laboratório/DCI/categoria num período ("vendas da Bial nos últimos 3 meses"); (4) recomendação do que vale a pena encomendar de um laboratório ("o que vale a pena encomendar da Mylan"); (5) stock e validades curtas.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        foco: {
+          type: 'string',
+          enum: ['monos', 'vendas', 'comparacao_periodos', 'recomendacao_encomenda', 'stock_validades'],
+          description: 'Tipo de consulta comercial.',
+        },
+        laboratorio: { type: 'string', description: 'Nome do laboratório (ex: "Bial", "Mylan", "Teva").' },
+        dci: { type: 'string', description: 'Molécula / princípio ativo DCI.' },
+        categoria: { type: 'string', description: 'Categoria ou família.' },
+        ultimos_n_meses: { type: 'number', description: 'Número de meses completos mais recentes (ex: 3 para últimos 3 meses).' },
+        periodo_inicio: { type: 'string', description: 'Mês inicial YYYY-MM (ex: "2026-08").' },
+        periodo_fim: { type: 'string', description: 'Mês final YYYY-MM (ex: "2026-10").' },
+        mes_atual: { type: 'string', description: 'Mês principal da comparação YYYY-MM (ex: "2026-10").' },
+        mes_anterior: { type: 'string', description: 'Mês anterior da comparação YYYY-MM (ex: "2026-09").' },
+        direcao_variacao: { type: 'string', enum: ['subiu', 'desceu', 'ambos'], description: 'Direção da variação na comparação.' },
+        janela_mono_qtd: { type: 'number', description: 'Quantidade da janela de monos (ex: 3 para "3 meses", 1 para "última semana").' },
+        janela_mono_unidade: {
+          type: 'string',
+          enum: ['dias', 'semanas', 'meses', 'anos', 'meio_ano'],
+          description: 'Unidade da janela de monos. Usar "meio_ano" para "meio ano".',
+        },
+        janela_mono_desde: { type: 'string', description: 'Data inicial para monos no formato YYYY-MM-DD ou YYYY-MM (ex: "2026-09-01" para "desde setembro").' },
+        janela_mono_dias: { type: 'number', description: 'Alternativa direta em dias (ex: 90, 180).' },
+        limite: { type: 'number', description: 'Máximo de linhas na tabela (padrão: 15).' },
+      },
+      required: ['foco'],
     },
   },
   {
@@ -490,6 +528,7 @@ export type CopilotMode = 'STOCKS' | 'FINANCE' | 'MARKETING' | 'CLINICAL' | 'GEN
 
 const DATA_TOOL_NAMES = new Set([
   'relatorio_laboratorio',
+  'consulta_comercial',
   'consultar_vendas',
   'consultar_produtos',
   'consultar_grupos_dci',
@@ -610,12 +649,13 @@ Foco sugerido pelo modo selecionado: ${focoModo} (apenas indicação; a pergunta
 6. Se houver algo relevante que não foi pedido, no máximo UMA linha final: "Posso também ver X."
 7. Todos os números vêm das ferramentas. Campo nulo = "Sem dados". Nunca estimes, arredondes
    para além do que a ferramenta devolve, nem uses "presumível", "provavelmente" ou equivalentes. NUNCA INVENTES NÚMEROS. NUNCA INVENTES NOMES DE PRODUTOS/MEDICAMENTOS que não constem dos dados devolvidos pela ferramenta (ex.: nunca inventes Ácido Valpróico se não estiver no resultado). SEM ALUCINAÇÕES.
-8. Relatórios de Laboratório (ferramenta relatorio_laboratorio):
-   As tabelas completas, a distribuição por classe de ação e a secção de Ações Imediatas são geradas e inseridas AUTOMATICAMENTE pelo código abaixo da tua resposta.
-   Escreve 2 a 3 frases corridas em texto simples. Não escrevas títulos (#), listas nem secções por classe.
-   Cita apenas os totais gerais (faturação, unidades, n.º de produtos com vendas), o Top 5 com a sua %, e produtos concretos de destaque.
+8. Relatórios e Consultas Estruturadas (ferramentas relatorio_laboratorio e consulta_comercial):
+   As tabelas completas e as secções de detalhe são geradas e inseridas AUTOMATICAMENTE pelo código abaixo da tua resposta.
+   Escreve 2 a 3 frases corridas em texto simples. Escolhe 2 ou 3 itens do bloco "destaques" e explica o que fazer primeiro e porquê.
+   Não somes, não contes, não calcules, não escrevas títulos (#), listas nem tabelas; usa apenas os valores exatos de "totais" e "destaques".
    NÃO repitas contagens de classes nem de blocos (rutura, excesso, monos, sem vendas, manter, repor, etc.); essas contagens já estão nas tabelas.
    Não caracterizes grupos (ex.: "concentram-se em…") nem uses verbos proibidos (eliminar, descartar, destruir, abater, liquidar).
+   Para monos (com qualquer janela: 3 meses, meio ano, desde setembro, última semana), vendas por período, comparações entre meses ou recomendações de encomenda por laboratório, usa SEMPRE a ferramenta consulta_comercial.
 9. Se a consulta devolver 0 linhas ou for fora do âmbito: "Questão Fora de Âmbito" ou "ℹ️ Dados Não Encontrados" + o que foi pesquisado. Sem números.
 10. Se existirem avisos em meta.avisos_dados (ex.: DCI em falta, mês parcial, margem estimada),
    refere-os numa nota curta de uma linha, apenas se afetarem o que mostras.
@@ -822,6 +862,25 @@ async function getCatalogTermsForValidation(prisma: PrismaClient): Promise<Catal
 
 function buildDeterministicSummaryForReport(relatorio: any): string {
   const t = relatorio?.totais || {};
+  if (relatorio?.foco === 'monos') {
+    const eurStr =
+      !relatorio?.meta?.faturacao_oculta && t.valor_imobilizado_eur !== null && t.valor_imobilizado_eur !== undefined
+        ? ` (${Number(t.valor_imobilizado_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2 })} € a preço de custo)`
+        : '';
+    return `Foram identificados **${Number(t.total_monos ?? 0).toLocaleString('pt-PT')} monos** (${relatorio?.meta?.nota_janela || ''}), totalizando ${Number(t.total_unidades ?? 0).toLocaleString('pt-PT')} unidades em stock${eurStr}. Consulte abaixo os detalhes.`;
+  }
+  if (relatorio?.foco === 'comparacao_periodos') {
+    return `Comparação de vendas entre **${relatorio?.meta?.mes_atual}** e **${relatorio?.meta?.mes_anterior}** (vendas registadas até ${relatorio?.meta?.data_referencia || '2026-10-31'}): ${t.n_subidas ?? 0} produtos subiram e ${t.n_descidas ?? 0} desceram. Consulte abaixo os totais e o ranking.`;
+  }
+  if (relatorio?.foco === 'vendas') {
+    return `Resumo de vendas de **${relatorio?.meta?.filtro || 'Farmácia'}** em **${relatorio?.meta?.periodo_rotulo || ''}**: ${Number(t.unidades_vendidas ?? 0).toLocaleString('pt-PT')} unidades vendidas em ${t.produtos_vendidos ?? 0} produtos. Consulte abaixo a evolução mensal e o ranking.`;
+  }
+  if (relatorio?.foco === 'recomendacao_encomenda') {
+    return `Proposta de encomenda para **${relatorio?.meta?.filtro || 'Farmácia'}**: ${t.n_a_encomendar ?? 0} produtos prioritários a encomendar (${t.total_qtd_sugerida ?? 0} un sugeridas). Consulte abaixo a lista detalhada.`;
+  }
+  if (relatorio?.foco === 'stock_validades') {
+    return `Resumo de stock e validades de **${relatorio?.meta?.filtro || 'Farmácia'}**: ${t.total_referencias ?? 0} referências em stock e ${t.n_validades_curtas ?? 0} produtos com validade curta. Consulte abaixo os detalhes.`;
+  }
   const lab = relatorio?.meta?.laboratorio || 'Laboratório';
   const per = relatorio?.meta?.periodo_rotulo || '2026 (jan–out)';
   const showEur = !relatorio?.meta?.faturacao_oculta && t.faturacao_eur !== null;
@@ -924,6 +983,53 @@ export async function askConversationalCopilot(
     };
   }
 
+  // Fase 2: Deteção de pergunta ambígua curta (ex.: "Bial" sozinho) -> devolve até 3 opções e grava pergunta_de_volta = true
+  const ambCheck = detectAmbiguousBareQuery(question);
+  if (ambCheck.isAmbiguous && ambCheck.reply) {
+    const ambTracer = new CopilotAuditTracer(
+      secContext.farmaciaId,
+      sessionId,
+      question,
+      (secContext as any).utilizadorId || null
+    );
+    ambTracer.persistAsync(prisma, {
+      utilizadorId: (secContext as any).utilizadorId || null,
+      perfil: secContext.perfil || null,
+      sessionId,
+      modo: mode,
+      pergunta: question,
+      intencao: 'AMBIGUA',
+      parametros: { termo: ambCheck.termo },
+      texto_referencias: ambCheck.reply,
+      texto_final: ambCheck.reply,
+      estado: 'ok',
+      pergunta_de_volta: true,
+      modelo_final: 'deterministico',
+      tokens_in: 0,
+      tokens_out: 0,
+      tokens_cache_write: 0,
+      tokens_cache_read: 0,
+      custo_eur: 0,
+      duracao_ms: Date.now() - ambTracer.startTime,
+    });
+    return {
+      text: ambCheck.reply,
+      toolsUsed: [],
+      ferramentas: [],
+      sessionId,
+      interacaoId: ambTracer.interacaoId,
+      mode,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        custoEstimadoEur: 0,
+        duracaoMs: Date.now() - ambTracer.startTime,
+      },
+    };
+  }
+
   let history = sessionHistory.get(sessionId);
   if (!history) {
     history = [];
@@ -1001,9 +1107,9 @@ export async function askConversationalCopilot(
       tracer.nChamadasApi++;
       if (activeModel.includes('sonnet')) tracer.escalouSonnet = true;
 
-      // Secção 4.1 / Revisão Fase 1: Quando já temos um relatório estruturado, o modelo escreve apenas 2-4 frases (max_tokens = 400)
+      // Secção 4.1 / Fase 1+2: Quando já temos dados estruturados, a Leitura fica limitada a 2-3 frases (max_tokens = 280) e pára antes de tabelas/títulos
       const effectiveMaxTokens = activeRelatorio
-        ? 400
+        ? 280
         : useThinking
           ? THINKING_BUDGET + 4096
           : 4096;
@@ -1019,6 +1125,7 @@ export async function askConversationalCopilot(
         body: JSON.stringify({
           model: activeModel,
           max_tokens: effectiveMaxTokens,
+          ...(activeRelatorio ? { stop_sequences: ['\n\n---', '\n#', '\n|'] } : {}),
           ...(useThinking && !activeRelatorio ? { thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET } } : {}),
           system: systemBlocks,
           tools: scopedTools,
@@ -1338,6 +1445,10 @@ export async function askConversationalCopilot(
                 break;
               }
 
+              case 'consulta_comercial':
+                resultData = await toolConsultaComercial(prisma, secContext, args, sessionId, turnoAtual, todayLisbon);
+                break;
+
               case 'consultar_vendas':
                 resultData = await toolConsultarVendas(prisma, secContext, args, sessionId, turnoAtual);
                 break;
@@ -1581,6 +1692,71 @@ export async function askConversationalCopilot(
 
           activeRelatorio = resultData;
           // O modelo recebe APENAS o resumo_modelo compacto (<= 2.5k tokens), nunca as tabelas gigantes!
+          modelPayloadObj = {
+            ok: true,
+            result_ref: resultData.result_ref,
+            ...resultData.resumo_modelo,
+          };
+        } else if (call.name === 'consulta_comercial' && resultData?.ok) {
+          // Proteção contra atraso de dados (ex.: "monos da última semana"): devolve aviso determinístico imediato sem 2ª chamada ao LLM
+          if (resultData.bloqueado_atraso_dados && resultData.aviso_markdown) {
+            tracer.addEtapa({
+              etapa: 'ferramenta',
+              nome: call.name,
+              inicio_ms: toolStart - startTime,
+              duracao_ms: Date.now() - toolStart,
+              estado: 'aviso',
+              detalhe: { args, bloqueado_atraso_dados: true, meta: resultData.meta },
+            });
+            const duracaoMs = Date.now() - startTime;
+            const custoEstimadoEur = calculateClaudeCostEur(
+              activeModel,
+              totalInputTokens,
+              totalOutputTokens,
+              totalCacheCreationTokens,
+              totalCacheReadTokens
+            );
+            const avisoFinal = resultData.aviso_markdown;
+            history.push({ role: 'assistant', content: avisoFinal });
+            sessionHistory.set(sessionId, history);
+            tracer.persistAsync(prisma, {
+              utilizadorId: (secContext as any).utilizadorId || null,
+              perfil: secContext.perfil || null,
+              sessionId,
+              modo: mode,
+              pergunta: question,
+              intencao: intentInfo.intent,
+              parametros: { ferramentas: [{ nome: call.name, input: args }] },
+              texto_referencias: avisoFinal,
+              texto_final: avisoFinal,
+              estado: 'ok',
+              modelo_final: activeModel,
+              tokens_in: totalInputTokens,
+              tokens_out: totalOutputTokens,
+              tokens_cache_write: totalCacheCreationTokens,
+              tokens_cache_read: totalCacheReadTokens,
+              custo_eur: custoEstimadoEur,
+              duracao_ms: duracaoMs,
+            });
+            return {
+              text: avisoFinal,
+              toolsUsed,
+              ferramentas: ferramentasExecutadas,
+              sessionId,
+              interacaoId: tracer.interacaoId,
+              mode,
+              usage: {
+                inputTokens: totalInputTokens,
+                outputTokens: totalOutputTokens,
+                cacheCreationTokens: totalCacheCreationTokens,
+                cacheReadTokens: totalCacheReadTokens,
+                custoEstimadoEur,
+                duracaoMs,
+              },
+            };
+          }
+
+          activeRelatorio = resultData;
           modelPayloadObj = {
             ok: true,
             result_ref: resultData.result_ref,
