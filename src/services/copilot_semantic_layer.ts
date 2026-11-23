@@ -59,14 +59,166 @@ function stripAccents(s: string): string {
     .toLowerCase();
 }
 
-export function matchesLabFilter(labTitular: string | null | undefined, designacao: string, filtroLab: string): boolean {
-  const f = (filtroLab || '').trim();
+function normalizeLabToken(s: string | null | undefined): string {
+  return (s || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+}
+
+const CANONICAL_LAB_GROUPS: Record<string, string[]> = {
+  bial: ['bial'],
+  teva: ['teva', 'ratiopharm'],
+  ratiopharm: ['teva', 'ratiopharm'],
+  mylan: ['mylan', 'viatris'],
+  viatris: ['mylan', 'viatris'],
+};
+
+/**
+ * Função única e canónica de resolução de laboratório para todas as ferramentas do Copilot.
+ * Usa correspondência exata / fronteira de palavra em `laboratorio_titular` (ou grupo normalizado).
+ * NUNCA usa substring simples: "Labialfarma" NÃO é Bial.
+ */
+export function matchesLabFilter(labTitular: string | null | undefined, _designacao: string, filtroLab: string): boolean {
+  const f = normalizeLabToken(filtroLab);
   if (!f) return true;
-  const esc = escapeRx(f);
-  const wordRx = new RegExp(`\\b${esc}\\b`, 'i');
-  const lab = (labTitular || '').trim();
-  if (lab) return wordRx.test(lab);
+  const lab = normalizeLabToken(labTitular);
+  if (!lab) return false;
+
+  const aliases = CANONICAL_LAB_GROUPS[f] || [f];
+  for (const alias of aliases) {
+    const esc = escapeRx(alias);
+    const rx = new RegExp(`(?:^|[^a-z0-9])${esc}(?:$|[^a-z0-9])`, 'i');
+    if (rx.test(lab)) return true;
+  }
   return false;
+}
+
+export interface MonthCompletenessD6 {
+  mes: string;
+  mesRotuloPt: string;
+  incompleto: boolean;
+  vendasMesEur: number;
+  nProdutosMes: number;
+  media3mEur: number;
+  media3mProdutos: number;
+  racioVendasPct: number | null;
+  racioProdutosPct: number | null;
+  mesesBase: string[];
+  aviso?: string;
+}
+
+const PT_MONTH_NAMES = [
+  'janeiro', 'fevereiro', 'março', 'abril', 'maio', 'junho',
+  'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro',
+];
+
+export function formatYmPt(ym: string): string {
+  const m = ym.match(/^(\d{4})-(\d{2})$/);
+  if (!m) return ym;
+  const idx = Number(m[2]) - 1;
+  return `${PT_MONTH_NAMES[idx] || m[2]} de ${m[1]}`;
+}
+
+function shiftYm(ym: string, deltaMonths: number): string {
+  const m = ym.match(/^(\d{4})-(\d{2})$/);
+  if (!m) return ym;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1 + deltaMonths, 1));
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+/**
+ * Regra D6 — Verificação de integridade/completude mensal:
+ * Compara o volume (€) e o n.º de produtos distintos vendidos num mês com a média dos 3 meses anteriores.
+ * Se vendas ou n.º de produtos estiver abaixo de 70 % da média dos 3 meses anteriores, sinaliza o mês como incompleto.
+ */
+export async function checkMonthCompletenessD6(
+  prisma: PrismaClient,
+  farmaciaId: string,
+  targetYm: string
+): Promise<MonthCompletenessD6> {
+  const prev1 = shiftYm(targetYm, -1);
+  const prev2 = shiftYm(targetYm, -2);
+  const prev3 = shiftYm(targetYm, -3);
+  const meses = [prev3, prev2, prev1, targetYm];
+
+  const rows = await prisma.martProdutoMes.findMany({
+    where: {
+      farmaciaId,
+      mes: { in: meses },
+    },
+    select: {
+      mes: true,
+      cnp_codigo: true,
+      valor_total: true,
+      quantidade: true,
+    },
+  });
+
+  const stats = new Map<string, { eur: number; cnps: Set<string> }>();
+  for (const m of meses) stats.set(m, { eur: 0, cnps: new Set() });
+
+  for (const r of rows) {
+    const ym = String(r.mes).slice(0, 7);
+    const st = stats.get(ym);
+    if (!st) continue;
+    st.eur += Number(r.valor_total || 0);
+    if (Number(r.quantidade || 0) > 0) st.cnps.add(r.cnp_codigo);
+  }
+
+  const targetSt = stats.get(targetYm) || { eur: 0, cnps: new Set() };
+  const baseMeses = [prev3, prev2, prev1].filter((m) => (stats.get(m)?.cnps.size || 0) > 0);
+
+  if (baseMeses.length < 2) {
+    return {
+      mes: targetYm,
+      mesRotuloPt: formatYmPt(targetYm),
+      incompleto: false,
+      vendasMesEur: Math.round(targetSt.eur * 100) / 100,
+      nProdutosMes: targetSt.cnps.size,
+      media3mEur: 0,
+      media3mProdutos: 0,
+      racioVendasPct: null,
+      racioProdutosPct: null,
+      mesesBase: baseMeses,
+    };
+  }
+
+  const media3mEur =
+    Math.round((baseMeses.reduce((s, m) => s + (stats.get(m)?.eur || 0), 0) / baseMeses.length) * 100) / 100;
+  const media3mProdutos = Math.round(
+    baseMeses.reduce((s, m) => s + (stats.get(m)?.cnps.size || 0), 0) / baseMeses.length
+  );
+
+  const vendasMesEur = Math.round(targetSt.eur * 100) / 100;
+  const nProdutosMes = targetSt.cnps.size;
+  const racioVendasPct = media3mEur > 0 ? Math.round((vendasMesEur / media3mEur) * 1000) / 10 : null;
+  const racioProdutosPct = media3mProdutos > 0 ? Math.round((nProdutosMes / media3mProdutos) * 1000) / 10 : null;
+
+  const incompleto =
+    (racioVendasPct !== null && racioVendasPct < 70) ||
+    (racioProdutosPct !== null && racioProdutosPct < 70);
+
+  const fmtE = (v: number) => `${v.toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`;
+  const mesRotuloPt = formatYmPt(targetYm);
+  const aviso = incompleto
+    ? `Os dados de ${mesRotuloPt} parecem incompletos: ${fmtE(vendasMesEur)} e ${nProdutosMes.toLocaleString('pt-PT')} produtos vendidos, contra uma média de ${fmtE(media3mEur)} e ${media3mProdutos.toLocaleString('pt-PT')} produtos nos ${baseMeses.length} meses anteriores (${baseMeses[0]} a ${baseMeses[baseMeses.length - 1]}).`
+    : undefined;
+
+  return {
+    mes: targetYm,
+    mesRotuloPt,
+    incompleto,
+    vendasMesEur,
+    nProdutosMes,
+    media3mEur,
+    media3mProdutos,
+    racioVendasPct,
+    racioProdutosPct,
+    mesesBase: baseMeses,
+    aviso,
+  };
 }
 
 export function computeSafeMarginPct(
@@ -2387,8 +2539,12 @@ export async function toolRelatorioLaboratorio(
   }
   const classesResumo = Array.from(classesMap.values()).sort((a, b) => b.n_produtos - a.n_produtos);
 
-  // Lacunas explícitas (Secção 2.3)
+  // Lacunas explícitas (Secção 2.3 + Regra D6)
   const lacunas: string[] = [];
+  const d6UltimoMes = await checkMonthCompletenessD6(prisma, ctx.farmaciaId, `${ano}-10`);
+  if (d6UltimoMes.incompleto && d6UltimoMes.aviso) {
+    lacunas.push(`[D6 — Integridade de dados] ${d6UltimoMes.aviso} Os totais do período e os monos podem estar afetados.`);
+  }
   const semDciCount = prods.filter((p) => !p.dci).length;
   if (semDciCount > 0) {
     lacunas.push(`${semDciCount} produtos do laboratório não têm DCI catalogada no ProdutoMestre.`);

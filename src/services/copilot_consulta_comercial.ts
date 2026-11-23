@@ -16,7 +16,7 @@ import { analyzePharmacyInventory } from './analysis';
 import { ToolSecurityContext } from './mcp_pharma_tools';
 import { canVerFaturacao } from '../platform/permissoes';
 import { saveToolResult } from './copilot_result_store';
-import { classifyProductAction } from './copilot_semantic_layer';
+import { classifyProductAction, matchesLabFilter, checkMonthCompletenessD6 } from './copilot_semantic_layer';
 import { isTherapeuticChronic } from './copilot_chronic_therapies';
 
 export type ConsultaComercialFoco =
@@ -95,18 +95,6 @@ function normalizeStr(s: string | null | undefined): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .trim();
-}
-
-function matchesLab(labField: string | null | undefined, designacao: string | null | undefined, query: string): boolean {
-  const q = normalizeStr(query);
-  if (!q) return true;
-  const lf = normalizeStr(labField);
-  const df = normalizeStr(designacao);
-  if (lf.includes(q) || df.includes(q)) return true;
-  // Aliases conhecidos de laboratórios em Portugal
-  if (q === 'teva' && (lf.includes('ratiopharm') || df.includes('ratiopharm'))) return true;
-  if ((q === 'mylan' || q === 'viatris') && (lf.includes('mylan') || lf.includes('viatris') || df.includes('mylan'))) return true;
-  return false;
 }
 
 /**
@@ -295,15 +283,28 @@ export async function toolConsultaComercial(
     }
 
     // Paridade exata com o painel: usa analyzePharmacyInventory com periodoMonosDias = janela.dias
-    const analysis = await analyzePharmacyInventory(prisma, ctx.farmaciaId, {
-      periodoMonosDias: janela.dias,
-      dataReferencia: parseIsoUtc(hojeIso),
-    });
+    const [analysis, d6UltimoMes] = await Promise.all([
+      analyzePharmacyInventory(prisma, ctx.farmaciaId, {
+        periodoMonosDias: janela.dias,
+        dataReferencia: parseIsoUtc(hojeIso),
+      }),
+      checkMonthCompletenessD6(prisma, ctx.farmaciaId, ultimoMesYm),
+    ]);
 
     let monosList = analysis.monos || [];
     const filtrosTexto: string[] = [];
     if (args.laboratorio) {
-      monosList = monosList.filter((m) => matchesLab(m.laboratorio_titular, m.designacao, args.laboratorio!));
+      const cnpsMonos = monosList.map((m) => m.cnp_codigo);
+      const catMonos = cnpsMonos.length > 0
+        ? await prisma.produtoMestre.findMany({
+            where: { cnp_codigo: { in: cnpsMonos } },
+            select: { cnp_codigo: true, laboratorio_titular: true },
+          })
+        : [];
+      const catLabMap = new Map(catMonos.map((c) => [c.cnp_codigo, c.laboratorio_titular]));
+      monosList = monosList.filter((m) =>
+        matchesLabFilter(catLabMap.get(m.cnp_codigo) || m.laboratorio_titular, m.designacao, args.laboratorio!)
+      );
       filtrosTexto.push(`Laboratório: ${args.laboratorio}`);
     }
     if (args.dci) {
@@ -335,6 +336,9 @@ export async function toolConsultaComercial(
     const tituloFiltro = filtrosTexto.length > 0 ? ` (${filtrosTexto.join(' · ')})` : '';
     let md = `## Monos — ${janela.rotulo}${tituloFiltro}\n`;
     md += `**Critério aplicado:** ${notaJanela}\n\n`;
+    if (d6UltimoMes.incompleto && d6UltimoMes.aviso) {
+      md += `> ⚠️ **Nota de integridade dos dados (D6):** ${d6UltimoMes.aviso} Produtos vendidos no final desse mês podem constar temporariamente como parados.\n\n`;
+    }
     md += `### Resumo\n`;
     md += `- **Total de monos:** ${totalMonos.toLocaleString('pt-PT')} ${totalMonos === 1 ? 'produto' : 'produtos'} (${totalUnidades.toLocaleString('pt-PT')} un em stock)\n`;
     if (allowEur) {
@@ -443,6 +447,48 @@ export async function toolConsultaComercial(
       args.mes_anterior && /^\d{4}-\d{2}$/.test(args.mes_anterior) ? args.mes_anterior : prevMonthYm(mesAtualYm, 1);
     const direcao = args.direcao_variacao || 'subiu';
 
+    // Regra D6: verificar se algum dos meses comparados tem volume anormal (< 70 % da média dos 3 meses anteriores)
+    const [d6Atual, d6Ant] = await Promise.all([
+      checkMonthCompletenessD6(prisma, ctx.farmaciaId, mesAtualYm),
+      checkMonthCompletenessD6(prisma, ctx.farmaciaId, mesAnteriorYm),
+    ]);
+    const d6Falha = d6Atual.incompleto ? d6Atual : d6Ant.incompleto ? d6Ant : null;
+    if (d6Falha && d6Falha.aviso) {
+      const altMesAtual = d6Atual.incompleto ? prevMonthYm(mesAtualYm, 1) : mesAtualYm;
+      const altMesAnt = prevMonthYm(altMesAtual, 1);
+      const avisoMd = [
+        `⚠️ **Dados potencialmente incompletos (Regra D6)**`,
+        ``,
+        `${d6Falha.aviso}`,
+        ``,
+        `Por este motivo, a comparação direta **${mesAtualYm} vs ${mesAnteriorYm}** não deve ser apresentada como uma variação real de vendas.`,
+        ``,
+        `Pretende comparar **${altMesAtual} vs ${altMesAnt}** (dois meses completos) ou escolher outro período?`,
+      ].join('\n');
+
+      return {
+        ok: true,
+        foco: 'comparacao_periodos',
+        bloqueado_atraso_dados: true,
+        bloqueado_dados_incompletos_d6: true,
+        meta: {
+          foco: 'comparacao_periodos',
+          mes_atual: mesAtualYm,
+          mes_anterior: mesAnteriorYm,
+          data_referencia: dataUltimosDadosIso,
+          d6: d6Falha,
+          faturacao_oculta: !allowEur,
+        },
+        aviso_markdown: avisoMd,
+        relatorio_markdown: avisoMd,
+        resumo_modelo: {
+          bloqueado: true,
+          regra: 'D6',
+          motivo: d6Falha.aviso,
+        },
+      };
+    }
+
     const rows = await prisma.martProdutoMes.findMany({
       where: {
         farmaciaId: ctx.farmaciaId,
@@ -451,18 +497,36 @@ export async function toolConsultaComercial(
     });
 
     const cnps = Array.from(new Set(rows.map((r) => r.cnp_codigo)));
-    const metricas = await prisma.martProdutoMetricas.findMany({
-      where: { farmaciaId: ctx.farmaciaId, cnp_codigo: { in: cnps } },
-      select: {
-        cnp_codigo: true,
-        designacao: true,
-        laboratorio_titular: true,
-        molecula_dci: true,
-        categoria: true,
-        tipo_venda: true,
-        stock_total_unidades: true,
-      },
-    });
+    const [catalogo, metricas] = await Promise.all([
+      cnps.length > 0
+        ? prisma.produtoMestre.findMany({
+            where: { cnp_codigo: { in: cnps } },
+            select: {
+              cnp_codigo: true,
+              designacao: true,
+              laboratorio_titular: true,
+              dci: true,
+              categoria: true,
+              tipo_venda: true,
+            },
+          })
+        : Promise.resolve([]),
+      cnps.length > 0
+        ? prisma.martProdutoMetricas.findMany({
+            where: { farmaciaId: ctx.farmaciaId, cnp_codigo: { in: cnps } },
+            select: {
+              cnp_codigo: true,
+              designacao: true,
+              laboratorio_titular: true,
+              molecula_dci: true,
+              categoria: true,
+              tipo_venda: true,
+              stock_total_unidades: true,
+            },
+          })
+        : Promise.resolve([]),
+    ]);
+    const catMap = new Map(catalogo.map((c) => [c.cnp_codigo, c]));
     const metMap = new Map(metricas.map((m) => [m.cnp_codigo, m]));
 
     const agg = new Map<
@@ -483,13 +547,14 @@ export async function toolConsultaComercial(
     >();
 
     for (const r of rows) {
+      const catRec = catMap.get(r.cnp_codigo);
       const m = metMap.get(r.cnp_codigo);
-      const des = m?.designacao || r.cnp_codigo;
-      const lab = m?.laboratorio_titular || '';
-      const dci = m?.molecula_dci || '';
-      const cat = m?.categoria || '';
+      const des = catRec?.designacao || m?.designacao || r.cnp_codigo;
+      const lab = catRec?.laboratorio_titular || m?.laboratorio_titular || '';
+      const dci = catRec?.dci || m?.molecula_dci || '';
+      const cat = catRec?.categoria || m?.categoria || '';
 
-      if (args.laboratorio && !matchesLab(lab, des, args.laboratorio)) continue;
+      if (args.laboratorio && !matchesLabFilter(lab, des, args.laboratorio)) continue;
       if (args.dci && !normalizeStr(dci).includes(normalizeStr(args.dci)) && !normalizeStr(des).includes(normalizeStr(args.dci)))
         continue;
       if (args.categoria && !normalizeStr(cat).includes(normalizeStr(args.categoria))) continue;
@@ -672,20 +737,41 @@ export async function toolConsultaComercial(
     });
 
     const cnps = Array.from(new Set(rows.map((r) => r.cnp_codigo)));
-    const metricas = await prisma.martProdutoMetricas.findMany({
-      where: { farmaciaId: ctx.farmaciaId, cnp_codigo: { in: cnps } },
-      select: {
-        cnp_codigo: true,
-        designacao: true,
-        laboratorio_titular: true,
-        molecula_dci: true,
-        categoria: true,
-        tipo_venda: true,
-        stock_total_unidades: true,
-        vmm: true,
-        margem_padrao: true,
-      },
-    });
+    const [catalogo, metricas, d6UltimoMes] = await Promise.all([
+      cnps.length > 0
+        ? prisma.produtoMestre.findMany({
+            where: { cnp_codigo: { in: cnps } },
+            select: {
+              cnp_codigo: true,
+              designacao: true,
+              laboratorio_titular: true,
+              dci: true,
+              categoria: true,
+              tipo_venda: true,
+            },
+          })
+        : Promise.resolve([]),
+      cnps.length > 0
+        ? prisma.martProdutoMetricas.findMany({
+            where: { farmaciaId: ctx.farmaciaId, cnp_codigo: { in: cnps } },
+            select: {
+              cnp_codigo: true,
+              designacao: true,
+              laboratorio_titular: true,
+              molecula_dci: true,
+              categoria: true,
+              tipo_venda: true,
+              stock_total_unidades: true,
+              vmm: true,
+              margem_padrao: true,
+            },
+          })
+        : Promise.resolve([]),
+      mesesYm.includes(ultimoMesYm)
+        ? checkMonthCompletenessD6(prisma, ctx.farmaciaId, ultimoMesYm)
+        : Promise.resolve(null),
+    ]);
+    const catMap = new Map(catalogo.map((c) => [c.cnp_codigo, c]));
     const metMap = new Map(metricas.map((m) => [m.cnp_codigo, m]));
 
     const porProd = new Map<
@@ -706,13 +792,14 @@ export async function toolConsultaComercial(
     for (const ym of mesesYm) porMes.set(ym, { ym, un: 0, eur: 0 });
 
     for (const r of rows) {
+      const catRec = catMap.get(r.cnp_codigo);
       const m = metMap.get(r.cnp_codigo);
-      const des = m?.designacao || r.cnp_codigo;
-      const lab = m?.laboratorio_titular || '';
-      const dci = m?.molecula_dci || '';
-      const cat = m?.categoria || '';
+      const des = catRec?.designacao || m?.designacao || r.cnp_codigo;
+      const lab = catRec?.laboratorio_titular || m?.laboratorio_titular || '';
+      const dci = catRec?.dci || m?.molecula_dci || '';
+      const cat = catRec?.categoria || m?.categoria || '';
 
-      if (args.laboratorio && !matchesLab(lab, des, args.laboratorio)) continue;
+      if (args.laboratorio && !matchesLabFilter(lab, des, args.laboratorio)) continue;
       if (args.dci && !normalizeStr(dci).includes(normalizeStr(args.dci)) && !normalizeStr(des).includes(normalizeStr(args.dci)))
         continue;
       if (args.categoria && !normalizeStr(cat).includes(normalizeStr(args.categoria))) continue;
@@ -749,6 +836,9 @@ export async function toolConsultaComercial(
 
     let md = `## Vendas — ${tituloFiltro} (${periodoRotulo})\n`;
     md += `**Vendas registadas até:** ${dataUltimosDadosPt}\n\n`;
+    if (d6UltimoMes?.incompleto && d6UltimoMes.aviso) {
+      md += `> ⚠️ **Nota de integridade dos dados (D6):** ${d6UltimoMes.aviso}\n\n`;
+    }
     md += `### Resumo do Período\n`;
     if (allowEur) md += `- **Faturação total:** ${fmtEur(totalEur)}\n`;
     md += `- **Unidades vendidas:** ${totalUn.toLocaleString('pt-PT')} un\n`;
@@ -851,19 +941,25 @@ export async function toolConsultaComercial(
   // FOCO 4: RECOMENDAÇÃO DE ENCOMENDA (ex.: o que vale a pena encomendar da Mylan)
   // ==========================================================================
   if (args.foco === 'recomendacao_encomenda') {
-    const allMetricas = await prisma.martProdutoMetricas.findMany({
-      where: { farmaciaId: ctx.farmaciaId },
-    });
+    const [allMetricas, allCatalog] = await Promise.all([
+      prisma.martProdutoMetricas.findMany({ where: { farmaciaId: ctx.farmaciaId } }),
+      prisma.produtoMestre.findMany({ select: { cnp_codigo: true, laboratorio_titular: true, dci: true, categoria: true } }),
+    ]);
+    const catMap = new Map(allCatalog.map((c) => [c.cnp_codigo, c]));
 
     const filtered = allMetricas.filter((m) => {
-      if (args.laboratorio && !matchesLab(m.laboratorio_titular, m.designacao, args.laboratorio)) return false;
+      const c = catMap.get(m.cnp_codigo);
+      const lab = c?.laboratorio_titular || m.laboratorio_titular;
+      const dci = c?.dci || m.molecula_dci;
+      const cat = c?.categoria || m.categoria;
+      if (args.laboratorio && !matchesLabFilter(lab, m.designacao, args.laboratorio)) return false;
       if (
         args.dci &&
-        !normalizeStr(m.molecula_dci).includes(normalizeStr(args.dci)) &&
+        !normalizeStr(dci).includes(normalizeStr(args.dci)) &&
         !normalizeStr(m.designacao).includes(normalizeStr(args.dci))
       )
         return false;
-      if (args.categoria && !normalizeStr(m.categoria).includes(normalizeStr(args.categoria))) return false;
+      if (args.categoria && !normalizeStr(cat).includes(normalizeStr(args.categoria))) return false;
       return true;
     });
 
@@ -1037,14 +1133,20 @@ export async function toolConsultaComercial(
   // ==========================================================================
   // FOCO 5: STOCK E VALIDADES
   // ==========================================================================
-  const allMetricas = await prisma.martProdutoMetricas.findMany({
-    where: { farmaciaId: ctx.farmaciaId, stock_total_unidades: { gt: 0 } },
-  });
+  const [allMetricas, allCatalog] = await Promise.all([
+    prisma.martProdutoMetricas.findMany({ where: { farmaciaId: ctx.farmaciaId, stock_total_unidades: { gt: 0 } } }),
+    prisma.produtoMestre.findMany({ select: { cnp_codigo: true, laboratorio_titular: true, dci: true, categoria: true } }),
+  ]);
+  const catMapVal = new Map(allCatalog.map((c) => [c.cnp_codigo, c]));
   const filtered = allMetricas.filter((m) => {
-    if (args.laboratorio && !matchesLab(m.laboratorio_titular, m.designacao, args.laboratorio)) return false;
-    if (args.dci && !normalizeStr(m.molecula_dci).includes(normalizeStr(args.dci)) && !normalizeStr(m.designacao).includes(normalizeStr(args.dci)))
+    const c = catMapVal.get(m.cnp_codigo);
+    const lab = c?.laboratorio_titular || m.laboratorio_titular;
+    const dci = c?.dci || m.molecula_dci;
+    const cat = c?.categoria || m.categoria;
+    if (args.laboratorio && !matchesLabFilter(lab, m.designacao, args.laboratorio)) return false;
+    if (args.dci && !normalizeStr(dci).includes(normalizeStr(args.dci)) && !normalizeStr(m.designacao).includes(normalizeStr(args.dci)))
       return false;
-    if (args.categoria && !normalizeStr(m.categoria).includes(normalizeStr(args.categoria))) return false;
+    if (args.categoria && !normalizeStr(cat).includes(normalizeStr(args.categoria))) return false;
     return true;
   });
 

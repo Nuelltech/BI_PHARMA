@@ -157,13 +157,48 @@ export function stripUnsolicitedPurchaseSections(text: string): string {
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+const FOREIGN_MONTHS_MAP: Array<[RegExp, string, string]> = [
+  [/\b(Enero|January|Janvier)\b/g, 'Janeiro', 'janeiro'],
+  [/\b(enero|january|janvier)\b/g, 'janeiro', 'janeiro'],
+  [/\b(Febrero|February|Février)\b/g, 'Fevereiro', 'fevereiro'],
+  [/\b(febrero|february|février)\b/g, 'fevereiro', 'fevereiro'],
+  [/\b(Marzo|March|Mars)\b/g, 'Março', 'março'],
+  [/\b(marzo|march)\b/g, 'março', 'março'],
+  [/\b(April|Avril)\b/g, 'Abril', 'abril'],
+  [/\b(april|avril)\b/g, 'abril', 'abril'],
+  [/\b(Mayo|May)\b/g, 'Maio', 'maio'],
+  [/\b(mayo)\b/g, 'maio', 'maio'],
+  [/\b(Junio|June|Juin)\b/g, 'Junho', 'junho'],
+  [/\b(junio|june|juin)\b/g, 'junho', 'junho'],
+  [/\b(Julio|July|Juillet)\b/g, 'Julho', 'julho'],
+  [/\b(julio|july|juillet)\b/g, 'julho', 'julho'],
+  [/\b(August|Août)\b/g, 'Agosto', 'agosto'],
+  [/\b(august|août)\b/g, 'agosto', 'agosto'],
+  [/\b(Septiembre|September|Septembre)\b/g, 'Setembro', 'setembro'],
+  [/\b(septiembre|september|septembre)\b/g, 'setembro', 'setembro'],
+  [/\b(Octubre|October|Octobre)\b/g, 'Outubro', 'outubro'],
+  [/\b(octubre|october|octobre)\b/g, 'outubro', 'outubro'],
+  [/\b(Noviembre|November|Novembre)\b/g, 'Novembro', 'novembro'],
+  [/\b(noviembre|november|novembre)\b/g, 'novembro', 'novembro'],
+  [/\b(Diciembre|December|Décembre)\b/g, 'Dezembro', 'dezembro'],
+  [/\b(diciembre|december|décembre)\b/g, 'dezembro', 'dezembro'],
+];
+
+export function normalizePortugueseMonthNames(text: string): string {
+  let out = text || '';
+  for (const [rx, ptWord] of FOREIGN_MONTHS_MAP) {
+    out = out.replace(rx, ptWord);
+  }
+  return out;
+}
+
 export function postProcessCopilotText(
   rawText: string,
   toolsUsedThisTurn: string[],
   toolResultsJson: string[],
   intentInfo?: QuestionIntentInfo
 ): string {
-  let text = rawText || '';
+  let text = normalizePortugueseMonthNames(rawText || '');
 
   // V8: Remover marcadores de UI se a ferramenta correspondente não foi executada neste turno
   const ranEncomenda = toolsUsedThisTurn.includes('gerar_proposta_encomenda_reposicao');

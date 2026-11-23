@@ -4,6 +4,8 @@ import {
   detectAmbiguousBareQuery,
   toolConsultaComercial,
 } from '../services/copilot_consulta_comercial';
+import { matchesLabFilter, checkMonthCompletenessD6 } from '../services/copilot_semantic_layer';
+import { normalizePortugueseMonthNames } from '../services/copilot_validation';
 import { buildExecutiveReportFromStructuredData } from '../services/copilot_reporting';
 
 describe('Fase 2 — Regra C2: Conversão determinística de janelas de monos e proteção de atraso', () => {
@@ -67,12 +69,30 @@ describe('Fase 2 — toolConsultaComercial com fixtures congeladas', () => {
   const mockPrisma: any = {
     martProdutoMes: {
       findFirst: async () => ({ mes: '2026-10' }),
+      findMany: async (q?: any) => {
+        const allRows = [
+          { cnp_codigo: '1111111', mes: '2026-07', quantidade: 11, valor_total: 110 },
+          { cnp_codigo: '2222222', mes: '2026-07', quantidade: 14, valor_total: 140 },
+          { cnp_codigo: '1111111', mes: '2026-08', quantidade: 10, valor_total: 100 },
+          { cnp_codigo: '2222222', mes: '2026-08', quantidade: 14, valor_total: 140 },
+          { cnp_codigo: '1111111', mes: '2026-09', quantidade: 12, valor_total: 120 },
+          { cnp_codigo: '2222222', mes: '2026-09', quantidade: 15, valor_total: 150 },
+          { cnp_codigo: '1111111', mes: '2026-10', quantidade: 20, valor_total: 200 },
+          { cnp_codigo: '2222222', mes: '2026-10', quantidade: 10, valor_total: 100 },
+          { cnp_codigo: '4444444', mes: '2026-10', quantidade: 5, valor_total: 50 }, // Labialfarma (NÃO é Bial!)
+          { cnp_codigo: '5555555', mes: '2026-09', quantidade: 2, valor_total: 40 }, // Bial sem stock (só em ProdutoMestre)
+        ];
+        const allowedMeses: string[] | undefined = q?.where?.mes?.in;
+        return allowedMeses ? allRows.filter((r) => allowedMeses.includes(r.mes)) : allRows;
+      },
+    },
+    produtoMestre: {
       findMany: async () => [
-        { cnp_codigo: '1111111', mes: '2026-08', quantidade: 10, valor_total: 100 },
-        { cnp_codigo: '1111111', mes: '2026-09', quantidade: 12, valor_total: 120 },
-        { cnp_codigo: '1111111', mes: '2026-10', quantidade: 20, valor_total: 200 },
-        { cnp_codigo: '2222222', mes: '2026-09', quantidade: 15, valor_total: 150 },
-        { cnp_codigo: '2222222', mes: '2026-10', quantidade: 10, valor_total: 100 },
+        { cnp_codigo: '1111111', designacao: 'Bial Produto A 20 mg', laboratorio_titular: 'Bial - Portela & Cª', dci: 'Molecula A', categoria: 'Cardiovascular', tipo_venda: 'MSRM' },
+        { cnp_codigo: '2222222', designacao: 'Mylan Produto B 50 mg', laboratorio_titular: 'Mylan', dci: 'Molecula B', categoria: 'SNC', tipo_venda: 'MSRM' },
+        { cnp_codigo: '3333333', designacao: 'Mylan Excesso C 10 mg', laboratorio_titular: 'Viatris', dci: 'Molecula C', categoria: 'SNC', tipo_venda: 'MSRM' },
+        { cnp_codigo: '4444444', designacao: 'Labialfarma Creme 30 g', laboratorio_titular: 'Labialfarma', dci: null, categoria: 'Dermocosmética', tipo_venda: 'VENDA_LIVRE' },
+        { cnp_codigo: '5555555', designacao: 'Bial Sem Stock 10 mg', laboratorio_titular: 'Bial - Consumer Health', dci: 'Molecula D', categoria: 'Cardiovascular', tipo_venda: 'MSRM' },
       ],
     },
     martProdutoMetricas: {
@@ -152,7 +172,7 @@ describe('Fase 2 — toolConsultaComercial com fixtures congeladas', () => {
     expect(res.aviso_markdown).toContain('31-10-2026');
   });
 
-  it('compara outubro vs setembro e ordena o que subiu corretamente', async () => {
+  it('compara outubro vs setembro e ordena o que subiu corretamente (meses completos)', async () => {
     const res: any = await toolConsultaComercial(
       mockPrisma,
       ctxGestor,
@@ -162,15 +182,15 @@ describe('Fase 2 — toolConsultaComercial com fixtures congeladas', () => {
       '2026-11-23'
     );
     expect(res.ok).toBe(true);
-    expect(res.totais.total_atual_eur).toBe(300);
-    expect(res.totais.total_anterior_eur).toBe(270);
-    expect(res.totais.delta_eur).toBe(30);
-    expect(res.totais.n_subidas).toBe(1);
+    expect(res.bloqueado_dados_incompletos_d6).toBeUndefined();
+    expect(res.totais.total_atual_eur).toBe(350);
+    expect(res.totais.total_anterior_eur).toBe(310);
+    expect(res.totais.delta_eur).toBe(40);
     expect(res.relatorio_markdown).toContain('Bial Produto A');
     expect(res.result_ref).toBeTruthy();
   });
 
-  it('calcula vendas da Bial nos últimos 3 meses (2026-08 a 2026-10)', async () => {
+  it('calcula vendas da Bial nos últimos 3 meses (inclui sem stock e exclui Labialfarma)', async () => {
     const res: any = await toolConsultaComercial(
       mockPrisma,
       ctxGestor,
@@ -180,8 +200,11 @@ describe('Fase 2 — toolConsultaComercial com fixtures congeladas', () => {
       '2026-11-23'
     );
     expect(res.ok).toBe(true);
-    expect(res.totais.faturacao_eur).toBe(420);
-    expect(res.totais.unidades_vendidas).toBe(42);
+    expect(res.totais.produtos_vendidos).toBe(2); // 1111111 + 5555555 (sem stock), SEM 4444444 (Labialfarma)
+    expect(res.totais.faturacao_eur).toBe(460); // 420 + 40
+    expect(res.totais.unidades_vendidas).toBe(44); // 42 + 2
+    expect(res.relatorio_markdown).toContain('Bial Sem Stock');
+    expect(res.relatorio_markdown).not.toContain('Labialfarma');
     expect(res.relatorio_markdown).toContain('2026-08 a 2026-10');
   });
 
@@ -251,5 +274,53 @@ describe('Fase 1 (melhorias em paralelo) — PDF Validades Curtas + singular "1 
     expect(irbesartanRow).toBeDefined();
     expect(irbesartanRow?.[4]).toBe('2 un'); // Devolver
     expect(irbesartanRow?.[5]).toBe('1 un'); // Manter
+  });
+});
+
+describe('Fase 2 — Correções de revisão (Filtro canónico, Regra D6, Idioma PT-PT)', () => {
+  it('matchesLabFilter aceita grupo Bial e rejeita Labialfarma', () => {
+    expect(matchesLabFilter('Bial', '', 'Bial')).toBe(true);
+    expect(matchesLabFilter('Bial - Consumer Health', '', 'Bial')).toBe(true);
+    expect(matchesLabFilter('Bial - Portela & Cª', '', 'Bial')).toBe(true);
+    expect(matchesLabFilter('Labialfarma', '', 'Bial')).toBe(false);
+    expect(matchesLabFilter('Ratiopharm', '', 'Teva')).toBe(true);
+    expect(matchesLabFilter('Viatris', '', 'Mylan')).toBe(true);
+  });
+
+  it('Regra D6 deteta mês incompleto (< 70% da média 3M) e bloqueia comparação enganosa', async () => {
+    const mockIncompletePrisma: any = {
+      martProdutoMes: {
+        findFirst: async () => ({ mes: '2026-10' }),
+        findMany: async () => [
+          { cnp_codigo: '1', mes: '2026-07', quantidade: 100, valor_total: 60000 },
+          { cnp_codigo: '2', mes: '2026-07', quantidade: 50, valor_total: 0 },
+          { cnp_codigo: '1', mes: '2026-08', quantidade: 100, valor_total: 58000 },
+          { cnp_codigo: '2', mes: '2026-08', quantidade: 50, valor_total: 0 },
+          { cnp_codigo: '1', mes: '2026-09', quantidade: 100, valor_total: 61000 },
+          { cnp_codigo: '2', mes: '2026-09', quantidade: 50, valor_total: 0 },
+          { cnp_codigo: '1', mes: '2026-10', quantidade: 50, valor_total: 30000 }, // 50% da média!
+        ],
+      },
+    };
+    const d6 = await checkMonthCompletenessD6(mockIncompletePrisma, 'farm-test', '2026-10');
+    expect(d6.incompleto).toBe(true);
+    expect(d6.aviso).toContain('outubro de 2026 parecem incompletos');
+
+    const res: any = await toolConsultaComercial(
+      mockIncompletePrisma,
+      { farmaciaId: 'farm-test', farmaciaNome: 'Farmácia Teste', perfil: 'GESTOR', verFaturacao: true } as any,
+      { foco: 'comparacao_periodos', mes_atual: '2026-10', mes_anterior: '2026-09', direcao_variacao: 'subiu' },
+      'sess-d6',
+      1,
+      '2026-11-23'
+    );
+    expect(res.bloqueado_dados_incompletos_d6).toBe(true);
+    expect(res.aviso_markdown).toContain('Regra D6');
+    expect(res.aviso_markdown).toContain('2026-09 vs 2026-08');
+  });
+
+  it('normalizePortugueseMonthNames corrige nomes de meses noutras línguas (ex.: Octubre -> Outubro)', () => {
+    const fixed = normalizePortugueseMonthNames('Octubre registou queda face a Septiembre e August (en enero).');
+    expect(fixed).toBe('Outubro registou queda face a Setembro e Agosto (en janeiro).');
   });
 });
