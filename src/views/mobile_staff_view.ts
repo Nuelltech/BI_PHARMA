@@ -1869,10 +1869,10 @@ export function getMobileStaffHtml(): string {
           const valImp = ct.valor_impacto != null ? Number(ct.valor_impacto) : 0;
           const safeTitle = escapeHtml(ct.designacao || 'Missão da Equipa');
           const safeCat = escapeHtml(ct.categoria || 'DIRECAO_TECNICA');
-          const safeCnp = ct.cnp_codigo ? "'" + escapeHtml(ct.cnp_codigo) + "'" : 'null';
+          const safeCnp = escapeHtml(ct.cnp_codigo || '');
           return \`
             <div class="task-card \${isDone ? 'completed' : ''}" id="card_\${escapeHtml(ct.task_id)}" style="border-left: 4px solid #6366f1;">
-              <div class="task-check-btn" onclick="toggleTask('\${escapeHtml(ct.task_id)}', '\${safeCat}', \${safeCnp}, '\${safeTitle.replace(/'/g, "\\\\'")}', \${valImp})">
+              <div class="task-check-btn" data-task-id="\${escapeHtml(ct.task_id)}" data-cat="\${safeCat}" data-cnp="\${safeCnp}" data-desc="\${safeTitle}" data-val="\${valImp}" onclick="toggleTask(this.dataset.taskId, this.dataset.cat, this.dataset.cnp || null, this.dataset.desc, Number(this.dataset.val || 0))">
                 \${isDone ? '✓' : ''}
               </div>
               <div class="task-body">

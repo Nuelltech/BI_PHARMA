@@ -9893,7 +9893,7 @@ function getDashboardHtml(): string {
 
         return '<div class="weekly-task-item ' + (isDone ? 'task-completed' : '') + '" style="background: ' + (isDone ? '#f8fafc' : '#ffffff') + '; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; display: flex; gap: 12px; align-items: flex-start; justify-content: space-between;">' +
           '<div style="display: flex; gap: 10px; align-items: flex-start; flex: 1;">' +
-            '<input type="checkbox" class="weekly-task-checkbox" data-task-id="' + escapeHtml(t.task_id) + '" ' + (isDone ? 'checked' : '') + ' onchange="toggleWeeklyTask(\'' + escapeHtml(t.task_id) + '\', \'' + safeCat + '\', \'' + safeCnp + '\', \'' + safeDesc.replace(/'/g, "\\'") + '\', ' + valImpact + ')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #4f46e5;" />' +
+            '<input type="checkbox" class="weekly-task-checkbox" data-task-id="' + escapeHtml(t.task_id) + '" data-cat="' + safeCat + '" data-cnp="' + safeCnp + '" data-desc="' + safeDesc + '" data-val="' + valImpact + '" ' + (isDone ? 'checked' : '') + ' onchange="toggleWeeklyTask(this.dataset.taskId, this.dataset.cat, this.dataset.cnp, this.dataset.desc, Number(this.dataset.val || 0))" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #4f46e5;" />' +
             '<div style="flex: 1;">' +
               '<div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">' +
                 '<span style="font-size: 0.72rem; font-weight: 800; background: ' + badgeBg + '; color: ' + badgeColor + '; padding: 2px 8px; border-radius: 9999px;">' + badgeLabel + '</span>' +
@@ -9904,8 +9904,8 @@ function getDashboardHtml(): string {
             '</div>' +
           '</div>' +
           '<div style="display: flex; gap: 6px; flex-shrink: 0;">' +
-            '<button class="btn btn-secondary" onclick="editCustomTaskPrompt(\'' + escapeHtml(t.task_id) + '\')" title="Editar tarefa" style="padding: 4px 8px; font-size: 0.76rem;">✏️</button>' +
-            '<button class="btn btn-secondary" onclick="deleteCustomTaskUi(\'' + escapeHtml(t.task_id) + '\')" title="Remover tarefa" style="padding: 4px 8px; font-size: 0.76rem; color: #dc2626; border-color: #fecaca;">🗑️</button>' +
+            '<button class="btn btn-secondary" data-task-id="' + escapeHtml(t.task_id) + '" onclick="editCustomTaskPrompt(this.dataset.taskId)" title="Editar tarefa" style="padding: 4px 8px; font-size: 0.76rem;">✏️</button>' +
+            '<button class="btn btn-secondary" data-task-id="' + escapeHtml(t.task_id) + '" onclick="deleteCustomTaskUi(this.dataset.taskId)" title="Remover tarefa" style="padding: 4px 8px; font-size: 0.76rem; color: #dc2626; border-color: #fecaca;">🗑️</button>' +
           '</div>' +
         '</div>';
       }).join('');
@@ -15581,7 +15581,7 @@ function getDashboardHtml(): string {
             st.searchResults.map(item =>
               '<div style="display:flex; justify-content:space-between; align-items:center; padding: 6px 10px; border-bottom: 1px solid #e2e8f0; font-size: 0.8rem;">' +
                 '<div><b>' + escapeHtml(item.designacao) + '</b> <span style="color:#64748b;">(' + escapeHtml(item.cnp_codigo) + ' · ' + item.stock_atual + ' un · PVP €' + item.pvp_atual.toFixed(2) + ')</span></div>' +
-                '<button class="btn" onclick="campaignEditorAddProduct(\'' + escapeHtml(item.cnp_codigo) + '\')" style="background:#4f46e5;color:#fff;padding:3px 10px;font-size:0.74rem;">+ Adicionar</button>' +
+                '<button class="btn" data-cnp="' + escapeHtml(item.cnp_codigo) + '" onclick="campaignEditorAddProduct(this.dataset.cnp)" style="background:#4f46e5;color:#fff;padding:3px 10px;font-size:0.74rem;">+ Adicionar</button>' +
               '</div>'
             ).join('') +
           '</div>'
@@ -15612,7 +15612,7 @@ function getDashboardHtml(): string {
         '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin-bottom:14px;">' +
           '<div style="font-size:0.8rem;font-weight:700;color:#334155;margin-bottom:6px;">➕ Adicionar produto MNSRM / Venda Livre do stock à campanha:</div>' +
           '<div style="display:flex;gap:8px;">' +
-            '<input id="ceProductSearchInput" type="text" placeholder="Pesquisar por nome, CNP ou laboratório (ex: Antigrippine, CeraVe)..." onkeydown="if(event.key===\'Enter\') campaignEditorSearchProducts()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:7px;font-size:0.82rem;" />' +
+            '<input id="ceProductSearchInput" type="text" placeholder="Pesquisar por nome, CNP ou laboratório (ex: Antigrippine, CeraVe)..." onkeydown="if(event.keyCode===13) campaignEditorSearchProducts()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:7px;font-size:0.82rem;" />' +
             '<button class="btn" onclick="campaignEditorSearchProducts()" style="background:#0284c7;color:#fff;padding:7px 14px;font-size:0.8rem;">🔍 Pesquisar</button>' +
           '</div>' +
           '<div id="ceSearchResultsBox">' + searchHtml + '</div>' +
