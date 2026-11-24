@@ -28,7 +28,7 @@ export type SituacaoStock =
   | 'EXCESSO'
   | 'MONO'
   | 'BAIXA_ROTACAO_SEM_STOCK'
-  | 'SEM_STOCK_SEM_VENDAS'
+  | 'SEM_STOCK_SEM_VENDAS_12M'
   | 'DADOS_INCOMPLETOS';
 
 export interface ClassificacaoProdutoResult {
@@ -72,7 +72,7 @@ export function classificarProdutoUnificado(params: {
   // 1. Sem stock e sem vendas nos últimos 12M
   if (stock <= 0 && vendas12m <= 0 && vmm <= 0) {
     return {
-      situacao: 'SEM_STOCK_SEM_VENDAS',
+      situacao: 'SEM_STOCK_SEM_VENDAS_12M',
       acoes_permitidas: addRever(['TRABALHAR_ENCOMENDA', 'DESCONTINUAR']),
       acao_sugerida: 'TRABALHAR_ENCOMENDA',
       eh_cronico: ehCronico,
@@ -575,16 +575,95 @@ export function renderMarkdownTableFromStoredResult(
       : availableKeys.slice(0, 8);
   const finalCols = cols.length > 0 ? cols : availableKeys.slice(0, 6);
 
-  const fmtCell = (val: any): string => {
-    if (val === null || val === undefined) return '—';
-    if (Array.isArray(val)) return val.join(', ');
-    if (typeof val === 'object') return JSON.stringify(val);
-    return String(val).replace(/\|/g, '/').replace(/\n/g, ' ');
+  const COLUMN_LABELS_PT: Record<string, string> = {
+    cnp: 'CNP',
+    designacao: 'Produto',
+    laboratorioTitular: 'Laboratório',
+    dci: 'DCI',
+    segmento: 'Tipo',
+    categoria: 'Categoria',
+    subcategoria: 'Subcategoria',
+    stockAtual: 'Stock (un)',
+    vendasAno12M: 'Vendas 12M (un)',
+    vendasHistoricoTotalUnidades: 'Histórico (un)',
+    vendasHistoricoTotalEur: 'Faturação Hist. (€)',
+    vendasAnoAtualUnidades: 'Vendas Ano (un)',
+    unidadesVendidas: 'Unidades',
+    unidadesVendidasPeriodo: 'Unidades',
+    faturacaoEur: 'Faturação (€)',
+    faturacaoPeriodoEur: 'Faturação (€)',
+    ultimaVendaData: 'Última venda',
+    vendaMediaMensal: 'VMM (un/mês)',
+    vmmMensal: 'VMM (un/mês)',
+    vmm: 'VMM (un/mês)',
+    diasCoberturaAtual: 'Cobertura (dias)',
+    diasCobertura: 'Cobertura (dias)',
+    mesesCoberturaAtual: 'Cobertura (meses)',
+    pvpEur: 'PVP (€)',
+    custoUnitarioEur: 'Custo (€)',
+    taxa_iva_pct: 'IVA (%)',
+    margemUnitariaEur: 'Margem (€)',
+    margemPct: 'Margem (%)',
+    margemComercialPct: 'Margem (%)',
+    situacao: 'Situação',
+    acao_sugerida: 'Ação sugerida',
+    validade: 'Validade',
+    validadeMaisProxima: 'Validade',
   };
 
-  const header = `| ${finalCols.join(' | ')} |`;
+  const CODE_LABELS_PT: Record<string, string> = {
+    SEM_STOCK_SEM_VENDAS_12M: 'Sem stock e sem vendas (12M)',
+    SEM_STOCK_SEM_VENDAS: 'Sem stock e sem vendas (12M)',
+    BAIXA_ROTACAO_SEM_STOCK: 'Baixa rotação sem stock',
+    RUTURA: 'Rutura',
+    ABAIXO_MINIMO: 'Abaixo do mínimo',
+    EQUILIBRADO: 'Equilibrado',
+    EXCESSO: 'Excesso de stock',
+    MONO: 'Mono (parado)',
+    TRABALHAR_ENCOMENDA: 'Trabalhar por encomenda',
+    REPOR: 'Repor stock',
+    MANTER: 'Manter',
+    STOCK_MINIMO: 'Stock mínimo',
+    DEVOLVER_EXCESSO: 'Devolver excesso',
+    DEVOLVER_TUDO: 'Devolver ao fornecedor',
+    TRANSFERIR: 'Transferir',
+    ESCOAMENTO_BALCAO: 'Escoamento ao balcão',
+    DESCONTINUAR: 'Descontinuar',
+    REVER_DADOS: 'Rever dados',
+  };
+
+  const MESES_PT_ABREV = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
+
+  const fmtCell = (val: any, colName: string): string => {
+    if (val === null || val === undefined || val === '') return '—';
+    if (Array.isArray(val)) {
+      return val.map((v) => CODE_LABELS_PT[String(v)] || String(v)).join(', ');
+    }
+    if (typeof val === 'object') return JSON.stringify(val);
+    const s = String(val);
+    if (CODE_LABELS_PT[s]) return CODE_LABELS_PT[s];
+    // Formatar datas ISO (YYYY-MM-01 -> "mar/2026"; YYYY-MM-DD -> "11/11/2026")
+    const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (isoMatch) {
+      const y = isoMatch[1];
+      const mIdx = parseInt(isoMatch[2], 10) - 1;
+      const d = isoMatch[3];
+      if (d === '01' && mIdx >= 0 && mIdx < 12) return `${MESES_PT_ABREV[mIdx]}/${y}`;
+      return `${d}/${isoMatch[2]}/${y}`;
+    }
+    if (typeof val === 'number' && /(Eur|valor|custo|pvp|faturacao)/i.test(colName)) {
+      return `${val.toFixed(2).replace('.', ',')} €`;
+    }
+    if (typeof val === 'number' && /(Pct|iva)/i.test(colName)) {
+      return `${String(val).replace('.', ',')}%`;
+    }
+    return s.replace(/\|/g, '/').replace(/\n/g, ' ');
+  };
+
+  const headerLabels = finalCols.map((c) => COLUMN_LABELS_PT[c] || c);
+  const header = `| ${headerLabels.join(' | ')} |`;
   const sep = `| ${finalCols.map(() => '---').join(' | ')} |`;
-  const body = sliced.map((r) => `| ${finalCols.map((c) => fmtCell(r[c])).join(' | ')} |`).join('\n');
+  const body = sliced.map((r) => `| ${finalCols.map((c) => fmtCell(r[c], c)).join(' | ')} |`).join('\n');
   const titleLine = spec.titulo ? `### ${spec.titulo}\n\n` : '';
   const footer = rows.length > sliced.length ? `\n\n_Mostrando ${sliced.length} de ${rows.length} registos._` : '';
 

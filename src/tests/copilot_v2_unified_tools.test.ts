@@ -42,7 +42,7 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
       pvp: 12,
     });
     expect(semVendas.acao_sugerida).toBe('TRABALHAR_ENCOMENDA');
-    expect(semVendas.situacao).toBe('SEM_STOCK_SEM_VENDAS');
+    expect(semVendas.situacao).toBe('SEM_STOCK_SEM_VENDAS_12M');
     expect(semVendas.acoes_permitidas).not.toContain('REPOR');
 
     const baixaRot = classificarProdutoUnificado({
@@ -114,7 +114,7 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
     if (art6391151) {
       expect(art6391151.vendasAno12M).toBe(0);
       expect(art6391151.vendasHistoricoTotalUnidades).toBe(11);
-      expect(art6391151.situacao).toBe('SEM_STOCK_SEM_VENDAS');
+      expect(art6391151.situacao).toBe('SEM_STOCK_SEM_VENDAS_12M');
     }
     // Na Farmácia C (Demo): 6391169 (1 un em Mar/2026) + 6298752 (1 un em Abr/2026) = 2 un em 2026
     expect(resExato.resumoEncontrado.totalUnidadesVendidasAnoAtual).toBe(2);
@@ -163,7 +163,7 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
     });
     expect(tbl.ok).toBe(true);
     expect(tbl.rowCount).toBeGreaterThan(0);
-    expect(tbl.markdown).toContain('| cnp | designacao |');
+    expect(tbl.markdown).toContain('| CNP | Produto |');
 
     // Isolamento multi-tenant: outra farmácia não pode ler o resultado_id da Farmácia A
     const tblCross = renderMarkdownTableFromStoredResult(FARMACIA_C_ID, {

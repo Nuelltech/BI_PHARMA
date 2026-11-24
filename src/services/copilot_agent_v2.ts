@@ -76,8 +76,8 @@ REGRAS FUNDAMENTAIS DE RIGOR:
 1. FACTOS PRIMEIRO: Nunca inventes números, CNPs, stocks, vendas ou margens. Chama sempre as ferramentas necessárias antes de responder.
 2. REGRA DE INEXISTÊNCIA (CRÍTICA): Nunca afirmes que um produto, marca, laboratório ou vendas "não existe", "não há registos" ou "não está catalogado" sem, neste mesmo turno, teres chamado uma ferramenta que cobre esse âmbito (ex.: consultar_produtos ou consultar_vendas_periodo) e essa ferramenta ter devolvido 0 registos. Se encontraste o artigo no catálogo ou em vendas históricas mas com stock = 0, diz isso claramente ("0 un em stock atual, mas registou X un vendidas no histórico").
 3. CHAMADAS EM PARALELO: Quando precisares de cruzar várias fontes (ex.: vendas + stock + laboratório), chama várias ferramentas em paralelo na mesma ronda.
-4. VOCABULÁRIO DE AÇÕES: Respeita os campos \`situacao\`, \`acoes_permitidas\` e \`acao_sugerida\` devolvidos pelas ferramentas. NUNCA recomendes "encomendar urgente" ou "rutura total" para artigos com 0 vendas ou marcados como \`TRABALHAR_ENCOMENDA\`. NUNCA chames "rutura" a um artigo com \`situacao\` \`SEM_STOCK_SEM_VENDAS\` ou \`BAIXA_ROTACAO_SEM_STOCK\` — diz "sem stock atual (0 un)". Usa sempre os totais já calculados em \`resumoEncontrado\` / \`resumo\` sem fazer somas de cabeça.
-5. IVA E MARGEM: As ferramentas já devolvem \`margemUnitariaEur\` e \`margemPct\` com o IVA deduzido (\`taxa_iva_pct\`). Quando o PVP vier de fallback (\`pvp_origem: "PRODUTO_MESTRE"\`), menciona-o brevemente.
+4. VOCABULÁRIO DE AÇÕES E LINGUAGEM HUMANA: Respeita os campos \`situacao\`, \`acoes_permitidas\` e \`acao_sugerida\` devolvidos pelas ferramentas. NUNCA recomendes "encomendar urgente" ou "rutura total" para artigos com 0 vendas ou marcados como \`TRABALHAR_ENCOMENDA\`. NUNCA chames "rutura" a artigos sem stock e sem rotação — diz "sem stock atual (0 un)". TRADUZ SEMPRE todos os códigos internos para português natural na resposta ao utilizador (ex.: "trabalhar por encomenda", "sem stock e sem vendas nos últimos 12 meses", "baixa rotação sem stock", "descontinuar", "rever dados") — NUNCA mostres códigos em MAIÚSCULAS_COM_UNDERSCORE nem nomes técnicos de colunas em camelCase. Usa sempre os totais já calculados em \`resumoEncontrado\` / \`resumo\` sem fazer somas de cabeça.
+5. IVA E MARGEM: As ferramentas já devolvem \`margemUnitariaEur\` e \`margemPct\` com o IVA deduzido. Apresenta as margens em português limpo (ex.: "6,10 € (30%), sem IVA") sem mencionar nomes internos de origem do PVP (\`PRODUTO_MESTRE\`, \`FARMACIA\`).
 6. DADOS PARCIAIS (D6): Indica sempre até que data existem dados (\`dados_ate\`). Se \`mes_parcial: true\` ou existir \`aviso_dados_incompletos\`, inclui esse aviso de forma clara na resposta.
 7. TABELAS POR REFERÊNCIA: Sempre que quiseres apresentar uma tabela com 4 ou mais produtos/linhas, chama a ferramenta \`tabela\` passando o \`resultado_id\` devolvido pela consulta anterior (com colunas, ordenação e limite). O sistema gera a tabela exata a partir dos dados reais sem risco de erro de cópia. Na tua resposta final, refere a tabela gerada ou inclui o markdown devolvido sem alterar nenhum número.
 8. LIMITE CLÍNICO: Não dês aconselhamento clínico, diagnóstico ou posológico a utentes — essa competência é exclusiva do Diretor Técnico.
@@ -779,7 +779,10 @@ export async function runCopilotAgentV2(
       inicio_ms: valStart - startMs,
       duracao_ms: Date.now() - valStart,
       estado: issues.length === 0 ? 'ok' : 'aviso',
-      detalhe: { issues },
+      detalhe: {
+        issues,
+        ...(issues.length > 0 ? { texto_rejeitado: finalText.slice(0, 2000) } : {}),
+      },
     });
 
     if (issues.length > 0 && validationRetries < 1) {

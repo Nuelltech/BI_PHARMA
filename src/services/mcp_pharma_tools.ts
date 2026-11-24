@@ -847,31 +847,11 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
   }
 
   const freshness = await getPharmacyDataFreshness(prisma, ctx.farmaciaId);
-  const [catalog, martRows] = await Promise.all([
-    getPharmacyCatalog(prisma, ctx.farmaciaId),
-    prisma.martProdutoMetricas.findMany({
-      where: { farmaciaId: ctx.farmaciaId },
-      select: {
-        cnp_codigo: true,
-        designacao: true,
-        tipo_venda: true,
-        categoria: true,
-        subcategoria: true,
-        molecula_dci: true,
-        laboratorio_titular: true,
-        stock_total_unidades: true,
-        custo_unitario_medio: true,
-        pvp: true,
-        taxa_iva: true,
-        total_unidades_vendidas: true,
-        vmm: true,
-        eh_mono: true,
-      },
-    }),
-  ]);
-
+  // Otimização Ponto 3: usar getPharmacyCatalog (em cache <1ms) e NÃO carregar 5000 linhas de MartProdutoMetricas do Supabase;
+  // carregamos MartProdutoMetricas apenas para os topCandidateCnps encontrados!
+  const catalog = await getPharmacyCatalog(prisma, ctx.farmaciaId);
   const catalogByCnp = new Map<string, CatalogItem>(catalog.map((c) => [c.cnp, c]));
-  const martByCnp = new Map(martRows.map((m) => [m.cnp_codigo, m]));
+  const martByCnp = new Map<string, any>();
 
   // Correção Rhinodouche (a) + (b):
   // Pesquisar TAMBÉM diretamente no ProdutoMestre (catálogo completo) + histórico de vendas da farmácia
@@ -969,7 +949,7 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
     cnp: string;
     score: number;
     catItem?: CatalogItem;
-    martItem?: (typeof martRows)[number];
+    martItem?: any;
     pmItem?: (typeof pmCandidates)[number];
   }
 
@@ -1047,31 +1027,49 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
     ? scored.filter((s) => (s.catItem?.stock || s.martItem?.stock_total_unidades || 0) > 0)
     : scored;
 
-  // Garantir taxa_iva e pvp de ProdutoMestre para os CNPs que vieram só do catálogo
+  // Garantir taxa_iva, pvp de ProdutoMestre e MartProdutoMetricas APENAS para os topCandidateCnps encontrados (<< 1s)
   const topCandidateCnps = preFiltered.slice(0, 250).map((s) => s.cnp);
   const missingPmCnps = topCandidateCnps.filter((c) => !pmByCnp.has(c));
-  if (missingPmCnps.length > 0) {
-    const extraPm = await prisma.produtoMestre.findMany({
-      where: { cnp_codigo: { in: missingPmCnps } },
-      select: {
-        cnp_codigo: true,
-        designacao: true,
-        tipo_venda: true,
-        categoria: true,
-        subcategoria: true,
-        dci: true,
-        laboratorio_titular: true,
-        pvp: true,
-        taxa_iva: true,
-      },
-    });
-    for (const p of extraPm) pmByCnp.set(p.cnp_codigo, p);
-  }
-
-  // Consultar TODO o histórico de vendas na farmácia para estes CNPs
-  const vendasRaw =
+  const [extraPm, candMarts, vendasRaw] = await Promise.all([
+    missingPmCnps.length > 0
+      ? prisma.produtoMestre.findMany({
+          where: { cnp_codigo: { in: missingPmCnps } },
+          select: {
+            cnp_codigo: true,
+            designacao: true,
+            tipo_venda: true,
+            categoria: true,
+            subcategoria: true,
+            dci: true,
+            laboratorio_titular: true,
+            pvp: true,
+            taxa_iva: true,
+          },
+        })
+      : Promise.resolve([]),
     topCandidateCnps.length > 0
-      ? await prisma.venda.findMany({
+      ? prisma.martProdutoMetricas.findMany({
+          where: { farmaciaId: ctx.farmaciaId, cnp_codigo: { in: topCandidateCnps } },
+          select: {
+            cnp_codigo: true,
+            designacao: true,
+            tipo_venda: true,
+            categoria: true,
+            subcategoria: true,
+            molecula_dci: true,
+            laboratorio_titular: true,
+            stock_total_unidades: true,
+            custo_unitario_medio: true,
+            pvp: true,
+            taxa_iva: true,
+            total_unidades_vendidas: true,
+            vmm: true,
+            eh_mono: true,
+          },
+        })
+      : Promise.resolve([]),
+    topCandidateCnps.length > 0
+      ? prisma.venda.findMany({
           where: {
             farmaciaId: ctx.farmaciaId,
             cnp_codigo: { in: topCandidateCnps },
@@ -1084,7 +1082,10 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
           },
           orderBy: { data_venda: 'asc' },
         })
-      : [];
+      : Promise.resolve([]),
+  ]);
+  for (const p of extraPm) pmByCnp.set(p.cnp_codigo, p);
+  for (const m of candMarts) martByCnp.set(m.cnp_codigo, m);
 
   const monthlyByCnp = new Map<string, Map<string, { qtd: number; valor: number }>>();
   const totalVendasHistoricoByCnp = new Map<string, { qtd: number; valor: number; ultimaData: string | null; qtdAnoAtual: number; qtd12m: number }>();
@@ -1125,7 +1126,7 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
   // Re-ordenar dando prioridade a artigos com stock ou vendas históricas nesta farmácia
   const enrichedAll = preFiltered.slice(0, 250).map((s) => {
     const it = s.catItem;
-    const mart = s.martItem;
+    const mart = martByCnp.get(s.cnp) || s.martItem;
     const pm = pmByCnp.get(s.cnp) || s.pmItem;
     const histAgg = totalVendasHistoricoByCnp.get(s.cnp);
 
@@ -4026,6 +4027,32 @@ export async function toolConsultarVendasPeriodo(
   const whereMes: any = { farmaciaId: ctx.farmaciaId };
   if (cnpsInput.length > 0) {
     whereMes.cnp_codigo = { in: cnpsInput };
+  } else if (termo || labFilter) {
+    // Otimização Ponto 3: pré-filtrar CNPs no ProdutoMestre antes de ler MartProdutoMes (corta 10s -> <500ms)
+    const orClauses: any[] = [];
+    if (labFilter) {
+      orClauses.push({ laboratorio_titular: { contains: labFilter, mode: 'insensitive' } });
+      orClauses.push({ designacao: { contains: labFilter, mode: 'insensitive' } });
+    }
+    if (termo) {
+      const cleanT = stripAccents(termo).replace(/[^a-z0-9]/g, '');
+      orClauses.push({ designacao: { contains: termo, mode: 'insensitive' } });
+      orClauses.push({ cnp_codigo: { contains: termo } });
+      orClauses.push({ dci: { contains: termo, mode: 'insensitive' } });
+      if (cleanT.length >= 6) {
+        orClauses.push({ designacao: { contains: cleanT.slice(0, 4), mode: 'insensitive' } });
+        orClauses.push({ designacao: { contains: cleanT.slice(-4), mode: 'insensitive' } });
+      }
+    }
+    const pmPre = await prisma.produtoMestre.findMany({
+      where: { OR: orClauses },
+      select: { cnp_codigo: true },
+      take: 1200,
+    });
+    const preCnps = pmPre.map((p) => p.cnp_codigo);
+    if (preCnps.length > 0) {
+      whereMes.cnp_codigo = { in: preCnps };
+    }
   }
 
   let rangeLabel = periodoRaw || 'todos_os_meses_disponiveis';
