@@ -75,7 +75,7 @@ Tens acesso direto às ferramentas oficiais da farmácia (a mesma camada de dado
 REGRAS FUNDAMENTAIS DE RIGOR:
 1. FACTOS PRIMEIRO: Nunca inventes números, CNPs, stocks, vendas ou margens. Chama sempre as ferramentas necessárias antes de responder.
 2. REGRA DE INEXISTÊNCIA (CRÍTICA): Nunca afirmes que um produto, marca, laboratório ou vendas "não existe", "não há registos" ou "não está catalogado" sem, neste mesmo turno, teres chamado uma ferramenta que cobre esse âmbito (ex.: consultar_produtos ou consultar_vendas_periodo) e essa ferramenta ter devolvido 0 registos. Se encontraste o artigo no catálogo ou em vendas históricas mas com stock = 0, diz isso claramente ("0 un em stock atual, mas registou X un vendidas no histórico").
-3. CHAMADAS EM PARALELO: Quando precisares de cruzar várias fontes (ex.: vendas + stock + laboratório), chama várias ferramentas em paralelo na mesma ronda.
+3. CHAMADAS EM PARALELO E EFICIÊNCIA: Quando precisares de cruzar fontes, chama as ferramentas em paralelo na mesma ronda, mas evita disparar dezenas de chamadas redundantes (ex.: para analisar um laboratório e comparar alternativas na mesma DCI, \`analisar_desempenho_laboratorio\` + \`consultar_vendas_periodo\` já trazem quotas DCI, monos, excessos e vendas; não faças 6–8 chamadas separadas a \`consultar_produtos\` por cada molécula).
 4. VOCABULÁRIO DE AÇÕES E LINGUAGEM HUMANA: Respeita os campos \`situacao\`, \`acoes_permitidas\` e \`acao_sugerida\` devolvidos pelas ferramentas. NUNCA recomendes "encomendar urgente" ou "rutura total" para artigos com 0 vendas ou marcados como \`TRABALHAR_ENCOMENDA\`. NUNCA chames "rutura" a artigos sem stock e sem rotação — diz "sem stock atual (0 un)". TRADUZ SEMPRE todos os códigos internos para português natural na resposta ao utilizador (ex.: "trabalhar por encomenda", "sem stock e sem vendas nos últimos 12 meses", "baixa rotação sem stock", "descontinuar", "rever dados") — NUNCA mostres códigos em MAIÚSCULAS_COM_UNDERSCORE nem nomes técnicos de colunas em camelCase. Usa sempre os totais já calculados em \`resumoEncontrado\` / \`resumo\` sem fazer somas de cabeça.
 5. IVA E MARGEM: As ferramentas já devolvem \`margemUnitariaEur\` e \`margemPct\` com o IVA deduzido. Apresenta as margens em português limpo (ex.: "6,10 € (30%), sem IVA") sem mencionar nomes internos de origem do PVP (\`PRODUTO_MESTRE\`, \`FARMACIA\`).
 6. DADOS PARCIAIS (D6): Indica sempre até que data existem dados (\`dados_ate\`). Se \`mes_parcial: true\` ou existir \`aviso_dados_incompletos\`, inclui esse aviso de forma clara na resposta.
@@ -602,14 +602,61 @@ export async function runCopilotAgentV2(
 
   while (stepNum < 10) {
     if (Date.now() - startMs > timeoutMs) {
-      avisoValidacao = 'Tempo limite do agente atingido; resposta apresentada com os dados já recolhidos.';
+      // Se o timeout disparou antes de gerar texto final, faz 1 última síntese sem tools para nunca entregar tabelas sem análise
+      if (!finalText && messages.length > 1) {
+        try {
+          emit({ type: 'status', message: 'A finalizar síntese executiva com os dados recolhidos...', step: stepNum + 1 });
+          const synthResp = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': apiKey,
+              'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+              model: activeModel,
+              max_tokens: 2048,
+              system: AGENT_V2_SYSTEM_PROMPT,
+              messages: [
+                ...messages,
+                {
+                  role: 'user',
+                  content:
+                    'Com base exclusivamente nos dados já recolhidos acima, apresenta agora a síntese final concisa e acionável para o utilizador (sem chamar mais ferramentas).',
+                },
+              ],
+            }),
+          });
+          if (synthResp.ok) {
+            const synthData: any = await synthResp.json();
+            const synthBlocks: any[] = Array.isArray(synthData.content) ? synthData.content : [];
+            finalText = synthBlocks.filter((b) => b.type === 'text').map((b) => String(b.text || '')).join('\n').trim();
+            const u = synthData.usage || {};
+            totalIn += Number(u.input_tokens || 0);
+            totalOut += Number(u.output_tokens || 0);
+          }
+        } catch (_) {}
+      }
       break;
     }
 
     stepNum++;
     const llmStepStart = Date.now();
-    const callAnthropic = async (modelId: string) =>
-      fetch('https://api.anthropic.com/v1/messages', {
+    const callAnthropic = async (modelId: string, includeTools = true) => {
+      // Prompt Caching multi-turn: marcar a última mensagem de utilizador (tool_result) como cacheável para poupar ~90% nos turnos seguintes
+      const cachedMessages = messages.map((msg, idx) => {
+        if (idx === messages.length - 1 && msg.role === 'user') {
+          if (Array.isArray(msg.content) && msg.content.length > 0) {
+            const cloned = [...msg.content];
+            const lastBlock = { ...cloned[cloned.length - 1], cache_control: { type: 'ephemeral' } };
+            cloned[cloned.length - 1] = lastBlock;
+            return { ...msg, content: cloned };
+          }
+        }
+        return msg;
+      });
+
+      return fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -626,10 +673,11 @@ export async function runCopilotAgentV2(
               cache_control: { type: 'ephemeral' },
             },
           ],
-          tools: AGENT_V2_TOOLS,
-          messages,
+          ...(includeTools ? { tools: AGENT_V2_TOOLS } : {}),
+          messages: cachedMessages,
         }),
       });
+    };
 
     let response = await callAnthropic(activeModel);
     // Fallback seguro se o model ID 5-5 ainda não estiver ativo na conta Anthropic (evita HTTP 404 em produção)
@@ -725,13 +773,28 @@ export async function runCopilotAgentV2(
               },
             });
 
-            // Compactar ligeiramente se o JSON for muito grande (> 28KB) mantendo resumo + primeiras linhas
-            let serialized = JSON.stringify(res);
-            if (serialized.length > 28_000 && res && Array.isArray(res.artigos)) {
+            // Compactar o JSON devolvido ao contexto do LLM (<= 12 KB) para evitar explosão de tokens (os dados completos ficam intactos no resultado_id para a ferramenta `tabela`)
+            const compactForLlm = (rawObj: any): any => {
+              if (!rawObj || typeof rawObj !== 'object') return rawObj;
+              const copy: Record<string, any> = { ...rawObj };
+              // Remover duplicado de analisar_desempenho_laboratorio quando `artigos` já está presente
+              if (copy.artigos && copy.produtosMaisVendidosAltaRotacao) {
+                delete copy.produtosMaisVendidosAltaRotacao;
+              }
+              if (Array.isArray(copy.artigos) && copy.artigos.length > 5) {
+                copy.artigos = copy.artigos.slice(0, 20).map((a: any) => {
+                  const { historicoVendasMensais, vendasPorMes, vendasPorEstacao, ...rest } = a || {};
+                  return rest;
+                });
+              }
+              return copy;
+            };
+            let serialized = JSON.stringify(compactForLlm(res));
+            if (serialized.length > 12_000 && res && Array.isArray(res.artigos)) {
               const trimmed = {
-                ...res,
-                artigos: res.artigos.slice(0, 25),
-                _nota_truncagem: `Mostrados 25 de ${res.artigos.length} artigos no contexto; usa a ferramenta tabela(resultado_id="${res.resultado_id}") para apresentar mais linhas.`,
+                ...compactForLlm(res),
+                artigos: compactForLlm(res).artigos.slice(0, 12),
+                _nota_truncagem: `Mostrados 12 de ${res.artigos.length} artigos no contexto; usa a ferramenta tabela(resultado_id="${res.resultado_id}") para apresentar a tabela completa.`,
               };
               serialized = JSON.stringify(trimmed);
             }

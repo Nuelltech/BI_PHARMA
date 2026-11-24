@@ -63,6 +63,7 @@ export interface CatalogSearchParams {
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const catalogCache = new Map<string, { at: number; items: CatalogItem[] }>();
+const inFlightCatalog = new Map<string, Promise<CatalogItem[]>>();
 
 export function normalizeText(str: string): string {
   return (str || '')
@@ -75,16 +76,42 @@ export function normalizeText(str: string): string {
 
 /** Invalida a cache (ex: após nova importação de dados) */
 export function invalidateCatalog(farmaciaId?: string) {
-  if (farmaciaId) catalogCache.delete(farmaciaId);
-  else catalogCache.clear();
+  if (farmaciaId) {
+    catalogCache.delete(farmaciaId);
+    inFlightCatalog.delete(farmaciaId);
+  } else {
+    catalogCache.clear();
+    inFlightCatalog.clear();
+  }
 }
 
 /**
  * Carrega todos os produtos com stock ou vendas na farmácia, com métricas agregadas.
+ * Usa coalescing de promessas (inFlightCatalog) para evitar N cargas simultâneas da BD quando várias ferramentas correm em paralelo.
  */
 export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: string): Promise<CatalogItem[]> {
   const cached = catalogCache.get(farmaciaId);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.items;
+
+  const existingPromise = inFlightCatalog.get(farmaciaId);
+  if (existingPromise) return existingPromise;
+
+  const loader = loadPharmacyCatalogInternal(prisma, farmaciaId)
+    .then((items) => {
+      catalogCache.set(farmaciaId, { at: Date.now(), items });
+      inFlightCatalog.delete(farmaciaId);
+      return items;
+    })
+    .catch((err) => {
+      inFlightCatalog.delete(farmaciaId);
+      throw err;
+    });
+
+  inFlightCatalog.set(farmaciaId, loader);
+  return loader;
+}
+
+async function loadPharmacyCatalogInternal(prisma: PrismaClient, farmaciaId: string): Promise<CatalogItem[]> {
 
   // #19: Filtrar vendas estritamente pelos últimos 12 meses até à data mais recente da farmácia (nunca somar desde 2022!)
   const maxVendaAgg = await prisma.venda.aggregate({
