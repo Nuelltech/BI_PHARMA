@@ -626,8 +626,8 @@ export async function analyzePharmacyInventory(
       }
     }
 
-    // 1. Excesso de Cobertura
-    const excessoCobertura = coberturaMeses === null ? true : coberturaMeses > limiteCoberturaMeses;
+    // 1. Excesso de Cobertura (Catálogo 2 / P2 #16: apenas quando VMM > 0; monos sem vendas NÃO são excesso)
+    const excessoCobertura = vmm > 0 && coberturaMeses !== null && coberturaMeses > limiteCoberturaMeses;
 
     if (excessoCobertura) {
       const sugestaoBalcao = buildSmartItemRecommendation({

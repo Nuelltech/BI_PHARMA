@@ -11,6 +11,13 @@ import {
 } from './analysis';
 import { TipoVenda, SegmentoProduto } from './classifier';
 import { loadEnrichedCatalogMap, buildDeterministicDashboardGuidance } from './comercial_repo';
+import {
+  calcularEstadosProduto,
+  calcularVmm,
+  dataEfetivaUltimaVenda,
+  ehGenericoOficial,
+} from './metricas';
+import { getLatestImportForPharmacy } from './import_registry';
 
 const CHUNK_SIZE = 500;
 
@@ -133,48 +140,63 @@ export async function computeAndPersistMarts(
     }),
   ]);
 
-  const dataRef = new Date(p.data_referencia || '2026-10-31T23:59:59.999Z');
-  // Janela histórica dos últimos 13 meses (mês homólogo anterior até ao mês de referência)
-  const dataInicioJanela = new Date(Date.UTC(dataRef.getUTCFullYear() - 1, dataRef.getUTCMonth(), 1));
+  // Passo 4 (#26): Data de referência real do RegistoImportacao (ou última venda), removendo o fixo 31-10-2026
+  const latestImport = await getLatestImportForPharmacy(prisma, farmaciaId);
+  let dataRef: Date;
+  if (latestImport?.dados_ate) {
+    dataRef = new Date(`${latestImport.dados_ate}T23:59:59.999Z`);
+  } else if (p.data_referencia) {
+    dataRef = new Date(p.data_referencia);
+  } else {
+    const maxV = vendas.reduce<Date | null>((acc, v) => (!acc || v.data_venda > acc ? v.data_venda : acc), null);
+    dataRef = maxV ? dataEfetivaUltimaVenda(maxV, 'MENSAL') : new Date();
+  }
+
+  // Janela de 12 meses até dataRef (para VMM e total_unidades_vendidas)
+  const dataInicioJanela = new Date(Date.UTC(dataRef.getUTCFullYear() - 1, dataRef.getUTCMonth(), dataRef.getUTCDate()));
   const data3MesesAtras = new Date(dataRef.getTime() - 90 * 24 * 60 * 60 * 1000);
 
   const vendasTotaisPorCnp = new Map<string, number>();
   const ultimaVendaPorCnp = new Map<string, Date>();
   const vendasUltimos3MesesPorCnp = new Map<string, number>();
+  const mesesDistintos12m = new Set<string>();
   const mesMap = new Map<string, { cnp: string; mes: string; qtd: number; valor: number }>();
 
   for (const v of vendas) {
     const d = v.data_venda;
     if (d > dataRef) continue;
+    const dEfetiva = dataEfetivaUltimaVenda(d, v.granularidade);
 
-    // Acompanhar a data da última venda histórica real (apenas quantidade > 0)
+    // P1 #11: Guardar TODO o histórico em MartProdutoMes (sem cortar aos 13 meses)
+    const ym = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    const key = `${v.cnp_codigo}_${ym}`;
+    const cur = mesMap.get(key) || { cnp: v.cnp_codigo, mes: ym, qtd: 0, valor: 0 };
+    cur.qtd += v.quantidade;
+    cur.valor += Number(v.valor_total);
+    mesMap.set(key, cur);
+
+    // Acompanhar a data efetiva da última venda histórica real (apenas quantidade > 0)
     if (v.quantidade > 0) {
       const curLatest = ultimaVendaPorCnp.get(v.cnp_codigo);
-      if (!curLatest || d > curLatest) {
-        ultimaVendaPorCnp.set(v.cnp_codigo, d);
+      if (!curLatest || dEfetiva > curLatest) {
+        ultimaVendaPorCnp.set(v.cnp_codigo, dEfetiva);
       }
     }
 
-    if (d >= data3MesesAtras && v.quantidade > 0) {
+    if (dEfetiva >= data3MesesAtras && v.quantidade > 0) {
       vendasUltimos3MesesPorCnp.set(
         v.cnp_codigo,
         (vendasUltimos3MesesPorCnp.get(v.cnp_codigo) || 0) + v.quantidade
       );
     }
 
-    // Ignora movimentos históricos antigos fora do ciclo de 12-13 meses (ex: dados legados de 2022)
-    if (d < dataInicioJanela) continue;
-
-    if (v.granularidade !== 'DIARIO') {
+    // VMM e vendas 12M: estritamente nos últimos 12 meses até dataRef
+    if (dEfetiva > dataInicioJanela && v.granularidade !== 'DIARIO') {
+      mesesDistintos12m.add(ym);
       vendasTotaisPorCnp.set(v.cnp_codigo, (vendasTotaisPorCnp.get(v.cnp_codigo) || 0) + v.quantidade);
     }
-    const ym = `${v.data_venda.getUTCFullYear()}-${String(v.data_venda.getUTCMonth() + 1).padStart(2, '0')}`;
-    const key = `${v.cnp_codigo}_${ym}`;
-    const cur = mesMap.get(key) || { cnp: v.cnp_codigo, mes: ym, qtd: 0, valor: 0 };
-    cur.qtd += v.quantidade;
-    cur.valor += Number(v.valor_total);
-    mesMap.set(key, cur);
   }
+  const mesesComDados12m = Math.min(12, Math.max(1, mesesDistintos12m.size || 12));
 
   const productRows: any[] = [];
   const now = new Date();
@@ -188,7 +210,6 @@ export async function computeAndPersistMarts(
   }>();
 
   for (const inv of inventarios) {
-    // 3.4: Mesma regra do painel (analysis.ts): apenas artigos com stock positivo entram no mart de stock ativo
     if (inv.quantidade <= 0) continue;
     const existing = cnpAgg.get(inv.cnp_codigo) || {
       produto: inv.produto,
@@ -206,6 +227,27 @@ export async function computeAndPersistMarts(
     cnpAgg.set(inv.cnp_codigo, existing);
   }
 
+  // P0 #1 (Passo 5): Incluir TAMBÉM produtos com stock = 0 que tiveram vendas nos últimos 12 meses (ruturas & histórico ativo)
+  const zeroStockCnpsComVendas: string[] = [];
+  for (const [cnp, qtd12m] of vendasTotaisPorCnp.entries()) {
+    if (qtd12m > 0 && !cnpAgg.has(cnp)) {
+      zeroStockCnpsComVendas.push(cnp);
+    }
+  }
+  if (zeroStockCnpsComVendas.length > 0) {
+    const pmZero = await prisma.produtoMestre.findMany({
+      where: { cnp_codigo: { in: zeroStockCnpsComVendas } },
+    });
+    for (const pm of pmZero) {
+      cnpAgg.set(pm.cnp_codigo, {
+        produto: pm,
+        stockTotal: 0,
+        valorCustoTotal: 0,
+        validadeMin: null,
+      });
+    }
+  }
+
   for (const [cnp, item] of cnpAgg.entries()) {
     const p = item.produto;
     const mono = monosSet.get(cnp);
@@ -214,25 +256,27 @@ export async function computeAndPersistMarts(
     const rut = ruturaSet.get(cnp);
 
     const custoMedio = item.stockTotal > 0 ? item.valorCustoTotal / item.stockTotal : 0;
-
     const vendasTot = vendasTotaisPorCnp.get(cnp) || 0;
-    const vmmFallback = Math.round((vendasTot / 12) * 100) / 100;
-    const vmmFinal = exc?.vmm !== undefined ? Number(exc.vmm) : (cad?.vmm !== undefined ? Number(cad.vmm) : vmmFallback);
-    const cobFallback = vmmFinal > 0 ? Math.round((item.stockTotal / vmmFinal) * 100) / 100 : (item.stockTotal > 0 ? 999 : 0);
-    const cobFinal = exc?.cobertura_meses !== undefined ? Number(exc.cobertura_meses) : (cad?.cobertura_meses !== undefined ? Number(cad.cobertura_meses) : cobFallback);
-    const rutFinal = Boolean(rut) || (item.stockTotal === 0 && vendasTot >= 6) || (vmmFinal >= 1.0 && cobFinal < 0.7);
-
-    // P0.3: Cálculo de dias_sem_vendas real a partir da última venda e regra estrita de mono
+    const vendas90d = vendasUltimos3MesesPorCnp.get(cnp) || 0;
+    const vmmFinal = calcularVmm(vendasTot, mesesComDados12m);
     const lastSaleDate = ultimaVendaPorCnp.get(cnp) || (mono?.ultima_venda ? new Date(mono.ultima_venda) : null);
-    let diasSemVendasReal: number | null = null;
-    if (lastSaleDate) {
-      diasSemVendasReal = Math.max(0, Math.floor((dataRef.getTime() - lastSaleDate.getTime()) / (1000 * 60 * 60 * 24)));
-    } else if (item.stockTotal > 0) {
-      diasSemVendasReal = 999;
-    }
 
-    // C1: Regra canónica única de mono igual ao painel (stock > 0 e 0 vendas nos últimos N dias)
-    const ehMonoReal = Boolean(mono);
+    // Módulo único de métricas (Catálogo 2)
+    const estados = calcularEstadosProduto({
+      stockTotal: item.stockTotal,
+      vmm: vmmFinal,
+      vendasUltimos90d: vendas90d,
+      ultimaVendaEfetiva: lastSaleDate,
+      dataReferencia: dataRef,
+      janelaMonoDias: 90,
+      validadeMaisProxima: item.validadeMin,
+      custoUnitario: custoMedio > 0 ? custoMedio : null,
+    });
+
+    const cobFinal = estados.cobertura_meses ?? 0;
+    const rutFinal = Boolean(rut) || estados.eh_rutura || estados.eh_risco_rutura;
+    const ehMonoReal = item.stockTotal > 0 ? estados.eh_mono : false;
+    const ehExcessoReal = item.stockTotal > 0 ? estados.eh_excesso_cobertura : false;
 
     productRows.push({
       farmaciaId,
@@ -243,7 +287,8 @@ export async function computeAndPersistMarts(
       segmento: p.macro_area || null,
       categoria: p.categoria || null,
       subcategoria: p.subcategoria || null,
-      eh_generico: Boolean(p.dci || mono?.eh_generico || exc?.eh_generico),
+      // P2 #15: Classificação oficial de genérico (nunca "tem DCI")
+      eh_generico: ehGenericoOficial(cnp, p.designacao, p.taxa_iva),
       grupo_equivalencia_dci: p.dci || null,
       molecula_dci: p.dci || null,
       laboratorio_titular: p.laboratorio_titular || null,
@@ -257,16 +302,16 @@ export async function computeAndPersistMarts(
       vmm: vmmFinal,
       cobertura_meses: cobFinal,
       data_ultima_venda: lastSaleDate,
-      dias_sem_vendas: diasSemVendasReal,
+      dias_sem_vendas: estados.dias_sem_vendas,
       eh_mono: ehMonoReal,
-      eh_excesso_cobertura: Boolean(exc),
-      unidades_excesso: exc ? Math.max(0, exc.stock_atual - Math.ceil(exc.vmm * 4)) : 0,
-      capital_excesso: exc ? Math.max(0, (exc.stock_atual - Math.ceil(exc.vmm * 4)) * exc.custo_unitario) : 0,
+      eh_excesso_cobertura: ehExcessoReal,
+      unidades_excesso: estados.unidades_excesso,
+      capital_excesso: estados.capital_excesso_eur ?? 0,
       data_validade_mais_proxima: item.validadeMin,
       meses_ate_validade: cad?.meses_ate_caducidade || null,
-      unidades_em_risco_caducidade: cad?.unidades_em_risco || 0,
-      valor_em_risco_caducidade: cad?.valor_em_risco || 0,
-      eh_risco_caducidade: Boolean(cad),
+      unidades_em_risco_caducidade: estados.unidades_risco_caducidade,
+      valor_em_risco_caducidade: estados.capital_risco_caducidade_eur ?? 0,
+      eh_risco_caducidade: estados.eh_risco_caducidade,
       eh_risco_rutura: rutFinal,
       sugestao_cross_sell: exc?.sugestao_balcao || mono?.acao_sugerida || null,
       atualizadoEm: now,

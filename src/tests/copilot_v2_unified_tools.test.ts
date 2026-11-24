@@ -18,6 +18,11 @@ import {
 } from '../services/pharma_tool_helpers';
 import { calculateClaudeCostEur } from '../services/copilot_engine';
 import { validateAgentV2Response } from '../services/copilot_agent_v2';
+import {
+  calcularEstadosProduto,
+  calcularTaxaIva,
+  dataEfetivaUltimaVenda,
+} from '../services/metricas';
 
 const prisma = new PrismaClient();
 const FARMACIA_A_ID = '3ac42c32-87a8-4afe-98cc-4ca61ac64aca';
@@ -239,7 +244,41 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
     expect(goodIssues.length).toBe(0);
   });
 
-  it('9. Validação vm.Script de todos os blocos <script> inline em src/server.ts', () => {
+  it('9. Módulo único metricas.ts (Catálogo 2): cobertura null, última venda mensal = fim do mês, mono != excesso, IVA inferido (#27)', () => {
+    const ivaInf = calcularTaxaIva(null, 'VENDA_LIVRE');
+    expect(ivaInf).toEqual({ taxa_iva_pct: 23, taxa_iva_origem: 'INFERIDA' });
+    const ivaOfic = calcularTaxaIva(6, 'MSRM');
+    expect(ivaOfic).toEqual({ taxa_iva_pct: 6, taxa_iva_origem: 'OFICIAL' });
+
+    const fimMes = dataEfetivaUltimaVenda(new Date('2026-10-01T00:00:00Z'), 'MENSAL');
+    expect(fimMes.toISOString().slice(0, 10)).toBe('2026-10-31');
+
+    // Mono sem vendas: cobertura_meses === null, eh_mono === true, eh_excesso_cobertura === false (P2 #16)
+    const mono = calcularEstadosProduto({
+      stockTotal: 5,
+      vmm: 0,
+      vendasUltimos90d: 0,
+      ultimaVendaEfetiva: null,
+      dataReferencia: new Date('2026-11-11T23:59:59Z'),
+      custoUnitario: 10,
+    });
+    expect(mono.cobertura_meses).toBeNull();
+    expect(mono.eh_mono).toBe(true);
+    expect(mono.eh_excesso_cobertura).toBe(false);
+
+    // Rutura com stock 0 e vendas nos últimos 90d (P0 #1)
+    const rut = calcularEstadosProduto({
+      stockTotal: 0,
+      vmm: 3,
+      vendasUltimos90d: 9,
+      ultimaVendaEfetiva: new Date('2026-10-31T23:59:59Z'),
+      dataReferencia: new Date('2026-11-11T23:59:59Z'),
+    });
+    expect(rut.eh_rutura).toBe(true);
+    expect(rut.eh_mono).toBe(false);
+  });
+
+  it('10. Validação vm.Script de todos os blocos <script> inline em src/server.ts', () => {
     const src = fs.readFileSync('src/server.ts', 'utf8');
     const blocks = src.match(/<script>([\s\S]*?)<\/script>/g) || [];
     expect(blocks.length).toBeGreaterThan(0);

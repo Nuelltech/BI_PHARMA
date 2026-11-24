@@ -1,6 +1,8 @@
 import { PrismaClient } from '@prisma/client';
 import { matchesLabFilter, checkMonthCompletenessD6 } from './copilot_semantic_layer.js';
 import { isTherapeuticChronic } from './copilot_chronic_therapies.js';
+import { calcularMargemSemIva, TaxaIvaOrigem } from './metricas.js';
+import { getLatestImportForPharmacy } from './import_registry.js';
 
 export { matchesLabFilter, checkMonthCompletenessD6, isTherapeuticChronic };
 
@@ -145,6 +147,7 @@ export interface MargemIvaResult {
   pvp_eur: number | null;
   pvp_origem: 'FARMACIA' | 'PRODUTO_MESTRE' | 'INEXISTENTE';
   taxa_iva_pct: number;
+  taxa_iva_origem: TaxaIvaOrigem;
   pvp_sem_iva_eur: number | null;
   custo_unitario_eur: number | null;
   margem_unitaria_eur: number | null;
@@ -167,42 +170,13 @@ export function calcularMargemComIva(params: {
   taxaIva?: number | null;
   tipoVenda?: string | null;
 }): MargemIvaResult {
-  const pvpF = Number(params.pvpFarmacia || 0);
-  const pvpM = Number(params.pvpMestre || 0);
-  const custo = Number(params.custoUnitario || 0);
-  const taxa_iva_pct = inferTaxaIvaPct(params.taxaIva, params.tipoVenda);
-
-  let pvp_eur: number | null = null;
-  let pvp_origem: 'FARMACIA' | 'PRODUTO_MESTRE' | 'INEXISTENTE' = 'INEXISTENTE';
-  if (pvpF > 0) {
-    pvp_eur = Number(pvpF.toFixed(2));
-    pvp_origem = 'FARMACIA';
-  } else if (pvpM > 0) {
-    pvp_eur = Number(pvpM.toFixed(2));
-    pvp_origem = 'PRODUTO_MESTRE';
-  }
-
-  const pvp_sem_iva_eur =
-    pvp_eur !== null ? Number((pvp_eur / (1 + taxa_iva_pct / 100)).toFixed(2)) : null;
-
-  const custo_unitario_eur = custo > 0 ? Number(custo.toFixed(2)) : null;
-
-  let margem_unitaria_eur: number | null = null;
-  let margem_pct: number | null = null;
-  if (pvp_sem_iva_eur !== null && pvp_sem_iva_eur > 0 && custo_unitario_eur !== null && custo_unitario_eur > 0) {
-    margem_unitaria_eur = Number((pvp_sem_iva_eur - custo_unitario_eur).toFixed(2));
-    margem_pct = Number((((pvp_sem_iva_eur - custo_unitario_eur) / pvp_sem_iva_eur) * 100).toFixed(1));
-  }
-
-  return {
-    pvp_eur,
-    pvp_origem,
-    taxa_iva_pct,
-    pvp_sem_iva_eur,
-    custo_unitario_eur,
-    margem_unitaria_eur,
-    margem_pct,
-  };
+  return calcularMargemSemIva({
+    pvpFarmacia: params.pvpFarmacia,
+    pvpMestre: params.pvpMestre,
+    custoUnitario: params.custoUnitario,
+    taxaIvaDb: params.taxaIva,
+    tipoVenda: params.tipoVenda,
+  });
 }
 
 // ============================================================================
@@ -225,6 +199,22 @@ export async function getPharmacyDataFreshness(
   const cached = freshnessCache.get(farmaciaId);
   if (cached && Date.now() - cached.ts < FRESHNESS_TTL_MS) {
     return cached.data;
+  }
+
+  // #26: Priorizar a data real do RegistoImportacao (ex: 2026-11-11 na Farmácia A em vez de 2026-11-01)
+  const latestImp = await getLatestImportForPharmacy(prisma, farmaciaId);
+  if (latestImp) {
+    const aviso_dados_incompletos = latestImp.mes_parcial
+      ? `O mês ${latestImp.ultimo_mes} apresenta dados parciais (importação até ${latestImp.dados_ate}).`
+      : null;
+    const data: DataFreshnessMeta = {
+      dados_ate: latestImp.dados_ate,
+      ultimo_mes: latestImp.ultimo_mes,
+      mes_parcial: latestImp.mes_parcial,
+      aviso_dados_incompletos,
+    };
+    freshnessCache.set(farmaciaId, { ts: Date.now(), data });
+    return data;
   }
 
   const [maxVenda, maxInv] = await Promise.all([
