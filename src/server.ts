@@ -861,15 +861,35 @@ async function startServer() {
       const baseUrl = getBaseIssuerUrl(req);
 
       if (
+        pathname.startsWith('/mcp') ||
+        pathname.startsWith('/sse') ||
+        pathname.startsWith('/oauth') ||
+        pathname.startsWith('/.well-known/')
+      ) {
+        const mcpReqStart = Date.now();
+        res.on('finish', () => {
+          const hasAuth = Boolean(req.headers.authorization || parsedUrl.query.token || parsedUrl.query.acesso);
+          const hasSid = Boolean(req.headers['mcp-session-id']);
+          console.log(
+            `🧭 [MCP/OAUTH HTTP] ${req.method} ${pathname} -> ${res.statusCode} (${Date.now() - mcpReqStart}ms | auth:${hasAuth} | sid:${hasSid} | accept:${String(req.headers.accept || '-').slice(0, 40)})`
+          );
+        });
+      }
+
+      if (
         pathname === '/.well-known/oauth-protected-resource' ||
         pathname === '/.well-known/oauth-protected-resource/mcp' ||
         pathname === '/mcp/.well-known/oauth-protected-resource'
       ) {
+        const meta = getProtectedResourceMetadata(baseUrl);
+        if (pathname.includes('/mcp')) {
+          meta.resource = `${baseUrl}/mcp`;
+        }
         res.writeHead(200, {
           'Content-Type': 'application/json; charset=utf-8',
           'Access-Control-Allow-Origin': '*',
         });
-        res.end(JSON.stringify(getProtectedResourceMetadata(baseUrl)));
+        res.end(JSON.stringify(meta));
         return;
       }
 
@@ -1172,7 +1192,7 @@ async function startServer() {
             'Access-Control-Allow-Origin': '*',
           };
           if (statusCode === 401) {
-            errHeaders['WWW-Authenticate'] = `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`;
+            errHeaders['WWW-Authenticate'] = `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp"`;
           }
           res.writeHead(statusCode, errHeaders);
           res.end(JSON.stringify({ error: errorMsg, code: authRes.reason }));
