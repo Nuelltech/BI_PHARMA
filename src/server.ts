@@ -69,6 +69,8 @@ import {
   getProtectedResourceMetadata,
   getAuthorizationServerMetadata,
   registerOAuthClient,
+  getOAuthClient,
+  extractConnectorTokenInput,
   createOAuthAuthorizationCode,
   exchangeOAuthToken,
   renderOAuthConsentPage,
@@ -956,10 +958,14 @@ async function startServer() {
       }
 
       if (pathname === '/oauth/authorize') {
-        const farmacias = await prisma.farmacia.findMany({
-          orderBy: { criadoEm: 'asc' },
-          select: { id: true, nome: true, nif: true, codigo_acesso: true },
-        });
+        const isSafeRedirectUri = (uri: string): boolean => {
+          try {
+            const u = new URL(uri);
+            return u.protocol === 'https:' || (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1'));
+          } catch {
+            return false;
+          }
+        };
 
         if (req.method === 'GET') {
           const clientId = String(parsedUrl.query.client_id || '');
@@ -967,39 +973,27 @@ async function startServer() {
           const state = String(parsedUrl.query.state || '');
           const codeChallenge = String(parsedUrl.query.code_challenge || '');
           const codeChallengeMethod = String(parsedUrl.query.code_challenge_method || 'S256');
-          const autoApprove = parsedUrl.query.auto === '1' || parsedUrl.query.auto_approve === 'true';
+          const registeredClient = clientId ? getOAuthClient(clientId) : undefined;
 
-          if (autoApprove && farmacias.length > 0) {
-            const targetFarm = farmacias[0];
-            const authCode = createOAuthAuthorizationCode({
-              clientId,
-              redirectUri,
-              codeChallenge,
-              codeChallengeMethod,
-              state,
-              farmaciaId: targetFarm.id,
-              farmaciaNome: targetFarm.nome,
-              perfilPermissao: 'COMPLETO',
-            });
-            const redirectUrl = new URL(redirectUri);
-            redirectUrl.searchParams.set('code', authCode);
-            if (state) redirectUrl.searchParams.set('state', state);
-            redirectUrl.searchParams.set('iss', baseUrl);
-            res.writeHead(302, { Location: redirectUrl.toString() });
-            res.end();
+          if (!isSafeRedirectUri(redirectUri)) {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('redirect_uri inválido.');
             return;
           }
 
           const html = renderOAuthConsentPage({
             baseUrl,
             clientId,
+            clientName: registeredClient?.clientName,
             redirectUri,
             state,
             codeChallenge,
             codeChallengeMethod,
-            farmacias,
           });
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+          });
           res.end(html);
           return;
         }
@@ -1023,13 +1017,44 @@ async function startServer() {
           const state = params.state || String(parsedUrl.query.state || '');
           const codeChallenge = params.code_challenge || String(parsedUrl.query.code_challenge || '');
           const codeChallengeMethod = params.code_challenge_method || String(parsedUrl.query.code_challenge_method || 'S256');
-          const farmaciaId = params.farmacia_id || (farmacias[0]?.id ?? '');
-          const perfilPermissao = (params.perfil_permissao as McpPermissionProfile) || 'COMPLETO';
+          const registeredClient = clientId ? getOAuthClient(clientId) : undefined;
 
-          const chosenFarm = farmacias.find((f) => f.id === farmaciaId) || farmacias[0];
-          if (!chosenFarm) {
+          if (!isSafeRedirectUri(redirectUri)) {
             res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end('Nenhuma farmácia disponível para autorização.');
+            res.end('redirect_uri inválido.');
+            return;
+          }
+
+          const connectorToken = extractConnectorTokenInput(params.connector_token || '');
+          const clientIp = getClientIp(req);
+          const userAgent = String(req.headers['user-agent'] || '');
+
+          const authRes = await resolveMcpAuthentication(prisma, connectorToken, { ip: clientIp, userAgent });
+
+          if (!authRes.allowed || !authRes.farmacia || !authRes.connector) {
+            let errMsg = 'Token ou URL de conector MCP inválido. Copie o link gerado no painel "Governança MCP" da sua farmácia.';
+            if (authRes.reason === 'MCP_DISABLED_BY_PHARMACY') {
+              errMsg = 'O acesso externo MCP está desativado nas definições desta farmácia.';
+            } else if (authRes.reason === 'CONNECTOR_REVOKED') {
+              errMsg = 'Este conector MCP foi pausado ou revogado pelo Diretor Técnico da farmácia.';
+            } else if (authRes.allowed && !authRes.connector) {
+              errMsg = 'Por segurança, utilize um Token/URL de Conector MCP dedicado (gerado em Governança MCP) e não o código principal da farmácia.';
+            }
+            const html = renderOAuthConsentPage({
+              baseUrl,
+              clientId,
+              clientName: registeredClient?.clientName,
+              redirectUri,
+              state,
+              codeChallenge,
+              codeChallengeMethod,
+              errorMessage: errMsg,
+            });
+            res.writeHead(400, {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+            });
+            res.end(html);
             return;
           }
 
@@ -1039,9 +1064,11 @@ async function startServer() {
             codeChallenge,
             codeChallengeMethod,
             state,
-            farmaciaId: chosenFarm.id,
-            farmaciaNome: chosenFarm.nome,
-            perfilPermissao: perfilPermissao,
+            farmaciaId: authRes.farmacia.id,
+            farmaciaNome: authRes.farmacia.nome,
+            perfilPermissao: authRes.perfilPermissao || 'BALCAO_CLINICO',
+            connectorId: authRes.connector.id,
+            token: connectorToken,
           });
 
           const redirectUrl = new URL(redirectUri);

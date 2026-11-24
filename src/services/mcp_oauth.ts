@@ -255,26 +255,68 @@ export async function exchangeOAuthToken(
 }
 
 /**
- * Renderiza página de consentimento e vinculação amigável do Claude Web
+ * Deteta o nome amigável do Agente IA a partir do redirect_uri ou client_name registado
+ */
+export function detectOAuthClientDisplay(redirectUri: string, clientName?: string): {
+  shortName: string;
+  fullLabel: string;
+} {
+  const lowerUri = String(redirectUri || '').toLowerCase();
+  const lowerName = String(clientName || '').toLowerCase();
+
+  if (lowerUri.includes('chatgpt.com') || lowerUri.includes('openai.com') || lowerName.includes('chatgpt') || lowerName.includes('openai')) {
+    return { shortName: 'ChatGPT', fullLabel: 'ChatGPT (OpenAI)' };
+  }
+  if (lowerUri.includes('claude.ai') || lowerUri.includes('anthropic.com') || lowerName.includes('claude') || lowerName.includes('anthropic')) {
+    return { shortName: 'Claude', fullLabel: 'Claude (Anthropic)' };
+  }
+  if (lowerUri.includes('gemini.google.com') || lowerUri.includes('google.com') || lowerName.includes('gemini')) {
+    return { shortName: 'Gemini', fullLabel: 'Gemini (Google)' };
+  }
+  const cleanName = (clientName || '').trim();
+  if (cleanName) {
+    return { shortName: cleanName, fullLabel: cleanName };
+  }
+  return { shortName: 'Agente IA', fullLabel: 'Agente IA Externo' };
+}
+
+/**
+ * Extrai o token de conector quer o utilizador cole apenas a chave OU o URL completo copiado da app
+ */
+export function extractConnectorTokenInput(rawInput: string): string {
+  const trimmed = String(rawInput || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    try {
+      const u = new URL(trimmed);
+      const qTok = u.searchParams.get('token') || u.searchParams.get('acesso') || u.searchParams.get('code');
+      if (qTok) return qTok.trim();
+    } catch {}
+  }
+  return trimmed;
+}
+
+/**
+ * Renderiza página de consentimento segura (zero exposição de farmácias/códigos sem credencial)
  */
 export function renderOAuthConsentPage(data: {
   baseUrl: string;
   clientId: string;
+  clientName?: string;
   redirectUri: string;
   state?: string;
   codeChallenge?: string;
   codeChallengeMethod?: string;
-  farmacias: Array<{ id: string; nome: string; nif: string; codigo_acesso: string | null }>;
-  selectedFarmaciaId?: string;
+  errorMessage?: string;
 }): string {
-  const defaultFarm = data.farmacias.find((f) => f.id === data.selectedFarmaciaId) || data.farmacias[0];
+  const agent = detectOAuthClientDisplay(data.redirectUri, data.clientName);
 
   return `<!DOCTYPE html>
 <html lang="pt-PT">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Vincular Claude ao BI-PHARMA</title>
+  <title>Vincular ${escapeHtml(agent.shortName)} ao BI-PHARMA</title>
   <style>
     :root {
       --primary: #059669;
@@ -347,7 +389,17 @@ export function renderOAuthConsentPage(data: {
       color: var(--text-muted);
       font-size: 0.9rem;
       line-height: 1.5;
-      margin-bottom: 1.5rem;
+      margin-bottom: 1.25rem;
+    }
+    .error-banner {
+      background: rgba(239, 68, 68, 0.14);
+      border: 1px solid rgba(239, 68, 68, 0.45);
+      color: #fecaca;
+      border-radius: 0.65rem;
+      padding: 0.75rem 0.9rem;
+      font-size: 0.85rem;
+      line-height: 1.45;
+      margin-bottom: 1.25rem;
     }
     .box {
       background: rgba(15, 23, 42, 0.6);
@@ -357,38 +409,41 @@ export function renderOAuthConsentPage(data: {
       margin-bottom: 1.5rem;
     }
     .form-group {
-      margin-bottom: 1rem;
-    }
-    .form-group:last-child {
       margin-bottom: 0;
     }
     label {
       display: block;
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       font-weight: 600;
       color: var(--text-muted);
-      margin-bottom: 0.35rem;
+      margin-bottom: 0.45rem;
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
-    select, input {
+    input {
       width: 100%;
       background: #0f172a;
       border: 1px solid var(--border);
       color: #fff;
-      padding: 0.65rem 0.85rem;
+      padding: 0.7rem 0.85rem;
       border-radius: 0.5rem;
-      font-size: 0.95rem;
+      font-size: 0.92rem;
       outline: none;
       transition: border-color 0.2s;
     }
-    select:focus, input:focus {
+    input:focus {
       border-color: #10b981;
+    }
+    .hint {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      margin-top: 0.55rem;
+      line-height: 1.45;
     }
     .permissions-list {
       list-style: none;
-      margin: 1rem 0;
-      font-size: 0.85rem;
+      margin: 1rem 0 1.25rem;
+      font-size: 0.84rem;
       color: #cbd5e1;
     }
     .permissions-list li {
@@ -447,10 +502,12 @@ export function renderOAuthConsentPage(data: {
       </div>
     </div>
 
-    <h1>Autorizar Ligação do Claude AI</h1>
-    <p class="desc">A sua conta no <strong>Claude (Anthropic)</strong> está a solicitar acesso seguro em tempo real aos dados analíticos da farmácia.</p>
+    <h1>Autorizar Ligação do ${escapeHtml(agent.shortName)}</h1>
+    <p class="desc">A sua conta no <strong>${escapeHtml(agent.fullLabel)}</strong> está a solicitar acesso seguro aos dados analíticos da sua farmácia.</p>
 
-    <form method="POST" action="${data.baseUrl}/oauth/authorize">
+    ${data.errorMessage ? `<div class="error-banner">⚠️ ${escapeHtml(data.errorMessage)}</div>` : ''}
+
+    <form method="POST" action="${escapeHtml(data.baseUrl)}/oauth/authorize">
       <input type="hidden" name="client_id" value="${escapeHtml(data.clientId)}">
       <input type="hidden" name="redirect_uri" value="${escapeHtml(data.redirectUri)}">
       <input type="hidden" name="state" value="${escapeHtml(data.state || '')}">
@@ -459,35 +516,29 @@ export function renderOAuthConsentPage(data: {
 
       <div class="box">
         <div class="form-group">
-          <label>Farmácia a Conectar</label>
-          <select name="farmacia_id">
-            ${data.farmacias
-              .map(
-                (f) =>
-                  `<option value="${f.id}" ${f.id === defaultFarm?.id ? 'selected' : ''}>${escapeHtml(f.nome)} (${escapeHtml(f.codigo_acesso || f.nif)})</option>`
-              )
-              .join('')}
-          </select>
-        </div>
-
-        <div class="form-group" style="margin-top: 0.75rem;">
-          <label>Nível de Acesso (Perfil MCP)</label>
-          <select name="perfil_permissao">
-            <option value="COMPLETO" selected>Direção Técnica / Completo (20 Ferramentas)</option>
-            <option value="GESTAO_COMPRAS">Gestão de Compras & Stocks (Sem Anomalias Margem)</option>
-            <option value="BALCAO_CLINICO">Balcão Clínico (Sem Dados Financeiros Restritos)</option>
-          </select>
+          <label for="connector_token">URL ou Token do Conector MCP da Farmácia</label>
+          <input
+            id="connector_token"
+            name="connector_token"
+            type="password"
+            required
+            autocomplete="off"
+            placeholder="Cole aqui o URL ou Token gerado em Governança MCP..."
+          />
+          <p class="hint">
+            A farmácia e o perfil de permissões (Direção Técnica, Compras ou Balcão) são determinados automaticamente pelo conector criado na sua app BI-PHARMA.
+          </p>
         </div>
       </div>
 
       <ul class="permissions-list">
         <li>
           <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
-          Consulta inteligente de stock, ruturas e validades críticas
+          Isolamento estrito: acesso exclusivo à farmácia do conector autorizado
         </li>
         <li>
           <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
-          Análise de curvas ABC, sazonalidade e campanhas
+          Permissões limitadas ao perfil definido pelo Diretor Técnico na app
         </li>
         <li>
           <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
@@ -496,7 +547,7 @@ export function renderOAuthConsentPage(data: {
       </ul>
 
       <button type="submit" class="btn-submit">
-        <span>Vincular e Autorizar Claude</span>
+        <span>Vincular e Autorizar ${escapeHtml(agent.shortName)}</span>
         <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
       </button>
 

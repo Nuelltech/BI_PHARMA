@@ -7,6 +7,9 @@ import {
   registerOAuthClient,
   createOAuthAuthorizationCode,
   exchangeOAuthToken,
+  detectOAuthClientDisplay,
+  extractConnectorTokenInput,
+  renderOAuthConsentPage,
 } from '../services/mcp_oauth';
 
 describe('MCP OAuth 2.1 Handshake Service', () => {
@@ -105,5 +108,31 @@ describe('MCP OAuth 2.1 Handshake Service', () => {
         codeVerifier: 'wrongVerifierStringThatDoesNotMatchHash',
       })
     ).rejects.toThrow('Validação PKCE falhou');
+  });
+
+  it('deve detetar dinamicamente ChatGPT, Claude e Gemini no consentimento OAuth', () => {
+    expect(detectOAuthClientDisplay('https://chatgpt.com/connector/oauth/abc').shortName).toBe('ChatGPT');
+    expect(detectOAuthClientDisplay('https://claude.ai/api/mcp/auth_callback').shortName).toBe('Claude');
+    expect(detectOAuthClientDisplay('https://gemini.google.com/callback').shortName).toBe('Gemini');
+  });
+
+  it('deve extrair token tanto de chave direta como de URL completo colado pelo utilizador', () => {
+    expect(extractConnectorTokenInput('0bc5b3bc4e629930')).toBe('0bc5b3bc4e629930');
+    expect(extractConnectorTokenInput('https://bipharma.nuelltech.com/mcp?token=0bc5b3bc4e629930')).toBe('0bc5b3bc4e629930');
+  });
+
+  it('página de consentimento OAuth nunca expõe dropdown de farmácias nem perfis e adapta o nome do agente', () => {
+    const html = renderOAuthConsentPage({
+      baseUrl: mockBaseUrl,
+      clientId: 'mcp_client_123',
+      redirectUri: 'https://chatgpt.com/connector/oauth/xyz',
+      state: 'st1',
+    });
+    expect(html).toContain('ChatGPT (OpenAI)');
+    expect(html).toContain('Vincular e Autorizar ChatGPT');
+    expect(html).not.toContain('Claude (Anthropic)');
+    expect(html).not.toContain('name="farmacia_id"');
+    expect(html).not.toContain('name="perfil_permissao"');
+    expect(html).toContain('name="connector_token"');
   });
 });
