@@ -1088,7 +1088,7 @@ export function getMobileStaffHtml(): string {
     let rawReport = null;
     let tasksMap = {};
     let allFarmacias = [];
-    let statusFilters = ['all', 'all', 'all', 'all'];
+    let statusFilters = ['pending', 'pending', 'pending', 'pending'];
     let balcaoSubtab = 'restos'; // 'restos' | 'winter' | 'all'
     let syncInterval = null;
     let taskEventSource = null;
@@ -1473,6 +1473,12 @@ export function getMobileStaffHtml(): string {
         window.customTasksList = Array.isArray(tData.customTasks) ? tData.customTasks : [];
 
         renderMobileCustomMissionsBanner();
+        [0, 1, 2, 3].forEach(i => {
+          ['all', 'pending', 'done'].forEach(f => {
+            const el = document.getElementById('f' + i + '_' + f);
+            if (el) el.classList.toggle('active', statusFilters[i] === f);
+          });
+        });
         renderSection1();
         renderSection2();
         renderSection3();
@@ -1669,17 +1675,17 @@ export function getMobileStaffHtml(): string {
       if (!banner || !listEl) return;
 
       const list = Array.isArray(window.customTasksList) ? window.customTasksList : [];
-      if (list.length === 0) {
+      const pendingList = list.filter(ct => !(tasksMap[ct.task_id] ? !!tasksMap[ct.task_id].concluido : !!ct.concluido));
+      if (pendingList.length === 0) {
         banner.style.display = 'none';
         listEl.innerHTML = '';
         return;
       }
 
-      const pendingCount = list.filter(ct => !(tasksMap[ct.task_id] ? !!tasksMap[ct.task_id].concluido : !!ct.concluido)).length;
-      if (countEl) countEl.textContent = pendingCount + ' pendentes / ' + list.length;
+      if (countEl) countEl.textContent = pendingList.length + (pendingList.length === 1 ? ' pendente' : ' pendentes');
       banner.style.display = 'block';
 
-      listEl.innerHTML = list.map(ct => {
+      listEl.innerHTML = pendingList.map(ct => {
         const tInfo = tasksMap[ct.task_id];
         const isDone = tInfo ? !!tInfo.concluido : !!ct.concluido;
         const valImp = ct.valor_impacto != null ? Number(ct.valor_impacto) : 0;

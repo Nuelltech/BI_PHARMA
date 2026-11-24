@@ -5799,12 +5799,19 @@ function getDashboardHtml(): string {
             <span style="font-size: 1.05rem; font-weight: 800; color: #3730a3;">🎯 Missões da Direção, Copilot & Campanhas Ativas</span>
             <span id="planoCustomTasksCount" class="badge badge-info">0 missões</span>
           </div>
-          <button class="btn" onclick="openNewCustomTaskModal()" style="background: #4f46e5; color: #ffffff; font-size: 0.78rem; padding: 6px 12px; font-weight: 700;">
-            + Nova Tarefa Manual
-          </button>
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <div class="plano-status-group">
+              <button type="button" class="plano-status-pill active" id="customTasksPill_pending" onclick="setCustomTasksStatus('pending')">Pendentes</button>
+              <button type="button" class="plano-status-pill" id="customTasksPill_done" onclick="setCustomTasksStatus('done')">Concluídas</button>
+              <button type="button" class="plano-status-pill" id="customTasksPill_all" onclick="setCustomTasksStatus('all')">Todas</button>
+            </div>
+            <button class="btn" onclick="openNewCustomTaskModal()" style="background: #4f46e5; color: #ffffff; font-size: 0.78rem; padding: 6px 12px; font-weight: 700;">
+              + Nova Tarefa Manual
+            </button>
+          </div>
         </div>
         <div id="planoCustomTasksList" style="display: flex; flex-direction: column; gap: 8px;">
-          <div style="color: var(--muted); font-size: 0.82rem; padding: 6px 2px;">Sem missões personalizadas ou de campanhas nesta semana. Crie uma tarefa manual ou ative uma campanha no Estúdio / Copilot.</div>
+          <div style="color: var(--muted); font-size: 0.82rem; padding: 6px 2px;">Sem missões pendentes no momento.</div>
         </div>
       </div>
 
@@ -5853,9 +5860,9 @@ function getDashboardHtml(): string {
                 <input type="text" id="deskCadSearch" placeholder="Pesquisar produto, lote, CNP ou prateleira..." oninput="onDesktopCadFilterChange()" />
               </div>
               <div class="plano-status-group">
-                <button type="button" class="plano-status-pill active" id="deskCadPill_all" onclick="setDesktopCadStatus('all')">Todos</button>
-                <button type="button" class="plano-status-pill" id="deskCadPill_pending" onclick="setDesktopCadStatus('pending')">Pendentes</button>
+                <button type="button" class="plano-status-pill active" id="deskCadPill_pending" onclick="setDesktopCadStatus('pending')">Pendentes</button>
                 <button type="button" class="plano-status-pill" id="deskCadPill_done" onclick="setDesktopCadStatus('done')">Concluídos</button>
+                <button type="button" class="plano-status-pill" id="deskCadPill_all" onclick="setDesktopCadStatus('all')">Todos</button>
               </div>
               <span id="planoCard1FilteredBadge" class="plano-counter-badge">0 produtos</span>
             </div>
@@ -5902,9 +5909,9 @@ function getDashboardHtml(): string {
                 <input type="text" id="deskBalcaoSearch" placeholder="Pesquisar molécula DCI ou produto..." oninput="onDesktopBalcaoFilterChange()" />
               </div>
               <div class="plano-status-group">
-                <button type="button" class="plano-status-pill active" id="deskBalcaoPill_all" onclick="setDesktopBalcaoStatus('all')">Todos</button>
-                <button type="button" class="plano-status-pill" id="deskBalcaoPill_pending" onclick="setDesktopBalcaoStatus('pending')">Pendentes</button>
+                <button type="button" class="plano-status-pill active" id="deskBalcaoPill_pending" onclick="setDesktopBalcaoStatus('pending')">Pendentes</button>
                 <button type="button" class="plano-status-pill" id="deskBalcaoPill_done" onclick="setDesktopBalcaoStatus('done')">Concluídos</button>
+                <button type="button" class="plano-status-pill" id="deskBalcaoPill_all" onclick="setDesktopBalcaoStatus('all')">Todos</button>
               </div>
               <span id="planoCard2FilteredBadge" class="plano-counter-badge">0 itens</span>
             </div>
@@ -5947,9 +5954,9 @@ function getDashboardHtml(): string {
                 <input type="text" id="deskTravSearch" placeholder="Pesquisar artigo ou CNP a travar..." oninput="onDesktopTravFilterChange()" />
               </div>
               <div class="plano-status-group">
-                <button type="button" class="plano-status-pill active" id="deskTravPill_all" onclick="setDesktopTravStatus('all')">Todos</button>
-                <button type="button" class="plano-status-pill" id="deskTravPill_pending" onclick="setDesktopTravStatus('pending')">Pendentes</button>
+                <button type="button" class="plano-status-pill active" id="deskTravPill_pending" onclick="setDesktopTravStatus('pending')">Pendentes</button>
                 <button type="button" class="plano-status-pill" id="deskTravPill_done" onclick="setDesktopTravStatus('done')">Concluídos</button>
+                <button type="button" class="plano-status-pill" id="deskTravPill_all" onclick="setDesktopTravStatus('all')">Todos</button>
               </div>
               <span id="planoCard3FilteredBadge" class="plano-counter-badge">0 artigos</span>
             </div>
@@ -5992,9 +5999,9 @@ function getDashboardHtml(): string {
                 <input type="text" id="deskRuturaSearch" placeholder="Pesquisar medicamento em risco..." oninput="onDesktopRuturaFilterChange()" />
               </div>
               <div class="plano-status-group">
-                <button type="button" class="plano-status-pill active" id="deskRuturaPill_all" onclick="setDesktopRuturaStatus('all')">Todos</button>
-                <button type="button" class="plano-status-pill" id="deskRuturaPill_pending" onclick="setDesktopRuturaStatus('pending')">Pendentes</button>
+                <button type="button" class="plano-status-pill active" id="deskRuturaPill_pending" onclick="setDesktopRuturaStatus('pending')">Pendentes</button>
                 <button type="button" class="plano-status-pill" id="deskRuturaPill_done" onclick="setDesktopRuturaStatus('done')">Concluídos</button>
+                <button type="button" class="plano-status-pill" id="deskRuturaPill_all" onclick="setDesktopRuturaStatus('all')">Todos</button>
               </div>
               <span id="planoCard4FilteredBadge" class="plano-counter-badge">0 artigos</span>
             </div>
@@ -9857,6 +9864,16 @@ function getDashboardHtml(): string {
     // ========================================================================
     let remoteDoneTasksMap = {};
     let remoteCustomTasks = [];
+    let customTasksStatusFilter = 'pending';
+
+    function setCustomTasksStatus(st) {
+      customTasksStatusFilter = st;
+      ['pending', 'done', 'all'].forEach(k => {
+        const el = document.getElementById('customTasksPill_' + k);
+        if (el) el.classList.toggle('active', k === st);
+      });
+      renderPlanoCustomTasks();
+    }
 
     function renderPlanoCustomTasks() {
       const listEl = document.getElementById('planoCustomTasksList');
@@ -9865,23 +9882,34 @@ function getDashboardHtml(): string {
 
       const doneMap = getDoneTasksMap();
       const tasks = Array.isArray(remoteCustomTasks) ? remoteCustomTasks : [];
-      const doneCount = tasks.filter(t => {
+      const isTaskDone = (t) => {
         const entry = doneMap[t.task_id];
-        return entry ? (typeof entry === 'object' ? !!entry.concluido : !!entry) : !!t.concluido;
-      }).length;
+        return entry !== undefined ? (typeof entry === 'object' && entry !== null ? !!entry.concluido : !!entry) : !!t.concluido;
+      };
+      const doneCount = tasks.filter(isTaskDone).length;
+      const pendingCount = tasks.length - doneCount;
 
       if (countEl) {
-        countEl.textContent = tasks.length + (tasks.length === 1 ? ' missão' : ' missões') + (tasks.length > 0 ? ' (' + doneCount + ' concluídas)' : '');
+        countEl.textContent = pendingCount + (pendingCount === 1 ? ' pendente' : ' pendentes') + (doneCount > 0 ? ' · ' + doneCount + ' concluídas' : '');
       }
 
-      if (tasks.length === 0) {
-        listEl.innerHTML = '<div style="color: var(--muted); font-size: 0.82rem; padding: 6px 2px;">Sem missões personalizadas ou de campanhas nesta semana. Crie uma tarefa manual ou ative uma campanha no Estúdio / Copilot.</div>';
+      const visibleTasks = tasks.filter(t => {
+        const d = isTaskDone(t);
+        if (customTasksStatusFilter === 'pending') return !d;
+        if (customTasksStatusFilter === 'done') return d;
+        return true;
+      });
+
+      if (visibleTasks.length === 0) {
+        const msg = customTasksStatusFilter === 'pending'
+          ? (doneCount > 0 ? '✅ Todas as missões estão concluídas! Clique em "Concluídas" para consultar.' : 'Sem missões pendentes no momento. Crie uma tarefa manual ou ative uma campanha.')
+          : (customTasksStatusFilter === 'done' ? 'Ainda sem missões concluídas nos últimos 7 dias.' : 'Sem missões registadas.');
+        listEl.innerHTML = '<div style="color: var(--muted); font-size: 0.82rem; padding: 6px 2px;">' + msg + '</div>';
         return;
       }
 
-      listEl.innerHTML = tasks.map(t => {
-        const entry = doneMap[t.task_id];
-        const isDone = entry ? (typeof entry === 'object' ? !!entry.concluido : !!entry) : !!t.concluido;
+      listEl.innerHTML = visibleTasks.map(t => {
+        const isDone = isTaskDone(t);
         const isCamp = String(t.task_id || '').startsWith('CAMPANHA_') || String(t.categoria || '').includes('CAMPANHA');
         const badgeLabel = isCamp ? '🎯 Campanha' : (String(t.categoria || '') === 'ENCOMENDAS_CAMPANHA' || String(t.categoria || '') === 'TRAVAR' ? '🛒 Encomendas' : '📋 Direção / Copilot');
         const badgeBg = isCamp ? '#ffe4e6' : '#e0e7ff';
@@ -10021,6 +10049,11 @@ function getDashboardHtml(): string {
 
       remoteDoneTasksMap = map;
       localStorage.setItem('bi_pharma_weekly_done_' + activeFarmaciaId, JSON.stringify(map));
+      renderPlanoCustomTasks();
+      renderDesktopCard1(true);
+      renderDesktopCard2(true);
+      renderDesktopCard3(true);
+      renderDesktopCard4(true);
       updateWeeklyTasksCounter();
 
       try {
@@ -10522,12 +10555,17 @@ function getDashboardHtml(): string {
     // ESTADO E CONTROLO DOS FILTROS DA FICHA DE TRABALHO (DESKTOP)
     // ========================================================================
     let desktopFilters = {
-      cadStatus: 'all',
+      cadStatus: 'pending',
       balcaoSubtab: 'restos',
-      balcaoStatus: 'all',
-      travStatus: 'all',
-      ruturaStatus: 'all'
+      balcaoStatus: 'pending',
+      travStatus: 'pending',
+      ruturaStatus: 'pending'
     };
+
+    function isTaskDoneInMap(map, taskId) {
+      const entry = map && map[taskId];
+      return typeof entry === 'object' && entry !== null ? !!entry.concluido : !!entry;
+    }
 
     function setDesktopCadStatus(status) {
       desktopFilters.cadStatus = status;

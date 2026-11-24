@@ -31,13 +31,72 @@ export async function getPharmacyWeeklyTasks(
   weekKey?: string
 ) {
   const key = weekKey || getCurrentWeekKey();
-  const tasks = await (prisma as any).tarefaEquipa.findMany({
-    where: {
-      farmaciaId,
-      week_key: key,
-    },
-    orderBy: { concluido_em: 'desc' },
-  });
+  const now = Date.now();
+  const daysAgo = (d: number) => new Date(now - d * 24 * 60 * 60 * 1000);
+
+  // Carrega tarefas relevantes com ciclo de vida inteligente (não apaga tudo cegamente à segunda-feira):
+  // - Todas as tarefas pendentes manuais/Copilot/campanha (transitam de semana até conclusão)
+  // - Tarefas concluídas dentro da janela de silenciamento por categoria (Validades 90d, Travar 60d, Restantes 7d)
+  const [allRelevantTasks, activeCampaigns] = await Promise.all([
+    (prisma as any).tarefaEquipa.findMany({
+      where: {
+        farmaciaId,
+        OR: [
+          { week_key: key },
+          { concluido: false },
+          { concluido: true, concluido_em: { gte: daysAgo(90) } },
+        ],
+      },
+      orderBy: { concluido_em: 'desc' },
+    }),
+    prisma.campanhaAtiva.findMany({
+      where: { farmaciaId, estado: 'ATIVA' },
+      select: { campanhaId: true },
+    }),
+  ]);
+
+  const activeCampIds = new Set(activeCampaigns.map((c) => c.campanhaId));
+
+  const CUSTOM_CATS = new Set([
+    'BALCAO_CAMPANHA',
+    'ENCOMENDAS_CAMPANHA',
+    'DIRECAO_TECNICA',
+    'CAMPANHA',
+    'MANUAL',
+  ]);
+
+  const isCustomTask = (t: any) =>
+    String(t.task_id || '').startsWith('MANUAL_') ||
+    String(t.task_id || '').startsWith('CAMPANHA_') ||
+    String(t.task_id || '').startsWith('COPILOT_') ||
+    CUSTOM_CATS.has(String(t.categoria || '').toUpperCase());
+
+  const isWithinCooldown = (t: any): boolean => {
+    if (!t.concluido) return true;
+    const cat = String(t.categoria || '').toUpperCase();
+    const tid = String(t.task_id || '');
+    const doneMs = t.concluido_em ? new Date(t.concluido_em).getTime() : now;
+    const ageDays = (now - doneMs) / (24 * 60 * 60 * 1000);
+
+    if (cat === 'VALIDADE' || tid.startsWith('cad_')) return ageDays <= 90;
+    if (cat.includes('TRAVAR') || tid.startsWith('trav_')) return ageDays <= 60;
+    // Ruturas, Balcão/Restos, Manuais e Campanhas concluídas: visíveis em "Concluídas" durante 7 dias ou semana atual
+    return t.week_key === key || ageDays <= 7;
+  };
+
+  // Filtrar tarefas válidas e deduplicar por task_id (mais recente vence)
+  const seenTaskIds = new Set<string>();
+  const tasks: any[] = [];
+  for (const t of allRelevantTasks) {
+    if (seenTaskIds.has(t.task_id)) continue;
+    // Se for tarefa pendente de campanha já encerrada/não ativa, ignorar
+    if (!t.concluido && t.campanha_id && !activeCampIds.has(t.campanha_id)) {
+      continue;
+    }
+    if (!isWithinCooldown(t)) continue;
+    seenTaskIds.add(t.task_id);
+    tasks.push(t);
+  }
 
   const map: Record<
     string,
@@ -55,7 +114,7 @@ export async function getPharmacyWeeklyTasks(
 
   for (const t of tasks) {
     map[t.task_id] = {
-      concluido: t.concluido,
+      concluido: Boolean(t.concluido),
       concluido_por: t.concluido_por,
       concluido_em: t.concluido_em ? t.concluido_em.toISOString() : undefined,
       valor_impacto: t.valor_impacto !== null ? Number(t.valor_impacto) : undefined,
@@ -69,22 +128,8 @@ export async function getPharmacyWeeklyTasks(
     }
   }
 
-  const CUSTOM_CATS = new Set([
-    'BALCAO_CAMPANHA',
-    'ENCOMENDAS_CAMPANHA',
-    'DIRECAO_TECNICA',
-    'CAMPANHA',
-    'MANUAL',
-  ]);
-
   const customTasks = tasks
-    .filter(
-      (t: any) =>
-        String(t.task_id || '').startsWith('MANUAL_') ||
-        String(t.task_id || '').startsWith('CAMPANHA_') ||
-        String(t.task_id || '').startsWith('COPILOT_') ||
-        CUSTOM_CATS.has(String(t.categoria || '').toUpperCase())
-    )
+    .filter((t: any) => isCustomTask(t))
     .map((t: any) => ({
       id: t.id,
       task_id: t.task_id,
@@ -168,7 +213,7 @@ export async function updateManualWeeklyTask(
   return (prisma as any).tarefaEquipa.updateMany({
     where: {
       farmaciaId: params.farmaciaId,
-      week_key: key,
+      ...(params.weekKey ? { week_key: params.weekKey } : {}),
       task_id: params.taskId,
     },
     data,
@@ -183,11 +228,10 @@ export async function deleteManualWeeklyTask(
     weekKey?: string;
   }
 ) {
-  const key = params.weekKey || getCurrentWeekKey();
   return (prisma as any).tarefaEquipa.deleteMany({
     where: {
       farmaciaId: params.farmaciaId,
-      week_key: key,
+      ...(params.weekKey ? { week_key: params.weekKey } : {}),
       task_id: params.taskId,
     },
   });

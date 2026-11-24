@@ -113,12 +113,6 @@ export async function activateCampaign(
       valorImpacto: valorTotalCusto,
     },
     {
-      taskId: `CAMPANHA_${campanhaId}_SCRIPT`,
-      categoria: 'BALCAO_CAMPANHA',
-      designacao: `[${icone} Campanha] Atendimento Ativo: Recomendar ${top3Nomes || titulo} ao balcão com preço promocional`,
-      valorImpacto: undefined,
-    },
-    {
       taskId: `CAMPANHA_${campanhaId}_SIFARMA`,
       categoria: 'ENCOMENDAS_CAMPANHA',
       designacao: `[${icone} Campanha] Travar Compras: Rever Ponto de Encomenda = 0 no Sistema de Gestão nos ${totalProdutos} artigos desta campanha (${totalUnidades} un em stock) até escoar`,
@@ -214,6 +208,17 @@ export async function deactivateCampaign(
   campanhaIdOrActiveId: string,
   novoEstado: 'CONCLUIDA' | 'CANCELADA' = 'CONCLUIDA'
 ) {
+  const matching = await prisma.campanhaAtiva.findMany({
+    where: {
+      farmaciaId,
+      OR: [
+        { id: campanhaIdOrActiveId },
+        { campanhaId: campanhaIdOrActiveId, estado: 'ATIVA' }
+      ]
+    },
+    select: { id: true, campanhaId: true }
+  });
+
   const res = await prisma.campanhaAtiva.updateMany({
     where: {
       farmaciaId,
@@ -226,6 +231,20 @@ export async function deactivateCampaign(
       estado: novoEstado
     }
   });
+
+  // Limpar automaticamente tarefas pendentes (não concluídas) das campanhas encerradas
+  for (const m of matching) {
+    await prisma.tarefaEquipa.deleteMany({
+      where: {
+        farmaciaId,
+        concluido: false,
+        OR: [
+          { campanha_id: m.campanhaId },
+          { task_id: { startsWith: `CAMPANHA_${m.campanhaId}` } }
+        ]
+      }
+    });
+  }
 
   return {
     success: res.count > 0,
