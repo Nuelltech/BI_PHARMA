@@ -110,7 +110,8 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
       expect(art6391151.vendasHistoricoTotalUnidades).toBe(11);
       expect(art6391151.situacao).toBe('SEM_STOCK_SEM_VENDAS');
     }
-    expect(resExato.resumoEncontrado.totalUnidadesVendidasAnoAtual).toBe(6);
+    // Na Farmácia C (Demo): 6391169 (1 un em Mar/2026) + 6298752 (1 un em Abr/2026) = 2 un em 2026
+    expect(resExato.resumoEncontrado.totalUnidadesVendidasAnoAtual).toBe(2);
 
     // Variante com hífen/fonética ("Rino-duche")
     const resFuzzy: any = await toolConsultarProdutosPorNomeOuCategoria(prisma, ctxC, {
