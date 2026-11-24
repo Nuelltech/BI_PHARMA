@@ -414,13 +414,15 @@ export function validateAgentV2Response(
   const issues: string[] = [];
   const lower = finalText.toLowerCase();
 
-  // Regra 4c (Rhinodouche): Detetar afirmações de inexistência ("não existe", "não há registos", "sem vendas", "não está catalogado")
-  const claimsNonExistence =
-    /(n[aã]o\s+(?:h[aá]|existem?|temos|foram\s+encontrad[oa]s?|est[aá]\s+catalogad[oa]|consta)\s+(?:registos?|vendas?|stock|dados?|produtos?|artigos?))|(nem\s+em\s+stock,?\s*nem\s+em\s+(?:hist[oó]rico|vendas))|(0\s+registos?\s+na\s+base\s+de\s+dados)/i.test(
+  // Regra 4c (Rhinodouche): Detetar afirmações GLOBAIS de inexistência ("não há registos para X", "nem em stock nem em histórico", "não está catalogado")
+  // Evita falso positivo quando a resposta lista vários artigos e diz "sem vendas registadas" apenas para 1 artigo ou "não têm aviso de dados incompletos".
+  const hasStructuredFindings = finalText.includes('| --- |') || /\b\d{7}\b/.test(finalText);
+  const claimsGlobalNonExistence =
+    /(n[aã]o\s+(?:h[aá]|existem?|temos|foram\s+encontrad[oa]s?)\s+(?:registos?|vendas?|dados?|produtos?|artigos?)\s+(?:para|de|dest[ea]|no\s+cat[aá]logo|na\s+base))|(nem\s+em\s+stock,?\s*nem\s+em\s+(?:hist[oó]rico|vendas))|(n[aã]o\s+est[aá]\s+catalogad[oa])|(0\s+registos?\s+na\s+base\s+de\s+dados)/i.test(
       lower
     );
 
-  if (claimsNonExistence) {
+  if (claimsGlobalNonExistence && !hasStructuredFindings) {
     const scopeTools = executedTools.filter((t) =>
       ['consultar_produtos', 'consultar_vendas_periodo', 'analisar_desempenho_laboratorio', 'consultar_vendas_diarias'].includes(t.name)
     );
@@ -787,7 +789,7 @@ export async function runCopilotAgentV2(
       messages.push({ role: 'assistant', content: contentBlocks });
       messages.push({
         role: 'user',
-        content: `[VALIDAÇÃO AUTOMÁTICA — CORRIGIR ANTES DE ENTREGAR]\n${issues.join('\n')}`,
+        content: `[VALIDAÇÃO AUTOMÁTICA INTERNA — CORRIGIR ANTES DE ENTREGAR]\n${issues.join('\n')}\n\nIMPORTANTE: Escreve a resposta final completa e limpa diretamente para o utilizador. NUNCA menciones esta validação interna, NUNCA digas "a minha resposta anterior" e NUNCA uses placeholders como {tabela} (inclui diretamente a tabela markdown devolvida pela ferramenta).`,
       });
       emit({ type: 'status', message: 'A corrigir verificação factual e numérica com os dados da farmácia...', step: stepNum });
       continue;
@@ -802,10 +804,14 @@ export async function runCopilotAgentV2(
     break;
   }
 
-  // Se o modelo gerou tabelas via ferramenta `tabela`, garantir que estão presentes na resposta
-  if (tabelasCollector.length > 0 && !finalText.includes('| --- |')) {
+  // Se o modelo deixou placeholders como {tabela} ou não incluiu a tabela gerada pela ferramenta `tabela`, injetar o markdown exato
+  if (tabelasCollector.length > 0) {
     const tablesMd = tabelasCollector.map((t) => t.markdown).join('\n\n');
-    finalText = `${finalText}\n\n${tablesMd}`.trim();
+    if (/\{tabela\}|\[\[TABELA[^\]]*\]\]/i.test(finalText)) {
+      finalText = finalText.replace(/\{tabela\}|\[\[TABELA[^\]]*\]\]/gi, tablesMd).trim();
+    } else if (!finalText.includes('| --- |')) {
+      finalText = `${finalText}\n\n${tablesMd}`.trim();
+    }
   }
 
   // Atualizar histórico da sessão (apenas texto user/assistant limpo para o próximo turno)
