@@ -1291,7 +1291,11 @@ export function detectAmbiguousBareQuery(question: string): {
   const greetings = new Set(['ola', 'bom dia', 'boa tarde', 'boa noite', 'obrigado', 'obrigada', 'ajuda', 'help', 'sim', 'nao', 'confirmo', 'ok']);
   if (greetings.has(norm)) return { isAmbiguous: false };
 
-  const intentKeywords = /\b(monos?|vendas?|faturacao|stock|validades?|ruturas?|encomendar?|comprar?|relatorio|margem|comparar?|subiu|desceu|parados?|devolver)\b/i;
+  // Nunca intercetar respostas curtas de seguimento (percentagens, valores, correções "desculpa ...")
+  if (/^\d+([.,]\d+)?\s*(%|eur|€|dias?|meses?|un)?$/i.test(cleaned)) return { isAmbiguous: false };
+  if (/^(desculpa|afinal|quero|prefiro|muda|altera|cancela|confirmar?)\b/i.test(norm)) return { isAmbiguous: false };
+
+  const intentKeywords = /\b(monos?|vendas?|faturacao|stock|validades?|ruturas?|encomendar?|comprar?|relatorio|margem|comparar?|subiu|desceu|parados?|devolver|campanhas?|tarefas?)\b/i;
   if (intentKeywords.test(norm)) return { isAmbiguous: false };
 
   // 1-2 palavras que representam apenas um nome (ex.: "Bial", "Teva", "Mylan", "Ibuprofeno")

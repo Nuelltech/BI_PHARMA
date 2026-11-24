@@ -30,6 +30,9 @@ import {
   toggleWeeklyTaskInDb,
   resetWeeklyTasksInDb,
   verifyMobileStaffPin,
+  createManualWeeklyTask,
+  updateManualWeeklyTask,
+  deleteManualWeeklyTask,
 } from './services/weekly_tasks';
 import http from 'http';
 import url from 'url';
@@ -138,6 +141,7 @@ import {
   getActiveCampaigns,
   activateCampaign,
   deactivateCampaign,
+  updateActiveCampaign,
 } from './services/active_campaigns';
 
 import { computePackCompositionHash } from './services/comercial';
@@ -2395,13 +2399,15 @@ async function startServer() {
           const activeFarmacia = await requireActiveFarmacia(parsed.farmaciaId);
           const resActivate = await activateCampaign(prisma, {
             farmaciaId: activeFarmacia.id,
-            campanhaId: String(parsed.campanhaId || ''),
+            campanhaId: String(parsed.campanhaId || `custom_${Date.now()}`),
             titulo: String(parsed.titulo || 'Campanha Comercial'),
             icone: parsed.icone || '🎯',
-            descontoPct: Number(parsed.descontoPct || 15),
+            descontoPct: Number(parsed.descontoPct ?? 15),
             produtos: Array.isArray(parsed.produtos) ? parsed.produtos : [],
             diasDuracao: Number(parsed.diasDuracao || 15),
+            dataFimIso: parsed.dataFimIso || undefined,
             criadoPor: parsed.criadoPor || 'Diretor',
+            tarefasPersonalizadas: Array.isArray(parsed.tarefasPersonalizadas) ? parsed.tarefasPersonalizadas : undefined,
           });
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(resActivate));
@@ -2409,6 +2415,89 @@ async function startServer() {
           const status = e.statusCode || 400;
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 2.5A2b. Endpoint para Editar uma Campanha já Ativa (título, data, desconto, artigos, tarefas)
+      if (pathname === '/api/campaigns/active' && (req.method === 'PATCH' || req.method === 'PUT')) {
+        try {
+          const rawBody = await readRequestBody(req, 1024 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(parsed.farmaciaId);
+          const resUpdate = await updateActiveCampaign(prisma, {
+            farmaciaId: activeFarmacia.id,
+            activeId: String(parsed.activeId || parsed.id || parsed.campanhaId || ''),
+            titulo: parsed.titulo,
+            dataFimIso: parsed.dataFimIso,
+            descontoPct: parsed.descontoPct !== undefined ? Number(parsed.descontoPct) : undefined,
+            produtos: Array.isArray(parsed.produtos) ? parsed.produtos : undefined,
+            atualizarTarefas: parsed.atualizarTarefas !== false,
+          });
+          res.writeHead(resUpdate.success ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(resUpdate));
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 2.5A2c. Endpoint para pesquisar produtos elegíveis (MNSRM / Venda Livre) para adicionar a qualquer campanha
+      if (pathname === '/api/campaigns/search-products' && req.method === 'GET') {
+        try {
+          const activeFarmacia = await requireActiveFarmacia(parsedUrl.query.farmaciaId as string);
+          const q = String(parsedUrl.query.q || '').trim();
+          const rows = await prisma.inventario.findMany({
+            where: {
+              farmaciaId: activeFarmacia.id,
+              quantidade: { gt: 0 },
+              produto: {
+                tipo_venda: { not: 'MSRM' },
+                ...(q
+                  ? {
+                      OR: [
+                        { designacao: { contains: q, mode: 'insensitive' } },
+                        { cnp_codigo: { contains: q } },
+                        { laboratorio_titular: { contains: q, mode: 'insensitive' } },
+                      ],
+                    }
+                  : {}),
+              },
+            },
+            include: { produto: true },
+            orderBy: { quantidade: 'desc' },
+            take: 40,
+          });
+          const byCnp = new Map<string, any>();
+          for (const r of rows) {
+            if (!r.produto) continue;
+            const prev = byCnp.get(r.cnp_codigo);
+            if (prev) {
+              prev.stock_atual += Number(r.quantidade || 0);
+              continue;
+            }
+            const custo = Number(r.custo_unitario || (r.produto as any).custo_unitario || 0);
+            const pvp = Number((r.produto as any).pvp_oficial || (r.produto as any).pvp || (custo * 1.5));
+            const taxaIva = (r.produto as any).taxa_iva ? Number((r.produto as any).taxa_iva) : 0.23;
+            byCnp.set(r.cnp_codigo, {
+              cnp_codigo: r.cnp_codigo,
+              designacao: r.produto.designacao,
+              laboratorio_titular: r.produto.laboratorio_titular || '—',
+              tipo_venda: r.produto.tipo_venda,
+              stock_atual: Number(r.quantidade || 0),
+              custo_unitario: Number(custo.toFixed(2)),
+              pvp_atual: Number(pvp.toFixed(2)),
+              taxa_iva: taxaIva,
+            });
+          }
+          const items = Array.from(byCnp.values()).slice(0, 25);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, items }));
+        } catch (e: any) {
+          res.writeHead(e.statusCode || 500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
         }
         return;
       }
@@ -3404,6 +3493,77 @@ async function startServer() {
           res.end(JSON.stringify({ ok: false, error: e.message }));
         }
         return;
+      }
+
+      // 2.5L. CRUD Tarefas Personalizadas / Missões da Direção & Campanhas
+      if (pathname === '/api/weekly-tasks/custom') {
+        try {
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const body = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(String(body.farmaciaId || parsedUrl.query.farmaciaId || '').trim());
+
+          if (req.method === 'POST') {
+            if (!body.designacao || !String(body.designacao).trim()) {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: 'A descrição da tarefa é obrigatória.' }));
+              return;
+            }
+            const created = await createManualWeeklyTask(prisma, {
+              farmaciaId: activeFarmacia.id,
+              designacao: String(body.designacao).trim(),
+              categoria: body.categoria || 'DIRECAO_TECNICA',
+              cnp_codigo: body.cnp_codigo,
+              valor_impacto: body.valor_impacto !== undefined && body.valor_impacto !== '' ? Number(body.valor_impacto) : null,
+              campanha_id: body.campanha_id || null,
+            });
+            broadcastTaskUpdate(activeFarmacia.id, { type: 'CUSTOM_REFRESH', farmaciaId: activeFarmacia.id });
+            res.writeHead(201, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, task: created }));
+            return;
+          }
+
+          if (req.method === 'PATCH' || req.method === 'PUT') {
+            if (!body.taskId) {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: 'taskId obrigatório.' }));
+              return;
+            }
+            await updateManualWeeklyTask(prisma, {
+              farmaciaId: activeFarmacia.id,
+              taskId: String(body.taskId),
+              designacao: body.designacao !== undefined ? String(body.designacao) : undefined,
+              categoria: body.categoria !== undefined ? String(body.categoria) : undefined,
+              valor_impacto: body.valor_impacto !== undefined ? (body.valor_impacto === '' || body.valor_impacto === null ? null : Number(body.valor_impacto)) : undefined,
+              weekKey: body.weekKey,
+            });
+            broadcastTaskUpdate(activeFarmacia.id, { type: 'CUSTOM_REFRESH', farmaciaId: activeFarmacia.id });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+
+          if (req.method === 'DELETE') {
+            const targetTaskId = String(body.taskId || parsedUrl.query.taskId || '').trim();
+            if (!targetTaskId) {
+              res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ ok: false, error: 'taskId obrigatório.' }));
+              return;
+            }
+            await deleteManualWeeklyTask(prisma, {
+              farmaciaId: activeFarmacia.id,
+              taskId: targetTaskId,
+              weekKey: body.weekKey || (parsedUrl.query.weekKey as string),
+            });
+            broadcastTaskUpdate(activeFarmacia.id, { type: 'CUSTOM_REFRESH', farmaciaId: activeFarmacia.id });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+        } catch (e: any) {
+          res.writeHead(e.statusCode || 500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+          return;
+        }
       }
 
       
@@ -5630,7 +5790,23 @@ function getDashboardHtml(): string {
       </div>
 
       <!-- MISSÕES DE CAMPANHAS ATIVAS NA FOLHA DA SEMANA -->
-      <div id="planoActiveCampaignsBlock" style="display: none; margin-bottom: 20px;"></div>
+      <div id="planoActiveCampaignsBlock" style="display: none; margin-bottom: 16px;"></div>
+
+      <!-- MISSÕES DA DIREÇÃO, COPILOT & TAREFAS DE CAMPANHAS (TAREFAEQUIPA) -->
+      <div id="planoCustomTasksBlock" style="background: #ffffff; border: 1.5px solid #c7d2fe; border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(79, 70, 229, 0.06);">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 10px;">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span style="font-size: 1.05rem; font-weight: 800; color: #3730a3;">🎯 Missões da Direção, Copilot & Campanhas Ativas</span>
+            <span id="planoCustomTasksCount" class="badge badge-info">0 missões</span>
+          </div>
+          <button class="btn" onclick="openNewCustomTaskModal()" style="background: #4f46e5; color: #ffffff; font-size: 0.78rem; padding: 6px 12px; font-weight: 700;">
+            + Nova Tarefa Manual
+          </button>
+        </div>
+        <div id="planoCustomTasksList" style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="color: var(--muted); font-size: 0.82rem; padding: 6px 2px;">Sem missões personalizadas ou de campanhas nesta semana. Crie uma tarefa manual ou ative uma campanha no Estúdio / Copilot.</div>
+        </div>
+      </div>
 
       <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 20px; margin-bottom: 30px;">
         <!-- CARTÃO 1: VALIDADES URGENTES NA GAVETA -->
@@ -6562,7 +6738,7 @@ function getDashboardHtml(): string {
                 </label>
                 <span id="discountBadgeVal" style="font-size: 0.95rem; font-weight: 800; color: #fb7185;">15%</span>
               </div>
-              <input type="range" id="campaignDiscountRange" min="0" max="30" step="5" value="15" style="width: 100%; accent-color: #f43f5e; cursor: pointer;" oninput="onDiscountSliderChange(this.value)">
+              <input type="range" id="campaignDiscountRange" min="0" max="40" step="1" value="15" style="width: 100%; accent-color: #f43f5e; cursor: pointer;" oninput="onDiscountSliderChange(this.value)">
               <div style="display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--muted); margin-top: 4px;">
                 <span>0% (Sem desc.)</span>
                 <span>10%</span>
@@ -6603,6 +6779,9 @@ function getDashboardHtml(): string {
 
         <!-- BOTÃO PARA GERAR MATERIAIS & ATIVAR CAMPANHA -->
         <div style="display: flex; justify-content: flex-end; gap: 12px; flex-wrap: wrap;">
+          <button class="btn btn-secondary" onclick="openCampaignEditorModalForProposal()" style="border-color: #4f46e5; color: #4f46e5; background: #ffffff; font-weight: 700; font-size: 0.9rem; padding: 10px 18px; display: flex; align-items: center; gap: 6px;">
+            ✏️ Editar Proposta (Título, Artigos & Tarefas)
+          </button>
           <button class="btn" id="btnActivateCampaignStep2" onclick="activateCurrentCampaignUi()" style="background: #10b981; color: white; font-weight: 700; font-size: 0.95rem; padding: 10px 24px; display: flex; align-items: center; gap: 8px;">
             🚀 Ativar Campanha na Farmácia (Gerar Tarefas)
           </button>
@@ -6704,6 +6883,30 @@ function getDashboardHtml(): string {
   </div> <!-- /app-layout -->
 
   
+  <!-- MODAL EDITOR DE CAMPANHA (ANTES OU DEPOIS DE ATIVAR) -->
+  <div class="modal-backdrop" id="campaignEditorModal" style="display: none; z-index: 1050;" onclick="if(event.target===this) closeCampaignEditorModal()">
+    <div class="modal" style="max-width: 1080px; width: 95vw; max-height: 92vh; display: flex; flex-direction: column;">
+      <div class="modal-header" style="border-bottom: 1px solid #e2e8f0; padding-bottom: 12px; margin-bottom: 14px;">
+        <div>
+          <h2 id="campaignEditorModalTitle" style="font-size: 1.2rem; color: #3730a3; display: flex; align-items: center; gap: 8px;">
+            ✏️ Editor de Campanha
+          </h2>
+          <p style="font-size: 0.82rem; color: #64748b; margin-top: 2px;">
+            Ajuste título, data de fim, descontos individuais (margem protegida ≥ 5%), artigos MNSRM/Venda Livre e tarefas para a equipa.
+          </p>
+        </div>
+        <button class="btn btn-secondary" onclick="closeCampaignEditorModal()">✕ Fechar</button>
+      </div>
+      <div id="campaignEditorModalBody" style="overflow-y: auto; flex: 1; padding-right: 4px;"></div>
+      <div style="border-top: 1px solid #e2e8f0; padding-top: 12px; margin-top: 12px; display: flex; justify-content: flex-end; gap: 10px;">
+        <button class="btn btn-secondary" onclick="closeCampaignEditorModal()">Cancelar</button>
+        <button class="btn" id="campaignEditorSaveBtn" onclick="saveCampaignEditorModal()" style="background: #10b981; color: #ffffff; font-weight: 700; padding: 9px 22px;">
+          💾 Guardar & Aplicar
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- MODAL DE AUDITORIA DE TAREFAS CONCLUÍDAS (O QUE FOI FEITO, QUANDO E QUEM FEZ) -->
   <div class="modal-backdrop" id="completedTasksModal" style="display: none; z-index: 1000;" onclick="if(event.target===this) closeCompletedTasksModal()">
     <div class="modal" style="max-width: 1180px; width: 95vw; max-height: 92vh; display: flex; flex-direction: column;">
@@ -9624,10 +9827,13 @@ function getDashboardHtml(): string {
       if (tab === 'plano') {
         if (views.plano) views.plano.style.display = 'block';
         renderWeeklyActionPlan();
+        fetchWeeklyTasksFromDb();
+        loadActiveCampaigns();
       } else if (tab === 'copilot') {
         if (views.copilot) views.copilot.style.display = 'block';
       } else if (tab === 'campaigns') {
         if (views.campaigns) views.campaigns.style.display = 'block';
+        loadActiveCampaigns();
         if (!currentCampaignSuggestions || currentCampaignSuggestions.length === 0) {
           loadCampaignSuggestions();
         }
@@ -9650,6 +9856,128 @@ function getDashboardHtml(): string {
     // GESTOR DE TAREFAS SEMANAIS DA EQUIPA (PERSISTÊNCIA LOCAL + IMPRESSÃO A4)
     // ========================================================================
     let remoteDoneTasksMap = {};
+    let remoteCustomTasks = [];
+
+    function renderPlanoCustomTasks() {
+      const listEl = document.getElementById('planoCustomTasksList');
+      const countEl = document.getElementById('planoCustomTasksCount');
+      if (!listEl) return;
+
+      const doneMap = getDoneTasksMap();
+      const tasks = Array.isArray(remoteCustomTasks) ? remoteCustomTasks : [];
+      const doneCount = tasks.filter(t => {
+        const entry = doneMap[t.task_id];
+        return entry ? (typeof entry === 'object' ? !!entry.concluido : !!entry) : !!t.concluido;
+      }).length;
+
+      if (countEl) {
+        countEl.textContent = tasks.length + (tasks.length === 1 ? ' missão' : ' missões') + (tasks.length > 0 ? ' (' + doneCount + ' concluídas)' : '');
+      }
+
+      if (tasks.length === 0) {
+        listEl.innerHTML = '<div style="color: var(--muted); font-size: 0.82rem; padding: 6px 2px;">Sem missões personalizadas ou de campanhas nesta semana. Crie uma tarefa manual ou ative uma campanha no Estúdio / Copilot.</div>';
+        return;
+      }
+
+      listEl.innerHTML = tasks.map(t => {
+        const entry = doneMap[t.task_id];
+        const isDone = entry ? (typeof entry === 'object' ? !!entry.concluido : !!entry) : !!t.concluido;
+        const isCamp = String(t.task_id || '').startsWith('CAMPANHA_') || String(t.categoria || '').includes('CAMPANHA');
+        const badgeLabel = isCamp ? '🎯 Campanha' : (String(t.categoria || '') === 'ENCOMENDAS_CAMPANHA' || String(t.categoria || '') === 'TRAVAR' ? '🛒 Encomendas' : '📋 Direção / Copilot');
+        const badgeBg = isCamp ? '#ffe4e6' : '#e0e7ff';
+        const badgeColor = isCamp ? '#9f1239' : '#3730a3';
+        const valImpact = t.valor_impacto != null ? Number(t.valor_impacto) : 0;
+        const safeDesc = escapeHtml(t.designacao || 'Tarefa operacional');
+        const safeCat = escapeHtml(t.categoria || 'DIRECAO_TECNICA');
+        const safeCnp = escapeHtml(t.cnp_codigo || '');
+
+        return '<div class="weekly-task-item ' + (isDone ? 'task-completed' : '') + '" style="background: ' + (isDone ? '#f8fafc' : '#ffffff') + '; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; display: flex; gap: 12px; align-items: flex-start; justify-content: space-between;">' +
+          '<div style="display: flex; gap: 10px; align-items: flex-start; flex: 1;">' +
+            '<input type="checkbox" class="weekly-task-checkbox" data-task-id="' + escapeHtml(t.task_id) + '" ' + (isDone ? 'checked' : '') + ' onchange="toggleWeeklyTask(\'' + escapeHtml(t.task_id) + '\', \'' + safeCat + '\', \'' + safeCnp + '\', \'' + safeDesc.replace(/'/g, "\\'") + '\', ' + valImpact + ')" style="margin-top: 3px; width: 18px; height: 18px; cursor: pointer; accent-color: #4f46e5;" />' +
+            '<div style="flex: 1;">' +
+              '<div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">' +
+                '<span style="font-size: 0.72rem; font-weight: 800; background: ' + badgeBg + '; color: ' + badgeColor + '; padding: 2px 8px; border-radius: 9999px;">' + badgeLabel + '</span>' +
+                (valImpact > 0 ? '<span style="font-size: 0.74rem; font-weight: 700; color: #047857; background: #d1fae5; padding: 2px 7px; border-radius: 6px;">€' + valImpact.toFixed(2) + '</span>' : '') +
+                (t.cnp_codigo ? '<span style="font-size: 0.72rem; color: #0284c7; font-family: monospace;">CNP: ' + safeCnp + '</span>' : '') +
+              '</div>' +
+              '<div style="font-size: 0.88rem; font-weight: 600; color: #0f172a; margin-top: 4px; ' + (isDone ? 'text-decoration: line-through; color: #64748b;' : '') + '">' + safeDesc + '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div style="display: flex; gap: 6px; flex-shrink: 0;">' +
+            '<button class="btn btn-secondary" onclick="editCustomTaskPrompt(\'' + escapeHtml(t.task_id) + '\')" title="Editar tarefa" style="padding: 4px 8px; font-size: 0.76rem;">✏️</button>' +
+            '<button class="btn btn-secondary" onclick="deleteCustomTaskUi(\'' + escapeHtml(t.task_id) + '\')" title="Remover tarefa" style="padding: 4px 8px; font-size: 0.76rem; color: #dc2626; border-color: #fecaca;">🗑️</button>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    async function openNewCustomTaskModal() {
+      const desc = prompt('Descrição da nova tarefa para a equipa (ex: "Montar expositor de inverno junto à caixa 2"):');
+      if (!desc || !desc.trim()) return;
+      const catInput = prompt('Categoria (BALCAO, VALIDADE, TRAVAR, REPOR, CAMPANHA ou DIRECAO_TECNICA):', 'DIRECAO_TECNICA');
+      try {
+        const res = await fetch('/api/weekly-tasks/custom', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            designacao: desc.trim(),
+            categoria: (catInput || 'DIRECAO_TECNICA').trim().toUpperCase(),
+          }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          await fetchWeeklyTasksFromDb();
+        } else {
+          alert('Erro ao criar tarefa: ' + (data.error || 'falha inesperada'));
+        }
+      } catch (e) {
+        alert('Erro de rede ao criar tarefa: ' + e.message);
+      }
+    }
+
+    async function editCustomTaskPrompt(taskId) {
+      const existing = (remoteCustomTasks || []).find(t => t.task_id === taskId);
+      const novaDesc = prompt('Editar descrição da tarefa:', existing ? existing.designacao : '');
+      if (!novaDesc || !novaDesc.trim()) return;
+      try {
+        const res = await fetch('/api/weekly-tasks/custom', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            taskId: taskId,
+            designacao: novaDesc.trim(),
+          }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          await fetchWeeklyTasksFromDb();
+        }
+      } catch (e) {
+        alert('Erro ao editar tarefa: ' + e.message);
+      }
+    }
+
+    async function deleteCustomTaskUi(taskId) {
+      if (!confirm('Remover esta tarefa da Folha da Semana?')) return;
+      try {
+        const res = await fetch('/api/weekly-tasks/custom', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            farmaciaId: activeFarmaciaId,
+            taskId: taskId,
+          }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          await fetchWeeklyTasksFromDb();
+        }
+      } catch (e) {
+        alert('Erro ao remover tarefa: ' + e.message);
+      }
+    }
 
     async function fetchWeeklyTasksFromDb() {
       if (!activeFarmaciaId) return;
@@ -9658,7 +9986,9 @@ function getDashboardHtml(): string {
         const data = await res.json();
         if (data.ok && data.tasksMap) {
           remoteDoneTasksMap = data.tasksMap;
+          remoteCustomTasks = Array.isArray(data.customTasks) ? data.customTasks : [];
           localStorage.setItem('bi_pharma_weekly_done_' + activeFarmaciaId, JSON.stringify(remoteDoneTasksMap));
+          renderPlanoCustomTasks();
           updateWeeklyTasksCounter();
         }
       } catch (err) {
@@ -10454,7 +10784,8 @@ function getDashboardHtml(): string {
         const isDone = !!doneMap[taskId];
         const qtd = item.stock_atual != null ? item.stock_atual : (item.quantidade || 1);
         const valRisco = item.valor_em_risco != null ? item.valor_em_risco : (qtd * (item.custo_unitario || 0));
-        const instrucao = '⚠️ <b>Atenção à Validade:</b> Produto a aproximar-se do fim de vida útil (Data: <b>' + (item.data_validade || 'Curto Prazo') + '</b>). Requer ação prioritária de separação física na gaveta ou destaque no balcão.';
+        const smartRec = getSmartExpiryRecommendation(item);
+        const instrucao = smartRec.html;
 
         return \`
           <div class="weekly-task-item \${isDone ? 'task-completed' : ''}" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: flex; gap: 12px; align-items: flex-start; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
@@ -10479,6 +10810,81 @@ function getDashboardHtml(): string {
       }).join('');
 
       if (preserveScroll) c1El.scrollTop = oldScroll;
+    }
+
+    function getSmartExpiryRecommendation(item) {
+      const tipo = String(item.tipo_venda || item.macro_area || '').toUpperCase();
+      const isMsrm = tipo === 'MSRM';
+      const qtd = Number(item.stock_atual != null ? item.stock_atual : (item.quantidade || 1));
+      const vmm = Number(item.vmm || item.venda_media_mensal || 0);
+
+      let dias = null;
+      if (item.data_validade && /^\\d{4}-\\d{2}-\\d{2}/.test(String(item.data_validade))) {
+        const dt = new Date(String(item.data_validade).slice(0, 10) + 'T00:00:00');
+        const hoje = new Date();
+        hoje.setHours(0, 0, 0, 0);
+        dias = Math.round((dt.getTime() - hoje.getTime()) / 86400000);
+      } else if (item.meses_ate_caducidade != null) {
+        dias = Math.round(Number(item.meses_ate_caducidade) * 30);
+      }
+
+      const meses = dias !== null ? Math.max(0, dias / 30) : 99;
+      const vendasEsperadas = vmm > 0 ? Math.floor(vmm * meses) : 0;
+      const excedenteProvavel = Math.max(0, qtd - vendasEsperadas);
+      const escoaNaturalmente = dias !== null && dias > 30 && vmm > 0 && qtd <= vendasEsperadas;
+
+      if (dias !== null && dias <= 0) {
+        return {
+          html: '🚫 <b>Retirar Imediatamente (Quarentena):</b> Prazo expirado (<b>' + (item.data_validade || '') + '</b>). Retirar da gaveta/linear e encaminhar para devolução ao fornecedor ou abate/VALORMED.',
+          plain: '🚫 Caducado — Retirar imediatamente para quarentena (devolução ou abate/VALORMED).',
+        };
+      }
+      if (dias !== null && dias <= 30) {
+        if (isMsrm) {
+          return {
+            html: '🚫 <b>Retirar para Quarentena (' + dias + ' dias · MSRM):</b> Prazo demasiado curto para dispensa segura. Verificar devolução/crédito junto do armazenista/laboratório ou encaminhar para abate/VALORMED.',
+            plain: '🚫 Quarentena (' + dias + 'd · MSRM) — Retirar da gaveta; verificar devolução ao armazenista ou abate.',
+          };
+        }
+        return {
+          html: '🚫 <b>Retirar de Exposição (' + dias + ' dias):</b> Prazo demasiado curto para destaque no balcão.' + (qtd > 2 ? ' Com ' + qtd + ' un em stock, contactar laboratório/fornecedor para troca/devolução ou abater.' : ' Verificar devolução ou abate.'),
+          plain: '🚫 Retirar de exposição (' + dias + 'd) — Prazo curto; verificar devolução/troca ou abate.',
+        };
+      }
+      if (escoaNaturalmente) {
+        return {
+          html: '🟢 <b>Rotação FEFO na Gaveta (Escoa Naturalmente):</b> Stock (' + qtd + ' un) inferior ao ritmo esperado (~' + vmm.toFixed(1) + ' un/mês). Garantir apenas saída prioritária das caixas mais antigas.',
+          plain: '🟢 Escoa naturalmente — manter apenas FEFO na gaveta.',
+        };
+      }
+      if (dias !== null && dias <= 90) {
+        if (isMsrm) {
+          return {
+            html: '📦 <b>FEFO Rigoroso & Janela de Devolução (' + dias + ' dias · MSRM):</b> Colocar à frente na gaveta (dispensar 1.º), travar novas compras e verificar prazo limite de devolução ao armazenista.' + (excedenteProvavel > 0 && vmm > 0 ? ' Excedente provável: ~' + excedenteProvavel + ' un.' : ''),
+            plain: '📦 MSRM (' + dias + 'd) — FEFO rigoroso na gaveta, travar compras e verificar janela de devolução.',
+          };
+        }
+        return {
+          html: '🔥 <b>Escoamento Prioritário (' + dias + ' dias · Venda Livre):</b> Destaque no balcão / cesto de oportunidade e avaliar campanha com desconto (margem ≥ 5%).' + (excedenteProvavel > 0 && vmm > 0 ? ' Excedente provável: ~' + excedenteProvavel + ' un.' : ''),
+          plain: '🔥 Venda Livre (' + dias + 'd) — Destaque no balcão / cesto e avaliar campanha de escoamento (margem ≥ 5%).',
+        };
+      }
+      if (dias !== null && dias <= 180) {
+        if (isMsrm) {
+          return {
+            html: '🔄 <b>Rotação FEFO na Gaveta (3–6 meses · MSRM):</b> Garantir saída das caixas mais antigas; se a cobertura exceder o prazo restante, travar o ponto de encomenda.',
+            plain: '🔄 MSRM (3–6M) — Rotação FEFO na gaveta e rever ponto de encomenda.',
+          };
+        }
+        return {
+          html: '📌 <b>Rodar Linear (FEFO · 3–6 meses):</b> Passar caixas mais antigas para a frente da prateleira. Se stock exceder rotação, incluir em campanha/pack sazonal.',
+          plain: '📌 Venda Livre (3–6M) — Rodar linear (FEFO) e avaliar inclusão em campanha sazonal.',
+        };
+      }
+      return {
+        html: '✅ <b>Monitorização FEFO (&gt; 6 meses):</b> Manter rotação normal de stock por ordem de validade.',
+        plain: '✅ Monitorização FEFO (> 6M).',
+      };
     }
 
     function renderDesktopCard2(preserveScroll = false) {
@@ -10899,7 +11305,7 @@ function getDashboardHtml(): string {
                     <td><b>\${i.designacao}</b></td>
                     <td>\${qtd} un</td>
                     <td><b>\${i.data_validade || '-'}</b></td>
-                    <td>⚠️ Atenção à Validade: Separar fisicamente na gaveta ou destacar prioritariamente no balcão.</td>
+                    <td>\${getSmartExpiryRecommendation(i).plain}</td>
                   </tr>
                 \`;
               }).join('')}
@@ -14935,6 +15341,9 @@ function getDashboardHtml(): string {
               '</div>' +
             '</div>' +
             '<div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">' +
+              '<button class="btn btn-secondary" data-campid="' + c.id + '" onclick="openCampaignEditorModalForActive(this.dataset.campid)" style="font-size: 0.8rem; padding: 7px 14px; border-color: #4f46e5; color: #4f46e5; background: #ffffff; font-weight: 700;">' +
+                '✏️ Editar Campanha' +
+              '</button>' +
               '<button class="btn btn-secondary" data-campid="' + c.id + '" onclick="toggleActiveCampaignProducts(this.dataset.campid)" style="font-size: 0.8rem; padding: 7px 14px; border-color: #059669; color: #065f46; background: #ffffff; font-weight: 700;">' +
                 '👁️ Ver ' + c.totalProdutos + ' Artigos em Campanha' +
               '</button>' +
@@ -14977,6 +15386,309 @@ function getDashboardHtml(): string {
       const panel = document.getElementById('activeProductsPanel_' + campId);
       if (!panel) return;
       panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    }
+
+    // ========================================================================
+    // EDITOR COMPLETO DE CAMPANHAS (PROPOSTAS ANTES DE ATIVAR + CAMPANHAS ATIVAS)
+    // ========================================================================
+    let campaignEditorState = null;
+
+    function computeCampaignItemMetrics(p, discPct) {
+      const d = Math.max(0, Math.min(80, Number(discPct) || 0));
+      const pvpAtual = Number(p.pvp_atual || p.pvp || (Number(p.custo_unitario || 0) * 1.5));
+      const pvpCamp = Number((pvpAtual * (1 - d / 100)).toFixed(2));
+      const taxaIva = Number(p.taxa_iva || 0.23);
+      const custoComIva = Number(p.custo_unitario || 0) * (1 + taxaIva);
+      const margemPct = pvpCamp > 0 ? Number((((pvpCamp - custoComIva) / pvpCamp) * 100).toFixed(1)) : 0;
+      return {
+        cnp_codigo: p.cnp_codigo,
+        designacao: p.designacao || 'Produto',
+        laboratorio_titular: p.laboratorio_titular || '—',
+        stock_atual: Number(p.stock_atual || 0),
+        custo_unitario: Number(p.custo_unitario || 0),
+        taxa_iva: taxaIva,
+        pvp_atual: Number(pvpAtual.toFixed(2)),
+        pvp_campanha: pvpCamp,
+        desconto_pct: d,
+        margem_pct: margemPct,
+      };
+    }
+
+    function openCampaignEditorModalForProposal() {
+      if (!selectedCampaign) {
+        alert('Selecione primeiro uma proposta de campanha.');
+        return;
+      }
+      const discountPct = parseInt(document.getElementById('campaignDiscountRange')?.value || '15', 10);
+      const includedCnps = new Set(getIncludedCnpCodigos());
+      const baseProds = (selectedCampaign.eligibleProducts || []).filter(p => includedCnps.has(p.cnp_codigo));
+      const endDate = new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const produtos = baseProds.map(p => computeCampaignItemMetrics(p, discountPct));
+      const top3 = produtos.slice(0, 3).map(p => p.designacao.split(',')[0].slice(0, 28)).join(' + ');
+
+      campaignEditorState = {
+        mode: 'proposal',
+        campanhaId: selectedCampaign.id || ('custom_' + Date.now()),
+        icone: selectedCampaign.icone || '🎯',
+        titulo: selectedCampaign.titulo || 'Campanha Personalizada',
+        dataFimIso: endDate,
+        descontoPct: discountPct,
+        produtos: produtos,
+        tarefas: [
+          { categoria: 'BALCAO_CAMPANHA', designacao: '[' + (selectedCampaign.icone || '🎯') + ' Campanha] Montar Cesto/Ilha de Balcão: ' + (selectedCampaign.titulo || 'Campanha') + ' (-' + discountPct + '%)' },
+          { categoria: 'BALCAO_CAMPANHA', designacao: '[' + (selectedCampaign.icone || '🎯') + ' Campanha] Atendimento Ativo: Recomendar ' + (top3 || 'artigos da campanha') + ' com preço promocional' },
+          { categoria: 'ENCOMENDAS_CAMPANHA', designacao: '[' + (selectedCampaign.icone || '🎯') + ' Campanha] Travar Compras: Rever Ponto de Encomenda = 0 nos ' + produtos.length + ' artigos da campanha até escoar' },
+        ],
+        searchResults: [],
+      };
+
+      document.getElementById('campaignEditorModalTitle').textContent = '✏️ Editar & Personalizar Proposta de Campanha';
+      document.getElementById('campaignEditorSaveBtn').textContent = '🚀 Ativar Campanha Personalizada';
+      document.getElementById('campaignEditorModal').style.display = 'flex';
+      renderCampaignEditorBody();
+    }
+
+    function openCampaignEditorModalForActive(activeId) {
+      const c = (currentActiveCampaigns || []).find(x => x.id === activeId);
+      if (!c) return;
+      campaignEditorState = {
+        mode: 'active',
+        activeId: c.id,
+        campanhaId: c.campanhaId,
+        icone: c.icone || '🎯',
+        titulo: c.titulo || 'Campanha Ativa',
+        dataFimIso: c.dataFim || new Date(Date.now() + 15 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+        descontoPct: Number(c.descontoAplicadoPct || 15),
+        produtos: (c.produtos || []).map(p => computeCampaignItemMetrics(p, p.desconto_pct != null ? p.desconto_pct : c.descontoAplicadoPct)),
+        tarefas: [],
+        searchResults: [],
+      };
+
+      document.getElementById('campaignEditorModalTitle').textContent = '✏️ Editar Campanha Ativa';
+      document.getElementById('campaignEditorSaveBtn').textContent = '💾 Guardar Alterações';
+      document.getElementById('campaignEditorModal').style.display = 'flex';
+      renderCampaignEditorBody();
+    }
+
+    function closeCampaignEditorModal() {
+      const m = document.getElementById('campaignEditorModal');
+      if (m) m.style.display = 'none';
+      campaignEditorState = null;
+    }
+
+    function campaignEditorSyncHeaderFields() {
+      if (!campaignEditorState) return;
+      const tEl = document.getElementById('ceTitulo');
+      const dEl = document.getElementById('ceDataFim');
+      const gEl = document.getElementById('ceDescontoGlobal');
+      if (tEl) campaignEditorState.titulo = tEl.value;
+      if (dEl) campaignEditorState.dataFimIso = dEl.value;
+      if (gEl) campaignEditorState.descontoPct = Number(gEl.value || 0);
+    }
+
+    function campaignEditorApplyGlobalDiscount() {
+      campaignEditorSyncHeaderFields();
+      if (!campaignEditorState) return;
+      const g = campaignEditorState.descontoPct;
+      campaignEditorState.produtos = campaignEditorState.produtos.map(p => computeCampaignItemMetrics(p, g));
+      renderCampaignEditorBody();
+    }
+
+    function campaignEditorUpdateItemDiscount(idx, val) {
+      campaignEditorSyncHeaderFields();
+      if (!campaignEditorState || !campaignEditorState.produtos[idx]) return;
+      campaignEditorState.produtos[idx] = computeCampaignItemMetrics(campaignEditorState.produtos[idx], Number(val));
+      renderCampaignEditorBody();
+    }
+
+    function campaignEditorRemoveProduct(idx) {
+      campaignEditorSyncHeaderFields();
+      if (!campaignEditorState) return;
+      campaignEditorState.produtos.splice(idx, 1);
+      renderCampaignEditorBody();
+    }
+
+    async function campaignEditorSearchProducts() {
+      campaignEditorSyncHeaderFields();
+      if (!campaignEditorState) return;
+      const q = (document.getElementById('ceProductSearchInput')?.value || '').trim();
+      const box = document.getElementById('ceSearchResultsBox');
+      if (box) box.innerHTML = '<div style="padding:8px;font-size:0.78rem;color:#64748b;">A pesquisar produtos MNSRM/Venda Livre em stock...</div>';
+      try {
+        const res = await fetch('/api/campaigns/search-products?farmaciaId=' + encodeURIComponent(activeFarmaciaId || '') + '&q=' + encodeURIComponent(q));
+        const data = await res.json();
+        campaignEditorState.searchResults = data.ok && Array.isArray(data.items) ? data.items : [];
+        renderCampaignEditorBody();
+      } catch (e) {
+        if (box) box.innerHTML = '<div style="padding:8px;font-size:0.78rem;color:#dc2626;">Erro na pesquisa: ' + escapeHtml(e.message) + '</div>';
+      }
+    }
+
+    function campaignEditorAddProduct(cnp) {
+      campaignEditorSyncHeaderFields();
+      if (!campaignEditorState) return;
+      const found = (campaignEditorState.searchResults || []).find(x => x.cnp_codigo === cnp);
+      if (!found) return;
+      if (campaignEditorState.produtos.some(p => p.cnp_codigo === cnp)) {
+        alert('Este produto já está incluído na campanha.');
+        return;
+      }
+      campaignEditorState.produtos.unshift(computeCampaignItemMetrics(found, campaignEditorState.descontoPct));
+      renderCampaignEditorBody();
+    }
+
+    function campaignEditorUpdateTask(idx, val) {
+      if (!campaignEditorState || !campaignEditorState.tarefas[idx]) return;
+      campaignEditorState.tarefas[idx].designacao = val;
+    }
+
+    function campaignEditorRemoveTask(idx) {
+      campaignEditorSyncHeaderFields();
+      if (!campaignEditorState) return;
+      campaignEditorState.tarefas.splice(idx, 1);
+      renderCampaignEditorBody();
+    }
+
+    function campaignEditorAddTask() {
+      campaignEditorSyncHeaderFields();
+      if (!campaignEditorState) return;
+      campaignEditorState.tarefas.push({ categoria: 'BALCAO_CAMPANHA', designacao: '' });
+      renderCampaignEditorBody();
+    }
+
+    function renderCampaignEditorBody() {
+      const body = document.getElementById('campaignEditorModalBody');
+      if (!body || !campaignEditorState) return;
+      const st = campaignEditorState;
+      const lowMarginCount = st.produtos.filter(p => p.margem_pct < 5).length;
+
+      const prodRows = st.produtos.map((p, idx) => {
+        const low = p.margem_pct < 5;
+        return '<tr style="border-bottom: 1px solid #e2e8f0; background:' + (low ? '#fef2f2' : '#ffffff') + ';">' +
+          '<td style="padding: 6px 8px; font-family: monospace; font-size: 0.78rem; color: #0284c7;">' + escapeHtml(p.cnp_codigo) + '</td>' +
+          '<td style="padding: 6px 8px; font-weight: 600; font-size: 0.8rem; color: #0f172a;">' + escapeHtml(p.designacao) + '</td>' +
+          '<td style="padding: 6px 8px; text-align: center; font-size: 0.8rem;">' + p.stock_atual + ' un</td>' +
+          '<td style="padding: 6px 8px; text-align: right; font-size: 0.8rem; color: #64748b;">€' + p.pvp_atual.toFixed(2) + '</td>' +
+          '<td style="padding: 6px 8px; text-align: center;"><input type="number" min="0" max="60" step="1" value="' + p.desconto_pct + '" onchange="campaignEditorUpdateItemDiscount(' + idx + ', this.value)" style="width: 62px; padding: 3px 6px; border: 1px solid #cbd5e1; border-radius: 5px; text-align: center; font-weight: 700;" /> %</td>' +
+          '<td style="padding: 6px 8px; text-align: right; font-weight: 800; color: #059669;">€' + p.pvp_campanha.toFixed(2) + '</td>' +
+          '<td style="padding: 6px 8px; text-align: center;"><span style="padding: 2px 7px; border-radius: 9999px; font-size: 0.74rem; font-weight: 800; background:' + (low ? '#fee2e2' : '#d1fae5') + '; color:' + (low ? '#b91c1c' : '#065f46') + ';">' + p.margem_pct.toFixed(1) + '%</span></td>' +
+          '<td style="padding: 6px 8px; text-align: center;"><button class="btn btn-secondary" onclick="campaignEditorRemoveProduct(' + idx + ')" style="padding: 2px 7px; font-size: 0.74rem; color: #dc2626; border-color: #fecaca;">✕</button></td>' +
+        '</tr>';
+      }).join('');
+
+      const searchHtml = (st.searchResults || []).length > 0
+        ? '<div style="max-height: 150px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; margin-top: 8px; background: #f8fafc;">' +
+            st.searchResults.map(item =>
+              '<div style="display:flex; justify-content:space-between; align-items:center; padding: 6px 10px; border-bottom: 1px solid #e2e8f0; font-size: 0.8rem;">' +
+                '<div><b>' + escapeHtml(item.designacao) + '</b> <span style="color:#64748b;">(' + escapeHtml(item.cnp_codigo) + ' · ' + item.stock_atual + ' un · PVP €' + item.pvp_atual.toFixed(2) + ')</span></div>' +
+                '<button class="btn" onclick="campaignEditorAddProduct(\'' + escapeHtml(item.cnp_codigo) + '\')" style="background:#4f46e5;color:#fff;padding:3px 10px;font-size:0.74rem;">+ Adicionar</button>' +
+              '</div>'
+            ).join('') +
+          '</div>'
+        : '';
+
+      const tasksSection = st.mode === 'proposal'
+        ? '<div style="margin-top: 16px; padding: 12px; background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 10px;">' +
+            '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">' +
+              '<div style="font-weight: 800; font-size: 0.86rem; color: #3730a3;">📋 Tarefas a enviar para a Folha da Semana (' + st.tarefas.length + ')</div>' +
+              '<button class="btn btn-secondary" onclick="campaignEditorAddTask()" style="font-size: 0.74rem; padding: 4px 10px;">+ Adicionar Tarefa</button>' +
+            '</div>' +
+            st.tarefas.map((t, idx) =>
+              '<div style="display:flex; gap: 8px; margin-bottom: 6px;">' +
+                '<input type="text" value="' + escapeHtml(t.designacao) + '" oninput="campaignEditorUpdateTask(' + idx + ', this.value)" style="flex:1; padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.82rem;" />' +
+                '<button class="btn btn-secondary" onclick="campaignEditorRemoveTask(' + idx + ')" style="padding: 4px 8px; color: #dc2626; border-color: #fecaca;">🗑️</button>' +
+              '</div>'
+            ).join('') +
+          '</div>'
+        : '';
+
+      body.innerHTML =
+        '<div style="display:grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; margin-bottom: 14px;">' +
+          '<div><label style="display:block;font-size:0.74rem;font-weight:700;color:#475569;margin-bottom:4px;">Título da Campanha</label><input id="ceTitulo" type="text" value="' + escapeHtml(st.titulo) + '" style="width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:7px;font-weight:700;" /></div>' +
+          '<div><label style="display:block;font-size:0.74rem;font-weight:700;color:#475569;margin-bottom:4px;">Válida até</label><input id="ceDataFim" type="date" value="' + escapeHtml(st.dataFimIso) + '" style="width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:7px;" /></div>' +
+          '<div><label style="display:block;font-size:0.74rem;font-weight:700;color:#475569;margin-bottom:4px;">Desconto Global (%)</label><div style="display:flex;gap:6px;"><input id="ceDescontoGlobal" type="number" min="0" max="60" step="1" value="' + st.descontoPct + '" style="width:72px;padding:8px;border:1px solid #cbd5e1;border-radius:7px;font-weight:700;" /><button class="btn btn-secondary" onclick="campaignEditorApplyGlobalDiscount()" style="font-size:0.74rem;padding:6px 10px;">Aplicar a todos</button></div></div>' +
+        '</div>' +
+        (lowMarginCount > 0 ? '<div style="background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;padding:8px 12px;border-radius:8px;font-size:0.8rem;font-weight:700;margin-bottom:12px;">⚠️ Atenção Anti-Dumping: ' + lowMarginCount + ' artigo(s) com margem abaixo de 5%. Ajuste o desconto individual antes de guardar.</div>' : '') +
+        '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin-bottom:14px;">' +
+          '<div style="font-size:0.8rem;font-weight:700;color:#334155;margin-bottom:6px;">➕ Adicionar produto MNSRM / Venda Livre do stock à campanha:</div>' +
+          '<div style="display:flex;gap:8px;">' +
+            '<input id="ceProductSearchInput" type="text" placeholder="Pesquisar por nome, CNP ou laboratório (ex: Antigrippine, CeraVe)..." onkeydown="if(event.key===\'Enter\') campaignEditorSearchProducts()" style="flex:1;padding:7px 10px;border:1px solid #cbd5e1;border-radius:7px;font-size:0.82rem;" />' +
+            '<button class="btn" onclick="campaignEditorSearchProducts()" style="background:#0284c7;color:#fff;padding:7px 14px;font-size:0.8rem;">🔍 Pesquisar</button>' +
+          '</div>' +
+          '<div id="ceSearchResultsBox">' + searchHtml + '</div>' +
+        '</div>' +
+        '<div style="font-size:0.84rem;font-weight:700;color:#0f172a;margin-bottom:6px;">📦 Artigos na Campanha (' + st.produtos.length + ' SKUs):</div>' +
+        '<div style="overflow-x:auto;border:1px solid #e2e8f0;border-radius:8px;max-height:260px;overflow-y:auto;">' +
+          '<table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#f1f5f9;font-size:0.74rem;color:#475569;text-align:left;"><th style="padding:7px 8px;">CNP</th><th style="padding:7px 8px;">Designação</th><th style="padding:7px 8px;text-align:center;">Stock</th><th style="padding:7px 8px;text-align:right;">PVP</th><th style="padding:7px 8px;text-align:center;">Desconto</th><th style="padding:7px 8px;text-align:right;">PVP Promo</th><th style="padding:7px 8px;text-align:center;">Margem</th><th style="padding:7px 8px;text-align:center;">Rem.</th></tr></thead><tbody>' +
+          (prodRows || '<tr><td colspan="8" style="padding:16px;text-align:center;color:#64748b;">Nenhum produto selecionado. Use a pesquisa acima para adicionar.</td></tr>') +
+          '</tbody></table>' +
+        '</div>' +
+        tasksSection;
+    }
+
+    async function saveCampaignEditorModal() {
+      campaignEditorSyncHeaderFields();
+      if (!campaignEditorState) return;
+      const st = campaignEditorState;
+      if (!st.produtos || st.produtos.length === 0) {
+        alert('Adicione pelo menos 1 produto MNSRM/Venda Livre à campanha.');
+        return;
+      }
+      const lowMargin = st.produtos.filter(p => p.margem_pct < 5);
+      if (lowMargin.length > 0) {
+        alert('Regra Anti-Dumping: ajuste o desconto dos artigos com margem inferior a 5% (' + lowMargin.map(p => p.cnp_codigo).join(', ') + ').');
+        return;
+      }
+
+      const btn = document.getElementById('campaignEditorSaveBtn');
+      if (btn) { btn.disabled = true; btn.textContent = '⏳ A guardar...'; }
+
+      try {
+        let res;
+        if (st.mode === 'active') {
+          res = await fetch('/api/campaigns/active', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              farmaciaId: activeFarmaciaId,
+              activeId: st.activeId,
+              titulo: st.titulo,
+              dataFimIso: st.dataFimIso,
+              descontoPct: st.descontoPct,
+              produtos: st.produtos,
+              atualizarTarefas: true,
+            }),
+          });
+        } else {
+          res = await fetch('/api/campaigns/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              farmaciaId: activeFarmaciaId,
+              campanhaId: st.campanhaId,
+              titulo: st.titulo,
+              icone: st.icone,
+              descontoPct: st.descontoPct,
+              dataFimIso: st.dataFimIso,
+              produtos: st.produtos,
+              tarefasPersonalizadas: st.tarefas,
+            }),
+          });
+        }
+        const data = await res.json();
+        if (data.success) {
+          closeCampaignEditorModal();
+          await loadActiveCampaigns();
+          await fetchWeeklyTasksFromDb();
+          alert('✅ ' + (data.mensagem || 'Campanha guardada com sucesso!'));
+        } else {
+          alert('Erro: ' + (data.mensagem || data.error || 'falha ao guardar campanha'));
+        }
+      } catch (e) {
+        alert('Erro de rede ao guardar campanha: ' + e.message);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '💾 Guardar & Aplicar'; }
+      }
     }
 
         function goToCampaignsTab() {

@@ -21,7 +21,23 @@ export interface ActivateCampaignInput {
   descontoPct?: number;
   produtos: ActiveCampaignProductItem[];
   diasDuracao?: number;
+  dataFimIso?: string;
   criadoPor?: string;
+  tarefasPersonalizadas?: Array<{
+    categoria?: string;
+    designacao: string;
+    valorImpacto?: number;
+  }>;
+}
+
+export interface UpdateActiveCampaignInput {
+  farmaciaId: string;
+  activeId: string;
+  titulo?: string;
+  dataFimIso?: string;
+  descontoPct?: number;
+  produtos?: ActiveCampaignProductItem[];
+  atualizarTarefas?: boolean;
 }
 
 /**
@@ -40,11 +56,15 @@ export async function activateCampaign(
     descontoPct = 15,
     produtos,
     diasDuracao = 15,
-    criadoPor = 'Diretor'
+    dataFimIso,
+    criadoPor = 'Diretor',
+    tarefasPersonalizadas,
   } = input;
 
   const dataInicio = new Date();
-  const dataFim = new Date(dataInicio.getTime() + diasDuracao * 24 * 60 * 60 * 1000);
+  const dataFim = dataFimIso && !Number.isNaN(Date.parse(dataFimIso))
+    ? new Date(dataFimIso)
+    : new Date(dataInicio.getTime() + diasDuracao * 24 * 60 * 60 * 1000);
 
   // 1. Marca qualquer campanha ativa anterior com o mesmo ID como CONCLUIDA
   await prisma.campanhaAtiva.updateMany({
@@ -85,26 +105,38 @@ export async function activateCampaign(
     .map((p) => p.designacao.split(',')[0].slice(0, 30))
     .join(' + ');
 
-  const tarefasOperacionais = [
+  const defaultTarefas = [
     {
       taskId: `CAMPANHA_${campanhaId}_MERCH`,
       categoria: 'BALCAO_CAMPANHA',
-      designacao: `[${icone} Campanha] Montar Cesto/Ilha de Balcão: ${titulo} (${descontoPct}% desconto)`,
+      designacao: `[${icone} Campanha] Montar Cesto/Ilha de Balcão: ${titulo} (-${descontoPct}% desconto)`,
       valorImpacto: valorTotalCusto,
     },
     {
       taskId: `CAMPANHA_${campanhaId}_SCRIPT`,
       categoria: 'BALCAO_CAMPANHA',
-      designacao: `[${icone} Campanha] Atendimento Ativo: Recomendar ${top3Nomes || titulo} ao balcão com preço especial`,
+      designacao: `[${icone} Campanha] Atendimento Ativo: Recomendar ${top3Nomes || titulo} ao balcão com preço promocional`,
       valorImpacto: undefined,
     },
     {
       taskId: `CAMPANHA_${campanhaId}_SIFARMA`,
       categoria: 'ENCOMENDAS_CAMPANHA',
-      designacao: `[${icone} Campanha] Travar Encomendas: Ponto de Encomenda = 0 no Sistema de Gestão em produtos concorrentes enquanto decorre a campanha (${totalProdutos} SKUs, ${totalUnidades} un)`,
+      designacao: `[${icone} Campanha] Travar Compras: Rever Ponto de Encomenda = 0 no Sistema de Gestão nos ${totalProdutos} artigos desta campanha (${totalUnidades} un em stock) até escoar`,
       valorImpacto: undefined,
     }
   ];
+
+  const tarefasOperacionais =
+    Array.isArray(tarefasPersonalizadas) && tarefasPersonalizadas.length > 0
+      ? tarefasPersonalizadas
+          .filter((t) => String(t.designacao || '').trim().length > 0)
+          .map((t, idx) => ({
+            taskId: `CAMPANHA_${campanhaId}_CUSTOM_${idx + 1}`,
+            categoria: t.categoria || 'BALCAO_CAMPANHA',
+            designacao: String(t.designacao).trim(),
+            valorImpacto: t.valorImpacto !== undefined ? Number(t.valorImpacto) : idx === 0 ? valorTotalCusto : undefined,
+          }))
+      : defaultTarefas;
 
   for (const t of tarefasOperacionais) {
     try {
@@ -199,5 +231,115 @@ export async function deactivateCampaign(
     success: res.count > 0,
     afetados: res.count,
     mensagem: res.count > 0 ? `Campanha marcada como ${novoEstado}.` : 'Nenhuma campanha ativa encontrada.'
+  };
+}
+
+/**
+ * Atualiza uma campanha já ativa (título, data de fim, desconto, produtos/preços individuais e tarefas).
+ */
+export async function updateActiveCampaign(
+  prisma: PrismaClient,
+  input: UpdateActiveCampaignInput
+) {
+  const existing = await prisma.campanhaAtiva.findFirst({
+    where: {
+      farmaciaId: input.farmaciaId,
+      OR: [{ id: input.activeId }, { campanhaId: input.activeId, estado: 'ATIVA' }],
+    },
+  });
+
+  if (!existing) {
+    return { success: false, mensagem: 'Campanha ativa não encontrada.' };
+  }
+
+  // Bloqueio legal MSRM caso produtos tenham sido editados
+  const produtosFinais = Array.isArray(input.produtos) && input.produtos.length > 0
+    ? input.produtos
+    : ((existing.produtosJson as any[]) || []);
+
+  if (Array.isArray(input.produtos) && input.produtos.length > 0) {
+    const cnps = input.produtos.map((p) => p.cnp_codigo).filter(Boolean);
+    if (cnps.length > 0) {
+      const msrmFound = await prisma.produtoMestre.findMany({
+        where: { cnp_codigo: { in: cnps }, tipo_venda: 'MSRM' },
+        select: { cnp_codigo: true, designacao: true },
+      });
+      if (msrmFound.length > 0) {
+        return {
+          success: false,
+          mensagem: `Proibido incluir MSRM em campanhas: ${msrmFound.map((m) => m.cnp_codigo).join(', ')}.`,
+        };
+      }
+    }
+  }
+
+  const tituloFinal = input.titulo && input.titulo.trim() ? input.titulo.trim() : existing.titulo;
+  const descontoFinal = input.descontoPct !== undefined ? Number(input.descontoPct) : existing.descontoAplicadoPct;
+  const dataFimFinal =
+    input.dataFimIso && !Number.isNaN(Date.parse(input.dataFimIso))
+      ? new Date(input.dataFimIso)
+      : existing.dataFim;
+
+  const updated = await prisma.campanhaAtiva.update({
+    where: { id: existing.id },
+    data: {
+      titulo: tituloFinal,
+      descontoAplicadoPct: descontoFinal,
+      dataFim: dataFimFinal,
+      produtosJson: produtosFinais as any,
+    },
+  });
+
+  if (input.atualizarTarefas !== false) {
+    const weekKey = getCurrentWeekKey();
+    const totalProdutos = produtosFinais.length;
+    const totalUnidades = produtosFinais.reduce((s, p) => s + (Number(p.stock_atual) || 0), 0);
+    const valorTotalCusto = produtosFinais.reduce(
+      (s, p) => s + (Number(p.stock_atual) || 0) * (Number(p.custo_unitario) || 0),
+      0
+    );
+    const top3Nomes = produtosFinais
+      .slice(0, 3)
+      .map((p) => String(p.designacao || '').split(',')[0].slice(0, 30))
+      .join(' + ');
+    const icone = existing.icone || '🎯';
+
+    const syncList = [
+      {
+        taskId: `CAMPANHA_${existing.campanhaId}_MERCH`,
+        designacao: `[${icone} Campanha] Montar Cesto/Ilha de Balcão: ${tituloFinal} (-${descontoFinal}% desconto)`,
+        valorImpacto: valorTotalCusto,
+      },
+      {
+        taskId: `CAMPANHA_${existing.campanhaId}_SCRIPT`,
+        designacao: `[${icone} Campanha] Atendimento Ativo: Recomendar ${top3Nomes || tituloFinal} ao balcão com preço promocional`,
+        valorImpacto: undefined,
+      },
+      {
+        taskId: `CAMPANHA_${existing.campanhaId}_SIFARMA`,
+        designacao: `[${icone} Campanha] Travar Compras: Rever Ponto de Encomenda = 0 no Sistema de Gestão nos ${totalProdutos} artigos desta campanha (${totalUnidades} un em stock) até escoar`,
+        valorImpacto: undefined,
+      },
+    ];
+
+    for (const s of syncList) {
+      await prisma.tarefaEquipa.updateMany({
+        where: {
+          farmaciaId: input.farmaciaId,
+          week_key: weekKey,
+          task_id: s.taskId,
+        },
+        data: {
+          designacao: s.designacao,
+          ...(s.valorImpacto !== undefined ? { valor_impacto: Number(s.valorImpacto.toFixed(2)) } : {}),
+        },
+      });
+    }
+  }
+
+  return {
+    success: true,
+    campanhaAtiva: updated,
+    mensagem: `Campanha "${tituloFinal}" atualizada com sucesso (${produtosFinais.length} SKUs).`,
   };
 }

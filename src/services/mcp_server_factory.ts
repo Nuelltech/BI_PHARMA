@@ -62,8 +62,7 @@ export function createPharmaMcpServer(
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return {
-      tools: [
+    const allTools = [
         {
           name: 'analisar_evolucao_mensal_financeira',
           description:
@@ -302,8 +301,22 @@ export function createPharmaMcpServer(
             },
           },
         },
-      ],
-    };
+      ];
+
+    const perfil = options?.perfilPermissao || 'COMPLETO';
+    const tools = allTools
+      .filter((t) => checkToolPermission(perfil, t.name).allowed)
+      .map((t) => ({
+        ...t,
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      }));
+
+    return { tools };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

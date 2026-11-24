@@ -69,13 +69,128 @@ export async function getPharmacyWeeklyTasks(
     }
   }
 
+  const CUSTOM_CATS = new Set([
+    'BALCAO_CAMPANHA',
+    'ENCOMENDAS_CAMPANHA',
+    'DIRECAO_TECNICA',
+    'CAMPANHA',
+    'MANUAL',
+  ]);
+
+  const customTasks = tasks
+    .filter(
+      (t: any) =>
+        String(t.task_id || '').startsWith('MANUAL_') ||
+        String(t.task_id || '').startsWith('CAMPANHA_') ||
+        String(t.task_id || '').startsWith('COPILOT_') ||
+        CUSTOM_CATS.has(String(t.categoria || '').toUpperCase())
+    )
+    .map((t: any) => ({
+      id: t.id,
+      task_id: t.task_id,
+      week_key: t.week_key,
+      categoria: t.categoria,
+      cnp_codigo: t.cnp_codigo || null,
+      designacao: t.designacao || 'Tarefa operacional',
+      campanha_id: t.campanha_id || null,
+      concluido: Boolean(t.concluido),
+      concluido_por: t.concluido_por || null,
+      concluido_em: t.concluido_em ? t.concluido_em.toISOString() : null,
+      valor_impacto: t.valor_impacto !== null && t.valor_impacto !== undefined ? Number(t.valor_impacto) : null,
+    }));
+
   return {
     weekKey: key,
     tasksMap: map,
     totalConcluidas,
     valorPoupancaSalvo,
     recentTasks: tasks.filter((t: any) => t.concluido).slice(0, 10),
+    customTasks,
   };
+}
+
+export async function createManualWeeklyTask(
+  prisma: PrismaClient,
+  params: {
+    farmaciaId: string;
+    designacao: string;
+    categoria?: string;
+    cnp_codigo?: string;
+    valor_impacto?: number | null;
+    campanha_id?: string | null;
+  }
+) {
+  const key = getCurrentWeekKey();
+  const taskId = `MANUAL_${Date.now()}_${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+  const cat = (params.categoria || 'DIRECAO_TECNICA').toUpperCase();
+  const valDecimal =
+    params.valor_impacto !== undefined && params.valor_impacto !== null && !Number.isNaN(Number(params.valor_impacto))
+      ? new Prisma.Decimal(Number(params.valor_impacto))
+      : null;
+
+  return (prisma as any).tarefaEquipa.create({
+    data: {
+      farmaciaId: params.farmaciaId,
+      week_key: key,
+      task_id: taskId,
+      categoria: cat,
+      designacao: params.designacao.trim(),
+      cnp_codigo: params.cnp_codigo ? String(params.cnp_codigo).trim() : null,
+      campanha_id: params.campanha_id || null,
+      concluido: false,
+      concluido_por: null,
+      valor_impacto: valDecimal,
+    },
+  });
+}
+
+export async function updateManualWeeklyTask(
+  prisma: PrismaClient,
+  params: {
+    farmaciaId: string;
+    taskId: string;
+    designacao?: string;
+    categoria?: string;
+    valor_impacto?: number | null;
+    weekKey?: string;
+  }
+) {
+  const key = params.weekKey || getCurrentWeekKey();
+  const data: any = {};
+  if (params.designacao !== undefined) data.designacao = params.designacao.trim();
+  if (params.categoria !== undefined) data.categoria = params.categoria.toUpperCase();
+  if (params.valor_impacto !== undefined) {
+    data.valor_impacto =
+      params.valor_impacto !== null && !Number.isNaN(Number(params.valor_impacto))
+        ? new Prisma.Decimal(Number(params.valor_impacto))
+        : null;
+  }
+  return (prisma as any).tarefaEquipa.updateMany({
+    where: {
+      farmaciaId: params.farmaciaId,
+      week_key: key,
+      task_id: params.taskId,
+    },
+    data,
+  });
+}
+
+export async function deleteManualWeeklyTask(
+  prisma: PrismaClient,
+  params: {
+    farmaciaId: string;
+    taskId: string;
+    weekKey?: string;
+  }
+) {
+  const key = params.weekKey || getCurrentWeekKey();
+  return (prisma as any).tarefaEquipa.deleteMany({
+    where: {
+      farmaciaId: params.farmaciaId,
+      week_key: key,
+      task_id: params.taskId,
+    },
+  });
 }
 
 export async function toggleWeeklyTaskInDb(

@@ -2979,6 +2979,87 @@ export async function toolAtivarCampanhaFarmacia(
     }
   }
 
+  // 1. Prioridade absoluta: se o utilizador/Copilot indicou CNPs específicos, usar ESTRITAMENTE esses CNPs (nunca expandir para 18 artigos)
+  if (produtosSugeridos.length === 0 && cnpsList.length > 0) {
+    const exactRows = await prisma.inventario.findMany({
+      where: {
+        farmaciaId: ctx.farmaciaId,
+        cnp_codigo: { in: cnpsList },
+      },
+      include: { produto: true },
+    });
+    const byCnp = new Map<string, any>();
+    for (const r of exactRows) {
+      if (!r.produto || r.produto.tipo_venda === 'MSRM') continue;
+      const prev = byCnp.get(r.cnp_codigo);
+      const custo = Number(r.custo_unitario || (r.produto as any).custo_unitario || 0);
+      const pvp = Number((r.produto as any).pvp_oficial || (r.produto as any).pvp || (custo * 1.5));
+      if (prev) {
+        prev.stock_atual += Number(r.quantidade || 0);
+      } else {
+        byCnp.set(r.cnp_codigo, {
+          cnp_codigo: r.cnp_codigo,
+          designacao: r.produto.designacao,
+          laboratorio_titular: r.produto.laboratorio_titular,
+          stock_atual: Number(r.quantidade || 0),
+          custo_unitario: custo,
+          pvp,
+          taxa_iva: (r.produto as any).taxa_iva ? Number((r.produto as any).taxa_iva) : 0.23,
+        });
+      }
+    }
+    if (byCnp.size > 0) {
+      produtosSugeridos = Array.from(byCnp.values());
+    }
+  }
+
+  // 2. Se não vieram CNPs mas o tema/título é um nome de marca/produto específico (não um tema sazonal amplo), pesquisar diretamente esses artigos
+  if (produtosSugeridos.length === 0 && !args.campanha_id) {
+    const searchHint = String(args.tema_ou_evento || args.titulo || '').trim();
+    const isBroadTheme = /\b(inverno|ver[aã]o|outono|primavera|gripe|imunidade|alergia|solar|natal|black\s*friday|halloween|dermo|pele|cabelo|suplement|sazonal|monos?|validades?)\b/i.test(searchHint);
+    const cleanedBrand = searchHint
+      .replace(/\b(campanha|escoamento|promo[çc][aã]o|desconto|produto|artigo|de|do|da|dos|das|para|com)\b/gi, '')
+      .trim();
+    if (!isBroadTheme && cleanedBrand.length >= 3) {
+      const brandRows = await prisma.inventario.findMany({
+        where: {
+          farmaciaId: ctx.farmaciaId,
+          quantidade: { gt: 0 },
+          produto: {
+            tipo_venda: { not: 'MSRM' },
+            designacao: { contains: cleanedBrand, mode: 'insensitive' },
+          },
+        },
+        include: { produto: true },
+        orderBy: { quantidade: 'desc' },
+        take: 25,
+      });
+      const byCnp = new Map<string, any>();
+      for (const r of brandRows) {
+        if (!r.produto) continue;
+        const prev = byCnp.get(r.cnp_codigo);
+        const custo = Number(r.custo_unitario || (r.produto as any).custo_unitario || 0);
+        const pvp = Number((r.produto as any).pvp_oficial || (r.produto as any).pvp || (custo * 1.5));
+        if (prev) {
+          prev.stock_atual += Number(r.quantidade || 0);
+        } else {
+          byCnp.set(r.cnp_codigo, {
+            cnp_codigo: r.cnp_codigo,
+            designacao: r.produto.designacao,
+            laboratorio_titular: r.produto.laboratorio_titular,
+            stock_atual: Number(r.quantidade || 0),
+            custo_unitario: custo,
+            pvp,
+            taxa_iva: (r.produto as any).taxa_iva ? Number((r.produto as any).taxa_iva) : 0.23,
+          });
+        }
+      }
+      if (byCnp.size > 0) {
+        produtosSugeridos = Array.from(byCnp.values());
+      }
+    }
+  }
+
   if (produtosSugeridos.length === 0) {
     const { buildCustomCampaign } = await import('./campaigns');
     const customResult = await buildCustomCampaign(prisma, ctx.farmaciaId, {

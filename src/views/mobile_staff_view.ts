@@ -1461,6 +1461,7 @@ export function getMobileStaffHtml(): string {
 
         const tData = await tasksRes.json();
         tasksMap = tData.tasksMap || {};
+        window.customTasksList = Array.isArray(tData.customTasks) ? tData.customTasks : [];
 
         renderSection1();
         renderSection2();
@@ -1737,12 +1738,53 @@ export function getMobileStaffHtml(): string {
         return;
       }
 
+      function getSmartExpiryInstructionMobile(item) {
+        const tipo = String(item.tipo_venda || item.macro_area || '').toUpperCase();
+        const isMsrm = tipo === 'MSRM';
+        const qItem = Number(item.stock_atual != null ? item.stock_atual : (item.quantidade || 1));
+        const vmm = Number(item.vmm || item.venda_media_mensal || 0);
+        let dias = null;
+        if (item.data_validade && /^\\d{4}-\\d{2}-\\d{2}/.test(String(item.data_validade))) {
+          const dt = new Date(String(item.data_validade).slice(0, 10) + 'T00:00:00');
+          const hoje = new Date();
+          hoje.setHours(0, 0, 0, 0);
+          dias = Math.round((dt.getTime() - hoje.getTime()) / 86400000);
+        } else if (item.meses_ate_caducidade != null) {
+          dias = Math.round(Number(item.meses_ate_caducidade) * 30);
+        }
+        const meses = dias !== null ? Math.max(0, dias / 30) : 99;
+        const vendasEsp = vmm > 0 ? Math.floor(vmm * meses) : 0;
+        if (dias !== null && dias <= 0) {
+          return '🚫 <b>Retirar Imediatamente (Quarentena):</b> Prazo expirado. Encaminhar para devolução ou abate/VALORMED.';
+        }
+        if (dias !== null && dias <= 30) {
+          return isMsrm
+            ? '🚫 <b>Quarentena (' + dias + 'd · MSRM):</b> Prazo curto para dispensa. Verificar devolução ao armazenista ou abate/VALORMED.'
+            : '🚫 <b>Retirar de Exposição (' + dias + 'd):</b> Prazo demasiado curto para balcão. Verificar troca/devolução ou abate.';
+        }
+        if (dias !== null && dias > 30 && vmm > 0 && qItem <= vendasEsp) {
+          return '🟢 <b>FEFO na Gaveta (Escoa Naturalmente):</b> Garantir saída prioritária das caixas mais antigas.';
+        }
+        if (dias !== null && dias <= 90) {
+          return isMsrm
+            ? '📦 <b>FEFO + Devolução (' + dias + 'd · MSRM):</b> Colocar à frente na gaveta, travar compras e verificar janela de devolução.'
+            : '🔥 <b>Escoamento Balcão (' + dias + 'd · Venda Livre):</b> Destaque no balcão/cesto e avaliar campanha (margem ≥ 5%).';
+        }
+        if (dias !== null && dias <= 180) {
+          return isMsrm
+            ? '🔄 <b>FEFO Gaveta (3–6M · MSRM):</b> Garantir saída das caixas mais antigas e rever ponto de encomenda.'
+            : '📌 <b>Rodar Linear (FEFO · 3–6M):</b> Passar caixas mais antigas para a frente; avaliar pack/campanha.';
+        }
+        return '✅ <b>Monitorização FEFO (&gt; 6M):</b> Manter rotação normal por ordem de validade.';
+      }
+
       container.innerHTML = filtered.map(it => {
         const taskId = 'cad_' + it.cnp_codigo + '_' + (it.lote || 0);
         const tInfo = tasksMap[taskId];
         const isDone = !!tInfo?.concluido;
         const qtd = it.stock_atual != null ? it.stock_atual : (it.quantidade || 1);
         const valRisco = it.valor_em_risco != null ? it.valor_em_risco : (qtd * (it.custo_unitario || 0));
+        const smartInstr = getSmartExpiryInstructionMobile(it);
 
         return \`
           <div class="task-card \${isDone ? 'completed' : ''}" id="card_\${taskId}">
@@ -1758,7 +1800,7 @@ export function getMobileStaffHtml(): string {
                 <span class="tag tag-cnp">CNP: \${escapeHtml(it.cnp_codigo)}</span>
               </div>
               <div class="task-instruction">
-                ⚠️ <b>Ação Gaveta / Balcão:</b> Separar fisicamente da prateleira ou colocar em destaque imediato de balcão.
+                \${smartInstr}
               </div>
               \${isDone ? \`
                 <div class="task-completion-stamp">
@@ -1800,13 +1842,55 @@ export function getMobileStaffHtml(): string {
         .slice()
         .sort((a, b) => (a.designacao || '').localeCompare(b.designacao || '', 'pt'));
 
-      const totalItems = listGen.length + listSeasonal.length;
+      const customTasks = Array.isArray(window.customTasksList) ? window.customTasksList : [];
+      const totalItems = customTasks.length + listGen.length + listSeasonal.length;
       document.getElementById('tabCount2').textContent = totalItems;
 
       const q = (document.getElementById('search1').value || '').toLowerCase().trim();
       const statusF = statusFilters[1];
 
       let html = '';
+
+      // Bloco 0: Missões da Direção, Copilot & Campanhas Ativas
+      const filteredCustom = customTasks.filter(ct => {
+        const isDone = tasksMap[ct.task_id] ? !!tasksMap[ct.task_id].concluido : !!ct.concluido;
+        if (statusF === 'pending' && isDone) return false;
+        if (statusF === 'done' && !isDone) return false;
+        if (q) {
+          return String(ct.designacao || '').toLowerCase().includes(q) || String(ct.cnp_codigo || '').toLowerCase().includes(q);
+        }
+        return true;
+      });
+      if (filteredCustom.length > 0) {
+        html += '<div style="font-size: 0.78rem; font-weight: 800; color: #f43f5e; text-transform: uppercase; margin: 4px 0 8px 0;">🎯 Missões da Direção & Campanhas Ativas:</div>';
+        html += filteredCustom.map(ct => {
+          const tInfo = tasksMap[ct.task_id];
+          const isDone = tInfo ? !!tInfo.concluido : !!ct.concluido;
+          const valImp = ct.valor_impacto != null ? Number(ct.valor_impacto) : 0;
+          const safeTitle = escapeHtml(ct.designacao || 'Missão da Equipa');
+          const safeCat = escapeHtml(ct.categoria || 'DIRECAO_TECNICA');
+          const safeCnp = ct.cnp_codigo ? "'" + escapeHtml(ct.cnp_codigo) + "'" : 'null';
+          return \`
+            <div class="task-card \${isDone ? 'completed' : ''}" id="card_\${escapeHtml(ct.task_id)}" style="border-left: 4px solid #6366f1;">
+              <div class="task-check-btn" onclick="toggleTask('\${escapeHtml(ct.task_id)}', '\${safeCat}', \${safeCnp}, '\${safeTitle.replace(/'/g, "\\\\'")}', \${valImp})">
+                \${isDone ? '✓' : ''}
+              </div>
+              <div class="task-body">
+                <div class="task-title">\${safeTitle}</div>
+                <div class="task-tags">
+                  <span class="tag tag-purple">\${String(ct.task_id || '').startsWith('CAMPANHA_') ? '🎯 Campanha' : '📋 Direção / Copilot'}</span>
+                  \${valImp > 0 ? \`<span class="tag tag-green">€\${valImp.toFixed(2)}</span>\` : ''}
+                </div>
+                \${isDone ? \`
+                  <div class="task-completion-stamp">
+                    ✓ Concluído por \${escapeHtml(tInfo?.concluido_por || ct.concluido_por || 'Equipa')} · \${formatTime(tInfo?.concluido_em || ct.concluido_em)}
+                  </div>
+                \` : ''}
+              </div>
+            </div>
+          \`;
+        }).join('');
+      }
 
       // Bloco A: Restos de gaveta A-Z
       if (balcaoSubtab === 'restos' || balcaoSubtab === 'all') {

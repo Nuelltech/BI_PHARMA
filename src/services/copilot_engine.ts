@@ -717,6 +717,10 @@ Margens: a margem mensal é estimada com o custo médio atual; indica-o quando m
   só se o utilizador pediu uma decisão ou sugestão.
 - Ações de escrita (criar tarefa, ativar campanha): primeiro pré-visualização (confirmado=false),
   mostra o que vai ser feito e pede confirmação. Só gravas (confirmado=true) após um "sim" explícito.
+- Pesquisa de produtos: quando o utilizador mencionar o nome de um produto ou marca (ex.: "Ben-u-gripe", "Antigrippine"),
+  chama SEMPRE consultar_produtos primeiro — NUNCA peças o CNP ao farmacêutico sem antes pesquisar na base de dados.
+- Fidelidade em campanhas: quando o utilizador pedir uma campanha para produtos específicos, passa SEMPRE os CNPs exatos
+  em cnps_especificos na pré-visualização E na ativação confirmada; nunca alargues silenciosamente para outros produtos que o utilizador não confirmou.
 - Para follow-ups sobre uma lista já mostrada, usa refinar_resultado com o result_id.
 - Se uma ferramenta devolver ok=false, lê o erro, corrige a chamada uma vez, e se persistir
   diz de forma simples o que não foi possível obter.
@@ -983,8 +987,9 @@ export async function askConversationalCopilot(
     };
   }
 
-  // Fase 2: Deteção de pergunta ambígua curta (ex.: "Bial" sozinho) -> devolve até 3 opções e grava pergunta_de_volta = true
-  const ambCheck = detectAmbiguousBareQuery(question);
+  // Fase 2: Deteção de pergunta ambígua curta (ex.: "Bial" sozinho) — APENAS no 1.º turno sem histórico ativo
+  const priorTurns = getCopilotSessionHistory(sessionId);
+  const ambCheck = priorTurns.length === 0 ? detectAmbiguousBareQuery(question) : { isAmbiguous: false };
   if (ambCheck.isAmbiguous && ambCheck.reply) {
     const ambTracer = new CopilotAuditTracer(
       secContext.farmaciaId,
