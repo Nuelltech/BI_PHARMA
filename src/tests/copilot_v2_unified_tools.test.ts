@@ -17,6 +17,7 @@ import {
   renderMarkdownTableFromStoredResult,
 } from '../services/pharma_tool_helpers';
 import { calculateClaudeCostEur } from '../services/copilot_engine';
+import { validateAgentV2Response } from '../services/copilot_agent_v2';
 
 const prisma = new PrismaClient();
 const FARMACIA_A_ID = '3ac42c32-87a8-4afe-98cc-4ca61ac64aca';
@@ -206,7 +207,39 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
     }
   }, 20000);
 
-  it('8. Validação vm.Script de todos os blocos <script> inline em src/server.ts', () => {
+  it('8. Validação numérica (#25): deteta valores €, % e unidades inventados pelo modelo', () => {
+    const fakeTools = [
+      {
+        name: 'consultar_produtos',
+        input: { termo_pesquisa: 'rhinodouche' },
+        result: {
+          totalArtigosEncontrados: 5,
+          resumoEncontrado: { totalUnidadesVendidasAnoAtual: 2, totalUnidadesVendidas12M: 2 },
+          artigos: [
+            { cnp: '6391169', vendasAno12M: 1, vendasHistoricoTotalEur: 125.0, margemComercialPct: 38.5 },
+            { cnp: '6298752', vendasAno12M: 1, vendasHistoricoTotalEur: 21.8, margemComercialPct: 35.0 },
+          ],
+        },
+      },
+    ];
+    // Resposta com números inventados ("7 un / 96,30 €") -> tem de falhar #25
+    const badIssues = validateAgentV2Response(
+      'Foram vendidas 7 unidades num total de 96,30 € nos últimos 12M com margem de 52,4%.',
+      fakeTools
+    );
+    expect(badIssues.some((i) => i.includes('VALIDAÇÃO NUMÉRICA (#25)'))).toBe(true);
+    expect(badIssues.join(' ')).toContain('96,30 €');
+    expect(badIssues.join(' ')).toContain('7 un');
+
+    // Resposta só com números reais dos dados -> 0 issues
+    const goodIssues = validateAgentV2Response(
+      'Foram vendidas 2 unidades nos últimos 12M; o histórico soma 125,00 € no 6391169 (margem 38,5%) e 21,80 € no 6298752.',
+      fakeTools
+    );
+    expect(goodIssues.length).toBe(0);
+  });
+
+  it('9. Validação vm.Script de todos os blocos <script> inline em src/server.ts', () => {
     const src = fs.readFileSync('src/server.ts', 'utf8');
     const blocks = src.match(/<script>([\s\S]*?)<\/script>/g) || [];
     expect(blocks.length).toBeGreaterThan(0);

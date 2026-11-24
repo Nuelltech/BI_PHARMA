@@ -39,6 +39,8 @@ export interface CatalogItem {
   stock: number;
   custo: number;
   pvp: number;
+  pvpOrigem?: 'FARMACIA' | 'PRODUTO_MESTRE' | 'INEXISTENTE';
+  taxaIva?: number;
   margem: number;
   vendasQtd: number;
   faturacao: number;
@@ -84,6 +86,16 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
   const cached = catalogCache.get(farmaciaId);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.items;
 
+  // #19: Filtrar vendas estritamente pelos últimos 12 meses até à data mais recente da farmácia (nunca somar desde 2022!)
+  const maxVendaAgg = await prisma.venda.aggregate({
+    where: { farmaciaId },
+    _max: { data_venda: true },
+  });
+  const refDate = maxVendaAgg._max.data_venda || new Date();
+  const cutoff12m = new Date(
+    Date.UTC(refDate.getUTCFullYear() - 1, refDate.getUTCMonth(), refDate.getUTCDate())
+  );
+
   const [inventarios, vendas, precosFarmacia] = await Promise.all([
     prisma.inventario.findMany({
       where: { farmaciaId },
@@ -91,7 +103,10 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
     }),
     prisma.venda.groupBy({
       by: ['cnp_codigo'],
-      where: { farmaciaId },
+      where: {
+        farmaciaId,
+        data_venda: { gt: cutoff12m },
+      },
       _sum: { quantidade: true, valor_total: true },
     }),
     (prisma as any).precoFarmacia
@@ -102,11 +117,29 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
       : Promise.resolve([]),
   ]);
 
-  const invMap = new Map<string, { stock: number; custo: number; validade: Date | null }>();
+  // #21: Custo médio ponderado pelos lotes positivos (em vez de só o primeiro lote)
+  const invMap = new Map<
+    string,
+    { stock: number; custoSum: number; stockComCusto: number; fallbackCusto: number; validade: Date | null }
+  >();
   for (const i of inventarios) {
-    const cur = invMap.get(i.cnp_codigo) || { stock: 0, custo: 0, validade: null as Date | null };
-    cur.stock += i.quantidade;
-    if (!cur.custo) cur.custo = Number(i.custo_unitario);
+    const cur = invMap.get(i.cnp_codigo) || {
+      stock: 0,
+      custoSum: 0,
+      stockComCusto: 0,
+      fallbackCusto: 0,
+      validade: null as Date | null,
+    };
+    const qty = Number(i.quantidade || 0);
+    const cUnit = Number(i.custo_unitario || 0);
+    cur.stock += qty;
+    if (cUnit > 0) {
+      if (!cur.fallbackCusto) cur.fallbackCusto = cUnit;
+      if (qty > 0) {
+        cur.custoSum += cUnit * qty;
+        cur.stockComCusto += qty;
+      }
+    }
     if (i.data_validade && (!cur.validade || i.data_validade < cur.validade)) cur.validade = i.data_validade;
     invMap.set(i.cnp_codigo, cur);
   }
@@ -154,7 +187,10 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
     const vend = vendMap.get(p.cnp_codigo);
     const pf = precoMap.get(p.cnp_codigo);
     const c = classifyProduct(p.cnp_codigo, p.designacao, p.taxa_iva);
-    let custo = inv?.custo || 0;
+    let custo =
+      inv && inv.stockComCusto > 0
+        ? Number((inv.custoSum / inv.stockComCusto).toFixed(4))
+        : inv?.fallbackCusto || 0;
     const vendasQtd = vend?.qtd || 0;
     const faturacao = vend?.fat || 0;
 
@@ -166,29 +202,37 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
       custo = Number((custo / 500).toFixed(4));
     }
 
-    // Determinação rigorosa de PVP e Margem:
-    // 1. O PrecoFarmacia (pf) reflete o ficheiro Sifarma da própria farmácia.
-    // 2. Se for MSRM e o pf.pvp for inferior ao custo, trata-se de distorção de copagamento do SNS registado no Sifarma;
-    //    nesse caso, utiliza-se o PVP oficial do Infarmed (p.pvp).
-    // 3. Caso contrário, o ficheiro da farmácia (pf) é a verdade absoluta.
-    const rawPvp = pf?.pvp !== undefined && pf?.pvp !== null ? Number(pf.pvp) : p.pvp ? Number(p.pvp) : null;
-    const rawMargem = pf?.margem !== undefined && pf?.margem !== null ? Number(pf.margem) : p.margem_padrao ? Number(p.margem_padrao) : null;
+    // #20: Determinação rigorosa de PVP e Margem SEM IVA — NUNCA inventar PVP (sem custo * 1.4 nem faturação / qtd)
+    const taxaIva =
+      p.taxa_iva && Number(p.taxa_iva) > 0
+        ? Number(p.taxa_iva)
+        : c.tipo_venda === 'MSRM' || c.tipo_venda === 'MNSRM'
+        ? 6
+        : 23;
 
-    let pvp: number;
-    let margem: number;
+    const pfPvp = pf?.pvp !== undefined && pf?.pvp !== null && Number(pf.pvp) > 0 ? Number(pf.pvp) : null;
+    const mestrePvp = p.pvp !== undefined && p.pvp !== null && Number(p.pvp) > 0 ? Number(p.pvp) : null;
 
-    if (rawPvp !== null) {
-      if (c.tipo_venda === 'MSRM' && rawPvp < custo && p.pvp && Number(p.pvp) > custo) {
-        // Copagamento do SNS no ficheiro: corrige para o PVP legal Infarmed
-        pvp = Number(p.pvp);
-        margem = ((pvp - custo) / pvp) * 100;
+    let pvp = 0;
+    let pvpOrigem: 'FARMACIA' | 'PRODUTO_MESTRE' | 'INEXISTENTE' = 'INEXISTENTE';
+    let margem = 0;
+
+    if (pfPvp !== null) {
+      if (c.tipo_venda === 'MSRM' && pfPvp < custo && mestrePvp !== null && mestrePvp > custo) {
+        pvp = mestrePvp;
+        pvpOrigem = 'PRODUTO_MESTRE';
       } else {
-        pvp = rawPvp;
-        margem = rawMargem !== null ? rawMargem : pvp > 0 ? ((pvp - custo) / pvp) * 100 : 0;
+        pvp = pfPvp;
+        pvpOrigem = 'FARMACIA';
       }
-    } else {
-      pvp = p.pvp ? Number(p.pvp) : vendasQtd > 0 ? faturacao / vendasQtd : custo * 1.4;
-      margem = pvp > 0 ? ((pvp - custo) / pvp) * 100 : 0;
+    } else if (mestrePvp !== null) {
+      pvp = mestrePvp;
+      pvpOrigem = 'PRODUTO_MESTRE';
+    }
+
+    if (pvp > 0 && custo > 0) {
+      const pvpSemIva = pvp / (1 + taxaIva / 100);
+      margem = pvpSemIva > 0 ? Number((((pvpSemIva - custo) / pvpSemIva) * 100).toFixed(1)) : 0;
     }
 
     const cat = p.categoria || c.categoria || '';
@@ -229,6 +273,8 @@ export async function getPharmacyCatalog(prisma: PrismaClient, farmaciaId: strin
       stock: inv?.stock || 0,
       custo,
       pvp,
+      pvpOrigem,
+      taxaIva,
       margem,
       vendasQtd,
       faturacao,

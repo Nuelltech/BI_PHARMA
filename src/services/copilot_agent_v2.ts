@@ -347,10 +347,67 @@ async function executeUnifiedTool(
 }
 
 /**
- * Validação factual pós-resposta (Decisão 2 + Decisão 4c Rhinodouche):
+ * Recolhe todos os valores numéricos presentes nos resultados das ferramentas do turno (#25).
+ */
+function collectToolNumbers(obj: any, out: Set<number>, depth = 0): void {
+  if (depth > 8 || obj === null || obj === undefined) return;
+  if (typeof obj === 'number' && Number.isFinite(obj)) {
+    out.add(Math.round(obj * 100) / 100);
+    out.add(Math.round(obj * 10) / 10);
+    out.add(Math.round(obj));
+    return;
+  }
+  if (typeof obj === 'string') {
+    const matches = obj.match(/-?\d+(?:[.,]\d+)?/g);
+    if (matches) {
+      for (const m of matches) {
+        const n = Number(m.replace(',', '.'));
+        if (Number.isFinite(n)) {
+          out.add(Math.round(n * 100) / 100);
+          out.add(Math.round(n * 10) / 10);
+          out.add(Math.round(n));
+        }
+      }
+    }
+    return;
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) collectToolNumbers(item, out, depth + 1);
+    return;
+  }
+  if (typeof obj === 'object') {
+    for (const v of Object.values(obj)) collectToolNumbers(v, out, depth + 1);
+  }
+}
+
+function parsePtNumber(raw: string): number {
+  const s = raw.trim().replace(/\s+/g, '');
+  if (s.includes(',') && s.includes('.')) {
+    // ex: 1.234,56 -> 1234.56
+    return Number(s.replace(/\./g, '').replace(',', '.'));
+  }
+  if (s.includes(',')) {
+    return Number(s.replace(',', '.'));
+  }
+  // ex: 1.234 (milhar PT se 3 dígitos após ponto)
+  if (/^\d{1,3}\.\d{3}$/.test(s)) {
+    return Number(s.replace(/\./g, ''));
+  }
+  return Number(s);
+}
+
+function hasApproxNumber(pool: number[], target: number, tol: number): boolean {
+  for (const n of pool) {
+    if (Math.abs(n - target) <= tol) return true;
+  }
+  return false;
+}
+
+/**
+ * Validação factual pós-resposta (Decisão 2 + Decisão 4c Rhinodouche + Adenda #25):
  * Devolve lista de problemas detetados; se não estiver vazia, o loop pede ao modelo para corrigir 1 vez.
  */
-function validateAgentV2Response(
+export function validateAgentV2Response(
   finalText: string,
   executedTools: Array<{ name: string; input: any; result: any }>
 ): string[] {
@@ -401,7 +458,85 @@ function validateAgentV2Response(
     }
   }
 
+  // Regra #25 (Validação factual numérica): conferir valores €, % e unidades mencionados no texto contra os dados das ferramentas do turno
+  if (executedTools.length > 0) {
+    const numSet = new Set<number>();
+    for (const t of executedTools) {
+      collectToolNumbers(t.result, numSet);
+    }
+    const pool = Array.from(numSet);
+    const unverifiedValues: string[] = [];
+
+    // 1. Valores em € (ex: "349,80 €", "€ 96,30", "1.250,00€")
+    const eurMatches = finalText.matchAll(/(?:€\s*(\d[\d.\s]*(?:,\d{1,2})?))|(?:(\d[\d.\s]*(?:,\d{1,2})?)\s*€)/g);
+    for (const m of eurMatches) {
+      const rawNum = (m[1] || m[2] || '').trim();
+      const val = parsePtNumber(rawNum);
+      if (!Number.isFinite(val) || val === 0) continue;
+      if (!hasApproxNumber(pool, val, 0.15)) {
+        unverifiedValues.push(`${rawNum} €`);
+      }
+    }
+
+    // 2. Percentagens (ex: "45,2%", "23%")
+    const pctMatches = finalText.matchAll(/(\d+(?:[.,]\d{1,2})?)\s*%/g);
+    for (const m of pctMatches) {
+      const rawNum = (m[1] || '').trim();
+      const val = parsePtNumber(rawNum);
+      if (!Number.isFinite(val) || val === 0 || val === 100 || val === 6 || val === 23) continue;
+      if (!hasApproxNumber(pool, val, 0.25)) {
+        unverifiedValues.push(`${rawNum}%`);
+      }
+    }
+
+    // 3. Quantidades explícitas (ex: "7 un", "11 unidades")
+    const unitMatches = finalText.matchAll(/(\d+(?:[.,]\d+)?)\s*(?:un\b|unidades?\b)/gi);
+    for (const m of unitMatches) {
+      const rawNum = (m[1] || '').trim();
+      const val = parsePtNumber(rawNum);
+      if (!Number.isFinite(val) || val <= 2) continue; // ignora 0, 1, 2
+      if (!hasApproxNumber(pool, val, 0.05)) {
+        unverifiedValues.push(`${rawNum} un`);
+      }
+    }
+
+    if (unverifiedValues.length > 0) {
+      const uniqueUnv = Array.from(new Set(unverifiedValues)).slice(0, 8);
+      issues.push(
+        `VALIDAÇÃO NUMÉRICA (#25): Os seguintes valores citados no texto não constam nos resultados devolvidos pelas ferramentas deste turno: ${uniqueUnv.join(', ')}. Usa exclusivamente os números e totais pré-calculados devolvidos pelas ferramentas, sem somar ou inventar valores.`
+      );
+    }
+  }
+
   return issues;
+}
+
+function summarizeToolResultForAudit(res: any): {
+  resultado_id: string | null;
+  num_linhas: number;
+  totais: Record<string, any> | null;
+} {
+  if (!res || typeof res !== 'object') {
+    return { resultado_id: null, num_linhas: 0, totais: null };
+  }
+  const listKey = ['artigos', 'produtos', 'itens', 'monos', 'linhas', 'propostaEncomenda', 'artigosVendidosNoDia'].find((k) =>
+    Array.isArray(res[k])
+  );
+  const num_linhas = listKey ? res[listKey].length : 0;
+  const totais: Record<string, any> = {};
+  if (res.resumo) totais.resumo = res.resumo;
+  if (res.resumoEncontrado) totais.resumoEncontrado = res.resumoEncontrado;
+  if (res.resumoExecutivo) totais.resumoExecutivo = res.resumoExecutivo;
+  if (res.resumoGeral) totais.resumoGeral = res.resumoGeral;
+  if (res.dados_ate !== undefined) totais.dados_ate = res.dados_ate;
+  if (res.mes_parcial !== undefined) totais.mes_parcial = res.mes_parcial;
+  if (res.totalArtigosEncontrados !== undefined) totais.totalArtigosEncontrados = res.totalArtigosEncontrados;
+
+  return {
+    resultado_id: typeof res.resultado_id === 'string' ? res.resultado_id : null,
+    num_linhas,
+    totais: Object.keys(totais).length > 0 ? totais : null,
+  };
 }
 
 export async function runCopilotAgentV2(
@@ -422,13 +557,15 @@ export async function runCopilotAgentV2(
   }
 
   const startMs = Date.now();
-  const activeModel =
+  const isBalcao = String(ctx.perfil || '').toUpperCase().includes('BALCAO');
+  // #23: Modelo por defeito — claude-sonnet-5-5 para gestão, claude-haiku-5-5 para balcão
+  let activeModel =
     options?.model ||
-    process.env.COPILOT_V2_MODEL ||
-    process.env.ANTHROPIC_MODEL ||
-    'claude-sonnet-4-5';
-  const maxToolCalls = options?.maxToolCalls ?? 15;
-  const timeoutMs = options?.timeoutMs ?? 90_000;
+    (isBalcao
+      ? process.env.COPILOT_V2_MODEL_BALCAO || 'claude-haiku-5-5'
+      : process.env.COPILOT_V2_MODEL || 'claude-sonnet-5-5');
+  const maxToolCalls = options?.maxToolCalls ?? (isBalcao ? 3 : 15);
+  const timeoutMs = options?.timeoutMs ?? (isBalcao ? 15_000 : 90_000);
   const emit = options?.onProgress || (() => {});
 
   const tracer = new CopilotAuditTracer(
@@ -468,45 +605,86 @@ export async function runCopilotAgentV2(
     }
 
     stepNum++;
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: activeModel,
-        max_tokens: 4096,
-        system: [
-          {
-            type: 'text',
-            text: AGENT_V2_SYSTEM_PROMPT,
-            cache_control: { type: 'ephemeral' },
-          },
-        ],
-        tools: AGENT_V2_TOOLS,
-        messages,
-      }),
-    });
+    const llmStepStart = Date.now();
+    const callAnthropic = async (modelId: string) =>
+      fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: modelId,
+          max_tokens: 4096,
+          system: [
+            {
+              type: 'text',
+              text: AGENT_V2_SYSTEM_PROMPT,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+          tools: AGENT_V2_TOOLS,
+          messages,
+        }),
+      });
+
+    let response = await callAnthropic(activeModel);
+    // Fallback seguro se o model ID 5-5 ainda não estiver ativo na conta Anthropic (evita HTTP 404 em produção)
+    if (response.status === 404) {
+      const fallbackModel = process.env.ANTHROPIC_MODEL || (isBalcao ? 'claude-haiku-4-5' : 'claude-sonnet-4-5');
+      if (fallbackModel !== activeModel) {
+        console.warn(`[Copilot v2] Model "${activeModel}" devolveu 404; fallback para "${fallbackModel}".`);
+        activeModel = fallbackModel;
+        response = await callAnthropic(activeModel);
+      }
+    }
 
     if (!response.ok) {
       const errTxt = await response.text().catch(() => '');
+      tracer.addEtapa({
+        etapa: 'leitura',
+        nome: activeModel,
+        inicio_ms: llmStepStart - startMs,
+        duracao_ms: Date.now() - llmStepStart,
+        estado: 'falha',
+        detalhe: { httpStatus: response.status, erro: errTxt.slice(0, 300) },
+      });
       throw new Error(`Anthropic API HTTP ${response.status}: ${errTxt.slice(0, 300)}`);
     }
 
     const data: any = await response.json();
     const usage = data.usage || {};
-    totalIn += Number(usage.input_tokens || 0);
-    totalOut += Number(usage.output_tokens || 0);
-    totalCacheW += Number(usage.cache_creation_input_tokens || 0);
-    totalCacheR += Number(usage.cache_read_input_tokens || 0);
+    const stepIn = Number(usage.input_tokens || 0);
+    const stepOut = Number(usage.output_tokens || 0);
+    const stepCacheW = Number(usage.cache_creation_input_tokens || 0);
+    const stepCacheR = Number(usage.cache_read_input_tokens || 0);
+    totalIn += stepIn;
+    totalOut += stepOut;
+    totalCacheW += stepCacheW;
+    totalCacheR += stepCacheR;
+    tracer.nChamadasApi++;
+
+    const stepCost = calculateClaudeCostEur(activeModel, stepIn, stepOut, stepCacheW, stepCacheR);
+    tracer.addEtapa({
+      etapa: 'leitura',
+      nome: `${activeModel} (ronda ${stepNum})`,
+      inicio_ms: llmStepStart - startMs,
+      duracao_ms: Date.now() - llmStepStart,
+      estado: 'ok',
+      tokens_in: stepIn,
+      tokens_out: stepOut,
+      tokens_cache_write: stepCacheW,
+      tokens_cache_read: stepCacheR,
+      custo_eur: stepCost,
+      detalhe: { stop_reason: data.stop_reason || null },
+    });
 
     const contentBlocks: any[] = Array.isArray(data.content) ? data.content : [];
     const toolUseBlocks = contentBlocks.filter((b) => b.type === 'tool_use');
     const textBlocks = contentBlocks.filter((b) => b.type === 'text').map((b) => String(b.text || ''));
 
-    // Caso 1: O modelo pediu ferramentas -> executar em PARALELO (Promise.all)
+    // Caso 1: O modelo pediu ferramentas -> executar em PARALELO (Promise.all) + registar cada uma em CopilotEtapa (#24)
     if (toolUseBlocks.length > 0 && totalToolCalls < maxToolCalls) {
       messages.push({ role: 'assistant', content: contentBlocks });
 
@@ -523,9 +701,28 @@ export async function runCopilotAgentV2(
         batch.map(async (block) => {
           totalToolCalls++;
           if (!toolsUsedNames.includes(block.name)) toolsUsedNames.push(block.name);
+          const toolStart = Date.now();
           try {
             const res = await executeUnifiedTool(prisma, ctx, block.name, block.input, tabelasCollector);
+            const toolDur = Date.now() - toolStart;
             executedTools.push({ name: block.name, input: block.input, result: res });
+
+            // #24: Registar na CopilotEtapa: nome, input, duração, resultado_id, n.º linhas e totais
+            const auditSummary = summarizeToolResultForAudit(res);
+            tracer.addEtapa({
+              etapa: 'ferramenta',
+              nome: block.name,
+              inicio_ms: toolStart - startMs,
+              duracao_ms: toolDur,
+              estado: res?.error ? 'falha' : 'ok',
+              detalhe: {
+                input: block.input || {},
+                resultado_id: auditSummary.resultado_id,
+                num_linhas: auditSummary.num_linhas,
+                totais: auditSummary.totais,
+              },
+            });
+
             // Compactar ligeiramente se o JSON for muito grande (> 28KB) mantendo resumo + primeiras linhas
             let serialized = JSON.stringify(res);
             if (serialized.length > 28_000 && res && Array.isArray(res.artigos)) {
@@ -542,6 +739,18 @@ export async function runCopilotAgentV2(
               content: serialized,
             };
           } catch (err: any) {
+            const toolDur = Date.now() - toolStart;
+            tracer.addEtapa({
+              etapa: 'ferramenta',
+              nome: block.name,
+              inicio_ms: toolStart - startMs,
+              duracao_ms: toolDur,
+              estado: 'falha',
+              detalhe: {
+                input: block.input || {},
+                erro: err?.message || 'Erro ao executar ferramenta',
+              },
+            });
             return {
               type: 'tool_result',
               tool_use_id: block.id,
@@ -556,23 +765,36 @@ export async function runCopilotAgentV2(
       continue;
     }
 
-    // Caso 2: Resposta textual final -> correr validação factual (1 retry se houver erro)
+    // Caso 2: Resposta textual final -> correr validação factual + numérica (#25) com 1 retry
     finalText = textBlocks.join('\n').trim();
-    emit({ type: 'validating', message: 'A validar factos e coerência da resposta...', step: stepNum });
+    emit({ type: 'validating', message: 'A validar factos e números da resposta...', step: stepNum });
 
+    const valStart = Date.now();
     const issues = validateAgentV2Response(finalText, executedTools);
+    tracer.addEtapa({
+      etapa: 'validacao_texto',
+      nome: `validacao_ronda_${stepNum}`,
+      inicio_ms: valStart - startMs,
+      duracao_ms: Date.now() - valStart,
+      estado: issues.length === 0 ? 'ok' : 'aviso',
+      detalhe: { issues },
+    });
+
     if (issues.length > 0 && validationRetries < 1) {
       validationRetries++;
+      tracer.reescritas++;
+      tracer.markRuleFailed('VALIDACAO_FACTUAL_V2');
       messages.push({ role: 'assistant', content: contentBlocks });
       messages.push({
         role: 'user',
         content: `[VALIDAÇÃO AUTOMÁTICA — CORRIGIR ANTES DE ENTREGAR]\n${issues.join('\n')}`,
       });
-      emit({ type: 'status', message: 'A corrigir verificação factual com os dados da farmácia...', step: stepNum });
+      emit({ type: 'status', message: 'A corrigir verificação factual e numérica com os dados da farmácia...', step: stepNum });
       continue;
     }
 
     if (issues.length > 0) {
+      tracer.markRuleFailed('VALIDACAO_FACTUAL_V2_PERSISTENTE');
       avisoValidacao = issues.join(' | ');
       finalText = `> ⚠️ **Aviso de validação automática:** ${avisoValidacao}\n\n${finalText}`;
     }
