@@ -899,6 +899,15 @@ export function getMobileStaffHtml(): string {
       </div>
     </div>
 
+    <!-- Banner Global de Missões da Direção, Copilot & Campanhas Ativas (visível em todas as abas) -->
+    <div id="mobileCustomMissionsBanner" style="display: none; background: #1e1b4b; border-bottom: 1px solid #4338ca; padding: 10px 14px;">
+      <div onclick="var l=document.getElementById('mobileCustomMissionsList'); if(l) l.style.display = l.style.display==='none' ? 'flex' : 'none';" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
+        <span style="font-size: 0.84rem; font-weight: 800; color: #e0e7ff;">🎯 Missões da Direção & Campanhas (<span id="mobileCustomMissionsCount">0</span>)</span>
+        <span style="font-size: 0.74rem; color: #a5b4fc;">Ver / Ocultar ▾</span>
+      </div>
+      <div id="mobileCustomMissionsList" style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px; max-height: 220px; overflow-y: auto;"></div>
+    </div>
+
     <!-- Barra de Separadores / Tabs (4 Secções) -->
     <div class="tabs-bar">
       <button class="tab-btn tab-1 active" onclick="goToSection(0)">
@@ -1463,6 +1472,7 @@ export function getMobileStaffHtml(): string {
         tasksMap = tData.tasksMap || {};
         window.customTasksList = Array.isArray(tData.customTasks) ? tData.customTasks : [];
 
+        renderMobileCustomMissionsBanner();
         renderSection1();
         renderSection2();
         renderSection3();
@@ -1651,6 +1661,43 @@ export function getMobileStaffHtml(): string {
     // ========================================================================
     // RENDERIZAÇÃO DAS 4 SECÇÕES EM FORMATO LISTA
     // ========================================================================
+
+    function renderMobileCustomMissionsBanner() {
+      const banner = document.getElementById('mobileCustomMissionsBanner');
+      const listEl = document.getElementById('mobileCustomMissionsList');
+      const countEl = document.getElementById('mobileCustomMissionsCount');
+      if (!banner || !listEl) return;
+
+      const list = Array.isArray(window.customTasksList) ? window.customTasksList : [];
+      if (list.length === 0) {
+        banner.style.display = 'none';
+        listEl.innerHTML = '';
+        return;
+      }
+
+      const pendingCount = list.filter(ct => !(tasksMap[ct.task_id] ? !!tasksMap[ct.task_id].concluido : !!ct.concluido)).length;
+      if (countEl) countEl.textContent = pendingCount + ' pendentes / ' + list.length;
+      banner.style.display = 'block';
+
+      listEl.innerHTML = list.map(ct => {
+        const tInfo = tasksMap[ct.task_id];
+        const isDone = tInfo ? !!tInfo.concluido : !!ct.concluido;
+        const valImp = ct.valor_impacto != null ? Number(ct.valor_impacto) : 0;
+        const safeTitle = escapeHtml(ct.designacao || 'Missão da Equipa');
+        const safeCat = escapeHtml(ct.categoria || 'DIRECAO_TECNICA');
+        const safeCnp = escapeHtml(ct.cnp_codigo || '');
+        return \`
+          <div style="background: \${isDone ? 'rgba(15,23,42,0.45)' : 'rgba(30,41,59,0.9)'}; border: 1px solid \${isDone ? '#334155' : '#6366f1'}; border-radius: 8px; padding: 8px 10px; display: flex; align-items: flex-start; gap: 10px;">
+            <div class="task-check-btn" data-task-id="\${escapeHtml(ct.task_id)}" data-cat="\${safeCat}" data-cnp="\${safeCnp}" data-desc="\${safeTitle}" data-val="\${valImp}" onclick="toggleTask(this.dataset.taskId, this.dataset.cat, this.dataset.cnp || null, this.dataset.desc, Number(this.dataset.val || 0)); setTimeout(renderMobileCustomMissionsBanner, 50);" style="width: 24px; height: 24px; min-width: 24px; font-size: 0.82rem;">
+              \${isDone ? '✓' : ''}
+            </div>
+            <div style="flex: 1; font-size: 0.8rem; color: \${isDone ? '#94a3b8' : '#f8fafc'}; \${isDone ? 'text-decoration: line-through;' : ''}">
+              \${safeTitle}
+            </div>
+          </div>
+        \`;
+      }).join('');
+    }
 
     // SECÇÃO 1: VALIDADES PRÓXIMAS (GAVETA & PRATELEIRA COM FILTROS AVANÇADOS)
     function renderSection1(preserveScroll = false) {

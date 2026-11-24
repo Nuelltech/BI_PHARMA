@@ -10654,7 +10654,9 @@ function getDashboardHtml(): string {
       const checkboxes = document.querySelectorAll('.weekly-task-checkbox');
       let done = 0;
       checkboxes.forEach(cb => {
-        if (map[cb.dataset.taskId]) {
+        const entry = map[cb.dataset.taskId];
+        const isDone = typeof entry === 'object' && entry !== null ? !!entry.concluido : !!entry;
+        if (isDone) {
           cb.checked = true;
           done++;
           cb.closest('.weekly-task-item')?.classList.add('task-completed');
@@ -11424,6 +11426,57 @@ function getDashboardHtml(): string {
       }
     }
 
+    const tableSortState = {
+      genericos: { key: 'num_laboratorios_abertos', dir: 'desc' },
+      caducidade: { key: 'valor_em_risco', dir: 'desc' },
+      monos: { key: 'capital_imobilizado', dir: 'desc' },
+      cobertura: { key: 'cobertura_meses', dir: 'desc' },
+    };
+
+    function toggleTableSort(tab, key) {
+      const cur = tableSortState[tab] || { key: '', dir: 'desc' };
+      if (cur.key === key) {
+        cur.dir = cur.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        cur.key = key;
+        cur.dir = (key === 'designacao' || key === 'grupo_equivalencia_dci' || key === 'categoria' || key === 'cnp_codigo' || key === 'data_validade') ? 'asc' : 'desc';
+      }
+      tableSortState[tab] = cur;
+      renderActiveTable();
+    }
+
+    function sortableTh(tab, key, label) {
+      const cur = tableSortState[tab] || {};
+      const arrow = cur.key === key ? (cur.dir === 'asc' ? ' ▲' : ' ▼') : ' ⇅';
+      const activeStyle = cur.key === key ? 'color:#0284c7;' : '';
+      return '<th data-sort-tab="' + tab + '" data-sort-key="' + key + '" onclick="toggleTableSort(this.dataset.sortTab, this.dataset.sortKey)" style="cursor:pointer;user-select:none;white-space:nowrap;' + activeStyle + '" title="Clique para ordenar">' + label + '<span style="font-size:0.7rem;opacity:0.75;">' + arrow + '</span></th>';
+    }
+
+    function sortRowsByState(rows, tab) {
+      const st = tableSortState[tab];
+      if (!st || !st.key) return rows;
+      const mult = st.dir === 'asc' ? 1 : -1;
+      const k = st.key;
+      return rows.slice().sort((a, b) => {
+        let va = a[k];
+        let vb = b[k];
+        if (k === 'restos_count') {
+          va = (a.restos_gaveta_escobar_primeiro || []).length;
+          vb = (b.restos_gaveta_escobar_primeiro || []).length;
+        }
+        if (va == null && vb == null) return 0;
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * mult;
+        const na = Number(va);
+        const nb = Number(vb);
+        if (!Number.isNaN(na) && !Number.isNaN(nb) && String(va).trim() !== '' && String(vb).trim() !== '' && k !== 'cnp_codigo' && k !== 'data_validade' && k !== 'ultima_venda') {
+          return (na - nb) * mult;
+        }
+        return String(va).localeCompare(String(vb), 'pt', { numeric: true }) * mult;
+      });
+    }
+
     function renderActiveTable() {
       if (!currentReport || activeTab === 'plano' || activeTab === 'copilot' || activeTab === 'campaigns') return;
       const rawFilter = document.getElementById('tableFilter') ? document.getElementById('tableFilter').value : '';
@@ -11434,12 +11487,15 @@ function getDashboardHtml(): string {
 
       if (activeTab === 'genericos') {
         const isCompatible = tvFilter === 'ALL' || tvFilter === 'GENERICO_MG' || tvFilter === 'MSRM';
-        const rows = isCompatible ? currentReport.consolidacao_genericos_dci.filter(g =>
-          !filter ||
-          normStr(g.grupo_equivalencia_dci).includes(filter) ||
-          normStr(g.molecula_dci).includes(filter) ||
-          g.todos_laboratorios.some(l => normStr(l.cnp_codigo).includes(filter) || normStr(l.designacao).includes(filter))
-        ) : [];
+        const rows = sortRowsByState(
+          isCompatible ? currentReport.consolidacao_genericos_dci.filter(g =>
+            !filter ||
+            normStr(g.grupo_equivalencia_dci).includes(filter) ||
+            normStr(g.molecula_dci).includes(filter) ||
+            g.todos_laboratorios.some(l => normStr(l.cnp_codigo).includes(filter) || normStr(l.designacao).includes(filter))
+          ) : [],
+          'genericos'
+        );
 
         if (countEl) {
           countEl.textContent = \`\${rows.length} \${rows.length === 1 ? 'molécula/apresentação' : 'moléculas/apresentações'}\`;
@@ -11462,14 +11518,14 @@ function getDashboardHtml(): string {
         table.innerHTML = \`
           <thead>
             <tr>
-              <th>Molécula DCI + Dosagem + Embalagem</th>
-              <th>Nº Labs Abertos</th>
-              <th>Stock Conjunto</th>
-              <th>VMM Conjunta</th>
-              <th>Custo Mínimo (Lab + Barato)</th>
-              <th>Custo Máximo (Lab + Caro)</th>
-              <th>Diferença Preço Custo</th>
-              <th>Restos de Gaveta (≤ 2 caixas) a Escoar Primeiro</th>
+              \${sortableTh('genericos', 'grupo_equivalencia_dci', 'Molécula DCI + Dosagem + Embalagem')}
+              \${sortableTh('genericos', 'num_laboratorios_abertos', 'Nº Labs Abertos')}
+              \${sortableTh('genericos', 'stock_total_unidades', 'Stock Conjunto')}
+              \${sortableTh('genericos', 'vmm_total_grupo', 'VMM Conjunta')}
+              \${sortableTh('genericos', 'custo_minimo', 'Custo Mínimo (Lab + Barato)')}
+              \${sortableTh('genericos', 'custo_maximo', 'Custo Máximo (Lab + Caro)')}
+              \${sortableTh('genericos', 'diferenca_custo_pct', 'Diferença Preço Custo')}
+              \${sortableTh('genericos', 'restos_count', 'Restos de Gaveta (≤ 2 caixas)')}
             </tr>
           </thead>
           <tbody>
@@ -11513,11 +11569,11 @@ function getDashboardHtml(): string {
 
       let allRows = [];
       if (activeTab === 'caducidade') {
-        allRows = currentReport.risco_elevado_caducidade.filter(matchRow);
+        allRows = sortRowsByState(currentReport.risco_elevado_caducidade.filter(matchRow), 'caducidade');
       } else if (activeTab === 'monos') {
-        allRows = currentReport.monos.filter(matchRow);
+        allRows = sortRowsByState(currentReport.monos.filter(matchRow), 'monos');
       } else {
-        allRows = currentReport.alertas_excesso_cobertura.filter(matchRow);
+        allRows = sortRowsByState(currentReport.alertas_excesso_cobertura.filter(matchRow), 'cobertura');
       }
 
       const displayRows = allRows.slice(0, 500);
@@ -11548,14 +11604,14 @@ function getDashboardHtml(): string {
         table.innerHTML = \`
           <thead>
             <tr>
-              <th>Código</th>
-              <th>Categoria & Sazonalidade</th>
-              <th>Designação</th>
-              <th>Stock</th>
-              <th>Validade</th>
-              <th>VMM</th>
-              <th>Emb. Risco</th>
-              <th>Valor Risco (€)</th>
+              \${sortableTh('caducidade', 'cnp_codigo', 'Código')}
+              \${sortableTh('caducidade', 'categoria', 'Categoria & Sazonalidade')}
+              \${sortableTh('caducidade', 'designacao', 'Designação')}
+              \${sortableTh('caducidade', 'stock_atual', 'Stock')}
+              \${sortableTh('caducidade', 'data_validade', 'Validade')}
+              \${sortableTh('caducidade', 'vmm', 'VMM')}
+              \${sortableTh('caducidade', 'unidades_em_risco', 'Emb. Risco')}
+              \${sortableTh('caducidade', 'valor_em_risco', 'Valor Risco (€)')}
               <th>Ação Recomendada</th>
             </tr>
           </thead>
@@ -11579,14 +11635,14 @@ function getDashboardHtml(): string {
         table.innerHTML = \`
           <thead>
             <tr>
-              <th>Código</th>
-              <th>Categoria & Sazonalidade</th>
-              <th>Designação</th>
-              <th>Stock</th>
-              <th>Custo Unit.</th>
-              <th>PVP (Margem)</th>
-              <th>Capital Imobilizado (€)</th>
-              <th>Última Venda</th>
+              \${sortableTh('monos', 'cnp_codigo', 'Código')}
+              \${sortableTh('monos', 'categoria', 'Categoria & Sazonalidade')}
+              \${sortableTh('monos', 'designacao', 'Designação')}
+              \${sortableTh('monos', 'stock_atual', 'Stock')}
+              \${sortableTh('monos', 'custo_unitario', 'Custo Unit.')}
+              \${sortableTh('monos', 'pvp', 'PVP (Margem)')}
+              \${sortableTh('monos', 'capital_imobilizado', 'Capital Imobilizado (€)')}
+              \${sortableTh('monos', 'ultima_venda', 'Última Venda')}
               <th>Estratégia Recomendada</th>
             </tr>
           </thead>
@@ -11610,13 +11666,13 @@ function getDashboardHtml(): string {
         table.innerHTML = \`
           <thead>
             <tr>
-              <th>Código</th>
-              <th>Categoria & Sazonalidade</th>
-              <th>Designação</th>
-              <th>Stock</th>
-              <th>PVP (Margem)</th>
-              <th>VMM</th>
-              <th>Cobertura</th>
+              \${sortableTh('cobertura', 'cnp_codigo', 'Código')}
+              \${sortableTh('cobertura', 'categoria', 'Categoria & Sazonalidade')}
+              \${sortableTh('cobertura', 'designacao', 'Designação')}
+              \${sortableTh('cobertura', 'stock_atual', 'Stock')}
+              \${sortableTh('cobertura', 'pvp', 'PVP (Margem)')}
+              \${sortableTh('cobertura', 'vmm', 'VMM')}
+              \${sortableTh('cobertura', 'cobertura_meses', 'Cobertura')}
               <th>Orientação de Balcão / Substituição DCI</th>
             </tr>
           </thead>
