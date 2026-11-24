@@ -6,6 +6,8 @@ import {
   toolConsultarProdutosPorNomeOuCategoria,
   toolConsultarVendasPeriodo,
   toolAnalisarDesempenhoLaboratorio,
+  toolFiltrarProdutosPorValidadeEMargem,
+  toolIdentificarProdutosSemVenda,
   ToolSecurityContext,
 } from '../services/mcp_pharma_tools';
 import {
@@ -163,7 +165,39 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
     expect(resLab.resultado_id).toBeTruthy();
   }, 20000);
 
-  it('7. Validação vm.Script de todos os blocos <script> inline em src/server.ts', () => {
+  it('7. P0 MCP: filtrar_produtos_por_validade_e_margem respeita filtros e MSRM nunca recebe ESCOAMENTO_BALCAO/PACK', async () => {
+    const ctxA: ToolSecurityContext = {
+      farmaciaId: FARMACIA_A_ID,
+      farmaciaNome: 'Farmácia A',
+      nif: '505016419',
+      perfil: 'COMPLETO',
+      verFaturacao: true,
+    };
+    const resVal: any = await toolFiltrarProdutosPorValidadeEMargem(prisma, ctxA, {
+      meses_validade_max: 12,
+      limite: 15,
+    });
+    expect(resVal.resultado_id).toBeTruthy();
+    expect(resVal.dados_ate).toBeTruthy();
+    expect(Array.isArray(resVal.artigos)).toBe(true);
+    for (const a of resVal.artigos) {
+      if (a.msrm) {
+        expect(a.acoes_permitidas).not.toContain('ESCOAMENTO_BALCAO');
+        expect(a.acao_sugerida).toBe('DEVOLVER_TUDO');
+      }
+    }
+
+    const resMonos: any = await toolIdentificarProdutosSemVenda(prisma, ctxA, { limite: 20 });
+    const monosList = resMonos.itens || [];
+    for (const m of monosList) {
+      if (String(m.segmento || '').toUpperCase().includes('MSRM')) {
+        expect(m.acao_sugerida).not.toBe('ESCOAMENTO_BALCAO');
+        expect(JSON.stringify(m)).not.toContain('PACK_PROMOCIONAL');
+      }
+    }
+  }, 20000);
+
+  it('8. Validação vm.Script de todos os blocos <script> inline em src/server.ts', () => {
     const src = fs.readFileSync('src/server.ts', 'utf8');
     const blocks = src.match(/<script>([\s\S]*?)<\/script>/g) || [];
     expect(blocks.length).toBeGreaterThan(0);

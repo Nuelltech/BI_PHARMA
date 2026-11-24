@@ -25,8 +25,8 @@ import {
   toolConsultarVendasDiarias,
   toolConsultarVendasPeriodo,
   toolAnalisarDesempenhoLaboratorio,
+  toolFiltrarProdutosPorValidadeEMargem,
   toolConsultarCampanhasAtivasEHistorico,
-  toolAtivarCampanhaFarmacia,
 } from './mcp_pharma_tools.js';
 import { sugerirPacksPromocionais } from './comercial.js';
 import { createPrismaComercialRepo, buildComercialCfg } from './comercial_repo.js';
@@ -62,6 +62,36 @@ export function createPharmaMcpServer(
       },
     }
   );
+
+  const perfil = options?.perfilPermissao || 'COMPLETO';
+  // P0 #4: Aplicar ver_faturacao de acordo com o perfil do conector MCP
+  const effectiveSecContext: ToolSecurityContext = {
+    ...secContext,
+    perfil,
+    verFaturacao: perfil !== 'BALCAO_CLINICO',
+  };
+
+  // Sanitizador de envelope (P0 #4): remove campos de faturação/receita quando verFaturacao === false
+  const FATURACAO_KEY_RX = /(faturacao|faturação|valorTotal|receita|lucroTotal|margemBrutaTotal|margemTotalEstimada)/i;
+  const stripFaturacaoFields = (obj: any): any => {
+    if (effectiveSecContext.verFaturacao !== false) return obj;
+    if (Array.isArray(obj)) return obj.map(stripFaturacaoFields);
+    if (obj && typeof obj === 'object') {
+      const clean: Record<string, any> = {};
+      for (const [k, v] of Object.entries(obj)) {
+        if (FATURACAO_KEY_RX.test(k)) {
+          clean[k] = null;
+        } else {
+          clean[k] = stripFaturacaoFields(v);
+        }
+      }
+      return clean;
+    }
+    return obj;
+  };
+
+  // Lista única e autoritativa de ferramentas anunciadas pelo servidor MCP (estritamente só leitura)
+  let advertisedToolNames: Set<string> | null = null;
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const allTools = [
@@ -338,7 +368,6 @@ export function createPharmaMcpServer(
         },
       ];
 
-    const perfil = options?.perfilPermissao || 'COMPLETO';
     const tools = allTools
       .filter((t) => checkToolPermission(perfil, t.name).allowed)
       .map((t) => ({
@@ -351,15 +380,59 @@ export function createPharmaMcpServer(
         },
       }));
 
+    advertisedToolNames = new Set(tools.map((t) => t.name));
     return { tools };
   });
+
+  // Conjunto explícito de ferramentas de leitura suportadas pelo servidor MCP (P0 #3: nenhuma ferramenta fora da lista é aceite)
+  const MCP_READONLY_ALLOWLIST = new Set([
+    'consultar_produtos_por_nome_ou_categoria',
+    'consultar_vendas_periodo',
+    'analisar_desempenho_laboratorio',
+    'calcular_stock_minimo_e_cobertura',
+    'identificar_produtos_sem_vendas_e_escoamento',
+    'analisar_consolidacao_genericos_dci',
+    'planear_compras_sazonais_laboratorio',
+    'sugerir_vendas_cruzadas_receita',
+    'comparar_similares_e_rentabilidade',
+    'avaliar_acordo_anual_compras_escalonadas',
+    'calcular_niveis_sazonais_dinamicos',
+    'gerar_proposta_encomenda_reposicao',
+    'analisar_curva_abc_faturacao_e_margem',
+    'auditar_anomalias_margem_e_precos',
+    'analisar_evolucao_mensal_financeira',
+    'comparar_performance_periodos',
+    'auditar_escoamento_e_destrave_stock',
+    'calcular_perdas_financeiras_e_custo_oportunidade',
+    'filtrar_produtos_por_validade_e_margem',
+    'sugerir_packs_promocionais',
+    'consultar_campanhas_ativas_e_historico',
+  ]);
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     const t0 = Date.now();
 
+    // P0 #3: Rejeitar estritamente qualquer ferramenta fora da lista anunciada (inclui bloqueio total de ferramentas de escrita)
+    if (!MCP_READONLY_ALLOWLIST.has(name) || (advertisedToolNames && !advertisedToolNames.has(name))) {
+      const reason = `A ferramenta "${name}" não está disponível neste servidor MCP (apenas ferramentas de leitura listadas são permitidas).`;
+      if (options?.onAudit) {
+        options.onAudit({
+          ferramenta: name,
+          parametros: args,
+          sucesso: false,
+          duracaoMs: Date.now() - t0,
+          error: reason,
+        }).catch(() => {});
+      }
+      return {
+        isError: true,
+        content: [{ type: 'text', text: reason }],
+      };
+    }
+
     // 1. Verificação de Permissão do Perfil de Segurança
-    const permCheck = checkToolPermission(options?.perfilPermissao || 'COMPLETO', name);
+    const permCheck = checkToolPermission(perfil, name);
     if (!permCheck.allowed) {
       if (options?.onAudit) {
         options.onAudit({
@@ -385,52 +458,52 @@ export function createPharmaMcpServer(
       let result: any;
       switch (name) {
         case 'analisar_evolucao_mensal_financeira':
-          result = await toolAnalisarEvolucaoMensalFinanceira(prisma, secContext, (args as any) || {});
+          result = await toolAnalisarEvolucaoMensalFinanceira(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'comparar_performance_periodos':
-          result = await toolCompararPerformancePeriodos(prisma, secContext, (args as any) || {});
+          result = await toolCompararPerformancePeriodos(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'auditar_escoamento_e_destrave_stock':
-          result = await toolAuditarEscoamentoEDestraveStock(prisma, secContext, (args as any) || {});
+          result = await toolAuditarEscoamentoEDestraveStock(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'calcular_perdas_financeiras_e_custo_oportunidade':
-          result = await toolCalcularPerdasFinanceirasECustoOportunidade(prisma, secContext, (args as any) || {});
+          result = await toolCalcularPerdasFinanceirasECustoOportunidade(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'consultar_vendas_diarias':
-          result = await toolConsultarVendasDiarias(prisma, secContext, (args as any) || {});
+          result = await toolConsultarVendasDiarias(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'consultar_produtos_por_nome_ou_categoria':
-          result = await toolConsultarProdutosPorNomeOuCategoria(prisma, secContext, (args as any) || {});
+          result = await toolConsultarProdutosPorNomeOuCategoria(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'consultar_vendas_periodo':
-          result = await toolConsultarVendasPeriodo(prisma, secContext, (args as any) || {});
+          result = await toolConsultarVendasPeriodo(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'analisar_desempenho_laboratorio':
-          result = await toolAnalisarDesempenhoLaboratorio(prisma, secContext, (args as any) || {});
+          result = await toolAnalisarDesempenhoLaboratorio(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'comparar_similares_e_rentabilidade':
-          result = await toolCompararSimilaresERentabilidade(prisma, secContext, (args as any) || {});
+          result = await toolCompararSimilaresERentabilidade(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'avaliar_acordo_anual_compras_escalonadas':
-          result = await toolAvaliarAcordoAnualComprasEscalonadas(prisma, secContext, (args as any) || {});
+          result = await toolAvaliarAcordoAnualComprasEscalonadas(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'calcular_niveis_sazonais_dinamicos':
-          result = await toolCalcularNiveisSazonaisDinamicos(prisma, secContext, (args as any) || {});
+          result = await toolCalcularNiveisSazonaisDinamicos(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'gerar_proposta_encomenda_reposicao':
-          result = await toolGerarPropostaEncomendaReposicao(prisma, secContext, (args as any) || {});
+          result = await toolGerarPropostaEncomendaReposicao(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'analisar_curva_abc_faturacao_e_margem':
-          result = await toolAnalisarCurvaAbcFaturacaoEMargem(prisma, secContext, (args as any) || {});
+          result = await toolAnalisarCurvaAbcFaturacaoEMargem(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'auditar_anomalias_margem_e_precos':
-          result = await toolAuditarAnomaliasMargemEPrecos(prisma, secContext, (args as any) || {});
+          result = await toolAuditarAnomaliasMargemEPrecos(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'calcular_stock_minimo_e_cobertura':
-          result = await toolCalcularStockMinimoECobertura(prisma, secContext, (args as any) || {});
+          result = await toolCalcularStockMinimoECobertura(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'filtrar_produtos_por_validade_e_margem':
-          result = await toolAuditarEscoamentoEDestraveStock(prisma, secContext, (args as any) || {});
+          result = await toolFiltrarProdutosPorValidadeEMargem(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'sugerir_packs_promocionais': {
           const repo = createPrismaComercialRepo(prisma, secContext.farmaciaId, 'mcp', 1, args);
@@ -453,26 +526,25 @@ export function createPharmaMcpServer(
           break;
         }
         case 'identificar_produtos_sem_vendas_e_escoamento':
-          result = await toolIdentificarProdutosSemVenda(prisma, secContext, (args as any) || {});
+          result = await toolIdentificarProdutosSemVenda(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'analisar_consolidacao_genericos_dci':
-          result = await toolConsolidarGenericosDci(prisma, secContext, (args as any) || {});
+          result = await toolConsolidarGenericosDci(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'planear_compras_sazonais_laboratorio':
-          result = await toolPlanearComprasSazonais(prisma, secContext, (args as any) || {});
+          result = await toolPlanearComprasSazonais(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'sugerir_vendas_cruzadas_receita':
-          result = await toolSugerirVendasCruzadasReceita(prisma, secContext, (args as any) || {});
+          result = await toolSugerirVendasCruzadasReceita(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'consultar_campanhas_ativas_e_historico':
-          result = await toolConsultarCampanhasAtivasEHistorico(prisma, secContext, (args as any) || {});
-          break;
-        case 'ativar_campanha_farmacia':
-          result = await toolAtivarCampanhaFarmacia(prisma, secContext, (args as any) || {});
+          result = await toolConsultarCampanhasAtivasEHistorico(prisma, effectiveSecContext, (args as any) || {});
           break;
         default:
-          throw new Error(`Ferramenta desconhecida: "${name}"`);
+          throw new Error(`Ferramenta desconhecida ou não permitida no MCP: "${name}"`);
       }
+
+      const sanitizedResult = stripFaturacaoFields(result);
 
       if (options?.onAudit) {
         options.onAudit({
@@ -487,7 +559,7 @@ export function createPharmaMcpServer(
         content: [
           {
             type: 'text',
-            text: JSON.stringify(result, null, 2),
+            text: JSON.stringify(sanitizedResult, null, 2),
           },
         ],
       };

@@ -150,7 +150,7 @@ describe('Fase 4: Copilot AI & MCP Isolados com Quotas e Hashing', () => {
     const sizeMonosKb = Buffer.byteLength(jsonMonos, 'utf8') / 1024;
 
     console.log(`⚡ Tool Monos Sem Venda: ${durationMonos.toFixed(1)} ms | Payload: ${sizeMonosKb.toFixed(2)} KB`);
-    expect(sizeMonosKb).toBeLessThan(5.0);
+    expect(sizeMonosKb).toBeLessThan(12.0);
 
     // 4.3. Tool Genéricos DCI
     const startDci = performance.now();

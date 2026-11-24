@@ -359,18 +359,26 @@ export async function toolIdentificarProdutosSemVenda(
         reativadosCount++;
         liquidezRecuperadaPosteriormenteTotalEur += post.qtd * custo;
       }
+      const segmento = m.produto?.tipo_venda || 'OUTRO';
+      const isMsrm = segmento.toUpperCase().includes('MSRM');
+      const acoes_permitidas = isMsrm
+        ? ['DEVOLVER_TUDO', 'TRANSFERIR']
+        : ['DEVOLVER_TUDO', 'ESCOAMENTO_BALCAO', 'TRANSFERIR', 'DESCONTINUAR'];
+      const acao_sugerida = isMsrm || m.quantidade <= 2 ? 'DEVOLVER_TUDO' : 'ESCOAMENTO_BALCAO';
       return {
         cnp: m.cnp_codigo,
         designacao: m.produto?.designacao || m.cnp_codigo,
-        segmento: m.produto?.tipo_venda || 'OUTRO',
+        segmento,
+        msrm: isMsrm,
         stockNaData: m.quantidade,
-        custoUnitarioEur: custo,
+        custoUnitarioEur: custo > 0 ? custo : null,
         capitalImobilizadoEur: Number((m.quantidade * custo).toFixed(2)),
         mesesSemVendaEstimados: meses,
         reativadoNoMesSeguinte: reativado,
         unidadesVendidasPosteriormente: post ? post.qtd : 0,
         liquidezRecuperadaPosteriormenteEur: post ? Number((post.qtd * custo).toFixed(2)) : 0,
-        estrategiaSugerida: m.quantidade <= 2 ? 'DEVOLUCAO_FORNECEDOR_OU_TRANSFERENCIA' : 'PACK_PROMOCIONAL_OU_CAMPANHA',
+        acoes_permitidas,
+        acao_sugerida,
       };
     });
 
@@ -409,17 +417,28 @@ export async function toolIdentificarProdutosSemVenda(
       orderBy: { stock_total_valor_custo: 'desc' },
     });
 
-    const itens = monosMarts.map((m) => ({
-      cnp: m.cnp_codigo,
-      designacao: m.designacao,
-      segmento: m.tipo_venda || 'OUTRO',
-      stockAtual: m.stock_total_unidades,
-      custoUnitarioEur: Number(m.custo_unitario_medio),
-      capitalImobilizadoEur: Number(m.stock_total_valor_custo),
-      dataUltimaVenda: m.data_ultima_venda ? m.data_ultima_venda.toISOString().slice(0, 10) : 'Sem vendas registadas',
-      mesesSemVendaEstimados: m.dias_sem_vendas ? Math.round(m.dias_sem_vendas / 30) : 12,
-      estrategiaSugerida: m.stock_total_unidades <= 2 ? 'DEVOLUCAO_FORNECEDOR_OU_TRANSFERENCIA' : 'PACK_PROMOCIONAL_OU_CAMPANHA',
-    }));
+    const itens = monosMarts.map((m) => {
+      const segmento = m.tipo_venda || 'OUTRO';
+      const isMsrm = segmento.toUpperCase().includes('MSRM');
+      const acoes_permitidas = isMsrm
+        ? ['DEVOLVER_TUDO', 'TRANSFERIR']
+        : ['DEVOLVER_TUDO', 'ESCOAMENTO_BALCAO', 'TRANSFERIR', 'DESCONTINUAR'];
+      const acao_sugerida = isMsrm || m.stock_total_unidades <= 2 ? 'DEVOLVER_TUDO' : 'ESCOAMENTO_BALCAO';
+      return {
+        cnp: m.cnp_codigo,
+        designacao: m.designacao,
+        segmento,
+        msrm: isMsrm,
+        taxa_iva_pct: m.taxa_iva ?? (isMsrm ? 6 : 23),
+        stockAtual: m.stock_total_unidades,
+        custoUnitarioEur: Number(m.custo_unitario_medio) > 0 ? Number(m.custo_unitario_medio) : null,
+        capitalImobilizadoEur: Number(m.stock_total_valor_custo),
+        dataUltimaVenda: m.data_ultima_venda ? m.data_ultima_venda.toISOString().slice(0, 10) : null,
+        mesesSemVendaEstimados: m.dias_sem_vendas ? Math.round(m.dias_sem_vendas / 30) : null,
+        acoes_permitidas,
+        acao_sugerida,
+      };
+    });
 
     const capitalTotal = Number(itens.reduce((s, i) => s + i.capitalImobilizadoEur, 0).toFixed(2));
     return {
@@ -2093,24 +2112,15 @@ export async function toolAuditarAnomaliasMargemEPrecos(
     let correcaoSugeridaSifarma = '';
 
     if (isNegativa) {
-      if (isMsrm) {
-        tipoAnomalia = '🚨 DIVERGÊNCIA DE CUSTO (MSRM Preço Regulado Infarmed)';
-        correcaoSugeridaSifarma = `Medicamento de receita médica (MSRM) com PVP oficial de ${it.pvp.toFixed(2)}€ tabelado pelo Infarmed. O PVP NÃO PODE ser alterado por lei! Auditar com urgência a fatura de compra do armazenista no sistema de gestão: o custo registado de ${it.custo.toFixed(2)}€ contém provável erro de lançamento (IVA duplicado ou código de embalagem hospitalar).`;
-      } else {
-        tipoAnomalia = '🚨 VENDA COM PREJUÍZO (PVP < Custo)';
-        correcaoSugeridaSifarma = `Produto de venda livre. Atualizar PVP para ~${pvpSugerido}€ no sistema de gestão para cobrir o custo de ${it.custo.toFixed(2)}€ e restabelecer margem viável de 20%.`;
-      }
+      tipoAnomalia = isMsrm ? 'CUSTO_SUPERIOR_PVP_MSRM' : 'CUSTO_SUPERIOR_PVP';
+      correcaoSugeridaSifarma = 'REVER_DADOS';
     } else {
-      if (isFixedPvpDevice) {
-        tipoAnomalia = 'ℹ️ MARGEM FIXADA POR FABRICANTE (PVP Tabelado)';
-        correcaoSugeridaSifarma = 'PVP máximo tabelado pela Abbott em 53,00€ com IVA. NÃO aumentar o PVP para não perder utentes para a concorrência. Aumentar a margem negociando descontos comerciais de escala ou campanhas de transferência direta.';
-      } else if (isMsrm) {
-        tipoAnomalia = '⚠️ MARGEM REDUZIDA EM MEDICAMENTO REGULADO';
-        correcaoSugeridaSifarma = `PVP oficial Infarmed (${it.pvp.toFixed(2)}€). As margens de MSRM são reguladas por portaria. Recomenda-se incentivar a dispensa de genéricos equivalentes com maior margem unitária no balcão.`;
-      } else {
-        tipoAnomalia = '⚠️ MARGEM ANORMALMENTE BAIXA (< 5%)';
-        correcaoSugeridaSifarma = `Produto de venda livre. Rever preço de venda no sistema de gestão para ~${pvpSugerido}€ de modo a assegurar margem saudável.`;
-      }
+      tipoAnomalia = isFixedPvpDevice
+        ? 'MARGEM_BAIXA_DISPOSITIVO'
+        : isMsrm
+        ? 'MARGEM_BAIXA_MSRM'
+        : 'MARGEM_BAIXA_VENDA_LIVRE';
+      correcaoSugeridaSifarma = 'REVER_DADOS';
     }
 
     return {
@@ -2385,22 +2395,19 @@ export async function toolAnalisarEvolucaoMensalFinanceira(
     st.unidadesTotal += qtd;
     st.skusSet.add(v.cnp_codigo);
 
+    // P0 #5: Nunca inventar custo (ex: 70% do PVP). Usar apenas custo real; sem custo -> null.
     const pInfo = precoMap.get(v.cnp_codigo);
-    let custoUnit = 0;
-    if (pInfo && pInfo.custo > 0) {
-      custoUnit = pInfo.custo;
-    } else if (masterInfo && masterInfo.pvp && masterInfo.margem_padrao) {
-      const margemPct = Number(masterInfo.margem_padrao);
-      custoUnit = Number(masterInfo.pvp) * (1 - margemPct / 100);
-    } else {
-      custoUnit = (fat / (qtd || 1)) * 0.7;
+    const taxaIvaPct = (masterInfo as any)?.taxa_iva ?? (String(masterInfo?.tipo_venda || '').toUpperCase().includes('MSRM') ? 6 : 23);
+    const fatSemIva = fat / (1 + taxaIvaPct / 100);
+    const custoUnit: number | null = pInfo && pInfo.custo > 0 ? pInfo.custo : null;
+
+    const custoTotalItem = custoUnit !== null ? custoUnit * qtd : 0;
+    const margemTotalItem = custoUnit !== null ? fatSemIva - custoTotalItem : 0;
+
+    if (custoUnit !== null) {
+      st.custoTotalEur += custoTotalItem;
+      st.margemBrutaTotalEur += margemTotalItem;
     }
-
-    const custoTotalItem = custoUnit * qtd;
-    const margemTotalItem = fat - custoTotalItem;
-
-    st.custoTotalEur += custoTotalItem;
-    st.margemBrutaTotalEur += margemTotalItem;
 
     st.categoriasMap.set(cat, (st.categoriasMap.get(cat) || 0) + margemTotalItem);
 
@@ -2853,14 +2860,10 @@ export async function toolAuditarEscoamentoEDestraveStock(
     const prInfo = precoMap.get(cnp);
     const invInfo = stockMap.get(cnp);
 
-    let custoUnit = 0;
+    // P0 #5: Nunca inventar custo (70% do PVP). Usar apenas custo real da farmácia/inventário.
+    let custoUnit: number | null = null;
     if (prInfo && prInfo.custo > 0) custoUnit = prInfo.custo;
     else if (invInfo && invInfo.custo > 0) custoUnit = invInfo.custo;
-    else if (pInfo && pInfo.pvp && pInfo.margem_padrao) {
-      custoUnit = Number(pInfo.pvp) * (1 - Number(pInfo.margem_padrao) / 100);
-    } else {
-      custoUnit = (vendaAlvo.valor / (vendaAlvo.qtd || 1)) * 0.7;
-    }
 
     const designacao = pInfo?.designacao || cnp;
     const isSazonal = /gripe|griponal|ilvico|pastilha|tosse|broncho-vaxom|solar|spf|repelente/i.test(designacao);
@@ -2870,9 +2873,11 @@ export async function toolAuditarEscoamentoEDestraveStock(
     const eliminadoTotalmente = stockAtual === 0;
     if (args.apenas_eliminados_a_zero && !eliminadoTotalmente) continue;
 
-    const capitalRecuperadoEur = Math.round(vendaAlvo.qtd * custoUnit * 100) / 100;
+    const taxaIvaPct = (pInfo as any)?.taxa_iva ?? (pInfo?.tipo_venda === 'MSRM' ? 6 : 23);
+    const capitalRecuperadoEur = custoUnit !== null ? Math.round(vendaAlvo.qtd * custoUnit * 100) / 100 : 0;
     const faturacaoEur = Math.round(vendaAlvo.valor * 100) / 100;
-    const margemEur = Math.round((faturacaoEur - capitalRecuperadoEur) * 100) / 100;
+    const fatSemIva = vendaAlvo.valor / (1 + taxaIvaPct / 100);
+    const margemEur = custoUnit !== null ? Math.round((fatSemIva - capitalRecuperadoEur) * 100) / 100 : 0;
 
     const macroArea = pInfo?.macro_area || (pInfo?.tipo_venda === 'MSRM' ? 'MSRM' : 'OUTRO');
     const ehMsrmOuVacina = macroArea === 'MSRM' || /vacina|injetavel|insulina/i.test(designacao);
@@ -2906,7 +2911,7 @@ export async function toolAuditarEscoamentoEDestraveStock(
       mesesInativo: mesesInativos.length,
       periodoParado: `${mesesInativos[mesesInativos.length - 1]} a ${mesesInativos[0]}`,
       unidadesVendidas: vendaAlvo.qtd,
-      custoUnitarioEur: Math.round(custoUnit * 100) / 100,
+      custoUnitarioEur: custoUnit !== null ? Math.round(custoUnit * 100) / 100 : null,
       capitalRecuperadoEur,
       faturacaoEur,
       margemEur,
@@ -4234,5 +4239,192 @@ export async function toolConsultarVendasPeriodo(
   };
 
   const resultado_id = storeToolResult(ctx.farmaciaId, 'consultar_vendas', resultObj);
+  return { resultado_id, ...resultObj };
+}
+
+// ============================================================================
+// 23. FILTRAR PRODUTOS POR VALIDADE E MARGEM (P0 #2 — função dedicada)
+//     Substitui o encaminhamento errado para toolAuditarEscoamentoEDestraveStock.
+// ============================================================================
+export async function toolFiltrarProdutosPorValidadeEMargem(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  args: {
+    ano_limite_validade?: number;
+    meses_validade_max?: number;
+    margem_minima_pct?: number;
+    apenas_venda_livre?: boolean;
+    tipo_venda?: string;
+    pagina?: number;
+    limite?: number;
+  }
+) {
+  const freshness = await getPharmacyDataFreshness(prisma, ctx.farmaciaId);
+  const now = new Date();
+
+  let dataLimite: Date;
+  if (args.ano_limite_validade && Number.isFinite(Number(args.ano_limite_validade))) {
+    dataLimite = new Date(Date.UTC(Number(args.ano_limite_validade), 11, 31, 23, 59, 59));
+  } else {
+    const mesesMax = Math.max(1, Number(args.meses_validade_max || 6));
+    dataLimite = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + mesesMax, now.getUTCDate(), 23, 59, 59));
+  }
+
+  const margemMin = args.margem_minima_pct !== undefined ? Number(args.margem_minima_pct) : null;
+  const tipoFilter = (args.tipo_venda || '').trim().toUpperCase();
+  const apenasVl = Boolean(args.apenas_venda_livre);
+
+  const lotes = await prisma.inventario.findMany({
+    where: {
+      farmaciaId: ctx.farmaciaId,
+      quantidade: { gt: 0 },
+      data_validade: { not: null, lte: dataLimite },
+    },
+    include: {
+      produto: {
+        select: {
+          cnp_codigo: true,
+          designacao: true,
+          tipo_venda: true,
+          categoria: true,
+          subcategoria: true,
+          laboratorio_titular: true,
+          dci: true,
+          pvp: true,
+          taxa_iva: true,
+        },
+      },
+    },
+    orderBy: { data_validade: 'asc' },
+  });
+
+  // Agregar por CNP (validade mais próxima + stock total em risco)
+  const byCnp = new Map<string, {
+    cnp: string;
+    stockTotal: number;
+    custoSum: number;
+    validadeMaisProxima: Date;
+    pm: any;
+  }>();
+
+  for (const l of lotes) {
+    if (!l.data_validade) continue;
+    const cur = byCnp.get(l.cnp_codigo);
+    const custo = Number(l.custo_unitario || 0);
+    if (!cur) {
+      byCnp.set(l.cnp_codigo, {
+        cnp: l.cnp_codigo,
+        stockTotal: l.quantidade,
+        custoSum: custo * l.quantidade,
+        validadeMaisProxima: l.data_validade,
+        pm: l.produto,
+      });
+    } else {
+      cur.stockTotal += l.quantidade;
+      cur.custoSum += custo * l.quantidade;
+      if (l.data_validade < cur.validadeMaisProxima) {
+        cur.validadeMaisProxima = l.data_validade;
+      }
+    }
+  }
+
+  const cnps = Array.from(byCnp.keys());
+  const marts = cnps.length > 0
+    ? await prisma.martProdutoMetricas.findMany({
+        where: { farmaciaId: ctx.farmaciaId, cnp_codigo: { in: cnps } },
+        select: { cnp_codigo: true, pvp: true, custo_unitario_medio: true, taxa_iva: true, vmm: true, total_unidades_vendidas: true },
+      })
+    : [];
+  const martMap = new Map(marts.map((m) => [m.cnp_codigo, m]));
+
+  const resultados: any[] = [];
+  for (const [cnp, item] of byCnp.entries()) {
+    const pm = item.pm;
+    const m = martMap.get(cnp);
+    const tipoVenda = String(pm?.tipo_venda || 'OUTRO').toUpperCase();
+    const isMsrm = tipoVenda.includes('MSRM');
+
+    if (apenasVl && isMsrm) continue;
+    if (tipoFilter && !tipoVenda.includes(tipoFilter)) continue;
+
+    const custoMedio = item.stockTotal > 0 && item.custoSum > 0
+      ? item.custoSum / item.stockTotal
+      : m?.custo_unitario_medio
+      ? Number(m.custo_unitario_medio)
+      : null;
+
+    const margemInfo = calcularMargemComIva({
+      pvpFarmacia: m?.pvp ? Number(m.pvp) : null,
+      pvpMestre: pm?.pvp ? Number(pm.pvp) : null,
+      custoUnitario: custoMedio,
+      taxaIva: m?.taxa_iva ?? pm?.taxa_iva ?? null,
+      tipoVenda,
+    });
+
+    if (margemMin !== null && (margemInfo.margem_pct === null || margemInfo.margem_pct < margemMin)) {
+      continue;
+    }
+
+    const vmm = Number(m?.vmm || 0);
+    const diasAteValidade = Math.round((item.validadeMaisProxima.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+    const mesesAteValidade = Number((diasAteValidade / 30).toFixed(1));
+    const coberturaMeses = vmm > 0 ? Number((item.stockTotal / vmm).toFixed(1)) : null;
+    const riscoCaducidade = vmm === 0 || (coberturaMeses !== null && mesesAteValidade < coberturaMeses);
+
+    const acoes_permitidas = isMsrm
+      ? ['DEVOLVER_TUDO', 'TRANSFERIR']
+      : ['ESCOAMENTO_BALCAO', 'DEVOLVER_TUDO', 'TRANSFERIR'];
+    const acao_sugerida = isMsrm ? 'DEVOLVER_TUDO' : 'ESCOAMENTO_BALCAO';
+
+    resultados.push({
+      cnp,
+      designacao: pm?.designacao || cnp,
+      laboratorioTitular: pm?.laboratorio_titular || 'Sem dados',
+      dci: pm?.dci || null,
+      segmento: tipoVenda,
+      msrm: isMsrm,
+      categoria: pm?.categoria || 'Geral',
+      stockAtual: item.stockTotal,
+      validadeMaisProxima: item.validadeMaisProxima.toISOString().slice(0, 10),
+      diasAteValidade,
+      mesesAteValidade,
+      vmmMensal: Number(vmm.toFixed(2)),
+      coberturaMeses,
+      riscoCaducidade,
+      custoUnitarioEur: margemInfo.custo_unitario_eur,
+      capitalEmRiscoEur: margemInfo.custo_unitario_eur !== null ? Number((item.stockTotal * margemInfo.custo_unitario_eur).toFixed(2)) : null,
+      pvpEur: margemInfo.pvp_eur,
+      pvp_origem: margemInfo.pvp_origem,
+      taxa_iva_pct: margemInfo.taxa_iva_pct,
+      margemUnitariaEur: margemInfo.margem_unitaria_eur,
+      margemPct: margemInfo.margem_pct,
+      acoes_permitidas,
+      acao_sugerida,
+    });
+  }
+
+  resultados.sort((a, b) => a.diasAteValidade - b.diasAteValidade || (b.capitalEmRiscoEur || 0) - (a.capitalEmRiscoEur || 0));
+  const paged = paginateItems(resultados, args.pagina, args.limite, 30, 200);
+  const capitalTotalRisco = Number(resultados.reduce((s, r) => s + Number(r.capitalEmRiscoEur || 0), 0).toFixed(2));
+
+  const resultObj = {
+    farmacia: 'Farmácia Comunitária',
+    filtros: {
+      dataLimiteValidade: dataLimite.toISOString().slice(0, 10),
+      margemMinimaPct: margemMin,
+      apenasVendaLivre: apenasVl,
+      tipoVenda: tipoFilter || null,
+    },
+    resumo: {
+      totalProdutosEncontrados: resultados.length,
+      totalUnidadesEmRisco: resultados.reduce((s, r) => s + r.stockAtual, 0),
+      capitalTotalEmRiscoEur: capitalTotalRisco,
+    },
+    paginacao: paged.paginacao,
+    ...freshness,
+    artigos: paged.items,
+  };
+
+  const resultado_id = storeToolResult(ctx.farmaciaId, 'validade_margem', resultObj);
   return { resultado_id, ...resultObj };
 }
