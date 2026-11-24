@@ -1215,10 +1215,18 @@ async function startServer() {
           pathname === '/mcp' &&
           (req.method === 'POST' || req.method === 'DELETE' || (req.method === 'GET' && Boolean(headerSessionId)));
 
-        // --- MODO MODERNO: MCP STREAMABLE HTTP (CLAUDE WEB / SPEC 2025-03-26+) ---
+        // --- MODO MODERNO: MCP STREAMABLE HTTP (CLAUDE WEB / CHATGPT / SPEC 2025-03-26+) ---
         if (isStreamableHttpRequest) {
           res.setHeader('Access-Control-Allow-Origin', '*');
           res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+
+          // Compatibilidade com clientes MCP como o ChatGPT que enviam "Accept: */*" ou apenas "application/json"
+          const rawAccept = String(req.headers.accept || '');
+          if (req.method === 'POST' && (!rawAccept.includes('application/json') || !rawAccept.includes('text/event-stream'))) {
+            req.headers.accept = 'application/json, text/event-stream';
+          } else if (req.method === 'GET' && !rawAccept.includes('text/event-stream')) {
+            req.headers.accept = 'text/event-stream';
+          }
 
           if (headerSessionId) {
             const existing = mcpActiveSessions.get(headerSessionId);
