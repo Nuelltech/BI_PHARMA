@@ -2787,16 +2787,20 @@ export async function toolCriarTarefaEquipa(
   prisma: PrismaClient,
   ctx: ToolSecurityContext,
   args: {
-    descricao: string;
+    descricao?: string;
+    designacao?: string;
     categoria?: string;
     cnp_codigo?: string;
     valor_impacto?: number;
+    valor_impacto_eur?: number;
     campanha_id?: string;
   }
 ) {
   const { getCurrentWeekKey } = await import('./weekly_tasks');
   const weekKey = getCurrentWeekKey();
   const cat = args.categoria || 'DIRECAO_TECNICA';
+  const desc = args.designacao || args.descricao || 'Tarefa da Equipa';
+  const valor = args.valor_impacto !== undefined ? Number(args.valor_impacto) : args.valor_impacto_eur !== undefined ? Number(args.valor_impacto_eur) : null;
   const taskId = `MANUAL_${Date.now()}_${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
 
   const tarefa = await prisma.tarefaEquipa.create({
@@ -2805,12 +2809,12 @@ export async function toolCriarTarefaEquipa(
       week_key: weekKey,
       task_id: taskId,
       categoria: cat,
-      designacao: args.descricao,
+      designacao: desc,
       cnp_codigo: args.cnp_codigo || null,
       campanha_id: args.campanha_id || null,
       concluido: false,
       concluido_por: null,
-      valor_impacto: args.valor_impacto !== undefined ? Number(args.valor_impacto) : null,
+      valor_impacto: valor,
     },
   });
 

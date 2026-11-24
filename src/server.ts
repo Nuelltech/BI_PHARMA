@@ -62,6 +62,7 @@ import { parseMarkdownToExecutiveReport, buildExecutiveReportFromStructuredData,
 import { addDiscontinuedCnp, removeDiscontinuedCnp, getDiscontinuedList } from './services/discontinued_products';
 import { ToolSecurityContext } from './services/mcp_pharma_tools';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createPharmaMcpServer } from './services/mcp_server_factory';
 import {
   getBaseIssuerUrl,
@@ -87,7 +88,8 @@ import {
 interface McpActiveSession {
   sessionId: string;
   server: any;
-  transport: SSEServerTransport;
+  transport: SSEServerTransport | StreamableHTTPServerTransport;
+  transportType: 'sse' | 'streamable-http';
   farmaciaId: string;
   farmaciaNome: string;
   connectorId?: string | null;
@@ -1091,8 +1093,27 @@ async function startServer() {
       }
 
       // ======================================================================
-      // 🔌 MCP (MODEL CONTEXT PROTOCOL) SSE & MESSAGE ENDPOINTS (CLAUDE WEB)
+      // 🔌 MCP (MODEL CONTEXT PROTOCOL) STREAMABLE HTTP & LEGACY SSE (CLAUDE WEB)
       // ======================================================================
+      if (
+        req.method === 'OPTIONS' &&
+        (pathname === '/mcp' ||
+          pathname === '/mcp/sse' ||
+          pathname === '/sse' ||
+          pathname === '/mcp/messages' ||
+          pathname === '/sse/messages')
+      ) {
+        res.writeHead(204, {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+          'Access-Control-Allow-Headers':
+            'Content-Type, Authorization, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID, X-Access-Code',
+          'Access-Control-Expose-Headers': 'Mcp-Session-Id',
+        });
+        res.end();
+        return;
+      }
+
       if (pathname === '/mcp' || pathname === '/mcp/sse' || pathname === '/sse') {
         const clientIp = getClientIp(req);
         const userAgent = String(req.headers['user-agent'] || '');
@@ -1121,7 +1142,14 @@ async function startServer() {
             statusCode = 403;
             errorMsg = 'Este conector MCP foi revogado ou pausado pelo Diretor da farmácia.';
           }
-          res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+          const errHeaders: Record<string, string> = {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Access-Control-Allow-Origin': '*',
+          };
+          if (statusCode === 401) {
+            errHeaders['WWW-Authenticate'] = `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`;
+          }
+          res.writeHead(statusCode, errHeaders);
           res.end(JSON.stringify({ error: errorMsg, code: authRes.reason }));
           return;
         }
@@ -1137,16 +1165,147 @@ async function startServer() {
         const connectorNome = authRes.connector?.nome || null;
         const effectiveToken = rawAuthToken;
 
+        const headerSessionId = String(req.headers['mcp-session-id'] || '').trim();
+        const isStreamableHttpRequest =
+          pathname === '/mcp' &&
+          (req.method === 'POST' || req.method === 'DELETE' || (req.method === 'GET' && Boolean(headerSessionId)));
+
+        // --- MODO MODERNO: MCP STREAMABLE HTTP (CLAUDE WEB / SPEC 2025-03-26+) ---
+        if (isStreamableHttpRequest) {
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+
+          if (headerSessionId) {
+            const existing = mcpActiveSessions.get(headerSessionId);
+            if (!existing || existing.transportType !== 'streamable-http' || existing.farmaciaId !== farm.id) {
+              res.writeHead(404, {
+                'Content-Type': 'application/json; charset=utf-8',
+                'Access-Control-Allow-Origin': '*',
+              });
+              res.end(
+                JSON.stringify({
+                  jsonrpc: '2.0',
+                  error: { code: -32001, message: 'Sessão MCP não encontrada ou expirada. Por favor reinicialize.' },
+                  id: null,
+                })
+              );
+              return;
+            }
+            existing.lastActivity = new Date();
+            await (existing.transport as StreamableHTTPServerTransport).handleRequest(req, res);
+            return;
+          }
+
+          if (req.method === 'DELETE') {
+            res.writeHead(400, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Access-Control-Allow-Origin': '*',
+            });
+            res.end(JSON.stringify({ error: 'Header Mcp-Session-Id obrigatório para encerrar sessão.' }));
+            return;
+          }
+
+          // Novo pedido POST /mcp sem Mcp-Session-Id (ex: initialize)
+          let parsedBody: any = undefined;
+          try {
+            const rawBody = await readRequestBody(req, 4 * 1024 * 1024);
+            parsedBody = rawBody ? JSON.parse(rawBody) : undefined;
+          } catch (parseErr: any) {
+            res.writeHead(400, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Access-Control-Allow-Origin': '*',
+            });
+            res.end(
+              JSON.stringify({
+                jsonrpc: '2.0',
+                error: { code: -32700, message: `JSON inválido no pedido MCP: ${parseErr?.message || 'erro de parse'}` },
+                id: null,
+              })
+            );
+            return;
+          }
+
+          let activeSessionId: string | undefined;
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => crypto.randomUUID(),
+            enableJsonResponse: true,
+            onsessioninitialized: (newSessionId) => {
+              activeSessionId = newSessionId;
+              mcpActiveSessions.set(newSessionId, {
+                sessionId: newSessionId,
+                server: mcpServer,
+                transport,
+                transportType: 'streamable-http',
+                farmaciaId: farm.id,
+                farmaciaNome: farm.nome,
+                connectorId,
+                connectorNome,
+                token: effectiveToken,
+                ip: clientIp,
+                userAgent,
+                connectedAt: new Date(),
+                lastActivity: new Date(),
+                totalToolCalls: 0,
+              });
+              console.log(
+                `🔌 [MCP STREAMABLE HTTP]: Sessão iniciada para "${connectorNome || farm.nome}" (Session: ${newSessionId}, IP: ${clientIp})`
+              );
+            },
+            onsessionclosed: (closedSessionId) => {
+              mcpActiveSessions.delete(closedSessionId);
+            },
+          });
+
+          const mcpServer = createPharmaMcpServer(prisma, secContext, {
+            perfilPermissao: authRes.perfilPermissao,
+            connectorId: connectorId || undefined,
+            ip: clientIp,
+            userAgent,
+            onAudit: async (auditData) => {
+              const sid = activeSessionId || transport.sessionId;
+              if (sid) {
+                const s = mcpActiveSessions.get(sid);
+                if (s) {
+                  s.totalToolCalls++;
+                  s.lastActivity = new Date();
+                }
+              }
+              await recordMcpAuditLog(prisma, {
+                farmaciaId: farm.id,
+                connectorId,
+                ferramenta: auditData.ferramenta,
+                parametros: auditData.parametros,
+                sucesso: auditData.sucesso,
+                duracaoMs: auditData.duracaoMs,
+                ip: clientIp,
+                userAgent,
+              });
+            },
+          });
+
+          transport.onclose = () => {
+            const sid = activeSessionId || transport.sessionId;
+            if (sid) mcpActiveSessions.delete(sid);
+          };
+
+          await mcpServer.connect(transport);
+          await transport.handleRequest(req, res, parsedBody);
+          return;
+        }
+
         const isEventStream = req.headers.accept && req.headers.accept.includes('text/event-stream');
 
-        // Se for um probe/ping HTTP normal (ex: verificação do Claude ou navegador)
+        // Se for um probe/ping HTTP normal (ex: verificação do navegador)
         if (!isEventStream && req.method === 'GET') {
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Access-Control-Allow-Origin': '*',
+          });
           res.end(
             JSON.stringify({
               name: `bi-pharma-${farm.nome.toLowerCase().replace(/[^a-z0-9]/g, '-')}`,
               version: '1.0.0',
-              protocol: 'mcp-sse',
+              protocol: 'mcp-streamable-http+sse',
               status: 'online',
               farmacia: {
                 id: farm.id,
@@ -1154,14 +1313,15 @@ async function startServer() {
                 nif: farm.nif,
               },
               conector: authRes.connector ? { nome: authRes.connector.nome, perfil: authRes.perfilPermissao } : null,
-              endpoint: `/mcp/messages?token=${encodeURIComponent(effectiveToken)}`,
-              message: 'Servidor MCP pronto com governança ativa. Conecte com cliente MCP compatível com SSE.',
+              endpoint: `/mcp`,
+              legacy_sse_endpoint: `/mcp/messages?token=${encodeURIComponent(effectiveToken)}`,
+              message: 'Servidor MCP pronto (Streamable HTTP + SSE legacy) com governança ativa.',
             })
           );
           return;
         }
 
-        // Estabelecer SSE Stream para o Claude Web
+        // --- MODO LEGACY: SSE Stream (/sse, /mcp/sse, ou GET /mcp sem Mcp-Session-Id) ---
         const postEndpoint = `/mcp/messages?token=${encodeURIComponent(effectiveToken)}`;
         const transport = new SSEServerTransport(postEndpoint, res, {
           enableDnsRebindingProtection: false,
@@ -1197,6 +1357,7 @@ async function startServer() {
           sessionId: sId,
           server: mcpServer,
           transport,
+          transportType: 'sse',
           farmaciaId: farm.id,
           farmaciaNome: farm.nome,
           connectorId,
@@ -1227,14 +1388,14 @@ async function startServer() {
         }
 
         const session = mcpActiveSessions.get(querySessionId);
-        if (!session) {
+        if (!session || session.transportType !== 'sse') {
           res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ error: 'Sessão MCP não encontrada ou expirada.' }));
+          res.end(JSON.stringify({ error: 'Sessão MCP SSE não encontrada ou expirada.' }));
           return;
         }
 
         session.lastActivity = new Date();
-        await session.transport.handlePostMessage(req, res);
+        await (session.transport as SSEServerTransport).handlePostMessage(req, res);
         return;
       }
 
