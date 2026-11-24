@@ -103,6 +103,14 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
     expect(comVendas.length).toBeGreaterThan(0);
     expect(comVendas[0].origem_encontrada).toContain('vendas_historicas');
     expect(typeof comVendas[0].taxa_iva_pct).toBe('number');
+    // Artigo 6391151 (última venda Dez/2022) tem de ter vendasAno12M === 0 e vendasHistoricoTotalUnidades === 11
+    const art6391151 = (resExato.artigos || []).find((a: any) => a.cnp === '6391151');
+    if (art6391151) {
+      expect(art6391151.vendasAno12M).toBe(0);
+      expect(art6391151.vendasHistoricoTotalUnidades).toBe(11);
+      expect(art6391151.situacao).toBe('SEM_STOCK_SEM_VENDAS');
+    }
+    expect(resExato.resumoEncontrado.totalUnidadesVendidasAnoAtual).toBe(6);
 
     // Variante com hífen/fonética ("Rino-duche")
     const resFuzzy: any = await toolConsultarProdutosPorNomeOuCategoria(prisma, ctxC, {

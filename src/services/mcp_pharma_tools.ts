@@ -1087,8 +1087,12 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
       : [];
 
   const monthlyByCnp = new Map<string, Map<string, { qtd: number; valor: number }>>();
-  const totalVendasHistoricoByCnp = new Map<string, { qtd: number; valor: number; ultimaData: string | null; qtdAnoAtual: number }>();
-  const anoAtualPrefix = (freshness.dados_ate || new Date().toISOString().slice(0, 10)).slice(0, 4);
+  const totalVendasHistoricoByCnp = new Map<string, { qtd: number; valor: number; ultimaData: string | null; qtdAnoAtual: number; qtd12m: number }>();
+  const refDateStr = freshness.dados_ate || new Date().toISOString().slice(0, 10);
+  const anoAtualPrefix = refDateStr.slice(0, 4);
+  const refDateObj = new Date(`${refDateStr}T23:59:59Z`);
+  const cutoff12mObj = new Date(Date.UTC(refDateObj.getUTCFullYear() - 1, refDateObj.getUTCMonth(), refDateObj.getUTCDate()));
+  const cutoff12mYm = cutoff12mObj.toISOString().slice(0, 7);
 
   for (const v of vendasRaw) {
     let cMap = monthlyByCnp.get(v.cnp_codigo);
@@ -1108,11 +1112,13 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
       valor: 0,
       ultimaData: null,
       qtdAnoAtual: 0,
+      qtd12m: 0,
     };
     agg.qtd += v.quantidade;
     agg.valor += Number(v.valor_total || 0);
     agg.ultimaData = isoDate;
     if (isoDate.startsWith(anoAtualPrefix)) agg.qtdAnoAtual += v.quantidade;
+    if (mesKey > cutoff12mYm) agg.qtd12m += v.quantidade;
     totalVendasHistoricoByCnp.set(v.cnp_codigo, agg);
   }
 
@@ -1124,8 +1130,9 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
     const histAgg = totalVendasHistoricoByCnp.get(s.cnp);
 
     const stockAtual = it?.stock ?? mart?.stock_total_unidades ?? 0;
-    const vendas12m = it?.vendasQtd ?? mart?.total_unidades_vendidas ?? 0;
-    const vmm = mart ? Number(mart.vmm || 0) : vendas12m / 12.0;
+    // Calcular vendas12m estritamente dos últimos 12 meses até dados_ate (nunca usar soma histórica total!)
+    const vendas12m = histAgg ? histAgg.qtd12m : 0;
+    const vmm = vendas12m / 12.0;
     const vendaDiaria = vmm / 30.0;
     const diasCobertura = vendaDiaria > 0 ? Math.round(stockAtual / vendaDiaria) : stockAtual > 0 ? 999 : 0;
     const mesesCobertura = vmm > 0 ? Number((stockAtual / vmm).toFixed(1)) : stockAtual > 0 ? 99 : 0;
@@ -1253,6 +1260,9 @@ export async function toolConsultarProdutosPorNomeOuCategoria(
       comStockAtual: comStockCount,
       comVendasHistoricas: comVendasHistCount,
       apenasCatalogoSemMovimento: cleanArtigos.length - new Set([...cleanArtigos.filter((a) => a.stockAtual > 0).map((a) => a.cnp), ...cleanArtigos.filter((a) => a.vendasHistoricoTotalUnidades > 0).map((a) => a.cnp)]).size,
+      totalUnidadesVendidas12M: cleanArtigos.reduce((s, a) => s + a.vendasAno12M, 0),
+      totalUnidadesVendidasAnoAtual: cleanArtigos.reduce((s, a) => s + a.vendasAnoAtualUnidades, 0),
+      totalUnidadesVendidasHistorico: cleanArtigos.reduce((s, a) => s + a.vendasHistoricoTotalUnidades, 0),
     },
     paginacao: paged.paginacao,
     ...freshness,
