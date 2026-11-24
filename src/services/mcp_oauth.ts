@@ -92,29 +92,47 @@ export function registerOAuthClient(
     grant_types?: string[];
     response_types?: string[];
     token_endpoint_auth_method?: string;
+    scope?: string;
   }
-): RegisteredOAuthClient & { client_id_issued_at: number } {
+) {
   const clientId = `mcp_client_${crypto.randomBytes(8).toString('hex')}`;
-  const clientSecret = `sec_${crypto.randomBytes(16).toString('hex')}`;
+  const authMethod = body.token_endpoint_auth_method || 'none';
+  const clientSecret = authMethod === 'none' ? undefined : `sec_${crypto.randomBytes(16).toString('hex')}`;
   const redirectUris = Array.isArray(body.redirect_uris) && body.redirect_uris.length > 0
     ? body.redirect_uris
     : ['https://claude.ai/api/mcp/auth_callback'];
+  const grantTypes = Array.isArray(body.grant_types) && body.grant_types.length > 0
+    ? body.grant_types
+    : ['authorization_code', 'refresh_token'];
+  const responseTypes = Array.isArray(body.response_types) && body.response_types.length > 0
+    ? body.response_types
+    : ['code'];
+  const clientName = body.client_name || 'Claude Web MCP Client';
+  const issuedAt = Math.floor(Date.now() / 1000);
 
   const client: RegisteredOAuthClient = {
     clientId,
     clientSecret,
-    clientName: body.client_name || 'Claude Web MCP Client',
+    clientName,
     redirectUris,
-    grantTypes: body.grant_types || ['authorization_code'],
-    responseTypes: body.response_types || ['code'],
+    grantTypes,
+    responseTypes,
     createdAt: Date.now(),
   };
 
   oauthClients.set(clientId, client);
 
+  // Resposta estritamente conforme RFC 7591 (snake_case obrigatório para Claude Web / clientes MCP)
   return {
-    ...client,
-    client_id_issued_at: Math.floor(Date.now() / 1000),
+    client_id: clientId,
+    ...(clientSecret ? { client_secret: clientSecret, client_secret_expires_at: 0 } : {}),
+    client_id_issued_at: issuedAt,
+    client_name: clientName,
+    redirect_uris: redirectUris,
+    grant_types: grantTypes,
+    response_types: responseTypes,
+    token_endpoint_auth_method: authMethod,
+    scope: body.scope || 'mcp:tools',
   };
 }
 

@@ -894,6 +894,24 @@ async function startServer() {
         return;
       }
 
+      if (
+        req.method === 'OPTIONS' &&
+        (pathname === '/oauth/register' ||
+          pathname === '/oauth/token' ||
+          pathname === '/.well-known/oauth-protected-resource' ||
+          pathname === '/.well-known/oauth-protected-resource/mcp' ||
+          pathname === '/.well-known/oauth-authorization-server' ||
+          pathname === '/.well-known/openid-configuration')
+      ) {
+        res.writeHead(204, {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept',
+        });
+        res.end();
+        return;
+      }
+
       if (pathname === '/oauth/register' && req.method === 'POST') {
         try {
           const rawBody = await readRequestBody(req, 64 * 1024);
@@ -1035,7 +1053,14 @@ async function startServer() {
           const grantType = params.grant_type;
           const code = params.code;
           const codeVerifier = params.code_verifier;
-          const clientId = params.client_id;
+          let clientId = params.client_id;
+          if (!clientId && req.headers.authorization && req.headers.authorization.toLowerCase().startsWith('basic ')) {
+            try {
+              const decoded = Buffer.from(req.headers.authorization.slice(6).trim(), 'base64').toString('utf8');
+              const sepIdx = decoded.indexOf(':');
+              clientId = sepIdx >= 0 ? decoded.slice(0, sepIdx) : decoded;
+            } catch {}
+          }
           const redirectUri = params.redirect_uri;
 
           if (grantType !== 'authorization_code') {

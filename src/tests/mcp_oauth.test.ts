@@ -35,9 +35,10 @@ describe('MCP OAuth 2.1 Handshake Service', () => {
       redirect_uris: ['https://claude.ai/api/mcp/auth_callback'],
     });
 
-    expect(client.clientId).toMatch(/^mcp_client_/);
-    expect(client.clientName).toBe('Claude Web Vitest');
-    expect(client.redirectUris).toContain('https://claude.ai/api/mcp/auth_callback');
+    expect(client.client_id).toMatch(/^mcp_client_/);
+    expect(client.client_name).toBe('Claude Web Vitest');
+    expect(client.redirect_uris).toContain('https://claude.ai/api/mcp/auth_callback');
+    expect(client.token_endpoint_auth_method).toBe('none');
   });
 
   it('deve realizar o fluxo completo de autorização e troca de token com PKCE S256', async () => {
