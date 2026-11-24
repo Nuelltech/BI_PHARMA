@@ -1,0 +1,178 @@
+import { describe, it, expect } from 'vitest';
+import fs from 'fs';
+import vm from 'vm';
+import { PrismaClient } from '@prisma/client';
+import {
+  toolConsultarProdutosPorNomeOuCategoria,
+  toolConsultarVendasPeriodo,
+  toolAnalisarDesempenhoLaboratorio,
+  ToolSecurityContext,
+} from '../services/mcp_pharma_tools';
+import {
+  classificarProdutoUnificado,
+  calcularMargemComIva,
+  fuzzyNameMatchScore,
+  renderMarkdownTableFromStoredResult,
+} from '../services/pharma_tool_helpers';
+import { calculateClaudeCostEur } from '../services/copilot_engine';
+
+const prisma = new PrismaClient();
+const FARMACIA_A_ID = '3ac42c32-87a8-4afe-98cc-4ca61ac64aca';
+const FARMACIA_C_ID = '594bdf27-151b-49f7-be71-18660b745d84';
+
+describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
+  it('1. Correção 1: produto com 0 vendas ou VMM < 1 não-crónico devolve TRABALHAR_ENCOMENDA (nunca REPOR)', () => {
+    const semVendas = classificarProdutoUnificado({
+      stock: 0,
+      vmm: 0,
+      vendas12m: 0,
+      diasCobertura: 0,
+      mesesCobertura: 0,
+      tipoVenda: 'VENDA_LIVRE',
+      designacao: 'Creme Teste',
+      custoUnitario: 5,
+      pvp: 12,
+    });
+    expect(semVendas.acao_sugerida).toBe('TRABALHAR_ENCOMENDA');
+    expect(semVendas.situacao).toBe('SEM_STOCK_SEM_VENDAS');
+    expect(semVendas.acoes_permitidas).not.toContain('REPOR');
+
+    const baixaRot = classificarProdutoUnificado({
+      stock: 0,
+      vmm: 0.4,
+      vendas12m: 5,
+      diasCobertura: 0,
+      mesesCobertura: 0,
+      tipoVenda: 'VENDA_LIVRE',
+      designacao: 'Spray Nasal Teste',
+      custoUnitario: 4,
+      pvp: 10,
+    });
+    expect(baixaRot.acao_sugerida).toBe('TRABALHAR_ENCOMENDA');
+    expect(baixaRot.situacao).toBe('BAIXA_ROTACAO_SEM_STOCK');
+  });
+
+  it('2. Correções 2, 3 e 4: margem em € deduz IVA e faz fallback para ProdutoMestre.pvp', () => {
+    const m = calcularMargemComIva({
+      pvpFarmacia: null,
+      pvpMestre: 12.3,
+      custoUnitario: 6.0,
+      taxaIva: 23,
+      tipoVenda: 'VENDA_LIVRE',
+    });
+    expect(m.pvp_origem).toBe('PRODUTO_MESTRE');
+    expect(m.taxa_iva_pct).toBe(23);
+    expect(m.pvp_sem_iva_eur).toBe(10);
+    expect(m.margem_unitaria_eur).toBe(4);
+    expect(m.margem_pct).toBe(40);
+  });
+
+  it('3. Correção Rhinodouche (b): pesquisa aproximada e fonética (Rino-duche = Rhinodouche = Rhinodouch)', () => {
+    expect(fuzzyNameMatchScore('Rino-duche', 'Rhinodouche Sal 26 Saquetas')).toBeGreaterThan(80);
+    expect(fuzzyNameMatchScore('Rhinodouch', 'Rhinodouche Irrigador Nasal')).toBeGreaterThan(80);
+    expect(fuzzyNameMatchScore('rhinodouche', 'RHINODOUCHE SAL 40 SAQ')).toBeGreaterThan(100);
+  });
+
+  it('4. Preços Haiku 5.5 e Sonnet 5.5 em calculateClaudeCostEur()', () => {
+    // 1M input + 1M output + 1M cache read em Haiku 5.5 = ($0.10 + $0.50 + $0.01) * 0.92 = 0.5612
+    const haikuCost = calculateClaudeCostEur('claude-haiku-5-5', 1_000_000, 1_000_000, 0, 1_000_000);
+    expect(haikuCost).toBeCloseTo(0.5612, 3);
+    // 1M input + 1M output + 1M cache read em Sonnet 5.5 = ($2.00 + $10.00 + $0.10) * 0.92 = 11.132
+    const sonnetCost = calculateClaudeCostEur('claude-sonnet-5-5', 1_000_000, 1_000_000, 0, 1_000_000);
+    expect(sonnetCost).toBeCloseTo(11.132, 3);
+  });
+
+  it('5. Rhinodouche na Farmácia C (Demo): encontra vendas históricas e catálogo mesmo com stock = 0', async () => {
+    const ctxC: ToolSecurityContext = {
+      farmaciaId: FARMACIA_C_ID,
+      farmaciaNome: 'Farmácia C (Demo)',
+      nif: '999999990',
+      perfil: 'SUPERADMIN',
+      verFaturacao: true,
+    };
+
+    const resExato: any = await toolConsultarProdutosPorNomeOuCategoria(prisma, ctxC, {
+      termo_pesquisa: 'rhinodouche',
+    });
+    expect(resExato.totalArtigosEncontrados).toBeGreaterThan(0);
+    expect(resExato.resultado_id).toBeTruthy();
+    expect(resExato.dados_ate).toBeTruthy();
+    const comVendas = (resExato.artigos || []).filter((a: any) => a.vendasHistoricoTotalUnidades > 0);
+    expect(comVendas.length).toBeGreaterThan(0);
+    expect(comVendas[0].origem_encontrada).toContain('vendas_historicas');
+    expect(typeof comVendas[0].taxa_iva_pct).toBe('number');
+
+    // Variante com hífen/fonética ("Rino-duche")
+    const resFuzzy: any = await toolConsultarProdutosPorNomeOuCategoria(prisma, ctxC, {
+      termo_pesquisa: 'Rino-duche',
+    });
+    expect(resFuzzy.totalArtigosEncontrados).toBeGreaterThan(0);
+  }, 20000);
+
+  it('6. Bial em 2026 na Farmácia A: consulta rápida via MartProdutoMes, sem falsos positivos Labialfarma e tabela por resultado_id', async () => {
+    const ctxA: ToolSecurityContext = {
+      farmaciaId: FARMACIA_A_ID,
+      farmaciaNome: 'Farmácia A',
+      nif: '505016419',
+      perfil: 'SUPERADMIN',
+      verFaturacao: true,
+    };
+
+    const t0 = Date.now();
+    const resVendas: any = await toolConsultarVendasPeriodo(prisma, ctxA, {
+      periodo: '2026',
+      laboratorio: 'Bial',
+      limite: 20,
+    });
+    const elapsedMs = Date.now() - t0;
+
+    expect(elapsedMs).toBeLessThan(8000);
+    expect(resVendas.resultado_id).toBeTruthy();
+    expect(resVendas.dados_ate).toBeTruthy();
+    expect(resVendas.resumo.totalReferenciasComVenda).toBeGreaterThan(0);
+
+    // Nenhum falso positivo "Labialfarma"
+    const falsosPositivos = (resVendas.artigos || []).filter((a: any) =>
+      String(a.laboratorioTitular || '').toLowerCase().includes('labial')
+    );
+    expect(falsosPositivos.length).toBe(0);
+
+    // Tabela determinística por referência (resultado_id)
+    const tbl = renderMarkdownTableFromStoredResult(FARMACIA_A_ID, {
+      resultado_id: resVendas.resultado_id,
+      titulo: 'Top Bial 2026',
+      colunas: ['cnp', 'designacao', 'unidadesVendidas', 'taxa_iva_pct', 'acao_sugerida'],
+      limite: 10,
+    });
+    expect(tbl.ok).toBe(true);
+    expect(tbl.rowCount).toBeGreaterThan(0);
+    expect(tbl.markdown).toContain('| cnp | designacao |');
+
+    // Isolamento multi-tenant: outra farmácia não pode ler o resultado_id da Farmácia A
+    const tblCross = renderMarkdownTableFromStoredResult(FARMACIA_C_ID, {
+      resultado_id: resVendas.resultado_id,
+    });
+    expect(tblCross.ok).toBe(false);
+
+    // toolAnalisarDesempenhoLaboratorio também funciona com periodo="2026"
+    const resLab: any = await toolAnalisarDesempenhoLaboratorio(prisma, ctxA, {
+      nome_laboratorio: 'Bial',
+      periodo: '2026',
+    });
+    expect(resLab.success).toBe(true);
+    expect(resLab.resultado_id).toBeTruthy();
+  }, 20000);
+
+  it('7. Validação vm.Script de todos os blocos <script> inline em src/server.ts', () => {
+    const src = fs.readFileSync('src/server.ts', 'utf8');
+    const blocks = src.match(/<script>([\s\S]*?)<\/script>/g) || [];
+    expect(blocks.length).toBeGreaterThan(0);
+    for (const block of blocks) {
+      const code = block
+        .replace(/^<script>|<\/script>$/g, '')
+        .replace(/\\`/g, '`')
+        .replace(/\\\$/g, '$');
+      expect(() => new vm.Script(code)).not.toThrow();
+    }
+  });
+});

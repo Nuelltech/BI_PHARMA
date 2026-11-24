@@ -907,16 +907,28 @@ export function calculateClaudeCostEur(
 ): number {
   const usdToEur = process.env.COPILOT_USD_TO_EUR ? Number(process.env.COPILOT_USD_TO_EUR) : 0.92;
 
-  // P3.12: Tabela de preços oficiais Anthropic por Model ID
-  // Haiku 4.5 / 3.5: $1.00 / $5.00 (Cache escrita: $1.25, leitura: $0.10)
+  // P3.12 + Copilot v2: Tabela de preços oficiais Anthropic por Model ID
+  // Default Haiku 4.5 / 3.5: $1.00 / $5.00 (Cache escrita: $1.25, leitura: $0.10)
   let inputPerMillion = 1.0;
   let outputPerMillion = 5.0;
   let cacheWritePerMillion = 1.25;
   let cacheReadPerMillion = 0.10;
 
   const m = (model || '').toLowerCase();
-  if (m.includes('sonnet')) {
-    // Sonnet 3.7 / 3.5: $3.00 / $15.00 (Cache escrita: $3.75, leitura: $0.30)
+  if (m.includes('haiku') && (m.includes('5-5') || m.includes('5.5'))) {
+    // Haiku 5.5: $0.10 / $0.50 (Cache escrita: $0.125, leitura: $0.01)
+    inputPerMillion = 0.10;
+    outputPerMillion = 0.50;
+    cacheWritePerMillion = 0.125;
+    cacheReadPerMillion = 0.01;
+  } else if (m.includes('sonnet') && (m.includes('5-5') || m.includes('5.5'))) {
+    // Sonnet 5.5: $2.00 / $10.00 (Cache escrita: $2.50, leitura: $0.10)
+    inputPerMillion = 2.0;
+    outputPerMillion = 10.0;
+    cacheWritePerMillion = 2.50;
+    cacheReadPerMillion = 0.10;
+  } else if (m.includes('sonnet')) {
+    // Sonnet 4.5 / 3.7 / 3.5: $3.00 / $15.00 (Cache escrita: $3.75, leitura: $0.30)
     inputPerMillion = 3.0;
     outputPerMillion = 15.0;
     cacheWritePerMillion = 3.75;

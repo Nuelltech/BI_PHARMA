@@ -44,6 +44,7 @@ import zlib from 'zlib';
 import { ensureDatabaseReady } from './db';
 import { canVerFaturacao } from './platform/permissoes';
 import { recordCopilotFeedback } from './services/copilot_audit';
+import { runCopilotAgentV2, clearAgentV2Session } from './services/copilot_agent_v2';
 
 process.on('uncaughtException', (err) => {
   console.error('[Server] Uncaught Exception:', err);
@@ -3107,12 +3108,18 @@ async function startServer() {
       }
 
       // 3. Endpoint de Perguntas em Linguagem Natural / Consultas Rápidas (Multi-Tenant)
+      // Decisão v2: Copilot restrito estritamente a Superuser (ADMIN) durante a fase de validação.
       if (pathname === '/api/ask' && req.method === 'POST') {
         try {
+          const accessCtx = await resolveAccessContext();
+          if (accessCtx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'O Assistente Copilot encontra-se temporariamente restrito a administradores durante a fase de validação.' }));
+            return;
+          }
           const rawBody = await readRequestBody(req, 256 * 1024);
           const { question, farmaciaId, sessionId, mode } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
-          const ctx = await resolveAccessContext();
           const q = String(question || '').trim();
 
           if (!q) {
@@ -3122,8 +3129,7 @@ async function startServer() {
           }
 
           // Contexto de Segurança Multi-Tenant Estrito & Anonimização para LLM
-          const accessCtx = await resolveAccessContext();
-          const callerRole = accessCtx.role === 'ADMIN' ? 'SUPERADMIN' : 'PROPRIETARIO';
+          const callerRole = 'SUPERADMIN';
           const secContext: ToolSecurityContext = {
             farmaciaId: activeFarmacia.id,
             farmaciaNome: 'Farmácia Comunitária',
@@ -3135,6 +3141,31 @@ async function startServer() {
           // Isola estritamente o sessionId por farmácia para impedir leitura cruzada de conversas em RAM
           const cleanSid = String(sessionId || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
           const scopedSid = `${activeFarmacia.id}:${cleanSid}`;
+          const useLegacy = mode === 'LEGACY';
+          if (!useLegacy) {
+            const agentRes = await runCopilotAgentV2(prisma, secContext, q, scopedSid, {
+              maxToolCalls: 15,
+              timeoutMs: 90_000,
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+              success: true,
+              text: agentRes.text,
+              toolsUsed: agentRes.toolsUsed,
+              sessionId: cleanSid,
+              interacaoId: agentRes.interacaoId,
+              tabelasRenderizadas: agentRes.tabelasRenderizadas,
+              avisoValidacao: agentRes.avisoValidacao || null,
+              shoppingList: null,
+              farmaciaNome: activeFarmacia.nome,
+              titulo: `Copilot v2 — ${activeFarmacia.nome}`,
+              explicacao: agentRes.text,
+              usage: agentRes.usage,
+              engine: 'AGENT_V2',
+            }));
+            return;
+          }
+
           const copilotRes = await askConversationalCopilot(prisma, secContext, q, scopedSid, (mode || 'GENERAL'));
 
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -3148,6 +3179,7 @@ async function startServer() {
             titulo: `Copilot — ${activeFarmacia.nome}`,
             explicacao: copilotRes.text,
             usage: (copilotRes as any).usage || null,
+            engine: 'LEGACY',
           }));
         } catch (e: any) {
           const status = e.statusCode || 500;
@@ -3158,10 +3190,89 @@ async function startServer() {
         return;
       }
 
+      // 3.0B. Endpoint SSE em tempo real para o Copilot v2 (progresso em #copilotThinkingIndicator)
+      if (pathname === '/api/ask/stream' && req.method === 'POST') {
+        try {
+          const accessCtx = await resolveAccessContext();
+          if (accessCtx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'O Assistente Copilot encontra-se restrito a administradores.' }));
+            return;
+          }
+          const rawBody = await readRequestBody(req, 256 * 1024);
+          const { question, farmaciaId, sessionId } = JSON.parse(rawBody || '{}');
+          const activeFarmacia = await requireActiveFarmacia(farmaciaId);
+          const q = String(question || '').trim();
+          if (!q) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'Pergunta não fornecida.' }));
+            return;
+          }
+
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            Connection: 'keep-alive',
+          });
+
+          const sendSse = (eventName: string, payload: any) => {
+            try {
+              res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+            } catch (_) {}
+          };
+
+          const secContext: ToolSecurityContext = {
+            farmaciaId: activeFarmacia.id,
+            farmaciaNome: 'Farmácia Comunitária',
+            nif: '',
+            perfil: 'SUPERADMIN',
+            verFaturacao: canVerFaturacao('SUPERADMIN'),
+          };
+          const cleanSid = String(sessionId || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
+          const scopedSid = `${activeFarmacia.id}:${cleanSid}`;
+
+          const agentRes = await runCopilotAgentV2(prisma, secContext, q, scopedSid, {
+            maxToolCalls: 15,
+            timeoutMs: 90_000,
+            onProgress: (ev) => sendSse('progress', ev),
+          });
+
+          sendSse('result', {
+            success: true,
+            text: agentRes.text,
+            toolsUsed: agentRes.toolsUsed,
+            sessionId: cleanSid,
+            interacaoId: agentRes.interacaoId,
+            tabelasRenderizadas: agentRes.tabelasRenderizadas,
+            avisoValidacao: agentRes.avisoValidacao || null,
+            shoppingList: null,
+            farmaciaNome: activeFarmacia.nome,
+            titulo: `Copilot v2 — ${activeFarmacia.nome}`,
+            explicacao: agentRes.text,
+            usage: agentRes.usage,
+            engine: 'AGENT_V2',
+          });
+          res.end();
+        } catch (e: any) {
+          console.error('[API /api/ask/stream Error]:', e);
+          try {
+            res.write(`event: error\ndata: ${JSON.stringify({ success: false, error: e.message || 'Erro interno' })}\n\n`);
+            res.end();
+          } catch (_) {}
+        }
+        return;
+      }
+
       
       // 3.2. Endpoint para Feedback de Auditoria da Resposta do Copilot (Fase 0: persistido em CopilotInteracao)
       if (pathname === '/api/copilot/feedback' && req.method === 'POST') {
         try {
+          const accessCtx = await resolveAccessContext();
+          if (accessCtx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'Acesso restrito a administradores.' }));
+            return;
+          }
           const rawBody = await readRequestBody(req, 32 * 1024);
           const { sessionId, interacaoId, feedback, comment, comentario, farmaciaId } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
@@ -3196,11 +3307,18 @@ async function startServer() {
       // 3.1. Endpoint para Limpar Sessão Conversacional do Copilot (Isolado por Farmácia)
       if (pathname === '/api/copilot/clear' && req.method === 'POST') {
         try {
+          const accessCtx = await resolveAccessContext();
+          if (accessCtx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'Acesso restrito a administradores.' }));
+            return;
+          }
           const rawBody = await readRequestBody(req, 64 * 1024);
           const { sessionId, farmaciaId } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
           const cleanSid = String(sessionId || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
           clearCopilotSession(`${activeFarmacia.id}:${cleanSid}`);
+          clearAgentV2Session(`${activeFarmacia.id}:${cleanSid}`);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ success: true, message: 'Histórico da sessão reiniciado com sucesso.' }));
         } catch (e: any) {
@@ -3214,11 +3332,16 @@ async function startServer() {
       // 3.3. Endpoint para Gerar Síntese de Relatório Executivo a partir do Copilot (Fase 1: determinístico, sem chamada livre à IA)
       if (pathname === '/api/copilot/generate-report' && req.method === 'POST') {
         try {
+          const accessCtx = await resolveAccessContext();
+          if (accessCtx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'Acesso restrito a administradores.' }));
+            return;
+          }
           const rawBody = await readRequestBody(req, 512 * 1024);
           const { farmaciaId, sessionId, rawText, relatorioEstruturado, responsavel } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
-          const accessCtx = await resolveAccessContext();
-          const callerRole = accessCtx.role === 'ADMIN' ? 'SUPERADMIN' : 'PROPRIETARIO';
+          const callerRole = 'SUPERADMIN';
           const allowFaturacao = canVerFaturacao(callerRole);
           const emitente = String(responsavel || (accessCtx.role === 'ADMIN' ? 'Administrador' : `Sessão ${activeFarmacia.nome}`)).trim();
 
@@ -5574,9 +5697,9 @@ function getDashboardHtml(): string {
           <span class="nav-item-left">📋 Plano da Semana (Equipa)</span>
         </button>
 
-        <button class="nav-item tab-btn" id="tabBtn-copilot" onclick="switchTab('copilot')">
+        <button class="nav-item tab-btn" id="tabBtn-copilot" onclick="switchTab('copilot')" style="display: none;">
           <span class="nav-item-left">💬 Assistente Copilot</span>
-          <span class="badge badge-info" style="font-size:0.7rem;">IA</span>
+          <span class="badge badge-info" style="font-size:0.68rem;">ADMIN v2</span>
         </button>
 
         <button class="nav-item tab-btn" id="tabBtn-campaigns" onclick="switchTab('campaigns')">
@@ -6376,11 +6499,11 @@ function getDashboardHtml(): string {
         <div id="copilotThinkingIndicator" class="thinking-card" style="display: none; background: #f0f9ff !important; border: 1px solid #bae6fd !important;">
           <div style="font-size: 2rem; animation: spin 2.5s linear infinite;">🧠</div>
           <div>
-            <div style="font-size: 0.98rem; font-weight: 700; color: #0369a1 !important; margin-bottom: 2px;">
-              A analisar dados da farmácia com Inteligência Artificial...
+            <div id="copilotThinkingTitle" style="font-size: 0.98rem; font-weight: 700; color: #0369a1 !important; margin-bottom: 2px;">
+              A analisar dados da farmácia com Copilot v2...
             </div>
-            <div style="font-size: 0.82rem; color: #475569 !important; line-height: 1.4;">
-              A consultar o inventário, vendas e validades no PostgreSQL e a executar o raciocínio clínico.
+            <div id="copilotThinkingDetail" style="font-size: 0.82rem; color: #475569 !important; line-height: 1.4;">
+              A consultar o inventário, vendas e validades no PostgreSQL.
             </div>
           </div>
         </div>
@@ -8519,12 +8642,15 @@ function getDashboardHtml(): string {
       const selLabel = document.getElementById('farmaciaSelectorLabel');
       const lockedBadge = document.getElementById('lockedPharmacyBadge');
       const btnTrocar = document.getElementById('btnTrocarAcesso');
+      const copilotBtn = document.getElementById('tabBtn-copilot');
+      const copilotView = document.getElementById('tabContent-copilot');
 
       if (role === 'ADMIN') {
         if (adminBar) adminBar.style.display = 'flex';
         if (sel) sel.style.display = 'inline-block';
         if (selLabel) selLabel.style.display = 'inline-block';
         if (lockedBadge) lockedBadge.style.display = 'none';
+        if (copilotBtn) copilotBtn.style.display = 'flex';
         if (btnTrocar) {
           btnTrocar.style.display = 'inline-block';
           btnTrocar.innerHTML = '🚪 Sair de Admin';
@@ -8535,6 +8661,9 @@ function getDashboardHtml(): string {
         if (adminBar) adminBar.style.display = 'none';
         if (sel) sel.style.display = 'none';
         if (selLabel) selLabel.style.display = 'none';
+        if (copilotBtn) copilotBtn.style.display = 'none';
+        if (copilotView) copilotView.style.display = 'none';
+        if (activeTab === 'copilot') switchTab('plano');
         // Acesso estritamente isolado: esconder completamente o botão de trocar!
         if (btnTrocar) btnTrocar.style.display = 'none';
         if (lockedBadge) {
@@ -9807,6 +9936,9 @@ function getDashboardHtml(): string {
     }
 
     function switchTab(tab) {
+      if (tab === 'copilot' && activeAuthRole !== 'ADMIN') {
+        tab = 'plano';
+      }
       activeTab = tab;
       ['plano', 'copilot', 'campaigns', 'rebalance', 'labs', 'evolution', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
         const btn = document.getElementById('tabBtn-' + t);
@@ -13181,18 +13313,73 @@ function getDashboardHtml(): string {
 
       try {
         const sid = getCopilotSessionId();
-        const res = await fetch('/api/ask', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            question,
-            farmaciaId: activeFarmaciaId,
-            sessionId: sid,
-            mode: currentCopilotMode || 'GENERAL',
-          }),
-        });
+        const thinkingTitle = document.getElementById('copilotThinkingTitle');
+        const thinkingDetail = document.getElementById('copilotThinkingDetail');
+        if (thinkingTitle) thinkingTitle.textContent = 'A analisar dados da farmácia com Copilot v2...';
+        if (thinkingDetail) thinkingDetail.textContent = 'A preparar ferramentas analíticas...';
 
-        const data = await res.json();
+        let data = null;
+        try {
+          const streamRes = await fetch('/api/ask/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              question,
+              farmaciaId: activeFarmaciaId,
+              sessionId: sid,
+              mode: currentCopilotMode || 'GENERAL',
+            }),
+          });
+
+          if (streamRes.ok && streamRes.body && streamRes.headers.get('content-type') && streamRes.headers.get('content-type').includes('text/event-stream')) {
+            const reader = streamRes.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+            let currentEvent = '';
+            while (true) {
+              const chunk = await reader.read();
+              if (chunk.done) break;
+              buffer += decoder.decode(chunk.value, { stream: true });
+              const lines = buffer.split('\\n');
+              buffer = lines.pop() || '';
+              for (const line of lines) {
+                if (line.startsWith('event:')) {
+                  currentEvent = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  const raw = line.slice(5).trim();
+                  if (!raw) continue;
+                  try {
+                    const parsed = JSON.parse(raw);
+                    if (currentEvent === 'progress') {
+                      if (thinkingDetail && parsed.message) thinkingDetail.textContent = parsed.message;
+                      if (thinkingTitle && parsed.step) thinkingTitle.textContent = 'Copilot v2 — Passo ' + parsed.step;
+                    } else if (currentEvent === 'result') {
+                      data = parsed;
+                    } else if (currentEvent === 'error') {
+                      data = { success: false, text: '❌ Erro: ' + (parsed.error || 'Erro desconhecido') };
+                    }
+                  } catch (_) {}
+                }
+              }
+            }
+          }
+        } catch (_) {
+          // fallback para /api/ask síncrono
+        }
+
+        if (!data) {
+          const res = await fetch('/api/ask', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              question,
+              farmaciaId: activeFarmaciaId,
+              sessionId: sid,
+              mode: currentCopilotMode || 'GENERAL',
+            }),
+          });
+          data = await res.json();
+        }
 
         if (data.shoppingList && Array.isArray(data.shoppingList) && data.shoppingList.length > 0) {
           window.lastCopilotShoppingList = data.shoppingList;

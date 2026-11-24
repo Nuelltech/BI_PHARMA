@@ -23,6 +23,8 @@ import {
   toolAuditarEscoamentoEDestraveStock,
   toolCalcularPerdasFinanceirasECustoOportunidade,
   toolConsultarVendasDiarias,
+  toolConsultarVendasPeriodo,
+  toolAnalisarDesempenhoLaboratorio,
   toolConsultarCampanhasAtivasEHistorico,
   toolAtivarCampanhaFarmacia,
 } from './mcp_pharma_tools.js';
@@ -122,15 +124,48 @@ export function createPharmaMcpServer(
         {
           name: 'consultar_produtos_por_nome_ou_categoria',
           description:
-            'Pesquisa e detalha produtos da farmácia por nome comercial, marca, substância DCI, código CNP ou categoria. Devolve stock atual, histórico real mês a mês, VMM, dias de cobertura e parecer de compras.',
+            'Pesquisa e detalha produtos da farmácia por nome comercial (com tolerância a acentos, hífens e pequenas gralhas), marca, substância DCI, código CNP (ou lista de CNPs) ou categoria. Cobre catálogo completo + vendas históricas + stock atual, devolve margem líquida com IVA deduzido, origem_encontrada, acoes_permitidas e resultado_id.',
           inputSchema: {
             type: 'object',
             properties: {
               termo_pesquisa: { type: 'string', description: 'Nome do produto, marca, categoria ou CNP' },
+              cnps: { type: 'array', items: { type: 'string' }, description: 'Lista de códigos CNP para consulta em lote' },
               apenas_com_stock: { type: 'boolean', description: 'Filtrar apenas produtos com stock físico > 0' },
-              limite: { type: 'number', description: 'Número máximo de registos (default 20)' },
+              limite: { type: 'number', description: 'Número máximo de registos por página (default 30, máx 200)' },
+              pagina: { type: 'number', description: 'Número da página (default 1)' },
             },
-            required: ['termo_pesquisa'],
+          },
+        },
+        {
+          name: 'consultar_vendas_periodo',
+          description:
+            'Consulta rápida de vendas agregadas por período (ex: "2026", "2026-01", "2025-11..2026-02", "ultimos_3m", "ultimos_12m"), com filtro opcional por laboratório (matching canónico), categoria, termo de pesquisa ou lista de CNPs. Devolve unidades, faturação, margem líquida sem IVA, aviso de dados parciais (D6) e resultado_id.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              periodo: { type: 'string', description: 'Período: YYYY, YYYY-MM, YYYY-MM..YYYY-MM, ultimos_3m ou ultimos_12m' },
+              laboratorio: { type: 'string', description: 'Nome do laboratório (matching canónico exato)' },
+              categoria: { type: 'string', description: 'Categoria ou subcategoria' },
+              termo_pesquisa: { type: 'string', description: 'Termo de pesquisa no nome/DCI/CNP' },
+              cnps: { type: 'array', items: { type: 'string' }, description: 'Lista de códigos CNP em lote' },
+              limite: { type: 'number', description: 'Número máximo de registos por página (default 30, máx 200)' },
+              pagina: { type: 'number', description: 'Página (default 1)' },
+            },
+          },
+        },
+        {
+          name: 'analisar_desempenho_laboratorio',
+          description:
+            'Análise completa de desempenho de um laboratório (matching canónico rigoroso), com filtro opcional por período (ex: "2026"), stock, vendas, margem líquida sem IVA, monos, excessos, ruturas reais e quotas DCI.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              nome_laboratorio: { type: 'string', description: 'Nome do laboratório (ex: Bial, Generis, Teva, Pierre Fabre)' },
+              periodo: { type: 'string', description: 'Período opcional (ex: "2026", "2026-01")' },
+              limite_detalhes: { type: 'number', description: 'Número máximo de registos por página (default 30, máx 200)' },
+              pagina: { type: 'number', description: 'Página (default 1)' },
+            },
+            required: ['nome_laboratorio'],
           },
         },
         {
@@ -366,6 +401,12 @@ export function createPharmaMcpServer(
           break;
         case 'consultar_produtos_por_nome_ou_categoria':
           result = await toolConsultarProdutosPorNomeOuCategoria(prisma, secContext, (args as any) || {});
+          break;
+        case 'consultar_vendas_periodo':
+          result = await toolConsultarVendasPeriodo(prisma, secContext, (args as any) || {});
+          break;
+        case 'analisar_desempenho_laboratorio':
+          result = await toolAnalisarDesempenhoLaboratorio(prisma, secContext, (args as any) || {});
           break;
         case 'comparar_similares_e_rentabilidade':
           result = await toolCompararSimilaresERentabilidade(prisma, secContext, (args as any) || {});

@@ -1,0 +1,645 @@
+import { PrismaClient } from '@prisma/client';
+import {
+  ToolSecurityContext,
+  toolConsultarProdutosPorNomeOuCategoria,
+  toolConsultarVendasPeriodo,
+  toolAnalisarDesempenhoLaboratorio,
+  toolCalcularStockMinimoECobertura,
+  toolIdentificarProdutosSemVenda,
+  toolAnalisarEvolucaoMensalFinanceira,
+  toolCompararPerformancePeriodos,
+  toolAuditarEscoamentoEDestraveStock,
+  toolConsolidarGenericosDci,
+  toolGerarPropostaEncomendaReposicao,
+  toolAnalisarCurvaAbcFaturacaoEMargem,
+  toolConsultarCampanhasAtivasEHistorico,
+  toolConsultarProgressoTarefasEquipa,
+  toolConsultarVendasDiarias,
+} from './mcp_pharma_tools.js';
+import {
+  renderMarkdownTableFromStoredResult,
+  TabelaSpec,
+} from './pharma_tool_helpers.js';
+import { calculateClaudeCostEur } from './copilot_engine.js';
+import { CopilotAuditTracer } from './copilot_audit.js';
+
+// ============================================================================
+// BI-PHARMA COPILOT v2 — MODO AGENTE (Opção A, Piloto Superuser)
+// - Camada única de ferramentas (mcp_pharma_tools.ts)
+// - Chamadas em paralelo (Promise.all)
+// - Sem max_tokens=280, sem stop_sequences, sem corte T1-T8
+// - Tabelas determinísticas por referência (resultado_id)
+// - Validação factual com 1 retry de auto-correção (incl. regra Rhinodouche 4c)
+// - Progresso em tempo real (SSE callback)
+// ============================================================================
+
+export interface AgentV2ProgressEvent {
+  type: 'status' | 'tools' | 'validating' | 'done' | 'error';
+  message: string;
+  tools?: string[];
+  step?: number;
+}
+
+export interface AgentV2Result {
+  text: string;
+  toolsUsed: string[];
+  sessionId: string;
+  interacaoId: string;
+  tabelasRenderizadas: Array<{ resultado_id: string; titulo?: string; markdown: string; rowCount: number }>;
+  avisoValidacao?: string | null;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheCreationTokens: number;
+    cacheReadTokens: number;
+    custoEstimadoEur: number;
+    duracaoMs: number;
+    modelo: string;
+  };
+}
+
+interface AgentSessionMessage {
+  role: 'user' | 'assistant';
+  content: any;
+}
+
+const agentV2Sessions = new Map<string, AgentSessionMessage[]>();
+
+export function clearAgentV2Session(scopedSessionId: string) {
+  agentV2Sessions.delete(scopedSessionId);
+}
+
+const AGENT_V2_SYSTEM_PROMPT = `És o Copilot v2 do BI-Pharma, agente analítico de gestão de farmácia comunitária em Portugal (PT-PT).
+Tens acesso direto às ferramentas oficiais da farmácia (a mesma camada de dados do MCP).
+
+REGRAS FUNDAMENTAIS DE RIGOR:
+1. FACTOS PRIMEIRO: Nunca inventes números, CNPs, stocks, vendas ou margens. Chama sempre as ferramentas necessárias antes de responder.
+2. REGRA DE INEXISTÊNCIA (CRÍTICA): Nunca afirmes que um produto, marca, laboratório ou vendas "não existe", "não há registos" ou "não está catalogado" sem, neste mesmo turno, teres chamado uma ferramenta que cobre esse âmbito (ex.: consultar_produtos ou consultar_vendas_periodo) e essa ferramenta ter devolvido 0 registos. Se encontraste o artigo no catálogo ou em vendas históricas mas com stock = 0, diz isso claramente ("0 un em stock atual, mas registou X un vendidas no histórico").
+3. CHAMADAS EM PARALELO: Quando precisares de cruzar várias fontes (ex.: vendas + stock + laboratório), chama várias ferramentas em paralelo na mesma ronda.
+4. VOCABULÁRIO DE AÇÕES: Respeita os campos \`situacao\`, \`acoes_permitidas\` e \`acao_sugerida\` devolvidos pelas ferramentas. NUNCA recomendes "encomendar urgente" ou "rutura total" para artigos com 0 vendas ou marcados como \`TRABALHAR_ENCOMENDA\`.
+5. IVA E MARGEM: As ferramentas já devolvem \`margemUnitariaEur\` e \`margemPct\` com o IVA deduzido (\`taxa_iva_pct\`). Quando o PVP vier de fallback (\`pvp_origem: "PRODUTO_MESTRE"\`), menciona-o brevemente.
+6. DADOS PARCIAIS (D6): Indica sempre até que data existem dados (\`dados_ate\`). Se \`mes_parcial: true\` ou existir \`aviso_dados_incompletos\`, inclui esse aviso de forma clara na resposta.
+7. TABELAS POR REFERÊNCIA: Sempre que quiseres apresentar uma tabela com 4 ou mais produtos/linhas, chama a ferramenta \`tabela\` passando o \`resultado_id\` devolvido pela consulta anterior (com colunas, ordenação e limite). O sistema gera a tabela exata a partir dos dados reais sem risco de erro de cópia. Na tua resposta final, refere a tabela gerada ou inclui o markdown devolvido sem alterar nenhum número.
+8. LIMITE CLÍNICO: Não dês aconselhamento clínico, diagnóstico ou posológico a utentes — essa competência é exclusiva do Diretor Técnico.
+9. ESTILO: Responde em português de Portugal, de forma clara, estruturada, objetiva e acionável para a gestão da farmácia.`;
+
+const AGENT_V2_TOOLS = [
+  {
+    name: 'consultar_produtos',
+    description:
+      'Pesquisa produtos por nome (com tolerância a acentos, hífens e pequenas gralhas, ex: Rino-duche = Rhinodouche), marca, DCI, categoria ou lista de CNPs. Cobre catálogo completo + vendas históricas (todos os anos) + stock atual. Devolve origem_encontrada, stock, vendas históricas e 12M, IVA, margem líquida sem IVA, acoes_permitidas e resultado_id.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        termo_pesquisa: { type: 'string', description: 'Nome, marca, DCI, categoria ou CNP' },
+        cnps: { type: 'array', items: { type: 'string' }, description: 'Lista de CNPs em lote' },
+        apenas_com_stock: { type: 'boolean', description: 'Se true, devolve só artigos com stock > 0 (default false)' },
+        limite: { type: 'number', description: 'Máximo por página (default 30, máx 200)' },
+        pagina: { type: 'number', description: 'Página (default 1)' },
+      },
+    },
+  },
+  {
+    name: 'consultar_vendas_periodo',
+    description:
+      'Consulta rápida de vendas agregadas por período (YYYY, YYYY-MM, YYYY-MM..YYYY-MM, ultimos_3m, ultimos_12m) a partir do Mart mensal. Aceita filtros por laboratório (matching canónico exato), categoria, termo_pesquisa ou lista de CNPs. Devolve unidades, faturação, margem líquida sem IVA, aviso D6 e resultado_id.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        periodo: { type: 'string', description: 'Ex: "2026", "2026-01", "2025-11..2026-02", "ultimos_3m", "ultimos_12m"' },
+        laboratorio: { type: 'string', description: 'Nome do laboratório (ex: Bial, Generis, Teva)' },
+        categoria: { type: 'string', description: 'Categoria ou subcategoria' },
+        termo_pesquisa: { type: 'string', description: 'Termo de pesquisa no produto/DCI/CNP' },
+        cnps: { type: 'array', items: { type: 'string' }, description: 'Lista de CNPs' },
+        limite: { type: 'number', description: 'Registos por página (default 30, máx 200)' },
+        pagina: { type: 'number', description: 'Página (default 1)' },
+      },
+    },
+  },
+  {
+    name: 'analisar_desempenho_laboratorio',
+    description:
+      'Análise completa de um laboratório (matching canónico rigoroso): vendas no período ou 12M, stock, capital empatado em monos e excessos, artigos para repor, quotas DCI internas, IVA, margem líquida e resultado_id.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        nome_laboratorio: { type: 'string', description: 'Nome do laboratório (ex: Bial, Generis, Pierre Fabre)' },
+        periodo: { type: 'string', description: 'Opcional: "2026", "2026-01", etc.' },
+        limite_detalhes: { type: 'number', description: 'Máximo por página (default 30, máx 200)' },
+        pagina: { type: 'number', description: 'Página (default 1)' },
+      },
+      required: ['nome_laboratorio'],
+    },
+  },
+  {
+    name: 'calcular_stock_minimo_cobertura',
+    description:
+      'Calcula stock mínimo, cobertura em dias/meses, ruturas reais e excessos para os dias de cobertura desejados. Aceita termo_pesquisa, cnps, pagina e limite.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dias_cobertura_desejados: { type: 'number', description: 'Dias de cobertura alvo (default 7)' },
+        apenas_abaixo_minimo: { type: 'boolean', description: 'Filtrar apenas ruturas / abaixo do mínimo' },
+        termo_pesquisa: { type: 'string', description: 'Filtro opcional por nome ou CNP' },
+        cnps: { type: 'array', items: { type: 'string' }, description: 'Lista de CNPs' },
+        limite: { type: 'number', description: 'Registos por página (default 30, máx 200)' },
+        pagina: { type: 'number', description: 'Página (default 1)' },
+      },
+    },
+  },
+  {
+    name: 'identificar_monos_sem_venda',
+    description:
+      'Identifica produtos com stock físico parado sem vendas nos últimos X meses (monos) e capital imobilizado.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        meses_sem_venda: { type: 'number', description: 'Meses sem vendas (default 6)' },
+        tipo_venda: { type: 'string', description: 'MSRM, MNSRM ou VENDA_LIVRE' },
+        laboratorio: { type: 'string', description: 'Filtro opcional por laboratório' },
+        limite: { type: 'number', description: 'Máximo de artigos (default 30)' },
+      },
+    },
+  },
+  {
+    name: 'analisar_evolucao_mensal',
+    description: 'Evolução mensal de faturação, unidades vendidas e margem da farmácia mês a mês.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        meses: { type: 'number', description: 'Número de meses a analisar (default 12)' },
+      },
+    },
+  },
+  {
+    name: 'comparar_periodos',
+    description: 'Compara a performance entre dois períodos (ex: 2026-01 vs 2025-12 ou 2026-01 vs 2025-01).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        periodo_atual: { type: 'string', description: 'Ex: "2026-01" ou "2026"' },
+        periodo_anterior: { type: 'string', description: 'Ex: "2025-12" ou "2025"' },
+      },
+      required: ['periodo_atual', 'periodo_anterior'],
+    },
+  },
+  {
+    name: 'auditar_escoamento_validades',
+    description: 'Lista produtos com validade próxima ou risco de quebra/escoamento prioritário.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dias_validade_max: { type: 'number', description: 'Horizonte máximo em dias (default 180)' },
+        limite: { type: 'number', description: 'Máximo de registos (default 30)' },
+      },
+    },
+  },
+  {
+    name: 'consolidar_genericos_dci',
+    description: 'Analisa pulverização de laboratórios genéricos na mesma molécula DCI e oportunidades de consolidação.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        min_laboratorios: { type: 'number', description: 'Mínimo de laboratórios por molécula (default 3)' },
+        limite: { type: 'number', description: 'Máximo de moléculas (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'gerar_proposta_encomenda',
+    description: 'Gera proposta quantificada de encomenda de reposição para artigos em rutura ou stock crítico.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dias_cobertura: { type: 'number', description: 'Dias de cobertura alvo (default 21)' },
+        laboratorio: { type: 'string', description: 'Filtro opcional por laboratório' },
+        limite: { type: 'number', description: 'Máximo de linhas (default 30)' },
+      },
+    },
+  },
+  {
+    name: 'analisar_curva_abc',
+    description: 'Classificação ABC de produtos por faturação ou margem (classe A = top 80%).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        criterio: { type: 'string', enum: ['faturacao', 'margem', 'unidades'], description: 'Critério de ordenação' },
+        limite: { type: 'number', description: 'Máximo de artigos (default 30)' },
+      },
+    },
+  },
+  {
+    name: 'consultar_vendas_diarias',
+    description: 'Consulta vendas de dias específicos importados com granularidade diária.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        data: { type: 'string', description: 'Data no formato YYYY-MM-DD' },
+        cnp_ou_nome: { type: 'string', description: 'Filtro opcional por CNP ou nome' },
+        limite: { type: 'number', description: 'Máximo de linhas (default 30)' },
+      },
+    },
+  },
+  {
+    name: 'consultar_campanhas',
+    description: 'Consulta campanhas ativas e histórico de campanhas da farmácia.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'consultar_tarefas_equipa',
+    description: 'Consulta o progresso das tarefas semanais e missões da equipa da farmácia.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'tabela',
+    description:
+      'Gera uma tabela Markdown determinística diretamente a partir de um resultado_id devolvido por uma ferramenta anterior, sem copiar números à mão. Usa esta ferramenta para qualquer tabela com 4+ linhas.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        resultado_id: { type: 'string', description: 'O resultado_id devolvido pela ferramenta de consulta' },
+        titulo: { type: 'string', description: 'Título da tabela' },
+        colunas: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Lista de nomes exatos de campos a incluir como colunas',
+        },
+        filtro: {
+          type: 'object',
+          properties: {
+            campo: { type: 'string' },
+            valor: { type: 'string' },
+          },
+          description: 'Filtro opcional por campo/valor',
+        },
+        ordenar: {
+          type: 'object',
+          properties: {
+            campo: { type: 'string' },
+            direcao: { type: 'string', enum: ['asc', 'desc'] },
+          },
+        },
+        limite: { type: 'number', description: 'Máximo de linhas na tabela (default 30, máx 100)' },
+      },
+      required: ['resultado_id'],
+    },
+  },
+];
+
+async function executeUnifiedTool(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  name: string,
+  input: any,
+  tabelasCollector: Array<{ resultado_id: string; titulo?: string; markdown: string; rowCount: number }>
+): Promise<any> {
+  switch (name) {
+    case 'consultar_produtos':
+      return toolConsultarProdutosPorNomeOuCategoria(prisma, ctx, input || {});
+    case 'consultar_vendas_periodo':
+      return toolConsultarVendasPeriodo(prisma, ctx, input || {});
+    case 'analisar_desempenho_laboratorio':
+      return toolAnalisarDesempenhoLaboratorio(prisma, ctx, input || {});
+    case 'calcular_stock_minimo_cobertura':
+      return toolCalcularStockMinimoECobertura(prisma, ctx, input || {});
+    case 'identificar_monos_sem_venda':
+      return toolIdentificarProdutosSemVenda(prisma, ctx, input || {});
+    case 'analisar_evolucao_mensal':
+      return toolAnalisarEvolucaoMensalFinanceira(prisma, ctx, input || {});
+    case 'comparar_periodos':
+      return toolCompararPerformancePeriodos(prisma, ctx, input || {});
+    case 'auditar_escoamento_validades':
+      return toolAuditarEscoamentoEDestraveStock(prisma, ctx, input || {});
+    case 'consolidar_genericos_dci':
+      return toolConsolidarGenericosDci(prisma, ctx, input || {});
+    case 'gerar_proposta_encomenda':
+      return toolGerarPropostaEncomendaReposicao(prisma, ctx, input || {});
+    case 'analisar_curva_abc':
+      return toolAnalisarCurvaAbcFaturacaoEMargem(prisma, ctx, input || {});
+    case 'consultar_vendas_diarias':
+      return toolConsultarVendasDiarias(prisma, ctx, input || {});
+    case 'consultar_campanhas':
+      return toolConsultarCampanhasAtivasEHistorico(prisma, ctx, input || {});
+    case 'consultar_tarefas_equipa':
+      return toolConsultarProgressoTarefasEquipa(prisma, ctx, input || {});
+    case 'tabela': {
+      const spec = (input || {}) as TabelaSpec;
+      const rendered = renderMarkdownTableFromStoredResult(ctx.farmaciaId, spec);
+      if (rendered.ok && rendered.markdown) {
+        tabelasCollector.push({
+          resultado_id: spec.resultado_id,
+          titulo: spec.titulo,
+          markdown: rendered.markdown,
+          rowCount: rendered.rowCount,
+        });
+      }
+      return rendered;
+    }
+    default:
+      return { error: `Ferramenta desconhecida: ${name}` };
+  }
+}
+
+/**
+ * Validação factual pós-resposta (Decisão 2 + Decisão 4c Rhinodouche):
+ * Devolve lista de problemas detetados; se não estiver vazia, o loop pede ao modelo para corrigir 1 vez.
+ */
+function validateAgentV2Response(
+  finalText: string,
+  executedTools: Array<{ name: string; input: any; result: any }>
+): string[] {
+  const issues: string[] = [];
+  const lower = finalText.toLowerCase();
+
+  // Regra 4c (Rhinodouche): Detetar afirmações de inexistência ("não existe", "não há registos", "sem vendas", "não está catalogado")
+  const claimsNonExistence =
+    /(n[aã]o\s+(?:h[aá]|existem?|temos|foram\s+encontrad[oa]s?|est[aá]\s+catalogad[oa]|consta)\s+(?:registos?|vendas?|stock|dados?|produtos?|artigos?))|(nem\s+em\s+stock,?\s*nem\s+em\s+(?:hist[oó]rico|vendas))|(0\s+registos?\s+na\s+base\s+de\s+dados)/i.test(
+      lower
+    );
+
+  if (claimsNonExistence) {
+    const scopeTools = executedTools.filter((t) =>
+      ['consultar_produtos', 'consultar_vendas_periodo', 'analisar_desempenho_laboratorio', 'consultar_vendas_diarias'].includes(t.name)
+    );
+    if (scopeTools.length === 0) {
+      issues.push(
+        'VIOLAÇÃO DA REGRA 4c: Afirmaste que não existem registos/vendas sem teres chamado nenhuma ferramenta de consulta (consultar_produtos ou consultar_vendas_periodo) neste turno. Chama a ferramenta adequada agora antes de responder.'
+      );
+    } else {
+      const anyFound = scopeTools.some((t) => {
+        const r = t.result || {};
+        const count =
+          Number(r.totalArtigosEncontrados || 0) +
+          Number(r.resumo?.totalReferenciasComVenda || 0) +
+          Number(r.resumoExecutivo?.totalReferenciasNoCatalogo || 0) +
+          (Array.isArray(r.artigos) ? r.artigos.length : 0);
+        return count > 0;
+      });
+      if (anyFound) {
+        issues.push(
+          'CONTRADIÇÃO FACTUAL (REGRA 4c): As ferramentas chamadas neste turno devolveram registos reais (> 0), mas a tua resposta afirma que não existem registos. Revê os resultados devolvidos (incluindo vendas históricas com stock = 0) e corrige a resposta.'
+        );
+      }
+    }
+  }
+
+  // Regra 1: Impedir recomendação de "rutura total / encomenda urgente" quando todos os artigos consultados têm TRABALHAR_ENCOMENDA
+  const recommendsUrgentOrder = /(rutura\s+total|encomenda\s+urgente|encomendar\s+refor[cç]o)/i.test(lower);
+  if (recommendsUrgentOrder) {
+    const prodTools = executedTools.filter((t) => t.name === 'consultar_produtos' || t.name === 'calcular_stock_minimo_cobertura');
+    const allItems = prodTools.flatMap((t) => (Array.isArray(t.result?.artigos) ? t.result.artigos : Array.isArray(t.result?.itens) ? t.result.itens : []));
+    if (allItems.length > 0 && allItems.every((i: any) => i.acao_sugerida === 'TRABALHAR_ENCOMENDA' || i.situacao === 'SEM_STOCK_SEM_VENDAS')) {
+      issues.push(
+        'VIOLAÇÃO DA REGRA DE AÇÕES: Os artigos devolvidos estão classificados como TRABALHAR_ENCOMENDA (0 vendas ou baixa rotação não-crónica). Não recomendes "rutura total" nem "encomenda urgente"; indica que são artigos para trabalhar sob encomenda.'
+      );
+    }
+  }
+
+  return issues;
+}
+
+export async function runCopilotAgentV2(
+  prisma: PrismaClient,
+  ctx: ToolSecurityContext,
+  question: string,
+  scopedSessionId: string,
+  options?: {
+    model?: string;
+    maxToolCalls?: number;
+    timeoutMs?: number;
+    onProgress?: (ev: AgentV2ProgressEvent) => void;
+  }
+): Promise<AgentV2Result> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error('ANTHROPIC_API_KEY não configurada no servidor.');
+  }
+
+  const startMs = Date.now();
+  const activeModel =
+    options?.model ||
+    process.env.COPILOT_V2_MODEL ||
+    process.env.ANTHROPIC_MODEL ||
+    'claude-sonnet-4-5';
+  const maxToolCalls = options?.maxToolCalls ?? 15;
+  const timeoutMs = options?.timeoutMs ?? 90_000;
+  const emit = options?.onProgress || (() => {});
+
+  const tracer = new CopilotAuditTracer(
+    ctx.farmaciaId,
+    scopedSessionId,
+    question,
+    (ctx as any).utilizadorId || null
+  );
+
+  // Histórico da sessão (últimas 10 mensagens)
+  const history = agentV2Sessions.get(scopedSessionId) || [];
+  const messages: AgentSessionMessage[] = [
+    ...history.slice(-10),
+    { role: 'user', content: question },
+  ];
+
+  const executedTools: Array<{ name: string; input: any; result: any }> = [];
+  const toolsUsedNames: string[] = [];
+  const tabelasCollector: Array<{ resultado_id: string; titulo?: string; markdown: string; rowCount: number }> = [];
+
+  let totalIn = 0;
+  let totalOut = 0;
+  let totalCacheW = 0;
+  let totalCacheR = 0;
+  let totalToolCalls = 0;
+  let stepNum = 0;
+  let validationRetries = 0;
+  let finalText = '';
+  let avisoValidacao: string | null = null;
+
+  emit({ type: 'status', message: 'A analisar a pergunta e selecionar ferramentas...', step: 0 });
+
+  while (stepNum < 10) {
+    if (Date.now() - startMs > timeoutMs) {
+      avisoValidacao = 'Tempo limite do agente atingido; resposta apresentada com os dados já recolhidos.';
+      break;
+    }
+
+    stepNum++;
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: activeModel,
+        max_tokens: 4096,
+        system: [
+          {
+            type: 'text',
+            text: AGENT_V2_SYSTEM_PROMPT,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        tools: AGENT_V2_TOOLS,
+        messages,
+      }),
+    });
+
+    if (!response.ok) {
+      const errTxt = await response.text().catch(() => '');
+      throw new Error(`Anthropic API HTTP ${response.status}: ${errTxt.slice(0, 300)}`);
+    }
+
+    const data: any = await response.json();
+    const usage = data.usage || {};
+    totalIn += Number(usage.input_tokens || 0);
+    totalOut += Number(usage.output_tokens || 0);
+    totalCacheW += Number(usage.cache_creation_input_tokens || 0);
+    totalCacheR += Number(usage.cache_read_input_tokens || 0);
+
+    const contentBlocks: any[] = Array.isArray(data.content) ? data.content : [];
+    const toolUseBlocks = contentBlocks.filter((b) => b.type === 'tool_use');
+    const textBlocks = contentBlocks.filter((b) => b.type === 'text').map((b) => String(b.text || ''));
+
+    // Caso 1: O modelo pediu ferramentas -> executar em PARALELO (Promise.all)
+    if (toolUseBlocks.length > 0 && totalToolCalls < maxToolCalls) {
+      messages.push({ role: 'assistant', content: contentBlocks });
+
+      const batch = toolUseBlocks.slice(0, Math.max(1, maxToolCalls - totalToolCalls));
+      const batchNames = batch.map((b) => b.name);
+      emit({
+        type: 'tools',
+        message: `A consultar dados (${batchNames.join(', ')})...`,
+        tools: batchNames,
+        step: stepNum,
+      });
+
+      const results = await Promise.all(
+        batch.map(async (block) => {
+          totalToolCalls++;
+          if (!toolsUsedNames.includes(block.name)) toolsUsedNames.push(block.name);
+          try {
+            const res = await executeUnifiedTool(prisma, ctx, block.name, block.input, tabelasCollector);
+            executedTools.push({ name: block.name, input: block.input, result: res });
+            // Compactar ligeiramente se o JSON for muito grande (> 28KB) mantendo resumo + primeiras linhas
+            let serialized = JSON.stringify(res);
+            if (serialized.length > 28_000 && res && Array.isArray(res.artigos)) {
+              const trimmed = {
+                ...res,
+                artigos: res.artigos.slice(0, 25),
+                _nota_truncagem: `Mostrados 25 de ${res.artigos.length} artigos no contexto; usa a ferramenta tabela(resultado_id="${res.resultado_id}") para apresentar mais linhas.`,
+              };
+              serialized = JSON.stringify(trimmed);
+            }
+            return {
+              type: 'tool_result',
+              tool_use_id: block.id,
+              content: serialized,
+            };
+          } catch (err: any) {
+            return {
+              type: 'tool_result',
+              tool_use_id: block.id,
+              is_error: true,
+              content: JSON.stringify({ error: err?.message || 'Erro ao executar ferramenta' }),
+            };
+          }
+        })
+      );
+
+      messages.push({ role: 'user', content: results });
+      continue;
+    }
+
+    // Caso 2: Resposta textual final -> correr validação factual (1 retry se houver erro)
+    finalText = textBlocks.join('\n').trim();
+    emit({ type: 'validating', message: 'A validar factos e coerência da resposta...', step: stepNum });
+
+    const issues = validateAgentV2Response(finalText, executedTools);
+    if (issues.length > 0 && validationRetries < 1) {
+      validationRetries++;
+      messages.push({ role: 'assistant', content: contentBlocks });
+      messages.push({
+        role: 'user',
+        content: `[VALIDAÇÃO AUTOMÁTICA — CORRIGIR ANTES DE ENTREGAR]\n${issues.join('\n')}`,
+      });
+      emit({ type: 'status', message: 'A corrigir verificação factual com os dados da farmácia...', step: stepNum });
+      continue;
+    }
+
+    if (issues.length > 0) {
+      avisoValidacao = issues.join(' | ');
+      finalText = `> ⚠️ **Aviso de validação automática:** ${avisoValidacao}\n\n${finalText}`;
+    }
+
+    break;
+  }
+
+  // Se o modelo gerou tabelas via ferramenta `tabela`, garantir que estão presentes na resposta
+  if (tabelasCollector.length > 0 && !finalText.includes('| --- |')) {
+    const tablesMd = tabelasCollector.map((t) => t.markdown).join('\n\n');
+    finalText = `${finalText}\n\n${tablesMd}`.trim();
+  }
+
+  // Atualizar histórico da sessão (apenas texto user/assistant limpo para o próximo turno)
+  agentV2Sessions.set(scopedSessionId, [
+    ...history.slice(-8),
+    { role: 'user', content: question },
+    { role: 'assistant', content: finalText },
+  ]);
+
+  const duracaoMs = Date.now() - startMs;
+  const custoEstimadoEur = calculateClaudeCostEur(
+    activeModel,
+    totalIn,
+    totalOut,
+    totalCacheW,
+    totalCacheR
+  );
+
+  tracer.persistAsync(prisma, {
+    utilizadorId: (ctx as any).utilizadorId || null,
+    perfil: ctx.perfil || 'SUPERADMIN',
+    sessionId: scopedSessionId,
+    modo: 'AGENT_V2',
+    pergunta: question,
+    intencao: 'AGENT_V2',
+    parametros: { tools: toolsUsedNames, totalToolCalls, validationRetries },
+    texto_referencias: finalText,
+    texto_final: finalText,
+    estado: 'ok',
+    pergunta_de_volta: false,
+    modelo_final: activeModel,
+    tokens_in: totalIn,
+    tokens_out: totalOut,
+    tokens_cache_write: totalCacheW,
+    tokens_cache_read: totalCacheR,
+    custo_eur: custoEstimadoEur,
+    duracao_ms: duracaoMs,
+  });
+
+  emit({ type: 'done', message: 'Resposta concluída.', tools: toolsUsedNames, step: stepNum });
+
+  return {
+    text: finalText,
+    toolsUsed: toolsUsedNames,
+    sessionId: scopedSessionId,
+    interacaoId: tracer.interacaoId,
+    tabelasRenderizadas: tabelasCollector,
+    avisoValidacao,
+    usage: {
+      inputTokens: totalIn,
+      outputTokens: totalOut,
+      cacheCreationTokens: totalCacheW,
+      cacheReadTokens: totalCacheR,
+      custoEstimadoEur,
+      duracaoMs,
+      modelo: activeModel,
+    },
+  };
+}

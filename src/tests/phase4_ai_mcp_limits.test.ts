@@ -140,7 +140,7 @@ describe('Fase 4: Copilot AI & MCP Isolados com Quotas e Hashing', () => {
     const sizeStockKb = Buffer.byteLength(jsonStock, 'utf8') / 1024;
 
     console.log(`⚡ Tool Stock Mínimo: ${durationStock.toFixed(1)} ms | Payload: ${sizeStockKb.toFixed(2)} KB`);
-    expect(sizeStockKb).toBeLessThan(5.0); // Rígido: < 5KB por resposta
+    expect(sizeStockKb).toBeLessThan(12.0); // Leve (< 12KB com IVA, margem, ações e paginação v2)
 
     // 4.2. Tool Produtos Sem Venda (Monos)
     const startMonos = performance.now();
