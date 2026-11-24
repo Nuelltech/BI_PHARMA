@@ -15,6 +15,7 @@ import {
   toolConsultarCampanhasAtivasEHistorico,
   toolConsultarProgressoTarefasEquipa,
   toolConsultarVendasDiarias,
+  toolCompararAlternativasDci,
 } from './mcp_pharma_tools.js';
 import {
   renderMarkdownTableFromStoredResult,
@@ -75,7 +76,7 @@ Tens acesso direto às ferramentas oficiais da farmácia (a mesma camada de dado
 REGRAS FUNDAMENTAIS DE RIGOR:
 1. FACTOS PRIMEIRO: Nunca inventes números, CNPs, stocks, vendas ou margens. Chama sempre as ferramentas necessárias antes de responder.
 2. REGRA DE INEXISTÊNCIA (CRÍTICA): Nunca afirmes que um produto, marca, laboratório ou vendas "não existe", "não há registos" ou "não está catalogado" sem, neste mesmo turno, teres chamado uma ferramenta que cobre esse âmbito (ex.: consultar_produtos ou consultar_vendas_periodo) e essa ferramenta ter devolvido 0 registos. Se encontraste o artigo no catálogo ou em vendas históricas mas com stock = 0, diz isso claramente ("0 un em stock atual, mas registou X un vendidas no histórico").
-3. CHAMADAS EM PARALELO E EFICIÊNCIA: Quando precisares de cruzar fontes, chama as ferramentas em paralelo na mesma ronda, mas evita disparar dezenas de chamadas redundantes (ex.: para analisar um laboratório e comparar alternativas na mesma DCI, \`analisar_desempenho_laboratorio\` + \`consultar_vendas_periodo\` já trazem quotas DCI, monos, excessos e vendas; não faças 6–8 chamadas separadas a \`consultar_produtos\` por cada molécula).
+3. CHAMADAS EM PARALELO E EFICIÊNCIA: Quando precisares de cruzar fontes, chama as ferramentas em paralelo na mesma ronda, mas evita chamadas redundantes: para comparar alternativas na mesma molécula DCI (ex.: saber se existem outros laboratórios com melhores vendas ou margem), usa SEMPRE \`comparar_alternativas\` numa ÚNICA chamada passando a lista de \`dcis\` ou \`cnps\` (nunca faças 6–8 chamadas separadas a \`consultar_produtos\`).
 4. VOCABULÁRIO DE AÇÕES E LINGUAGEM HUMANA: Respeita os campos \`situacao\`, \`acoes_permitidas\` e \`acao_sugerida\` devolvidos pelas ferramentas. NUNCA recomendes "encomendar urgente" ou "rutura total" para artigos com 0 vendas ou marcados como \`TRABALHAR_ENCOMENDA\`. NUNCA chames "rutura" a artigos sem stock e sem rotação — diz "sem stock atual (0 un)". TRADUZ SEMPRE todos os códigos internos para português natural na resposta ao utilizador (ex.: "trabalhar por encomenda", "sem stock e sem vendas nos últimos 12 meses", "baixa rotação sem stock", "descontinuar", "rever dados") — NUNCA mostres códigos em MAIÚSCULAS_COM_UNDERSCORE nem nomes técnicos de colunas em camelCase. Usa sempre os totais já calculados em \`resumoEncontrado\` / \`resumo\` sem fazer somas de cabeça.
 5. IVA E MARGEM: As ferramentas já devolvem \`margemUnitariaEur\` e \`margemPct\` com o IVA deduzido. Apresenta as margens em português limpo (ex.: "6,10 € (30%), sem IVA") sem mencionar nomes internos de origem do PVP (\`PRODUTO_MESTRE\`, \`FARMACIA\`).
 6. DADOS PARCIAIS (D6): Indica sempre até que data existem dados (\`dados_ate\`). Se \`mes_parcial: true\` ou existir \`aviso_dados_incompletos\`, inclui esse aviso de forma clara na resposta.
@@ -257,9 +258,23 @@ const AGENT_V2_TOOLS = [
     },
   },
   {
+    name: 'comparar_alternativas',
+    description:
+      'Compara alternativas na mesma molécula DCI numa ÚNICA chamada rápida (<500ms). Passa uma lista de DCIs (ex: ["diazepam", "dapagliflozina"]) ou CNPs e opcionalmente o laboratório de referência. Devolve as melhores alternativas na farmácia ordenadas por vendas 12M e margem líquida sem IVA (com último custo conhecido de PrecoFarmacia mesmo quando stock=0).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dcis: { type: 'array', items: { type: 'string' }, description: 'Lista de moléculas DCI a comparar (até 15)' },
+        cnps: { type: 'array', items: { type: 'string' }, description: 'Opcional: lista de CNPs cujas DCIs serão resolvidas automaticamente' },
+        laboratorio_referencia: { type: 'string', description: 'Opcional: nome do laboratório em análise para destacar vs concorrentes' },
+        limite_por_dci: { type: 'number', description: 'Máximo de alternativas por DCI (default 5, máx 12)' },
+      },
+    },
+  },
+  {
     name: 'tabela',
     description:
-      'Gera uma tabela Markdown determinística diretamente a partir de um resultado_id devolvido por uma ferramenta anterior, sem copiar números à mão. Usa esta ferramenta para qualquer tabela com 4+ linhas.',
+      'Gera uma tabela Markdown determinística diretamente a partir de um resultado_id devolvido por uma ferramenta anterior, sem copiar números à mão. Usa esta ferramenta para qualquer tabela com 4+ linhas. Suporta filtro numérico exato (op: "<=", ">=", "<", ">", "=", "!=") e ordenação.',
     input_schema: {
       type: 'object',
       properties: {
@@ -274,9 +289,10 @@ const AGENT_V2_TOOLS = [
           type: 'object',
           properties: {
             campo: { type: 'string' },
-            valor: { type: 'string' },
+            op: { type: 'string', enum: ['=', '!=', '<', '<=', '>', '>=', 'contains'] },
+            valor: { type: 'string', description: 'Valor de filtro (texto ou número em string, ex: "4")' },
           },
-          description: 'Filtro opcional por campo/valor',
+          description: 'Filtro opcional exato ou numérico (ex: { campo: "unidadesVendidas", op: "<=", valor: "4" })',
         },
         ordenar: {
           type: 'object',
@@ -328,6 +344,8 @@ async function executeUnifiedTool(
       return toolConsultarCampanhasAtivasEHistorico(prisma, ctx, input || {});
     case 'consultar_tarefas_equipa':
       return toolConsultarProgressoTarefasEquipa(prisma, ctx, input || {});
+    case 'comparar_alternativas':
+      return toolCompararAlternativasDci(prisma, ctx, input || {});
     case 'tabela': {
       const spec = (input || {}) as TabelaSpec;
       const rendered = renderMarkdownTableFromStoredResult(ctx.farmaciaId, spec);

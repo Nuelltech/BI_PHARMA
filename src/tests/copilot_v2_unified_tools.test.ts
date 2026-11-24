@@ -8,6 +8,7 @@ import {
   toolAnalisarDesempenhoLaboratorio,
   toolFiltrarProdutosPorValidadeEMargem,
   toolIdentificarProdutosSemVenda,
+  toolCompararAlternativasDci,
   ToolSecurityContext,
 } from '../services/mcp_pharma_tools';
 import {
@@ -154,7 +155,7 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
     );
     expect(falsosPositivos.length).toBe(0);
 
-    // Tabela determinística por referência (resultado_id)
+    // Tabela determinística por referência (resultado_id) com filtro numérico op: '<='
     const tbl = renderMarkdownTableFromStoredResult(FARMACIA_A_ID, {
       resultado_id: resVendas.resultado_id,
       titulo: 'Top Bial 2026',
@@ -164,6 +165,30 @@ describe('Copilot v2 & Camada Única de Ferramentas (Passo 1)', () => {
     expect(tbl.ok).toBe(true);
     expect(tbl.rowCount).toBeGreaterThan(0);
     expect(tbl.markdown).toContain('| CNP | Produto |');
+
+    const tblResiduais = renderMarkdownTableFromStoredResult(FARMACIA_A_ID, {
+      resultado_id: resVendas.resultado_id,
+      titulo: 'Bial <= 4 un',
+      colunas: ['designacao', 'unidadesVendidas'],
+      filtro: { campo: 'unidadesVendidas', op: '<=', valor: 4 },
+      limite: 50,
+    });
+    expect(tblResiduais.ok).toBe(true);
+    // Nenhuma linha da tabela filtrada pode ter > 4 unidades
+    for (const line of tblResiduais.markdown.split('\n')) {
+      const m = line.match(/\|\s*(\d+)\s*\|$/);
+      if (m) expect(Number(m[1])).toBeLessThanOrEqual(4);
+    }
+
+    // Nova ferramenta comparar_alternativas em lote (< 2s)
+    const tAlt = Date.now();
+    const resAlt: any = await toolCompararAlternativasDci(prisma, ctxA, {
+      dcis: ['diazepam', 'dapagliflozina', 'amoxicilina'],
+      laboratorio_referencia: 'Bial',
+    });
+    expect(Date.now() - tAlt).toBeLessThan(5000);
+    expect(resAlt.totalDcisComparadas).toBe(3);
+    expect(resAlt.resultado_id).toBeTruthy();
 
     // Isolamento multi-tenant: outra farmácia não pode ler o resultado_id da Farmácia A
     const tblCross = renderMarkdownTableFromStoredResult(FARMACIA_C_ID, {

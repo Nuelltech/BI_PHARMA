@@ -26,6 +26,7 @@ import {
   toolConsultarVendasPeriodo,
   toolAnalisarDesempenhoLaboratorio,
   toolFiltrarProdutosPorValidadeEMargem,
+  toolCompararAlternativasDci,
   toolConsultarCampanhasAtivasEHistorico,
 } from './mcp_pharma_tools.js';
 import { sugerirPacksPromocionais } from './comercial.js';
@@ -180,6 +181,20 @@ export function createPharmaMcpServer(
               cnps: { type: 'array', items: { type: 'string' }, description: 'Lista de códigos CNP em lote' },
               limite: { type: 'number', description: 'Número máximo de registos por página (default 30, máx 200)' },
               pagina: { type: 'number', description: 'Página (default 1)' },
+            },
+          },
+        },
+        {
+          name: 'comparar_alternativas',
+          description:
+            'Compara alternativas na mesma molécula DCI numa única chamada rápida. Aceita lista de DCIs ou CNPs e laboratório de referência, devolvendo vendas 12M, stock, último custo conhecido (incl. PrecoFarmacia quando stock=0) e margem sem IVA.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              dcis: { type: 'array', items: { type: 'string' }, description: 'Lista de moléculas DCI (até 15)' },
+              cnps: { type: 'array', items: { type: 'string' }, description: 'Lista de CNPs' },
+              laboratorio_referencia: { type: 'string', description: 'Laboratório em análise (opcional)' },
+              limite_por_dci: { type: 'number', description: 'Máximo por DCI (default 5)' },
             },
           },
         },
@@ -388,6 +403,7 @@ export function createPharmaMcpServer(
   const MCP_READONLY_ALLOWLIST = new Set([
     'consultar_produtos_por_nome_ou_categoria',
     'consultar_vendas_periodo',
+    'comparar_alternativas',
     'analisar_desempenho_laboratorio',
     'calcular_stock_minimo_e_cobertura',
     'identificar_produtos_sem_vendas_e_escoamento',
@@ -477,6 +493,9 @@ export function createPharmaMcpServer(
           break;
         case 'consultar_vendas_periodo':
           result = await toolConsultarVendasPeriodo(prisma, effectiveSecContext, (args as any) || {});
+          break;
+        case 'comparar_alternativas':
+          result = await toolCompararAlternativasDci(prisma, effectiveSecContext, (args as any) || {});
           break;
         case 'analisar_desempenho_laboratorio':
           result = await toolAnalisarDesempenhoLaboratorio(prisma, effectiveSecContext, (args as any) || {});

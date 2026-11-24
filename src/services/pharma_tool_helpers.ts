@@ -519,7 +519,11 @@ export interface TabelaSpec {
   resultado_id: string;
   titulo?: string;
   colunas?: string[];
-  filtro?: { campo: string; valor: string };
+  filtro?: {
+    campo: string;
+    op?: '=' | '!=' | '<' | '<=' | '>' | '>=' | 'contains';
+    valor: string | number;
+  };
   ordenar?: { campo: string; direcao?: 'asc' | 'desc' };
   limite?: number;
 }
@@ -548,8 +552,33 @@ export function renderMarkdownTableFromStoredResult(
   }
 
   if (spec.filtro && spec.filtro.campo && spec.filtro.valor !== undefined) {
-    const targetVal = normalizeSearchText(String(spec.filtro.valor));
-    rows = rows.filter((r) => normalizeSearchText(String(r[spec.filtro!.campo] ?? '')).includes(targetVal));
+    const { campo, op, valor } = spec.filtro;
+    const numTarget = Number(valor);
+    const isNumericOp = op && ['<', '<=', '>', '>='].includes(op) && Number.isFinite(numTarget);
+    if (isNumericOp) {
+      rows = rows.filter((r) => {
+        const rv = Number(r[campo]);
+        if (!Number.isFinite(rv)) return false;
+        if (op === '<') return rv < numTarget;
+        if (op === '<=') return rv <= numTarget;
+        if (op === '>') return rv > numTarget;
+        if (op === '>=') return rv >= numTarget;
+        return true;
+      });
+    } else if (op === '=' || op === '!=') {
+      const targetStr = normalizeSearchText(String(valor));
+      rows = rows.filter((r) => {
+        const rv = r[campo];
+        const eq =
+          Number.isFinite(numTarget) && Number.isFinite(Number(rv))
+            ? Number(rv) === numTarget
+            : normalizeSearchText(String(rv ?? '')) === targetStr;
+        return op === '=' ? eq : !eq;
+      });
+    } else {
+      const targetVal = normalizeSearchText(String(valor));
+      rows = rows.filter((r) => normalizeSearchText(String(r[campo] ?? '')).includes(targetVal));
+    }
   }
 
   if (spec.ordenar && spec.ordenar.campo) {
