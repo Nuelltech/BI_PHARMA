@@ -718,6 +718,7 @@ async function loadTenantCatalog(prisma: PrismaClient, farmaciaId: string): Prom
         dosagem: true,
         forma_farmaceutica: true,
         tipo_venda: true,
+        subcategoria: true,
       },
     }),
   ]);
@@ -802,12 +803,16 @@ async function loadTenantCatalog(prisma: PrismaClient, farmaciaId: string): Prom
       ? Number(Math.max(0, (Date.parse(valDateStr) - Date.now()) / (30.4375 * 86_400_000)).toFixed(1))
       : null;
 
+    const SUB_VAGAS = new Set(['geral', 'terapeutica cronica / geral', 'msrm', 'mnsrm']);
+    const subBd = m.subcategoria && !SUB_VAGAS.has(norm(m.subcategoria)) ? m.subcategoria : null;
+    const sub = subBd || hmr3;
+
     const cand: Cand = {
       cnp_codigo: cnp,
       designacao: m.designacao,
       categoria_id: tax.categoria_id,
-      subcategoria_id: slugify(hmr3),
-      finalidade_curta: hmr3 && hmr3 !== 'MSRM' ? hmr3 : tax.categoria_id.replace(/_/g, ' ').toLowerCase(),
+      subcategoria_id: slugify(sub),
+      finalidade_curta: sub && sub !== 'MSRM' ? sub : tax.categoria_id.replace(/_/g, ' ').toLowerCase(),
       papel_cesto: tax.papel_cesto,
       publico: tax.publico,
       precisa_receita,
@@ -1264,6 +1269,14 @@ export function createPrismaComercialRepo(
         }
       }
       return out;
+    },
+
+    async candidatosPorSubcategorias(slugs: string[]): Promise<Cand[]> {
+      const alvo = new Set(slugs);
+      const { items } = await loadTenantCatalog(prisma, farmaciaId);
+      return items.filter(
+        (i) => alvo.has(i.subcategoria_id) && !i.precisa_receita && i.permite_marketing && !i.uso_veterinario
+      );
     },
 
     async calendario(): Promise<Calendario[]> {

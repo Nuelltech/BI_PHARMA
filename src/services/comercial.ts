@@ -84,6 +84,7 @@ export interface Repo {
   regrasAtivas(g: Extract<GatilhoRes, { ok: true }>): Promise<Regra[]>; // ativa AND validada_por NOT NULL
   candidatosPorRegras(ids: string[]): Promise<Cand[]>;
   candidatosPorCampanha(campanhaId: string): Promise<Cand[]>;
+  candidatosPorSubcategorias?(slugs: string[]): Promise<Cand[]>;
   calendario(): Promise<Calendario[]>;
   epocaSubcategoria(): Promise<Record<string, number[] | null>>;
   campanhasAtivas(): Promise<CampanhaAtivaRow[]>;
@@ -579,7 +580,7 @@ export async function sugerirPacksPromocionais(inp: PacksIn, ctx: Ctx) {
       pack_proposto_id,
       packs_montaveis: packsMontaveis,
       hash_composicao: hashComposicao,
-      estado_aprovacao: 'APROVADO_DT',
+      estado_aprovacao: 'PENDENTE_VALIDACAO_DT',
     });
   }
   return vazio(cx, F, 'CESTO_INCOMPLETO', { ...metaBase, excluidos_resumo: exFinal, conflito_campanha: conflitoCampanha, publico_aplicado: publico });

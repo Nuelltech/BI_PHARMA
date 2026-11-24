@@ -1,7 +1,9 @@
 import { PrismaClient } from '@prisma/client';
 import { getPharmacyCatalog, searchCatalog, CatalogItem, normalizeText, termMatches, getSmartCrossSelling } from './product_catalog';
 import { loadEnrichedCatalogMap, CATEGORIA_LABELS, createPrismaComercialRepo, buildComercialCfg } from './comercial_repo';
-import { QUALIDADE_OK, sugerirPacksPromocionais, Ctx, computePackCompositionHash } from './comercial';
+import { QUALIDADE_OK, sugerirPacksPromocionais, Ctx, Cand, computePackCompositionHash } from './comercial';
+import { SITUACOES } from './situacoes_config';
+import { gerarIdeiasPacks, slugsPorCampanha } from './situacoes_packs';
 
 async function getMarketingEligibleCatalog(
   prisma: PrismaClient,
@@ -2872,86 +2874,109 @@ export async function generateClinicalThemePacks(
     },
   };
 
-  for (const row of temasLinhas) {
-    const campanhaId = String(row[0]);
-    const packId = `pack_${campanhaId}`;
-    if (activePackIds.has(packId)) continue; // Já ativo na farmácia com assinatura DT
+  // Motor de Packs v2 — por SITUAÇÃO DO UTENTE (gerarIdeiasPacks)
+  const temasElegiveis: Array<{ campanha_id: string; desconto_sugerido_pct: number; janela: 'EM_EPOCA' | 'PROXIMA' }> = temasLinhas
+    .filter((r: any[]) => r[2] === 'EM_EPOCA' || r[2] === 'PROXIMA')
+    .map((r: any[]) => ({
+      campanha_id: String(r[0]),
+      desconto_sugerido_pct: Number(r[7] || 15),
+      janela: r[2] === 'PROXIMA' ? 'PROXIMA' : 'EM_EPOCA',
+    }));
 
-    const titulo = String(row[1]);
-    const meta = THEME_METADATA[campanhaId] || {
-      icone: '📦',
-      sintoma: `Campanha ativa: ${titulo}`,
-      orientacao: 'Aconselhamento personalizado de balcão de acordo com as necessidades do utente.',
-      disposicao: 'Cesto temático na secção de venda livre.',
-    };
+  const candsPorCampanha: Record<string, Cand[]> = {};
+  for (const t of temasElegiveis) {
+    const slugs = slugsPorCampanha(SITUACOES, t.campanha_id);
+    candsPorCampanha[t.campanha_id] = repo.candidatosPorSubcategorias
+      ? await repo.candidatosPorSubcategorias(slugs)
+      : await repo.candidatosPorCampanha(t.campanha_id);
+  }
 
-    // Pack físico determinístico com mínimo de 3 unidades por item e público adulto
-    const packRes = await sugerirPacksPromocionais(
-      {
-        modo: 'PACK',
-        campanha_id: campanhaId,
-        publico: 'ADULTO',
-        min_stock_por_item: 3,
-        tipo_oferta: 'PACK_FISICO',
-      },
-      ctx
+  const [epocaSub, campanhasAtivas] = await Promise.all([
+    repo.epocaSubcategoria(),
+    repo.campanhasAtivas(),
+  ]);
+
+  const ideias = gerarIdeiasPacks(
+    SITUACOES,
+    temasElegiveis,
+    candsPorCampanha,
+    { ref: ctx.ref, epoca: epocaSub, ativas: campanhasAtivas },
+    { minPacksMontaveis: 3, stockMinimoOpcao: 1, opcoesPorLugar: 3 }
+  );
+
+  const SITUACAO_ICONES: Record<string, string> = {
+    maos_labios_frio: '❄️',
+    pele_atopica_seca: '🧴',
+    gripe_constipacao: '🧣',
+    tosse: '🫁',
+    pe_diabetico: '🩺',
+    homem_50: '💙',
+    queda_capilar: '🍂',
+    rotina_facial: '✨',
+    higiene_oral: '🪥',
+    presente_natal_mulher: '🎁',
+    presente_natal_homem: '🎀',
+    cuidado_bebe: '👶',
+  };
+
+  for (const ideia of ideias) {
+    const packId = `pack_${ideia.situacao_id}`;
+    if (activePackIds.has(packId)) continue;
+    if (ideia.estado !== 'PRONTO' || !ideia.sugestao) continue;
+
+    const sug = ideia.sugestao;
+    const sit = SITUACOES.find((s) => s.id === ideia.situacao_id);
+    const campRef = sit?.campanhas[0] || '';
+    const metaFallback = THEME_METADATA[campRef];
+
+    const produtos: ClinicalThemePackItem[] = sug.itens.map((it) => ({
+      cnp: it.cnp_codigo,
+      designacao: it.designacao,
+      propositoUtente: it.texto_utente || it.finalidade_curta || it.subcategoria_id || 'Cuidado complementar',
+      stockAtual: it.stock_total_unidades,
+      custoUnitario: it.custo_unitario_medio,
+      pvpUnitario: it.pvp,
+      margemPct: Number((it.margem_pct_promo || it.margem_pct || 0).toFixed(1)),
+      tipoVenda: it.permite_desconto_promo ? 'VENDA_LIVRE' : 'MNSRM',
+    }));
+
+    const pvpTotalOriginal = Number(sug.totais.pvp_cesto.toFixed(2));
+    const pvpPackComDesconto = Number(sug.totais.preco_promo_cesto.toFixed(2));
+    const custoTotal = Number(produtos.reduce((s, p) => s + p.custoUnitario, 0).toFixed(2));
+    const poupancaUtente = Number(sug.totais.poupanca.toFixed(2));
+    const descontoPct = pvpTotalOriginal > 0 ? Math.round((poupancaUtente / pvpTotalOriginal) * 100) : 15;
+    const margemPackPct = Number(sug.totais.margem_pct_cesto.toFixed(1));
+    const publicoLabel = sug.publico === 'PEDIATRICO' ? 'Pediátrico / Bebé' : 'Adultos e Famílias (Adulto)';
+
+    // Alinhar hash SHA-256 com o hash determinístico do motor v2 (evita divergência na validação DT)
+    const hash = sug.hash_composicao || computePackCompositionHash(
+      produtos.map((p) => p.cnp),
+      sug.publico,
+      descontoPct
     );
 
-    if (packRes.ok) {
-      const envelope = packRes as any;
-      const itensRaw: any[] = envelope.itens || envelope.extra?.itens || [];
-      const totais = envelope.totais || envelope.extra?.totais || {};
-      const validacao = envelope.validacao_legal || envelope.extra?.validacao_legal || { ok: true };
-
-      if (itensRaw.length >= 2 && validacao.ok) {
-        const produtos: ClinicalThemePackItem[] = itensRaw.map((it: any) => ({
-          cnp: it.cnp_codigo,
-          designacao: it.designacao,
-          propositoUtente: it.finalidade_curta || it.subcategoria_id || 'Cuidado complementar',
-          stockAtual: it.stock_total_unidades,
-          custoUnitario: it.custo_unitario_medio,
-          pvpUnitario: it.pvp,
-          margemPct: Number((it.margem_pct_promo || it.margem_pct || 0).toFixed(1)),
-          tipoVenda: it.permite_desconto_promo ? 'VENDA_LIVRE' : 'MNSRM',
-        }));
-
-        const pvpTotalOriginal = Number(totais.pvp_cesto || produtos.reduce((s, p) => s + p.pvpUnitario, 0).toFixed(2));
-        const pvpPackComDesconto = Number(totais.preco_promo_cesto || pvpTotalOriginal);
-        const custoTotal = Number(produtos.reduce((s, p) => s + p.custoUnitario, 0).toFixed(2));
-        const poupancaUtente = Number(Math.max(0, pvpTotalOriginal - pvpPackComDesconto).toFixed(2));
-        const descontoPct = pvpTotalOriginal > 0 ? Math.round((poupancaUtente / pvpTotalOriginal) * 100) : 0;
-        const margemPackPct = Number(totais.margem_pct_cesto || (pvpPackComDesconto > 0 ? (((pvpPackComDesconto - custoTotal) / pvpPackComDesconto) * 100).toFixed(1) : 0));
-        const minStockMontavel = Math.min(...produtos.map((p) => p.stockAtual));
-        const hash = computePackCompositionHash(
-          produtos.map((p) => p.cnp),
-          'Adultos e Famílias (Adulto)',
-          descontoPct
-        );
-
-        packs.push({
-          id: packId,
-          titulo: `Pack ${titulo}`,
-          sintomaOuQueixa: meta.sintoma,
-          publicoAlvo: 'Adultos e Famílias (Adulto)',
-          icone: meta.icone,
-          produtos,
-          pvpTotalOriginal,
-          custoTotal,
-          descontoPct,
-          pvpPackComDesconto,
-          poupancaUtente,
-          margemPackPct,
-          orientacaoBalcao: meta.orientacao,
-          disposicaoFisica: meta.disposicao,
-          estadoCiclo: 'PROPOSTO',
-          hashComposicao: hash,
-          packsMontaveis: minStockMontavel,
-          validadoPor: null,
-          validadoEm: null,
-          campanhaAtivaId: null,
-        });
-      }
-    }
+    packs.push({
+      id: packId,
+      titulo: ideia.titulo,
+      sintomaOuQueixa: ideia.queixa,
+      publicoAlvo: publicoLabel,
+      icone: SITUACAO_ICONES[ideia.situacao_id] || metaFallback?.icone || '📦',
+      produtos,
+      pvpTotalOriginal,
+      custoTotal,
+      descontoPct,
+      pvpPackComDesconto,
+      poupancaUtente,
+      margemPackPct,
+      orientacaoBalcao: ideia.pergunta_balcao,
+      disposicaoFisica: metaFallback?.disposicao || 'Cesto temático junto ao balcão de atendimento.',
+      estadoCiclo: 'PROPOSTO',
+      hashComposicao: hash,
+      packsMontaveis: sug.packs_montaveis,
+      validadoPor: null,
+      validadoEm: null,
+      campanhaAtivaId: null,
+    });
   }
 
   return packs;

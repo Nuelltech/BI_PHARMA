@@ -2717,9 +2717,10 @@ async function startServer() {
             return;
           }
 
+          const pubCanon = /pediatr|beb[eé]/i.test(String(packData.publicoAlvo || '')) ? 'PEDIATRICO' : 'ADULTO';
           const expectedHash = computePackCompositionHash(
             packData.produtos.map(p => p.cnp),
-            packData.publicoAlvo,
+            pubCanon,
             packData.descontoPct
           );
 
