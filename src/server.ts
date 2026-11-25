@@ -50,6 +50,8 @@ import {
   logoutSession,
   requestPasswordReset,
   consumePasswordReset,
+  createTeamMemberInvite,
+  acceptInviteToken,
 } from './services/auth_service';
 
 process.on('uncaughtException', (err) => {
@@ -3950,7 +3952,7 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
-      // 4.2. Convidar / Adicionar Membro da Equipa
+      // 4.2. Convidar / Adicionar Membro da Equipa (cria acesso + envia email real de convite via Resend)
       if (pathname === '/api/settings/team/invite' && req.method === 'POST') {
         try {
           const rawBody = await readRequestBody(req, 64 * 1024);
@@ -3959,12 +3961,86 @@ self.addEventListener('fetch', (e) => {
           if (!nome || !email) {
             throw new Error('Nome e email são de preenchimento obrigatório.');
           }
+          // 1. Mantém registo operacional para lista da equipa / PIN mobile
           const member = await addPharmacyTeamMember(prisma, activeFarmacia.id, { nome, email, role, pin });
+
+          // 2. Cria conta Utilizador + vínculo MembroFarmacia + envia email real pelo Resend (/accept-invite)
+          const rawRole = String(role || '').toUpperCase();
+          const mappedPerfil = rawRole.includes('PROPRIET')
+            ? 'PROPRIETARIO'
+            : rawRole.includes('DIRETOR') || rawRole.includes('ADMIN')
+            ? 'DIRETOR_TECNICO'
+            : rawRole.includes('COMPRADOR') || rawRole.includes('GEST')
+            ? 'COMPRADOR'
+            : 'OPERADOR_BALCAO';
+
+          const inviteRes = await createTeamMemberInvite(
+            prisma,
+            {
+              farmaciaId: activeFarmacia.id,
+              ip: getClientIp(req),
+              userAgent: String(req.headers['user-agent'] || ''),
+            },
+            { nome, email, perfil: mappedPerfil }
+          ).catch((err: any) => ({ ok: false, error: err?.message || 'Erro ao enviar convite por email' }));
+
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, member }));
+          res.end(
+            JSON.stringify({
+              ok: true,
+              member,
+              inviteSent: Boolean(inviteRes.ok),
+              inviteNote: inviteRes.ok
+                ? `Email de convite enviado para ${email} (válido 48h para definir password e PIN).`
+                : inviteRes.error || 'Membro adicionado, mas não foi possível enviar o email de convite.',
+            })
+          );
         } catch (e: any) {
           const status = e.statusCode || 400;
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
+      // 4.2B. Aceitar Convite por Email (/api/auth/accept-invite) -> define Password + PIN
+      if (pathname === '/api/auth/accept-invite' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 32 * 1024);
+          const { token, password, pin, nome } = JSON.parse(rawBody || '{}');
+          const result = await acceptInviteToken(prisma, {
+            token: String(token || '').trim(),
+            password: password ? String(password) : undefined,
+            pin: pin ? String(pin).trim() : undefined,
+            nome: nome ? String(nome).trim() : undefined,
+            ip: getClientIp(req),
+            userAgent: String(req.headers['user-agent'] || ''),
+          });
+          if (!result.ok) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: result.error || 'Convite inválido ou expirado.' }));
+            return;
+          }
+          // Se o convidado definiu PIN, sincronizar com MembroEquipa (para /mobile funcionar logo)
+          if (pin && result.user?.email && result.farmacia?.id) {
+            await prisma.membroEquipa
+              .updateMany({
+                where: { farmaciaId: result.farmacia.id, email: result.user.email },
+                data: { pin: String(pin).trim() },
+              })
+              .catch(() => {});
+          }
+          if (result.rawSessionToken) {
+            const secureFlag = IS_PROD ? '; Secure' : '';
+            res.setHeader(
+              'Set-Cookie',
+              `bipharma_session=${encodeURIComponent(result.rawSessionToken)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${secureFlag}`
+            );
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, farmacia: result.farmacia, user: result.user }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
         }
         return;
@@ -4198,6 +4274,101 @@ self.addEventListener('fetch', (e) => {
         res.setHeader('Expires', '0');
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(getDashboardHtml());
+        return;
+      }
+
+      // 5.9B. Página dedicada de Aceitação de Convite (/accept-invite?token=...) -> Definir Password + PIN
+      if (pathname === '/accept-invite' && req.method === 'GET') {
+        const acceptHtml = `<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aceitar Convite — BI Pharma</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #070f1e; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; padding: 20px; box-sizing: border-box; }
+    .card { width: 100%; max-width: 460px; background: #fff; border-radius: 20px; padding: 36px 32px; box-shadow: 0 25px 60px rgba(0,0,0,0.35); }
+    h1 { margin: 0 0 8px 0; font-size: 1.5rem; font-weight: 900; color: #0f172a; }
+    p { margin: 0 0 20px 0; font-size: 0.88rem; color: #64748b; line-height: 1.45; }
+    label { display: block; font-size: 0.76rem; font-weight: 800; color: #334155; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+    input { width: 100%; box-sizing: border-box; padding: 12px 14px; border: 1.5px solid #cbd5e1; border-radius: 10px; font-size: 0.95rem; margin-bottom: 14px; outline: none; }
+    input:focus { border-color: #0284c7; box-shadow: 0 0 0 3px rgba(2,132,199,0.12); }
+    button { width: 100%; padding: 14px; border: none; border-radius: 10px; background: #0284c7; color: #fff; font-size: 0.98rem; font-weight: 800; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .msg { display: none; padding: 12px 14px; border-radius: 10px; font-size: 0.85rem; font-weight: 600; margin-bottom: 16px; }
+    .msg.err { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
+    .msg.ok { background: #dcfce7; color: #15803d; border: 1px solid #86efac; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="font-size: 0.74rem; font-weight: 800; color: #0284c7; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 8px;">BI PHARMA · CONVITE DE EQUIPA</div>
+    <h1>Ativar a sua conta</h1>
+    <p>Defina a sua palavra-passe (mínimo 10 caracteres) e, opcionalmente, o seu PIN rápido de 4 a 6 dígitos para acesso ao balcão/mobile.</p>
+    <div id="msgBox" class="msg"></div>
+    <form id="inviteForm">
+      <label for="pwd1">Palavra-passe (mín. 10 caracteres)</label>
+      <input type="password" id="pwd1" autocomplete="new-password" required minlength="10" placeholder="Mínimo 10 caracteres" />
+      <label for="pwd2">Confirmar palavra-passe</label>
+      <input type="password" id="pwd2" autocomplete="new-password" required minlength="10" placeholder="Repita a palavra-passe" />
+      <label for="pinInput">PIN Rápido de Balcão / Mobile (4 a 6 dígitos — opcional)</label>
+      <input type="password" id="pinInput" inputmode="numeric" pattern="[0-9]{4,6}" maxlength="6" placeholder="Ex: 4829" />
+      <button type="submit" id="btnAccept">Ativar conta e entrar</button>
+    </form>
+    <div style="margin-top: 16px; text-align: center;">
+      <a href="/login" style="color: #0284c7; font-size: 0.84rem; font-weight: 700; text-decoration: none;">← Já tenho conta (ir para login)</a>
+    </div>
+  </div>
+  <script>
+    const token = (new URLSearchParams(window.location.search).get('token') || '').trim();
+    const msgBox = document.getElementById('msgBox');
+    const form = document.getElementById('inviteForm');
+    const btn = document.getElementById('btnAccept');
+    function showMsg(txt, isErr) {
+      msgBox.textContent = txt;
+      msgBox.className = 'msg ' + (isErr ? 'err' : 'ok');
+      msgBox.style.display = 'block';
+    }
+    if (!token) {
+      showMsg('Link de convite inválido ou incompleto. Peça um novo convite ao administrador da farmácia.', true);
+      btn.disabled = true;
+    }
+    form.addEventListener('submit', async function(e) {
+      e.preventDefault();
+      const p1 = document.getElementById('pwd1').value;
+      const p2 = document.getElementById('pwd2').value;
+      const pin = (document.getElementById('pinInput').value || '').trim();
+      if (p1 !== p2) { showMsg('As palavras-passe não coincidem.', true); return; }
+      if (p1.length < 10) { showMsg('A palavra-passe deve ter pelo menos 10 caracteres.', true); return; }
+      if (pin && !/^[0-9]{4,6}$/.test(pin)) { showMsg('O PIN deve conter entre 4 e 6 dígitos numéricos.', true); return; }
+      btn.disabled = true;
+      btn.textContent = 'A ativar conta...';
+      try {
+        const res = await fetch('/api/auth/accept-invite', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token, password: p1, pin: pin || undefined }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          showMsg(data.error || 'Não foi possível ativar o convite.', true);
+          btn.disabled = false;
+          btn.textContent = 'Ativar conta e entrar';
+          return;
+        }
+        showMsg('Conta ativada com sucesso! A entrar no BI Pharma...', false);
+        setTimeout(function() { window.location.href = '/'; }, 1400);
+      } catch (err) {
+        showMsg('Erro de ligação ao servidor.', true);
+        btn.disabled = false;
+        btn.textContent = 'Ativar conta e entrar';
+      }
+    });
+  </script>
+</body>
+</html>`;
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(acceptHtml);
         return;
       }
 
@@ -11011,7 +11182,7 @@ function getDashboardHtml(): string {
           document.getElementById('inviteName').value = '';
           document.getElementById('inviteEmail').value = '';
           document.getElementById('invitePin').value = '';
-          alert('Colaborador adicionado com sucesso!');
+          alert(data.inviteNote ? 'Colaborador adicionado! ' + data.inviteNote : 'Colaborador adicionado com sucesso!');
           loadSettingsTeam();
         } else {
           alert('Erro: ' + (data.error || 'Não foi possível adicionar colaborador.'));

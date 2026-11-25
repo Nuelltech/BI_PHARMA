@@ -76,11 +76,15 @@ export async function sendInviteEmail(input: {
       Para definir a sua password e aceder ao sistema, clique no botão seguro abaixo. Este convite é pessoal e expira em 48 horas.
     </p>
 
-    <div style="text-align: center; margin: 32px 0;">
-      <a href="${inviteLink}" style="background-color: #0284c7; color: #ffffff; text-decoration: none; padding: 12px 28px; border-radius: 8px; font-weight: 700; font-size: 14px; display: inline-block;">
-        Aceitar Convite e Definir Password
-      </a>
-    </div>
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" style="margin: 28px auto;">
+      <tr>
+        <td align="center" bgcolor="#0284c7" style="border-radius: 8px; background-color: #0284c7;">
+          <a href="${inviteLink}" target="_blank" style="display: inline-block; padding: 13px 28px; font-family: Arial, sans-serif; font-size: 14px; font-weight: 700; color: #ffffff; text-decoration: none; border-radius: 8px;">
+            <span style="color: #ffffff;">Aceitar Convite e Definir Password</span>
+          </a>
+        </td>
+      </tr>
+    </table>
 
     <p style="font-size: 12px; color: #94a3b8; line-height: 1.5; word-break: break-all;">
       Se o botão não funcionar, copie este endereço para o seu navegador:<br/>
