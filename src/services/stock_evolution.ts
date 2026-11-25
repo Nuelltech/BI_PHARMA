@@ -57,7 +57,54 @@ export interface StockEvolutionReport {
  * 3. A recuperação de liquidez e a evolução só começam a ser medidas após o Marco Zero (a partir do 2º fecho).
  * 4. Sem metas arbitrárias: foco em factos auditados.
  */
+const STOCK_EVOLUTION_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutos
+const stockEvolutionCache = new Map<string, { data: StockEvolutionReport; expiresAt: number }>();
+const stockEvolutionInflight = new Map<string, Promise<StockEvolutionReport>>();
+
+export function invalidateStockEvolutionCache(farmaciaId?: string): void {
+  if (farmaciaId) {
+    stockEvolutionCache.delete(farmaciaId);
+  } else {
+    stockEvolutionCache.clear();
+  }
+}
+
 export async function getStockEvolutionAnalytics(
+  prisma: PrismaClient,
+  farmaciaId: string,
+  opts?: { forceRefresh?: boolean }
+): Promise<StockEvolutionReport> {
+  const now = Date.now();
+  if (!opts?.forceRefresh) {
+    const cached = stockEvolutionCache.get(farmaciaId);
+    if (cached && cached.expiresAt > now) {
+      return cached.data;
+    }
+    const inflight = stockEvolutionInflight.get(farmaciaId);
+    if (inflight) {
+      return inflight;
+    }
+  }
+
+  const job = computeStockEvolutionAnalytics(prisma, farmaciaId)
+    .then((report) => {
+      stockEvolutionCache.set(farmaciaId, {
+        data: report,
+        expiresAt: Date.now() + STOCK_EVOLUTION_CACHE_TTL_MS,
+      });
+      stockEvolutionInflight.delete(farmaciaId);
+      return report;
+    })
+    .catch((err) => {
+      stockEvolutionInflight.delete(farmaciaId);
+      throw err;
+    });
+
+  stockEvolutionInflight.set(farmaciaId, job);
+  return job;
+}
+
+async function computeStockEvolutionAnalytics(
   prisma: PrismaClient,
   farmaciaId: string
 ): Promise<StockEvolutionReport> {

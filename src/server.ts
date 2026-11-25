@@ -3590,6 +3590,28 @@ async function startServer() {
         return;
       }
 
+      // 2.5H0. Endpoint Mobile Logout (encerra apenas sessões Mobile PIN daquele colaborador/farmácia sem afetar App Web)
+      if (pathname === '/api/mobile/logout' && req.method === 'POST') {
+        try {
+          const rawBody = await readRequestBody(req, 16 * 1024);
+          const { farmaciaId, operator } = JSON.parse(rawBody || '{}');
+          if (farmaciaId && operator) {
+            await prisma.sessaoUtilizador.deleteMany({
+              where: {
+                farmaciaId: String(farmaciaId),
+                userName: String(operator),
+              },
+            }).catch(() => {});
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true }));
+        }
+        return;
+      }
+
       // 2.5H1. Endpoint Mobile: Listar Nomes dos Colaboradores da Farmácia para Chips
       if (pathname === '/api/mobile/team-members' && req.method === 'GET') {
         try {
@@ -3684,8 +3706,9 @@ async function startServer() {
         if (pathname === '/api/analytics/stock-evolution' && req.method === 'GET') {
           try {
             const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+            const forceRefresh = String(parsedUrl.query.refresh || '') === '1';
             const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
-            const evolutionData = await getStockEvolutionAnalytics(prisma, activeFarmacia.id);
+            const evolutionData = await getStockEvolutionAnalytics(prisma, activeFarmacia.id, { forceRefresh });
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ ok: true, ...evolutionData }));
           } catch (e: any) {
@@ -6755,7 +6778,7 @@ function getDashboardHtml(): string {
             </div>
           </div>
           <div style="display: flex; gap: 10px; align-items: center;">
-            <button class="btn" onclick="loadStockEvolutionData()" style="background: #0284c7; color: #ffffff; font-weight: 700; padding: 8px 16px; border: none; border-radius: 8px; cursor: pointer;">
+            <button class="btn" onclick="loadStockEvolutionData(true)" style="background: #0284c7; color: #ffffff; font-weight: 700; padding: 8px 16px; border: none; border-radius: 8px; cursor: pointer;">
               🔄 Atualizar Balanço
             </button>
           </div>
@@ -10672,6 +10695,13 @@ function getDashboardHtml(): string {
         renderWeeklyActionPlan();
         loadActiveCampaigns();
         switchTab(activeTab);
+
+        // Prefetch silencioso da Evolução de Stock em background para abertura instantânea (0ms)
+        setTimeout(() => {
+          if (typeof prefetchStockEvolutionData === 'function') {
+            prefetchStockEvolutionData();
+          }
+        }, 300);
 
         if (feedback) {
           feedback.style.display = 'inline-block';
@@ -17252,16 +17282,61 @@ function getDashboardHtml(): string {
     }
 
     // ==========================================
-    // EVOLUÇÃO DE STOCK NO TEMPO & POUPANÇAS
+    // EVOLUÇÃO DE STOCK NO TEMPO & POUPANÇAS (COM CACHE & PREFETCH)
     // ==========================================
     let cachedEvolutionData = null;
+    const cachedEvolutionDataByFarm = {};
+    const inflightEvolutionByFarm = {};
 
-    async function loadStockEvolutionData() {
+    function prefetchStockEvolutionData() {
+      const fid = activeFarmaciaId || '';
+      if (!fid || cachedEvolutionDataByFarm[fid] || inflightEvolutionByFarm[fid]) return;
+      const p = fetch('/api/analytics/stock-evolution?farmaciaId=' + encodeURIComponent(fid))
+        .then(r => r.json())
+        .then(data => {
+          if (data && data.ok) {
+            cachedEvolutionDataByFarm[fid] = data;
+            if (activeTab === 'evolution' && activeFarmaciaId === fid) {
+              renderStockEvolutionData(data);
+            }
+          }
+          return data;
+        })
+        .catch(() => null)
+        .finally(() => {
+          delete inflightEvolutionByFarm[fid];
+        });
+      inflightEvolutionByFarm[fid] = p;
+    }
+
+    async function loadStockEvolutionData(forceRefresh) {
+      const fid = activeFarmaciaId || '';
+      if (!forceRefresh && fid && cachedEvolutionDataByFarm[fid]) {
+        renderStockEvolutionData(cachedEvolutionDataByFarm[fid]);
+        return;
+      }
       try {
-        const res = await fetch('/api/analytics/stock-evolution?farmaciaId=' + encodeURIComponent(activeFarmaciaId || ''));
-        const data = await res.json();
-        if (!data.ok) throw new Error(data.error || 'Erro ao obter evolução');
+        let data = null;
+        if (!forceRefresh && fid && inflightEvolutionByFarm[fid]) {
+          data = await inflightEvolutionByFarm[fid];
+        }
+        if (!data || !data.ok) {
+          const url = '/api/analytics/stock-evolution?farmaciaId=' + encodeURIComponent(fid) + (forceRefresh ? '&refresh=1' : '');
+          const res = await fetch(url);
+          data = await res.json();
+        }
+        if (!data || !data.ok) throw new Error((data && data.error) || 'Erro ao obter evolução');
+        if (fid) cachedEvolutionDataByFarm[fid] = data;
+        renderStockEvolutionData(data);
+      } catch (e) {
+        console.error('Erro ao carregar Evolução de Stock:', e);
+        const tbody = document.getElementById('evoMonthlyTableBody');
+        if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #e11d48;">Erro ao carregar dados: ' + escapeHtml(e.message) + '</td></tr>';
+      }
+    }
 
+    function renderStockEvolutionData(data) {
+      try {
         cachedEvolutionData = data;
         const isMarcoZero = !!data.is_marco_zero;
 

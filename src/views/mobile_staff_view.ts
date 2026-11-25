@@ -810,10 +810,23 @@ export function getMobileStaffHtml(): string {
       <p>Área de Operações da Equipa da Farmácia</p>
 
       <div class="form-group">
-        <label>Farmácia Ativa</label>
-        <select id="pinFarmSelect" class="select-farmacia" onchange="loadPharmacyTeamChips(this.value)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <label style="margin-bottom:0;">Farmácia Ativa</label>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <button type="button" onclick="toggleAddPharmacyBox()" style="background:none;border:none;color:#38bdf8;font-size:0.72rem;font-weight:700;cursor:pointer;padding:0;">+ Adicionar</button>
+            <button type="button" id="btnRemovePairedFarm" onclick="removeCurrentPairedPharmacy()" style="display:none;background:none;border:none;color:#f87171;font-size:0.72rem;font-weight:700;cursor:pointer;padding:0;">Remover</button>
+          </div>
+        </div>
+        <select id="pinFarmSelect" class="select-farmacia" onchange="onPinFarmSelectChange(this.value)">
           <option value="">A carregar farmácias...</option>
         </select>
+        <div id="addPharmacyBox" style="display:none;margin-top:8px;padding:10px;background:#0f172a;border:1px solid #334155;border-radius:10px;">
+          <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:6px;">Introduza o código da farmácia (ou leia o QR Code):</div>
+          <div style="display:flex;gap:6px;">
+            <input type="text" id="addPharmacyCodeInput" class="input-operator" placeholder="Ex: FARM-C-590964" style="padding:8px 10px;font-size:0.84rem;" />
+            <button type="button" id="btnPairPharmacy" onclick="pairPharmacyByCode()" style="background:#0284c7;color:#fff;border:none;border-radius:8px;padding:8px 12px;font-size:0.8rem;font-weight:800;cursor:pointer;white-space:nowrap;">Associar</button>
+          </div>
+        </div>
       </div>
 
       <div class="form-group">
@@ -1193,6 +1206,155 @@ export function getMobileStaffHtml(): string {
     // ========================================================================
     // AUTENTICAÇÃO POR PIN MÍNIMO
     // ========================================================================
+    // CARTEIRA DE FARMÁCIAS EMPARELHADAS NO DISPOSITIVO (MULTI-FARMÁCIA SEGURA)
+    // ========================================================================
+    const PAIRED_PHARMACIES_KEY = 'bi_pharma_mobile_paired_pharmacies';
+
+    function getPairedPharmacies() {
+      try {
+        const list = JSON.parse(localStorage.getItem(PAIRED_PHARMACIES_KEY) || '[]');
+        return Array.isArray(list) ? list.filter(f => f && f.id && f.nome) : [];
+      } catch {
+        return [];
+      }
+    }
+
+    function savePairedPharmacies(list) {
+      try {
+        localStorage.setItem(PAIRED_PHARMACIES_KEY, JSON.stringify(list));
+      } catch {}
+    }
+
+    function upsertPairedPharmacy(farm) {
+      if (!farm || !farm.id) return;
+      const list = getPairedPharmacies();
+      const idx = list.findIndex(f => f.id === farm.id);
+      const entry = {
+        id: farm.id,
+        nome: farm.nome || 'Farmácia',
+        codigo_acesso: farm.codigo_acesso || (idx >= 0 ? list[idx].codigo_acesso : '') || '',
+        nif: farm.nif || (idx >= 0 ? list[idx].nif : '') || '',
+      };
+      if (idx >= 0) list[idx] = entry;
+      else list.push(entry);
+      savePairedPharmacies(list);
+    }
+
+    function renderPairedPharmacySelect(preferredId) {
+      const sel = document.getElementById('pinFarmSelect');
+      const removeBtn = document.getElementById('btnRemovePairedFarm');
+      const addBox = document.getElementById('addPharmacyBox');
+      if (!sel) return;
+
+      const byId = new Map();
+      getPairedPharmacies().forEach(f => byId.set(f.id, f));
+      (allFarmacias || []).forEach(f => {
+        if (f && f.id) {
+          const prev = byId.get(f.id) || {};
+          byId.set(f.id, {
+            id: f.id,
+            nome: f.nome || prev.nome || 'Farmácia',
+            codigo_acesso: f.codigo_acesso || prev.codigo_acesso || '',
+            nif: f.nif || prev.nif || '',
+          });
+        }
+      });
+
+      const merged = Array.from(byId.values());
+      allFarmacias = merged;
+
+      if (merged.length === 0) {
+        sel.innerHTML = '<option value="">Nenhuma farmácia associada — adicione abaixo</option>';
+        if (removeBtn) removeBtn.style.display = 'none';
+        if (addBox) addBox.style.display = 'block';
+        const chips = document.getElementById('operatorChipsContainer');
+        if (chips) chips.innerHTML = '<span style="font-size:0.74rem;color:#94a3b8;">Associe uma farmácia (QR Code ou código) para ver a equipa.</span>';
+        return;
+      }
+
+      sel.innerHTML = merged
+        .map(f => '<option value="' + escapeHtml(f.id) + '">' + escapeHtml(f.nome) + (f.codigo_acesso ? ' (' + escapeHtml(f.codigo_acesso) + ')' : '') + '</option>')
+        .join('');
+
+      if (preferredId && merged.some(f => f.id === preferredId)) {
+        sel.value = preferredId;
+      } else {
+        sel.value = merged[0].id;
+      }
+
+      if (removeBtn) removeBtn.style.display = getPairedPharmacies().length > 0 ? 'inline-block' : 'none';
+      if (addBox) addBox.style.display = 'none';
+      loadPharmacyTeamChips(sel.value);
+    }
+
+    function onPinFarmSelectChange(farmId) {
+      clearPin();
+      selectedMemberId = null;
+      const input = document.getElementById('pinOperatorInput');
+      if (input) input.value = '';
+      if (farmId) {
+        loadPharmacyTeamChips(farmId);
+      }
+    }
+
+    function toggleAddPharmacyBox() {
+      const box = document.getElementById('addPharmacyBox');
+      if (!box) return;
+      box.style.display = box.style.display === 'none' ? 'block' : 'none';
+      if (box.style.display === 'block') {
+        const inp = document.getElementById('addPharmacyCodeInput');
+        if (inp) inp.focus();
+      }
+    }
+
+    async function pairPharmacyByCode() {
+      const inp = document.getElementById('addPharmacyCodeInput');
+      const btn = document.getElementById('btnPairPharmacy');
+      const code = (inp ? inp.value : '').trim();
+      if (!code) {
+        showToast('⚠️ Introduza o código da farmácia.', '#e11d48');
+        return;
+      }
+      if (btn) { btn.disabled = true; btn.textContent = '...'; }
+      try {
+        const res = await fetch('/api/pharmacies?acesso=' + encodeURIComponent(code), {
+          headers: { 'x-access-code': code }
+        });
+        const data = await res.json();
+        const list = Array.isArray(data) ? data : (data.pharmacies || []);
+        const matched = list.find(f =>
+          (f.codigo_acesso && f.codigo_acesso.toLowerCase() === code.toLowerCase()) ||
+          f.id === code
+        ) || (list.length === 1 ? list[0] : null);
+
+        if (!matched) {
+          showToast('❌ Código de farmácia não encontrado.', '#e11d48');
+          return;
+        }
+        if (!matched.codigo_acesso) matched.codigo_acesso = code;
+        upsertPairedPharmacy(matched);
+        if (inp) inp.value = '';
+        renderPairedPharmacySelect(matched.id);
+        showToast('✅ ' + matched.nome + ' associada a este dispositivo!', '#10b981');
+      } catch {
+        showToast('Erro de ligação ao validar código.', '#e11d48');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Associar'; }
+      }
+    }
+
+    function removeCurrentPairedPharmacy() {
+      const sel = document.getElementById('pinFarmSelect');
+      const farmId = sel ? sel.value : '';
+      if (!farmId) return;
+      const list = getPairedPharmacies().filter(f => f.id !== farmId);
+      savePairedPharmacies(list);
+      allFarmacias = allFarmacias.filter(f => f.id !== farmId);
+      renderPairedPharmacySelect(list[0] ? list[0].id : '');
+      showToast('Farmácia removida deste dispositivo.', '#64748b');
+    }
+
+    // ========================================================================
     // INICIALIZAÇÃO DA APP MOBILE
     // ========================================================================
     async function initMobileApp() {
@@ -1201,7 +1363,7 @@ export function getMobileStaffHtml(): string {
         const targetId = (urlParams.get('farmaciaId') || urlParams.get('farmacia') || '').trim();
         const accessCode = (urlParams.get('acesso') || urlParams.get('code') || urlParams.get('accessCode') || '').trim();
 
-        // 1. Chamar /api/pharmacies passando x-access-code se estiver no URL para autorizar de imediato
+        // 1. Chamar /api/pharmacies passando x-access-code se estiver no URL para associar à carteira local
         const fetchHeaders = {};
         if (accessCode) {
           fetchHeaders['x-access-code'] = accessCode;
@@ -1211,11 +1373,6 @@ export function getMobileStaffHtml(): string {
         });
         const data = await res.json();
         allFarmacias = Array.isArray(data) ? data : (data.pharmacies || []);
-        
-        const sel = document.getElementById('pinFarmSelect');
-        sel.innerHTML = allFarmacias
-          .map(f => \`<option value="\${escapeHtml(f.id)}">\${escapeHtml(f.nome)} (\${escapeHtml(f.codigo_acesso || f.nif)})</option>\`)
-          .join('');
 
         let targetFarmFromUrl = null;
         if (targetId || accessCode) {
@@ -1226,26 +1383,30 @@ export function getMobileStaffHtml(): string {
             return false;
           });
           if (targetFarmFromUrl) {
-            sel.value = targetFarmFromUrl.id;
+            if (accessCode && !targetFarmFromUrl.codigo_acesso) {
+              targetFarmFromUrl.codigo_acesso = accessCode;
+            }
+            upsertPairedPharmacy(targetFarmFromUrl);
           }
         }
 
-        // Se o endpoint retornou apenas 1 farmácia (ex: autenticada por x-access-code ou cookie)
-        if (!targetFarmFromUrl && allFarmacias.length === 1) {
-          targetFarmFromUrl = allFarmacias[0];
-          sel.value = targetFarmFromUrl.id;
-        }
-
-        if (sel.value) {
-          loadPharmacyTeamChips(sel.value);
+        // Guarda também na carteira local qualquer farmácia autenticada devolvida pelo servidor
+        if (allFarmacias.length > 0 && allFarmacias.length <= 10) {
+          allFarmacias.forEach(f => {
+            if (f && f.id && (f.codigo_acesso || targetFarmFromUrl)) {
+              upsertPairedPharmacy(f);
+            }
+          });
         }
 
         const saved = JSON.parse(localStorage.getItem('bi_pharma_mobile_session') || '{}');
+        const preferredId = (targetFarmFromUrl && targetFarmFromUrl.id) || (saved && saved.farmacia && saved.farmacia.id) || '';
+        renderPairedPharmacySelect(preferredId);
 
         // Apenas restaura sessão automaticamente se o utilizador já tiver validado o seu PIN pessoal
         // (Nunca faz auto-login apenas por existir cookie ou parâmetro na URL!)
         if (saved && saved.pinVerified === true && saved.farmacia && saved.farmacia.id) {
-          // Se abriu um link de outra farmácia, pede novo PIN nessa farmácia
+          // Se abriu um QR Code de outra farmácia, exige novo PIN nessa farmácia
           if (targetFarmFromUrl && targetFarmFromUrl.id !== saved.farmacia.id) {
             document.getElementById('pinOverlay').style.display = 'flex';
             return;
@@ -1254,16 +1415,18 @@ export function getMobileStaffHtml(): string {
           return;
         }
 
-        // Caso contrário, exige sempre seleção do colaborador autorizado + introdução do PIN pessoal
+        // Caso contrário, exige sempre seleção da farmácia + colaborador autorizado + PIN pessoal
         document.getElementById('pinOverlay').style.display = 'flex';
       } catch (err) {
         console.error('Erro na inicialização mobile:', err);
+        renderPairedPharmacySelect('');
         document.getElementById('pinOverlay').style.display = 'flex';
       }
     }
 
     function restoreMobileSession(saved) {
       currentFarmacia = saved.farmacia;
+      if (currentFarmacia) upsertPairedPharmacy(currentFarmacia);
       if (saved.operator) currentOperator = saved.operator;
       document.getElementById('pinOverlay').style.display = 'none';
       document.getElementById('hdrFarmName').textContent = currentFarmacia.nome;
@@ -1276,7 +1439,7 @@ export function getMobileStaffHtml(): string {
       const nomeFarm = currentFarmacia?.nome || 'esta farmácia';
       const txtEl = document.getElementById('mobileLogoutModalText');
       if (txtEl) {
-        txtEl.textContent = 'Deseja terminar a sessão na ' + nomeFarm + ' e bloquear o acesso por PIN?';
+        txtEl.textContent = 'Deseja terminar a sessão na ' + nomeFarm + '? Voltará ao ecrã de PIN (onde pode também trocar de farmácia).';
       }
       const modal = document.getElementById('mobileLogoutModal');
       if (modal) modal.style.display = 'flex';
@@ -1289,6 +1452,9 @@ export function getMobileStaffHtml(): string {
 
     function confirmLogoutMobile() {
       closeMobileLogoutModal();
+      const prevFarmId = currentFarmacia ? currentFarmacia.id : '';
+      const prevOperator = currentOperator || '';
+
       if (syncInterval) clearInterval(syncInterval);
       syncInterval = null;
       if (taskEventSource) {
@@ -1301,20 +1467,22 @@ export function getMobileStaffHtml(): string {
       tasksMap = {};
       clearPin();
 
-      // Revoga sessão no servidor em background (best-effort)
-      fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+      // Encerra apenas a sessão Mobile PIN na BD (sem tocar em sessões Web nem apagar a carteira de farmácias)
+      if (prevFarmId && prevOperator) {
+        fetch('/api/mobile/logout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ farmaciaId: prevFarmId, operator: prevOperator }),
+        }).catch(() => {});
+      }
 
-      // Limpar parâmetros de query da URL para não pré-forçar estado anterior
+      // Mantém em /mobile sem query antiga, preservando a carteira local de farmácias no dropdown
       const cleanUrl = window.location.origin + window.location.pathname;
       window.history.replaceState({}, '', cleanUrl);
 
-      const sel = document.getElementById('pinFarmSelect');
-      if (sel && sel.value) {
-        loadPharmacyTeamChips(sel.value);
-      }
-
+      renderPairedPharmacySelect(prevFarmId);
       document.getElementById('pinOverlay').style.display = 'flex';
-      showToast('👋 Sessão terminada. Introduza o seu PIN para entrar.', '#64748b');
+      showToast('🔒 Sessão terminada. Escolha a farmácia e introduza o seu PIN.', '#64748b');
     }
 
     function setOperator(name, memberId) {
@@ -1417,6 +1585,7 @@ export function getMobileStaffHtml(): string {
 
         if (data.ok && data.farmacia) {
           currentFarmacia = data.farmacia;
+          upsertPairedPharmacy(currentFarmacia);
           localStorage.setItem('bi_pharma_mobile_session', JSON.stringify({
             farmacia: currentFarmacia,
             operator: currentOperator,
