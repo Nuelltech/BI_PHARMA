@@ -633,7 +633,7 @@ export async function runCopilotAgentV2(
             },
             body: JSON.stringify({
               model: activeModel,
-              max_tokens: 2048,
+              max_tokens: 4096,
               system: AGENT_V2_SYSTEM_PROMPT,
               messages: [
                 ...messages,
@@ -683,7 +683,7 @@ export async function runCopilotAgentV2(
         },
         body: JSON.stringify({
           model: modelId,
-          max_tokens: 4096,
+          max_tokens: 8192,
           system: [
             {
               type: 'text',
