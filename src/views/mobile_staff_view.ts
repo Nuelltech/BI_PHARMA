@@ -817,20 +817,22 @@ export function getMobileStaffHtml(): string {
       </div>
 
       <div class="form-group">
-        <label>O Teu Nome / Operador</label>
-        <input type="text" id="pinOperatorInput" class="input-operator" placeholder="Ex: Nome do colaborador" />
+        <label>Colaborador Autorizado</label>
+        <input type="text" id="pinOperatorInput" class="input-operator" placeholder="Selecione o seu nome abaixo" readonly />
         <div class="operator-chips" id="operatorChipsContainer">
           <span style="font-size: 0.72rem; color: #94a3b8;">A carregar equipa...</span>
         </div>
       </div>
 
       <div class="form-group" style="text-align: center; margin-top: 14px;">
-        <label>PIN de Acesso (4 dígitos)</label>
+        <label>PIN Pessoal (4 a 6 dígitos)</label>
         <div class="pin-dots">
           <div class="pin-dot" id="dot1"></div>
           <div class="pin-dot" id="dot2"></div>
           <div class="pin-dot" id="dot3"></div>
           <div class="pin-dot" id="dot4"></div>
+          <div class="pin-dot" id="dot5" style="opacity:0.45;"></div>
+          <div class="pin-dot" id="dot6" style="opacity:0.45;"></div>
         </div>
       </div>
 
@@ -846,10 +848,24 @@ export function getMobileStaffHtml(): string {
         <button class="keypad-btn" onclick="pressPin('9')">9</button>
         <button class="keypad-btn action" onclick="clearPin()">Limpar</button>
         <button class="keypad-btn" onclick="pressPin('0')">0</button>
-        <button class="keypad-btn action" onclick="submitPin()" style="color: #38bdf8;">OK ➔</button>
+        <button class="keypad-btn action" id="pinSubmitBtn" onclick="submitPin()" style="color: #38bdf8;">OK ➔</button>
       </div>
 
-      <div class="pin-hint">💡 PIN padrão: <b>1234</b> ou os 4 dígitos do código da farmácia</div>
+      <div class="pin-hint">🔒 Introduza o seu PIN pessoal e prima <b>OK ➔</b></div>
+    </div>
+  </div>
+
+  <!-- Modal In-App de Confirmação de Logout (evita popup nativo do browser) -->
+  <div id="mobileLogoutModal" style="display:none;position:fixed;inset:0;background:rgba(2,6,23,0.75);backdrop-filter:blur(6px);z-index:10050;align-items:center;justify-content:center;padding:20px;">
+    <div style="width:100%;max-width:340px;background:#1e293b;border:1px solid rgba(255,255,255,0.12);border-radius:18px;padding:22px 20px;text-align:center;box-shadow:0 20px 45px rgba(0,0,0,0.55);">
+      <div style="font-size:1.1rem;font-weight:800;color:#f8fafc;margin-bottom:8px;">🚪 Terminar Sessão</div>
+      <div id="mobileLogoutModalText" style="font-size:0.86rem;color:#cbd5e1;line-height:1.45;margin-bottom:18px;">
+        Deseja terminar a sessão e bloquear o acesso por PIN?
+      </div>
+      <div style="display:flex;gap:10px;">
+        <button type="button" onclick="closeMobileLogoutModal()" style="flex:1;padding:11px;border-radius:10px;border:1px solid #475569;background:#0f172a;color:#cbd5e1;font-weight:700;font-size:0.86rem;cursor:pointer;">Cancelar</button>
+        <button type="button" onclick="confirmLogoutMobile()" style="flex:1;padding:11px;border-radius:10px;border:none;background:#e11d48;color:#ffffff;font-weight:800;font-size:0.86rem;cursor:pointer;">Sair</button>
+      </div>
     </div>
   </div>
 
@@ -1226,34 +1242,20 @@ export function getMobileStaffHtml(): string {
 
         const saved = JSON.parse(localStorage.getItem('bi_pharma_mobile_session') || '{}');
 
-        // Se o utilizador abriu um link específico da Farmácia ou foi autenticado:
-        if (targetFarmFromUrl) {
-          currentFarmacia = targetFarmFromUrl;
-          if (accessCode && !currentFarmacia.codigo_acesso) {
-            currentFarmacia.codigo_acesso = accessCode;
+        // Apenas restaura sessão automaticamente se o utilizador já tiver validado o seu PIN pessoal
+        // (Nunca faz auto-login apenas por existir cookie ou parâmetro na URL!)
+        if (saved && saved.pinVerified === true && saved.farmacia && saved.farmacia.id) {
+          // Se abriu um link de outra farmácia, pede novo PIN nessa farmácia
+          if (targetFarmFromUrl && targetFarmFromUrl.id !== saved.farmacia.id) {
+            document.getElementById('pinOverlay').style.display = 'flex';
+            return;
           }
-          if (saved && saved.operator) {
-            currentOperator = saved.operator;
-          }
-          localStorage.setItem('bi_pharma_mobile_session', JSON.stringify({
-            farmacia: currentFarmacia,
-            operator: currentOperator,
-            savedAt: Date.now(),
-          }));
-          document.getElementById('pinOverlay').style.display = 'none';
-          document.getElementById('hdrFarmName').textContent = currentFarmacia.nome;
-          document.getElementById('hdrOperatorName').textContent = currentOperator;
-          loadMobileData();
-          startLiveSync();
+          restoreMobileSession(saved);
           return;
         }
 
-        // Sem link de farmácia no URL: restaura a sessão guardada se existir
-        if (saved && saved.farmacia && saved.farmacia.id) {
-          restoreMobileSession(saved);
-        } else {
-          document.getElementById('pinOverlay').style.display = 'flex';
-        }
+        // Caso contrário, exige sempre seleção do colaborador autorizado + introdução do PIN pessoal
+        document.getElementById('pinOverlay').style.display = 'flex';
       } catch (err) {
         console.error('Erro na inicialização mobile:', err);
         document.getElementById('pinOverlay').style.display = 'flex';
@@ -1272,22 +1274,47 @@ export function getMobileStaffHtml(): string {
 
     function logoutMobile() {
       const nomeFarm = currentFarmacia?.nome || 'esta farmácia';
-      if (confirm('Deseja terminar a sessão na ' + nomeFarm + ' e mudar de farmácia?')) {
-        if (syncInterval) clearInterval(syncInterval);
-        syncInterval = null; if (taskEventSource) { try { taskEventSource.close(); } catch(e) {} taskEventSource = null; }
-        localStorage.removeItem('bi_pharma_mobile_session');
-        currentFarmacia = null;
-        rawReport = null;
-        tasksMap = {};
-        clearPin();
-
-        // Limpar parâmetros de query da URL para não forçar a mesma farmácia após logout
-        const cleanUrl = window.location.origin + window.location.pathname;
-        window.history.replaceState({}, '', cleanUrl);
-
-        document.getElementById('pinOverlay').style.display = 'flex';
-        showToast('👋 Sessão terminada. Pode escolher outra farmácia.', '#64748b');
+      const txtEl = document.getElementById('mobileLogoutModalText');
+      if (txtEl) {
+        txtEl.textContent = 'Deseja terminar a sessão na ' + nomeFarm + ' e bloquear o acesso por PIN?';
       }
+      const modal = document.getElementById('mobileLogoutModal');
+      if (modal) modal.style.display = 'flex';
+    }
+
+    function closeMobileLogoutModal() {
+      const modal = document.getElementById('mobileLogoutModal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    function confirmLogoutMobile() {
+      closeMobileLogoutModal();
+      if (syncInterval) clearInterval(syncInterval);
+      syncInterval = null;
+      if (taskEventSource) {
+        try { taskEventSource.close(); } catch(e) {}
+        taskEventSource = null;
+      }
+      localStorage.removeItem('bi_pharma_mobile_session');
+      currentFarmacia = null;
+      rawReport = null;
+      tasksMap = {};
+      clearPin();
+
+      // Revoga sessão no servidor em background (best-effort)
+      fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+
+      // Limpar parâmetros de query da URL para não pré-forçar estado anterior
+      const cleanUrl = window.location.origin + window.location.pathname;
+      window.history.replaceState({}, '', cleanUrl);
+
+      const sel = document.getElementById('pinFarmSelect');
+      if (sel && sel.value) {
+        loadPharmacyTeamChips(sel.value);
+      }
+
+      document.getElementById('pinOverlay').style.display = 'flex';
+      showToast('👋 Sessão terminada. Introduza o seu PIN para entrar.', '#64748b');
     }
 
     function setOperator(name, memberId) {
@@ -1314,34 +1341,31 @@ export function getMobileStaffHtml(): string {
       try {
         const res = await fetch('/api/mobile/team-members?farmaciaId=' + encodeURIComponent(farmId));
         const data = await res.json();
-        let chipsHtml = '';
         if (data.ok && Array.isArray(data.members) && data.members.length > 0) {
-          chipsHtml = data.members.map(function(m) {
+          container.innerHTML = data.members.map(function(m) {
             return '<span class="operator-chip" data-name="' + escapeHtml(m.nome) + '" data-id="' + escapeHtml(m.id) + '" onclick="handleOperatorChipClick(this)">' + escapeHtml(m.nome) + '</span>';
           }).join('');
 
-          const input = document.getElementById('pinOperatorInput');
-          if (input && (!input.value || input.value === 'Ana' || input.value === 'Balcão 1')) {
-            setOperator(data.members[0].nome, data.members[0].id);
+          // Seleciona o colaborador guardado (se ainda autorizado nesta farmácia) ou o primeiro autorizado
+          const matched = data.members.find(function(m) { return m.nome === currentOperator; }) || data.members[0];
+          if (matched) {
+            setOperator(matched.nome, matched.id);
           }
+        } else {
+          const input = document.getElementById('pinOperatorInput');
+          if (input) input.value = '';
+          selectedMemberId = null;
+          container.innerHTML = '<span style="font-size: 0.75rem; color: #f59e0b;">Nenhum colaborador autorizado nesta farmácia.</span>';
         }
-        chipsHtml += '<span class="operator-chip" data-name="Balcão 1" data-id="" onclick="handleOperatorChipClick(this)">Balcão 1</span>';
-        chipsHtml += '<span class="operator-chip" data-name="Armazém" data-id="" onclick="handleOperatorChipClick(this)">Armazém</span>';
-        container.innerHTML = chipsHtml;
       } catch (err) {
-        container.innerHTML = 
-          '<span class="operator-chip" data-name="Balcão 1" data-id="" onclick="handleOperatorChipClick(this)">Balcão 1</span>' +
-          '<span class="operator-chip" data-name="Armazém" data-id="" onclick="handleOperatorChipClick(this)">Armazém</span>';
+        container.innerHTML = '<span style="font-size: 0.75rem; color: #f87171;">Erro ao carregar lista de colaboradores.</span>';
       }
     }
 
     function pressPin(digit) {
-      if (enteredPin.length < 4) {
+      if (enteredPin.length < 6) {
         enteredPin += digit;
         updatePinDots();
-        if (enteredPin.length === 4) {
-          setTimeout(submitPin, 150);
-        }
       }
     }
 
@@ -1351,22 +1375,37 @@ export function getMobileStaffHtml(): string {
     }
 
     function updatePinDots() {
-      for (let i = 1; i <= 4; i++) {
+      for (let i = 1; i <= 6; i++) {
         const dot = document.getElementById('dot' + i);
+        if (!dot) continue;
         dot.classList.toggle('filled', i <= enteredPin.length);
+        if (i >= 5) {
+          dot.style.opacity = i <= enteredPin.length ? '1' : '0.45';
+        }
+      }
+      const okBtn = document.getElementById('pinSubmitBtn');
+      if (okBtn) {
+        okBtn.style.background = enteredPin.length >= 4 ? '#0284c7' : '#0f172a';
+        okBtn.style.color = enteredPin.length >= 4 ? '#ffffff' : '#38bdf8';
       }
     }
 
     async function submitPin() {
       const farmId = document.getElementById('pinFarmSelect').value;
-      const opName = (document.getElementById('pinOperatorInput').value || '').trim() || 'Equipa';
-      currentOperator = opName;
-      localStorage.setItem('bi_pharma_operator', currentOperator);
+      const opName = (document.getElementById('pinOperatorInput').value || '').trim();
 
-      if (!enteredPin) {
-        showToast('⚠️ Introduza o PIN.', '#e11d48');
+      if (!selectedMemberId || !opName) {
+        showToast('⚠️ Selecione o seu nome na lista de colaboradores.', '#e11d48');
         return;
       }
+
+      if (!enteredPin || enteredPin.length < 4) {
+        showToast('⚠️ Introduza o seu PIN (4 a 6 dígitos).', '#e11d48');
+        return;
+      }
+
+      currentOperator = opName;
+      localStorage.setItem('bi_pharma_operator', currentOperator);
 
       try {
         const res = await fetch('/api/mobile/auth-pin', {
@@ -1381,8 +1420,11 @@ export function getMobileStaffHtml(): string {
           localStorage.setItem('bi_pharma_mobile_session', JSON.stringify({
             farmacia: currentFarmacia,
             operator: currentOperator,
+            memberId: selectedMemberId,
+            pinVerified: true,
             savedAt: Date.now(),
           }));
+          clearPin();
           document.getElementById('pinOverlay').style.display = 'none';
           document.getElementById('hdrFarmName').textContent = currentFarmacia.nome;
           document.getElementById('hdrOperatorName').textContent = currentOperator;

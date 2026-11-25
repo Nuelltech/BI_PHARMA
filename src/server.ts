@@ -691,6 +691,26 @@ async function startServer() {
         return;
       }
 
+      // Redireciona navegação de browser no subdomínio técnico .onrender.com para o domínio oficial (bipharma.nuelltech.com)
+      if (
+        IS_PROD &&
+        req.method === 'GET' &&
+        (pathname === '/' ||
+          pathname === '/mobile' ||
+          pathname === '/login' ||
+          pathname === '/reset-password' ||
+          pathname === '/accept-invite') &&
+        configuredOrigins.length > 0 &&
+        String(req.headers.host || '').toLowerCase().endsWith('.onrender.com')
+      ) {
+        const canonicalBase = configuredOrigins[0].replace(/\/+$/, '');
+        if (!canonicalBase.toLowerCase().includes('.onrender.com')) {
+          res.writeHead(302, { Location: `${canonicalBase}${req.url || pathname}` });
+          res.end();
+          return;
+        }
+      }
+
       async function resolveAccessContext(explicitCode?: string | null) {
         // 0. Verificar sessão moderna por cookie HttpOnly (login Email + Password via auth_service)
         if (!explicitCode && req.headers.cookie) {
