@@ -11644,6 +11644,10 @@ function getDashboardHtml(): string {
       if (typeof renderDesktopCard3 === 'function') renderDesktopCard3(true);
       if (typeof renderDesktopCard4 === 'function') renderDesktopCard4(true);
       if (typeof updateWeeklyTasksCounter === 'function') updateWeeklyTasksCounter();
+      const auditModal = document.getElementById('completedTasksModal');
+      if (auditModal && auditModal.style.display !== 'none' && typeof loadCompletedTasksAudit === 'function') {
+        loadCompletedTasksAudit();
+      }
     }
 
     function initDesktopTasksRealtime(forceReconnect) {
@@ -11790,22 +11794,40 @@ function getDashboardHtml(): string {
     function updateWeeklyTasksCounter() {
       const map = getDoneTasksMap();
       const checkboxes = document.querySelectorAll('.weekly-task-checkbox');
-      let done = 0;
       checkboxes.forEach(cb => {
         const entry = map[cb.dataset.taskId];
         const isDone = typeof entry === 'object' && entry !== null ? !!entry.concluido : !!entry;
         if (isDone) {
           cb.checked = true;
-          done++;
           cb.closest('.weekly-task-item')?.classList.add('task-completed');
         } else {
           cb.checked = false;
           cb.closest('.weekly-task-item')?.classList.remove('task-completed');
         }
       });
+
+      // Contagem real a partir do mapa da semana (independente do filtro "Pendentes" que oculta as concluídas do DOM)
+      let done = 0;
+      for (const k in map) {
+        const entry = map[k];
+        if (typeof entry === 'object' && entry !== null ? !!entry.concluido : !!entry) {
+          done++;
+        }
+      }
+
+      const planTotal =
+        (currentWeeklyPlanData?.card1All?.length || 0) +
+        (currentWeeklyPlanData?.card2?.length || 0) +
+        (currentWeeklyPlanData?.card2Seasonal?.length || 0) +
+        (currentWeeklyPlanData?.card3All?.length || 0) +
+        (currentWeeklyPlanData?.card4All?.length || 0) +
+        (Array.isArray(remoteCustomTasks) ? remoteCustomTasks.length : 0);
+
+      const total = planTotal > 0 ? Math.max(planTotal, done) : Math.max(checkboxes.length, done);
+
       const txt = document.getElementById('planoProgressText');
       if (txt) {
-        txt.textContent = \`✅ \${done} de \${checkboxes.length} tarefas concluídas pela equipa\`;
+        txt.textContent = \`✅ \${done} de \${total} tarefas concluídas pela equipa\`;
       }
     }
 
