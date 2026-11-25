@@ -9180,6 +9180,9 @@ function getDashboardHtml(): string {
         const mainLayout = document.getElementById('mainAppLayout');
         if (gate) gate.style.display = 'none';
         if (mainLayout) mainLayout.style.display = 'flex';
+        if (window.location.pathname === '/login' || window.location.search) {
+          window.history.replaceState({}, document.title, '/');
+        }
         applyRoleUiState(data.role, data.lockedFarmacia);
         dismissInitLoader();
         await loadPharmaciesDropdown();

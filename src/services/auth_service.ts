@@ -222,14 +222,15 @@ export async function loginWithPassword(
     where: { utilizadorId: user.id, estado: 'ATIVO' },
     select: { perfil: true },
   });
-  const mustEnforceMfa = user.isSuperadmin || memberLinks.some((m) => mfaRoles.has(m.perfil));
+  const mustEnforceMfa =
+    !input.allowWithoutMfa && (user.isSuperadmin || memberLinks.some((m) => mfaRoles.has(m.perfil)));
 
   if (mustEnforceMfa || user.totpAtivo) {
     const secret = decryptTotpSecret(user.totpSecretEnc);
 
     // Se perfil exige MFA mas ainda não configurou TOTP:
     if (!user.totpAtivo || !secret) {
-      if (user.isSuperadmin && !input.allowWithoutMfa) {
+      if (user.isSuperadmin) {
         await logSecurityAudit(prisma, {
           evento: 'TOTP_FALHOU',
           utilizadorId: user.id,
