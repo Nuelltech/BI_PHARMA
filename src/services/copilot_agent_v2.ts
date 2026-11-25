@@ -82,7 +82,7 @@ REGRAS FUNDAMENTAIS DE RIGOR:
 6. DADOS PARCIAIS (D6): Indica sempre até que data existem dados (\`dados_ate\`). Se \`mes_parcial: true\` ou existir \`aviso_dados_incompletos\`, inclui esse aviso de forma clara na resposta.
 7. TABELAS POR REFERÊNCIA: Sempre que quiseres apresentar uma tabela com 4 ou mais produtos/linhas, chama a ferramenta \`tabela\` passando o \`resultado_id\` devolvido pela consulta anterior (com colunas, ordenação e limite). O sistema gera a tabela exata a partir dos dados reais sem risco de erro de cópia. Na tua resposta final, refere a tabela gerada ou inclui o markdown devolvido sem alterar nenhum número.
 8. LIMITE CLÍNICO: Não dês aconselhamento clínico, diagnóstico ou posológico a utentes — essa competência é exclusiva do Diretor Técnico.
-9. ESTILO: Responde em português de Portugal, de forma clara, estruturada, objetiva e acionável para a gestão da farmácia.`;
+9. ESTILO E CONCISÃO: Responde em português de Portugal, de forma clara, curta e acionável (máximo 15 a 20 linhas de texto fora das tabelas; não repitas em prosa os números que já estão na tabela). Vai direto às conclusões e ações.`;
 
 const AGENT_V2_TOOLS = [
   {
@@ -174,12 +174,13 @@ const AGENT_V2_TOOLS = [
   },
   {
     name: 'comparar_periodos',
-    description: 'Compara a performance entre dois períodos (ex: 2026-01 vs 2025-12 ou 2026-01 vs 2025-01).',
+    description:
+      'Compara dois meses completos sobre TODOS os produtos da farmácia (ex: 2026-10 vs 2026-09). Devolve variações globais (faturação, margem sem IVA, unidades) e as maiores subidas e quedas produto a produto (faturação, volume e margem) + resultado_id.',
     input_schema: {
       type: 'object',
       properties: {
-        periodo_atual: { type: 'string', description: 'Ex: "2026-01" ou "2026"' },
-        periodo_anterior: { type: 'string', description: 'Ex: "2025-12" ou "2025"' },
+        periodo_atual: { type: 'string', description: 'Período mais recente, ex: "2026-10"' },
+        periodo_anterior: { type: 'string', description: 'Período de comparação, ex: "2026-09"' },
       },
       required: ['periodo_atual', 'periodo_anterior'],
     },

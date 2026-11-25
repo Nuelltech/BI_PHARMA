@@ -121,8 +121,11 @@ export function classificarProdutoUnificado(params: {
     };
   }
 
-  // 6. Abaixo do mínimo (< 14 dias de cobertura com procura relevante)
-  if (diasCobertura < 14 && (vmm >= 1 || (vmm > 0 && ehCronico))) {
+  // 6. Abaixo do mínimo (< 14 dias de cobertura com procura relevante, ou stock = 1 com rotação ativa VMM >= 0.5)
+  if (
+    (diasCobertura < 14 && (vmm >= 1 || ehCronico)) ||
+    (stock <= 1 && vmm >= 0.5)
+  ) {
     return {
       situacao: 'ABAIXO_MINIMO',
       acoes_permitidas: addRever(['REPOR', 'STOCK_MINIMO']),

@@ -2368,6 +2368,8 @@ export async function toolAnalisarEvolucaoMensalFinanceira(
     {
       mes: string;
       faturacaoTotalEur: number;
+      faturacaoSemIvaTotalEur: number;
+      faturacaoSemIvaComCustoEur: number;
       custoTotalEur: number;
       margemBrutaTotalEur: number;
       unidadesTotal: number;
@@ -2389,6 +2391,8 @@ export async function toolAnalisarEvolucaoMensalFinanceira(
       monthlyStats.set(mesKey, {
         mes: mesKey,
         faturacaoTotalEur: 0,
+        faturacaoSemIvaTotalEur: 0,
+        faturacaoSemIvaComCustoEur: 0,
         custoTotalEur: 0,
         margemBrutaTotalEur: 0,
         unidadesTotal: 0,
@@ -2410,12 +2414,14 @@ export async function toolAnalisarEvolucaoMensalFinanceira(
     const pInfo = precoMap.get(v.cnp_codigo);
     const taxaIvaPct = (masterInfo as any)?.taxa_iva ?? (String(masterInfo?.tipo_venda || '').toUpperCase().includes('MSRM') ? 6 : 23);
     const fatSemIva = fat / (1 + taxaIvaPct / 100);
+    st.faturacaoSemIvaTotalEur += fatSemIva;
     const custoUnit: number | null = pInfo && pInfo.custo > 0 ? pInfo.custo : null;
 
     const custoTotalItem = custoUnit !== null ? custoUnit * qtd : 0;
     const margemTotalItem = custoUnit !== null ? fatSemIva - custoTotalItem : 0;
 
     if (custoUnit !== null) {
+      st.faturacaoSemIvaComCustoEur += fatSemIva;
       st.custoTotalEur += custoTotalItem;
       st.margemBrutaTotalEur += margemTotalItem;
     }
@@ -2440,7 +2446,15 @@ export async function toolAnalisarEvolucaoMensalFinanceira(
 
   const mesesFormatados: any[] = [];
   for (const [mes, st] of monthlyStats.entries()) {
-    const margemPct = st.faturacaoTotalEur > 0 ? (st.margemBrutaTotalEur / st.faturacaoTotalEur) * 100 : 0;
+    // Mesma base sem IVA que a margem por produto (apenas artigos com custo real registado)
+    const margemPct =
+      st.faturacaoSemIvaComCustoEur > 0
+        ? (st.margemBrutaTotalEur / st.faturacaoSemIvaComCustoEur) * 100
+        : 0;
+    const coberturaCustoPct =
+      st.faturacaoSemIvaTotalEur > 0
+        ? Math.round((st.faturacaoSemIvaComCustoEur / st.faturacaoSemIvaTotalEur) * 1000) / 10
+        : 0;
 
     const topCategorias = [...st.categoriasMap.entries()]
       .sort((a, b) => b[1] - a[1])
@@ -2465,9 +2479,11 @@ export async function toolAnalisarEvolucaoMensalFinanceira(
     mesesFormatados.push({
       mes,
       faturacaoTotalEur: Math.round(st.faturacaoTotalEur * 100) / 100,
+      faturacaoSemIvaTotalEur: Math.round(st.faturacaoSemIvaTotalEur * 100) / 100,
       custoTotalEur: Math.round(st.custoTotalEur * 100) / 100,
       margemBrutaTotalEur: Math.round(st.margemBrutaTotalEur * 100) / 100,
       margemBrutaPct: Math.round(margemPct * 10) / 10,
+      coberturaCustoPct,
       unidadesTotal: st.unidadesTotal,
       skusDistintos: st.skusSet.size,
       topCategorias,
@@ -2604,12 +2620,17 @@ export async function toolCompararPerformancePeriodos(
   prisma: PrismaClient,
   ctx: ToolSecurityContext,
   args: {
-    periodo_a: string; // ex: "2026-07" ou "outubro 2026"
-    periodo_b: string; // ex: "2026-06" ou "setembro 2026"
+    periodo_a?: string; // ex: "2026-10" ou "outubro 2026"
+    periodo_b?: string; // ex: "2026-09" ou "setembro 2026"
+    periodo_atual?: string;
+    periodo_anterior?: string;
   }
 ) {
-  const pA = normalizePeriodInput(args.periodo_a);
-  const pB = normalizePeriodInput(args.periodo_b);
+  const rawA = args.periodo_a || args.periodo_atual || '';
+  const rawB = args.periodo_b || args.periodo_anterior || '';
+  const pA = normalizePeriodInput(rawA);
+  const pB = normalizePeriodInput(rawB);
+  const freshness = await getPharmacyDataFreshness(prisma, ctx.farmaciaId);
 
   // Executa evolução mensal completa
   const dadosGerais = await toolAnalisarEvolucaoMensalFinanceira(prisma, ctx, { ordenar_por: 'CRONOLOGICO' });
@@ -2619,7 +2640,7 @@ export async function toolCompararPerformancePeriodos(
 
   if (!stA || !stB) {
     return {
-      error: `Um ou ambos os períodos não foram encontrados nos registos da farmácia (${args.periodo_a} -> ${pA}: ${stA ? 'Encontrado' : 'Não encontrado'}, ${args.periodo_b} -> ${pB}: ${stB ? 'Encontrado' : 'Não encontrado'}). Meses disponíveis: ${mesesList.map((m: any) => m.mes).join(', ')}`,
+      error: `Um ou ambos os períodos não foram encontrados nos registos da farmácia (${rawA} -> ${pA}: ${stA ? 'Encontrado' : 'Não encontrado'}, ${rawB} -> ${pB}: ${stB ? 'Encontrado' : 'Não encontrado'}). Meses disponíveis: ${mesesList.map((m: any) => m.mes).join(', ')}`,
     };
   }
 
@@ -2689,10 +2710,22 @@ export async function toolCompararPerformancePeriodos(
     .sort((a, b) => a.variacaoFaturacaoEur - b.variacaoFaturacaoEur)
     .slice(0, 10);
 
-  return {
+  const produtosComMaiorAumentoMargem = [...diffProdutos]
+    .filter((p) => p.variacaoMargemEur > 0)
+    .sort((a, b) => b.variacaoMargemEur - a.variacaoMargemEur)
+    .slice(0, 12);
+
+  const produtosComMaiorQuedaMargem = [...diffProdutos]
+    .filter((p) => p.variacaoMargemEur < 0)
+    .sort((a, b) => a.variacaoMargemEur - b.variacaoMargemEur)
+    .slice(0, 12);
+
+  const resultObj = {
     farmacia: ctx.farmaciaNome,
     periodoA: stA.mes,
     periodoB: stB.mes,
+    totalProdutosComparados: diffProdutos.length,
+    ...freshness,
     comparativo: {
       faturacao: {
         periodoA: stA.faturacaoTotalEur,
@@ -2700,7 +2733,7 @@ export async function toolCompararPerformancePeriodos(
         variacaoEur: deltaFatEur,
         variacaoPct: deltaFatPct,
       },
-      margemBruta: {
+      margemBrutaSemIva: {
         periodoAEur: stA.margemBrutaTotalEur,
         periodoBEur: stB.margemBrutaTotalEur,
         variacaoEur: deltaMargemEur,
@@ -2708,6 +2741,8 @@ export async function toolCompararPerformancePeriodos(
         margemPctA: stA.margemBrutaPct,
         margemPctB: stB.margemBrutaPct,
         variacaoPontosMargem: deltaMargemPontosPct,
+        coberturaCustoPctA: stA.coberturaCustoPct,
+        coberturaCustoPctB: stB.coberturaCustoPct,
       },
       unidades: {
         periodoA: stA.unidadesTotal,
@@ -2721,8 +2756,13 @@ export async function toolCompararPerformancePeriodos(
     produtosComMaiorAumentoVendas,
     produtosComMaiorAumentoVolume,
     produtosComMaiorQuedaVendas,
-    diagnosticoExplicativo: `No comparativo de ${stA.mes} face a ${stB.mes}, a faturação variou €${deltaFatEur > 0 ? '+' : ''}${deltaFatEur} (${deltaFatPct > 0 ? '+' : ''}${deltaFatPct}%), a margem bruta variou €${deltaMargemEur > 0 ? '+' : ''}${deltaMargemEur} (${deltaMargemPct > 0 ? '+' : ''}${deltaMargemPct}%), com uma variação de volume de ${deltaUnid > 0 ? '+' : ''}${deltaUnid} embalagens.`,
+    produtosComMaiorAumentoMargem,
+    produtosComMaiorQuedaMargem,
+    artigos: [...diffProdutos].sort((a, b) => Math.abs(b.variacaoFaturacaoEur) - Math.abs(a.variacaoFaturacaoEur)).slice(0, 50),
   };
+
+  const resultado_id = storeToolResult(ctx.farmaciaId, 'comparar_periodos', resultObj);
+  return { resultado_id, ...resultObj };
 }
 
 // ============================================================================
