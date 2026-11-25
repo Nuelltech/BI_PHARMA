@@ -4021,14 +4021,20 @@ self.addEventListener('fetch', (e) => {
             res.end(JSON.stringify({ ok: false, error: result.error || 'Convite inválido ou expirado.' }));
             return;
           }
-          // Se o convidado definiu PIN, sincronizar com MembroEquipa (para /mobile funcionar logo)
+          // Se o convidado definiu PIN, sincronizar o pinHash real com MembroEquipa (para /mobile validar o PIN escolhido pelo próprio)
           if (pin && result.user?.email && result.farmacia?.id) {
-            await prisma.membroEquipa
-              .updateMany({
-                where: { farmaciaId: result.farmacia.id, email: result.user.email },
-                data: { pin: String(pin).trim() },
-              })
-              .catch(() => {});
+            const existingMe = await prisma.membroEquipa.findFirst({
+              where: {
+                farmaciaId: result.farmacia.id,
+                email: { equals: result.user.email, mode: 'insensitive' },
+              },
+              select: { id: true },
+            });
+            if (existingMe) {
+              await updatePharmacyTeamMember(prisma, result.farmacia.id, existingMe.id, {
+                pin: String(pin).trim(),
+              }).catch(() => {});
+            }
           }
           if (result.rawSessionToken) {
             const secureFlag = IS_PROD ? '; Secure' : '';
