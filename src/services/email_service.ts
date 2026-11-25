@@ -18,8 +18,13 @@ export const DEFAULT_EMAIL_FROM = process.env.EMAIL_FROM || 'BI Pharma <info@bip
 
 function getBaseAppUrl(): string {
   const isProd = process.env.NODE_ENV === 'production';
-  const custom = process.env.ALLOWED_ORIGIN || (isProd ? 'https://bipharma.nuelltech.com' : 'http://localhost:3000');
-  return custom.replace(/\/$/, '');
+  const raw =
+    process.env.APP_URL ||
+    process.env.ALLOWED_ORIGIN ||
+    (isProd ? 'https://bipharma.nuelltech.com' : 'http://localhost:3000');
+  // ALLOWED_ORIGIN pode conter vários domínios separados por vírgula; usar sempre o 1.º domínio canónico
+  const primary = raw.split(',')[0].trim();
+  return primary.replace(/\/$/, '');
 }
 
 export interface SendEmailResult {
@@ -125,11 +130,19 @@ export async function sendPasswordResetEmail(input: {
       Recebemos um pedido para redefinir a password da sua conta no <strong>BI Pharma</strong>.
     </p>
 
-    <div style="text-align: center; margin: 32px 0;">
-      <a href="${resetLink}" style="background-color: #0f172a; color: #ffffff; text-decoration: none; padding: 12px 28px; border-radius: 8px; font-weight: 700; font-size: 14px; display: inline-block;">
-        Redefinir a Minha Password
-      </a>
-    </div>
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" style="margin: 28px auto;">
+      <tr>
+        <td align="center" bgcolor="#0284c7" style="border-radius: 8px; background-color: #0284c7;">
+          <a href="${resetLink}" target="_blank" style="display: inline-block; padding: 13px 28px; font-family: Arial, sans-serif; font-size: 14px; font-weight: 700; color: #ffffff; text-decoration: none; border-radius: 8px;">
+            <span style="color: #ffffff;">Redefinir a Minha Password</span>
+          </a>
+        </td>
+      </tr>
+    </table>
+    <p style="font-size: 12px; color: #64748b; word-break: break-all; margin: 0 0 18px 0;">
+      Se o botão não abrir, copie e cole este endereço no browser:<br />
+      <a href="${resetLink}" style="color: #0284c7;">${resetLink}</a>
+    </p>
 
     <p style="font-size: 13px; color: #64748b; line-height: 1.5;">
       Este link expira dentro de <strong>15 minutos</strong> e apenas pode ser utilizado uma única vez.

@@ -4229,13 +4229,13 @@ self.addEventListener('fetch', (e) => {
   <div class="card">
     <div style="font-size: 0.75rem; font-weight: 800; color: #0284c7; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 8px;">BI PHARMA · NUELLTECH</div>
     <h1>Definir nova palavra-passe</h1>
-    <p>Introduza uma nova palavra-passe segura (mínimo 8 caracteres, incluindo letras e números).</p>
+    <p>Introduza uma nova palavra-passe segura (mínimo 10 caracteres, sem usar o seu nome ou email).</p>
     <div id="msgBox" class="msg"></div>
     <form id="resetForm">
       <label for="pwd1">Nova palavra-passe</label>
-      <input type="password" id="pwd1" autocomplete="new-password" required minlength="8" placeholder="Mínimo 8 caracteres" />
+      <input type="password" id="pwd1" autocomplete="new-password" required minlength="10" placeholder="Mínimo 10 caracteres" />
       <label for="pwd2">Confirmar palavra-passe</label>
-      <input type="password" id="pwd2" autocomplete="new-password" required minlength="8" placeholder="Repita a palavra-passe" />
+      <input type="password" id="pwd2" autocomplete="new-password" required minlength="10" placeholder="Repita a palavra-passe" />
       <button type="submit" id="btnReset">Guardar nova palavra-passe</button>
     </form>
     <div style="margin-top: 18px; text-align: center;">
@@ -4261,7 +4261,7 @@ self.addEventListener('fetch', (e) => {
       const p1 = document.getElementById('pwd1').value;
       const p2 = document.getElementById('pwd2').value;
       if (p1 !== p2) { showMsg('As palavras-passe não coincidem.', true); return; }
-      if (p1.length < 8) { showMsg('A palavra-passe deve ter pelo menos 8 caracteres.', true); return; }
+      if (p1.length < 10) { showMsg('A palavra-passe deve ter pelo menos 10 caracteres.', true); return; }
       btn.disabled = true;
       btn.textContent = 'A guardar...';
       try {
