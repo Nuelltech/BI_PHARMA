@@ -136,9 +136,14 @@ export async function addPharmacyTeamMember(
 ): Promise<{ member: PharmacyTeamMember; temporaryPin?: string }> {
   const cleanEmail = params.email.trim().toLowerCase();
   const cleanNome = params.nome.trim();
-  const memberId = crypto.randomUUID();
 
-  let pinHash: string | null = null;
+  // Se o colaborador já existiu nesta farmácia (ex.: foi removido anteriormente), reativa-o em vez de falhar Unique constraint
+  const existing = await prisma.membroEquipa.findUnique({
+    where: { farmaciaId_email: { farmaciaId, email: cleanEmail } },
+  });
+  const memberId = existing ? existing.id : crypto.randomUUID();
+
+  let pinHash: string | null = existing?.pinHash ?? null;
   let pinTemporario = false;
   let temporaryPin: string | undefined;
 
@@ -155,24 +160,39 @@ export async function addPharmacyTeamMember(
     pinTemporario = true;
   }
 
-  const created = await prisma.membroEquipa.create({
-    data: {
-      id: memberId,
-      farmaciaId,
-      nome: cleanNome,
-      email: cleanEmail,
-      role: params.role || 'AUXILIAR',
-      pin: null,
-      pinHash,
-      pinAlteradoEm: pinHash ? new Date() : null,
-      pinFalhas: 0,
-      pinBloqueadoAte: null,
-      pinTemporario,
-      ativo: true,
-    },
-  });
+  const saved = existing
+    ? await prisma.membroEquipa.update({
+        where: { id: memberId },
+        data: {
+          nome: cleanNome,
+          role: params.role || existing.role || 'AUXILIAR',
+          pin: null,
+          pinHash,
+          pinAlteradoEm: pinHash ? new Date() : existing.pinAlteradoEm,
+          pinFalhas: 0,
+          pinBloqueadoAte: null,
+          pinTemporario,
+          ativo: true,
+        },
+      })
+    : await prisma.membroEquipa.create({
+        data: {
+          id: memberId,
+          farmaciaId,
+          nome: cleanNome,
+          email: cleanEmail,
+          role: params.role || 'AUXILIAR',
+          pin: null,
+          pinHash,
+          pinAlteradoEm: pinHash ? new Date() : null,
+          pinFalhas: 0,
+          pinBloqueadoAte: null,
+          pinTemporario,
+          ativo: true,
+        },
+      });
 
-  return { member: mapMember(created), temporaryPin };
+  return { member: mapMember(saved), temporaryPin };
 }
 
 export async function updatePharmacyTeamMember(

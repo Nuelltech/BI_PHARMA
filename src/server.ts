@@ -8694,8 +8694,8 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
-      <div style="font-size: 0.78rem; color: #059669; font-weight: 700; background: #d1fae5; padding: 8px 12px; border-radius: 8px; margin-bottom: 16px;">
-        🔒 PIN de Acesso da Equipa: <b>1234</b> (ou os 4 dígitos do código da farmácia)
+      <div style="font-size: 0.78rem; color: #0369a1; font-weight: 600; background: #f0f9ff; border: 1px solid #bae6fd; padding: 9px 12px; border-radius: 8px; margin-bottom: 16px;">
+        🔒 Cada colaborador entra com o seu <b>PIN pessoal</b> (definido no convite ou em Configurações → Equipa).
       </div>
 
       <button class="btn btn-secondary" onclick="closeMobileStaffModal()" style="width: 100%; font-size: 0.85rem; padding: 9px;">
@@ -11121,7 +11121,8 @@ function getDashboardHtml(): string {
               '<td style="padding: 10px 14px; color: #475569;">' + escapeHtml(m.email) + '</td>' +
               '<td style="padding: 10px 14px;">' + roleBadge + '</td>' +
               '<td style="padding: 10px 14px; font-family: monospace; font-weight: 700; color: #64748b;">' + escapeHtml(m.pin || '••••') + '</td>' +
-              '<td style="padding: 10px 14px; text-align: right;">' +
+              '<td style="padding: 10px 14px; text-align: right; white-space: nowrap;">' +
+              '<button data-id="' + m.id + '" data-nome="' + escapeHtml(m.nome) + '" onclick="resetTeamMemberPin(this.dataset.id, this.dataset.nome)" style="background: none; border: none; color: #0284c7; cursor: pointer; font-size: 0.8rem; font-weight: 700; margin-right: 12px;">Redefinir PIN</button>' +
               '<button data-id="' + m.id + '" onclick="deleteTeamMember(this.dataset.id)" style="background: none; border: none; color: #e11d48; cursor: pointer; font-size: 0.8rem; font-weight: 700;">Remover</button>' +
               '</td></tr>';
           });
@@ -11189,6 +11190,35 @@ function getDashboardHtml(): string {
         }
       } catch (err) {
         alert('Erro ao enviar pedido.');
+      }
+    }
+
+    async function resetTeamMemberPin(userId, nome) {
+      const novoPin = prompt('Definir novo PIN rápido (4 a 6 dígitos) para ' + (nome || 'este colaborador') + ':');
+      if (novoPin === null) return;
+      const cleanPin = novoPin.trim();
+      if (!/^[0-9]{4,6}$/.test(cleanPin)) {
+        alert('O PIN deve conter entre 4 e 6 dígitos numéricos.');
+        return;
+      }
+      try {
+        const res = await fetch('/api/settings/team/update', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-access-code': activeAccessCode
+          },
+          body: JSON.stringify({ farmaciaId: activeFarmaciaId, userId, updates: { pin: cleanPin } })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          alert('PIN atualizado com sucesso para ' + (nome || 'o colaborador') + '! Já está ativo no acesso Mobile.');
+          loadSettingsTeam();
+        } else {
+          alert('Erro: ' + (data.error || 'Não foi possível atualizar o PIN.'));
+        }
+      } catch (err) {
+        alert('Erro de ligação ao redefinir o PIN.');
       }
     }
 
