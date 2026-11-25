@@ -45,6 +45,13 @@ import { ensureDatabaseReady } from './db';
 import { canVerFaturacao } from './platform/permissoes';
 import { recordCopilotFeedback } from './services/copilot_audit';
 import { runCopilotAgentV2, clearAgentV2Session } from './services/copilot_agent_v2';
+import {
+  loginWithPassword,
+  resolveSessionAndTenant,
+  logoutSession,
+  requestPasswordReset,
+  consumePasswordReset,
+} from './services/auth_service';
 
 process.on('uncaughtException', (err) => {
   console.error('[Server] Uncaught Exception:', err);
@@ -710,6 +717,43 @@ async function startServer() {
       }
 
       async function resolveAccessContext(explicitCode?: string | null) {
+        // 0. Verificar sessão moderna por cookie HttpOnly (login Email + Password via auth_service)
+        if (!explicitCode && req.headers.cookie) {
+          const mSess = req.headers.cookie.match(/(?:^|;\s*)bipharma_session=([^;]+)/i);
+          if (mSess) {
+            let rawSess = '';
+            try { rawSess = decodeURIComponent(mSess[1].trim()); } catch { rawSess = mSess[1].trim(); }
+            if (rawSess && rawSess.length >= 32) {
+              const resolved = await resolveSessionAndTenant(prisma, {
+                rawToken: rawSess,
+                ip: getClientIp(req),
+                userAgent: String(req.headers['user-agent'] || ''),
+              });
+              if (resolved.ok) {
+                if (resolved.ctx.isSuperadmin) {
+                  return {
+                    authenticated: true,
+                    role: 'ADMIN' as const,
+                    code: rawSess,
+                    lockedFarmacia: null,
+                  };
+                }
+                if (resolved.ctx.farmaciaId) {
+                  const f = await prisma.farmacia.findUnique({ where: { id: resolved.ctx.farmaciaId } });
+                  if (f) {
+                    return {
+                      authenticated: true,
+                      role: 'PHARMACY' as const,
+                      code: f.codigo_acesso || f.id,
+                      lockedFarmacia: f,
+                    };
+                  }
+                }
+              }
+            }
+          }
+        }
+
         let authBearer = '';
         if (req.headers.authorization && req.headers.authorization.toLowerCase().startsWith('bearer ')) {
           authBearer = req.headers.authorization.slice(7).trim();
@@ -1625,6 +1669,89 @@ async function startServer() {
         return;
       }
 
+      // 0A.0. Login Profissional Email + Password (via auth_service + cookie HttpOnly)
+      if (pathname === '/api/auth/login-email' && req.method === 'POST') {
+        try {
+          const clientIp = getClientIp(req);
+          if (isRateLimited(clientIp)) {
+            res.writeHead(429, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Demasiadas tentativas falhadas. Aguarde 5 minutos.' }));
+            return;
+          }
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const email = String(parsed.email || '').trim().toLowerCase();
+          const password = String(parsed.password || '');
+          const totpCode = parsed.totpCode ? String(parsed.totpCode).trim() : undefined;
+
+          if (!email || !password) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Introduza o seu email e palavra-passe.' }));
+            return;
+          }
+
+          const loginRes = await loginWithPassword(prisma, {
+            email,
+            password,
+            totpCode,
+            ip: clientIp,
+            userAgent: String(req.headers['user-agent'] || ''),
+          });
+
+          if (!loginRes.ok) {
+            recordFailedAttempt(clientIp);
+            res.writeHead(loginRes.statusCode || 401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+              ok: false,
+              error: loginRes.error || 'Email ou palavra-passe incorretos.',
+              requiresTotp: (loginRes as any).requiresTotp || false,
+            }));
+            return;
+          }
+
+          resetFailedAttempts(clientIp);
+          const secureFlag = IS_PROD ? '; Secure' : '';
+          res.setHeader(
+            'Set-Cookie',
+            `bipharma_session=${encodeURIComponent(loginRes.token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${secureFlag}`
+          );
+
+          const isSuper = Boolean(loginRes.user?.isSuperadmin);
+          const role = isSuper ? 'ADMIN' : 'PHARMACY';
+          const allFarms = isSuper
+            ? await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } })
+            : loginRes.user?.farmaciaAtivaId
+            ? await prisma.farmacia.findMany({ where: { id: loginRes.user.farmaciaAtivaId } })
+            : [];
+          const lockedFarm = !isSuper && allFarms.length > 0 ? allFarms[0] : null;
+
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({
+            ok: true,
+            role,
+            code: '',
+            user: {
+              nome: loginRes.user?.nome || email,
+              email: loginRes.user?.email || email,
+              isSuperadmin: isSuper,
+            },
+            lockedFarmacia: lockedFarm
+              ? { id: lockedFarm.id, nome: lockedFarm.nome, nif: maskNif(lockedFarm.nif) }
+              : null,
+            pharmacies: allFarms.map((f) => ({
+              id: f.id,
+              nome: f.nome,
+              nif: maskNif(f.nif),
+              codigo_acesso: isSuper ? (f.codigo_acesso || f.id) : undefined,
+            })),
+          }));
+        } catch (e: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message || 'Erro ao iniciar sessão.' }));
+        }
+        return;
+      }
+
       // 0A. Endpoint de Autenticação / Validação (Código Exclusivo de Farmácia vs Password de Administrador)
       if (pathname === '/api/auth/verify' && req.method === 'POST') {
         try {
@@ -1737,14 +1864,28 @@ async function startServer() {
         return;
       }
 
-      // 0A.2. Endpoint de Logout Seguro (Revogação Ativa de Sessão Admin no Servidor)
+      // 0A.2. Endpoint de Logout Seguro (Revogação Ativa de Sessão Admin & Email no Servidor)
       if (pathname === '/api/auth/logout' && req.method === 'POST') {
         try {
           const headerToken = String(req.headers['x-access-code'] || '').trim();
           if (headerToken) {
             invalidateAdminSession(headerToken);
           }
+          if (req.headers.cookie) {
+            const mSess = req.headers.cookie.match(/(?:^|;\s*)bipharma_session=([^;]+)/i);
+            if (mSess) {
+              let rawSess = '';
+              try { rawSess = decodeURIComponent(mSess[1].trim()); } catch { rawSess = mSess[1].trim(); }
+              if (rawSess) {
+                await logoutSession(prisma, rawSess, {
+                  ip: getClientIp(req),
+                  userAgent: String(req.headers['user-agent'] || ''),
+                }).catch(() => {});
+              }
+            }
+          }
           res.setHeader('Set-Cookie', [
+            'bipharma_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; HttpOnly; SameSite=Lax',
             'farmacia_access_code=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax',
             'admin_session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; SameSite=Lax'
           ]);
@@ -3907,23 +4048,23 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
-      // 4.7. Recuperação de Password (Esqueci-me da Senha)
+      // 4.7. Recuperação de Password REAL via Resend (auth_service.requestPasswordReset)
       if (pathname === '/api/auth/forgot-password' && req.method === 'POST') {
         try {
           const rawBody = await readRequestBody(req, 32 * 1024);
-          const { email, farmaciaId } = JSON.parse(rawBody || '{}');
+          const { email } = JSON.parse(rawBody || '{}');
           const cleanEmail = String(email || '').trim().toLowerCase();
           if (!cleanEmail || !cleanEmail.includes('@')) {
             throw new Error('Por favor introduza um endereço de email válido.');
           }
-          const token = await createPasswordResetToken(prisma, cleanEmail, farmaciaId);
-          const resetLink = `${getBaseIssuerUrl(req)}/?resetToken=${token}`;
-          console.log(`📧 [Simulação de Envio de Email]: Link de recuperação gerado para ${cleanEmail}: ${resetLink} (válido por 15 min)`);
+          const result = await requestPasswordReset(prisma, cleanEmail, {
+            ip: getClientIp(req),
+            userAgent: String(req.headers['user-agent'] || ''),
+          });
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({
             ok: true,
-            message: 'Se o email constar no sistema, enviámos as instruções de recuperação com validade de 15 minutos.',
-            resetLinkPreview: !IS_PROD ? resetLink : undefined,
+            message: result.message || 'Se o email estiver registado, enviámos as instruções de recuperação.',
           }));
         } catch (e: any) {
           res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -3932,21 +4073,24 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
-      // 4.8. Validação e Redefinição de Nova Senha
+      // 4.8. Validação e Redefinição REAL de Nova Password (auth_service.consumePasswordReset)
       if (pathname === '/api/auth/reset-password' && req.method === 'POST') {
         try {
           const rawBody = await readRequestBody(req, 32 * 1024);
           const { token, newPassword } = JSON.parse(rawBody || '{}');
-          const tokenRecord = await verifyPasswordResetToken(prisma, token);
-          if (!tokenRecord) {
-            throw new Error('O token de recuperação é inválido ou já expirou.');
+          const result = await consumePasswordReset(prisma, {
+            token: String(token || '').trim(),
+            newPassword: String(newPassword || ''),
+            ip: getClientIp(req),
+            userAgent: String(req.headers['user-agent'] || ''),
+          });
+          if (!result.ok) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: result.error || 'Token inválido ou expirado.' }));
+            return;
           }
-          if (!newPassword || newPassword.length < 6) {
-            throw new Error('A nova palavra-passe deve ter pelo menos 6 caracteres.');
-          }
-          await consumePasswordResetToken(prisma, token);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, message: 'Palavra-passe redefinida com sucesso. Pode agora iniciar sessão.' }));
+          res.end(JSON.stringify({ ok: true, message: result.message || 'Palavra-passe redefinida com sucesso. Pode agora iniciar sessão.' }));
         } catch (e: any) {
           res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -4054,6 +4198,99 @@ self.addEventListener('fetch', (e) => {
         res.setHeader('Expires', '0');
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(getDashboardHtml());
+        return;
+      }
+
+      // 5.9. Página dedicada de Redefinição de Password (/reset-password?token=...)
+      if (pathname === '/reset-password' && req.method === 'GET') {
+        const tokenParam = String(parsedUrl.query.token || '').trim();
+        const safeToken = tokenParam.replace(/[^a-zA-Z0-9._-]/g, '');
+        const resetHtml = `<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Redefinir Palavra-Passe — BI Pharma</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #070f1e; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; padding: 20px; box-sizing: border-box; }
+    .card { width: 100%; max-width: 440px; background: #fff; border-radius: 20px; padding: 36px 32px; box-shadow: 0 25px 60px rgba(0,0,0,0.35); }
+    h1 { margin: 0 0 8px 0; font-size: 1.55rem; font-weight: 900; color: #0f172a; }
+    p { margin: 0 0 22px 0; font-size: 0.9rem; color: #64748b; line-height: 1.45; }
+    label { display: block; font-size: 0.78rem; font-weight: 800; color: #334155; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+    input { width: 100%; box-sizing: border-box; padding: 13px 14px; border: 1.5px solid #cbd5e1; border-radius: 10px; font-size: 0.96rem; margin-bottom: 16px; outline: none; }
+    input:focus { border-color: #0284c7; box-shadow: 0 0 0 3px rgba(2,132,199,0.12); }
+    button { width: 100%; padding: 14px; border: none; border-radius: 10px; background: #0f172a; color: #fff; font-size: 0.98rem; font-weight: 800; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .msg { display: none; padding: 12px 14px; border-radius: 10px; font-size: 0.86rem; font-weight: 600; margin-bottom: 16px; }
+    .msg.err { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
+    .msg.ok { background: #dcfce7; color: #15803d; border: 1px solid #86efac; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style="font-size: 0.75rem; font-weight: 800; color: #0284c7; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 8px;">BI PHARMA · NUELLTECH</div>
+    <h1>Definir nova palavra-passe</h1>
+    <p>Introduza uma nova palavra-passe segura (mínimo 8 caracteres, incluindo letras e números).</p>
+    <div id="msgBox" class="msg"></div>
+    <form id="resetForm">
+      <label for="pwd1">Nova palavra-passe</label>
+      <input type="password" id="pwd1" autocomplete="new-password" required minlength="8" placeholder="Mínimo 8 caracteres" />
+      <label for="pwd2">Confirmar palavra-passe</label>
+      <input type="password" id="pwd2" autocomplete="new-password" required minlength="8" placeholder="Repita a palavra-passe" />
+      <button type="submit" id="btnReset">Guardar nova palavra-passe</button>
+    </form>
+    <div style="margin-top: 18px; text-align: center;">
+      <a href="/login" style="color: #0284c7; font-size: 0.85rem; font-weight: 700; text-decoration: none;">← Voltar ao login</a>
+    </div>
+  </div>
+  <script>
+    const token = ${JSON.stringify(safeToken)};
+    const msgBox = document.getElementById('msgBox');
+    const form = document.getElementById('resetForm');
+    const btn = document.getElementById('btnReset');
+    function showMsg(txt, isErr) {
+      msgBox.textContent = txt;
+      msgBox.className = 'msg ' + (isErr ? 'err' : 'ok');
+      msgBox.style.display = 'block';
+    }
+    if (!token) {
+      showMsg('Link de recuperação inválido ou incompleto. Peça uma nova recuperação no ecrã de login.', true);
+      btn.disabled = true;
+    }
+    form.addEventListener('submit', async function(e) {
+      e.preventDefault();
+      const p1 = document.getElementById('pwd1').value;
+      const p2 = document.getElementById('pwd2').value;
+      if (p1 !== p2) { showMsg('As palavras-passe não coincidem.', true); return; }
+      if (p1.length < 8) { showMsg('A palavra-passe deve ter pelo menos 8 caracteres.', true); return; }
+      btn.disabled = true;
+      btn.textContent = 'A guardar...';
+      try {
+        const res = await fetch('/api/auth/reset-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token, newPassword: p1 }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          showMsg(data.error || 'Não foi possível redefinir a palavra-passe.', true);
+          btn.disabled = false;
+          btn.textContent = 'Guardar nova palavra-passe';
+          return;
+        }
+        showMsg('Palavra-passe atualizada com sucesso! A redirecionar para o login...', false);
+        setTimeout(function() { window.location.href = '/login'; }, 1800);
+      } catch (err) {
+        showMsg('Erro de ligação ao servidor.', true);
+        btn.disabled = false;
+        btn.textContent = 'Guardar nova palavra-passe';
+      }
+    });
+  </script>
+</body>
+</html>`;
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(resetHtml);
         return;
       }
 
@@ -7319,39 +7556,92 @@ function getDashboardHtml(): string {
             🔒 Sessão terminada com segurança.
           </div>
 
-          <form onsubmit="event.preventDefault(); submitPharmacyAccessCode();" style="display: flex; flex-direction: column; gap: 18px; text-align: left;">
+          <!-- FORMULÁRIO PRINCIPAL: EMAIL + PASSWORD -->
+          <form id="authEmailLoginForm" onsubmit="event.preventDefault(); submitEmailLogin();" style="display: flex; flex-direction: column; gap: 16px; text-align: left;">
             <div>
-              <label for="authAccessCodeInput" style="font-size: 0.8rem; font-weight: 800; color: #334155; text-transform: uppercase; letter-spacing: 0.6px; display: block; margin-bottom: 8px;">
-                Código da Farmácia
+              <label for="authEmailInput" style="font-size: 0.78rem; font-weight: 800; color: #334155; text-transform: uppercase; letter-spacing: 0.6px; display: block; margin-bottom: 6px;">
+                Email
               </label>
-              <div style="position: relative;">
-                <span style="position: absolute; left: 16px; top: 50%; transform: translateY(-50%); font-size: 1.15rem; color: #94a3b8;">🔑</span>
+              <input
+                type="email"
+                id="authEmailInput"
+                placeholder="nome@farmacia.pt"
+                autocomplete="username"
+                required
+                style="width: 100%; box-sizing: border-box; font-size: 0.96rem; font-weight: 600; padding: 13px 14px; border: 1.5px solid #cbd5e1; border-radius: 12px; outline: none; transition: all 0.2s; background: #f8fafc; color: #0f172a;"
+                onfocus="this.style.borderColor='#0284c7'; this.style.background='#ffffff';"
+                onblur="this.style.borderColor='#cbd5e1'; this.style.background='#f8fafc';"
+              />
+            </div>
+
+            <div>
+              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                <label for="authPasswordInput" style="font-size: 0.78rem; font-weight: 800; color: #334155; text-transform: uppercase; letter-spacing: 0.6px;">
+                  Palavra-passe
+                </label>
+                <button type="button" onclick="toggleForgotPasswordBox(true)" style="background: none; border: none; color: #0284c7; font-size: 0.78rem; font-weight: 700; cursor: pointer; padding: 0;">
+                  Esqueci-me da password?
+                </button>
+              </div>
+              <input
+                type="password"
+                id="authPasswordInput"
+                placeholder="••••••••"
+                autocomplete="current-password"
+                required
+                style="width: 100%; box-sizing: border-box; font-size: 0.96rem; font-weight: 600; padding: 13px 14px; border: 1.5px solid #cbd5e1; border-radius: 12px; outline: none; transition: all 0.2s; background: #f8fafc; color: #0f172a;"
+                onfocus="this.style.borderColor='#0284c7'; this.style.background='#ffffff';"
+                onblur="this.style.borderColor='#cbd5e1'; this.style.background='#f8fafc';"
+              />
+            </div>
+
+            <div id="authGateError" style="display: none; font-size: 0.84rem; color: #dc2626; background: #fee2e2; border: 1px solid #fca5a5; padding: 11px 14px; border-radius: 10px; text-align: center; font-weight: 600;"></div>
+
+            <button type="submit" id="btnSubmitEmailLogin" style="width: 100%; padding: 14px; font-size: 0.98rem; font-weight: 800; display: flex; align-items: center; justify-content: center; gap: 8px; background: #0f172a; color: #ffffff; border-radius: 12px; border: none; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.25);">
+              Entrar no Painel <span style="font-size: 1.1rem;">→</span>
+            </button>
+          </form>
+
+          <!-- RECUPERAÇÃO DE PASSWORD INLINE (OCULTA POR DEFEITO) -->
+          <div id="authForgotBox" style="display: none; text-align: left;">
+            <p style="font-size: 0.86rem; color: #475569; margin: 0 0 14px 0; line-height: 1.45;">
+              Introduza o email da sua conta. Enviaremos um link seguro para redefinir a palavra-passe.
+            </p>
+            <input
+              type="email"
+              id="authForgotEmailInput"
+              placeholder="nome@farmacia.pt"
+              style="width: 100%; box-sizing: border-box; font-size: 0.96rem; font-weight: 600; padding: 13px 14px; border: 1.5px solid #cbd5e1; border-radius: 12px; outline: none; background: #f8fafc; color: #0f172a; margin-bottom: 12px;"
+            />
+            <div id="authForgotMsg" style="display: none; font-size: 0.83rem; padding: 10px 12px; border-radius: 10px; margin-bottom: 12px; font-weight: 600;"></div>
+            <button type="button" id="btnSendResetEmail" onclick="submitInlineForgotPassword()" style="width: 100%; padding: 13px; font-size: 0.94rem; font-weight: 800; background: #0284c7; color: #ffffff; border-radius: 12px; border: none; cursor: pointer; margin-bottom: 10px;">
+              Enviar email de recuperação
+            </button>
+            <button type="button" onclick="toggleForgotPasswordBox(false)" style="width: 100%; padding: 8px; font-size: 0.82rem; font-weight: 700; background: none; color: #64748b; border: none; cursor: pointer;">
+              ← Voltar ao login
+            </button>
+          </div>
+
+          <!-- OPÇÃO DISCRETA LEGADA: CÓDIGO DA FARMÁCIA (TEMPORÁRIO DURANTE TRANSIÇÃO) -->
+          <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #f1f5f9; text-align: center;">
+            <button type="button" onclick="toggleLegacyCodeBox()" style="background: none; border: none; color: #64748b; font-size: 0.78rem; font-weight: 600; cursor: pointer; text-decoration: underline;">
+              Acesso alternativo com código da farmácia
+            </button>
+            <form id="authLegacyCodeForm" onsubmit="event.preventDefault(); submitPharmacyAccessCode();" style="display: none; margin-top: 12px; text-align: left;">
+              <div style="display: flex; gap: 8px;">
                 <input
                   type="text"
                   id="authAccessCodeInput"
                   placeholder="EX: FARM-A-279188"
                   autocomplete="organization"
-                  style="width: 100%; box-sizing: border-box; font-size: 1rem; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; padding: 14px 16px 14px 44px; border: 1.5px solid #cbd5e1; border-radius: 12px; outline: none; transition: all 0.2s; background: #f8fafc; color: #0f172a;"
-                  onfocus="this.style.borderColor='#0284c7'; this.style.background='#ffffff'; this.style.boxShadow='0 0 0 4px rgba(2, 132, 199, 0.1)';"
-                  onblur="this.style.borderColor='#cbd5e1'; this.style.background='#f8fafc'; this.style.boxShadow='none';"
-                  onkeydown="if(event.key==='Enter') submitPharmacyAccessCode()"
+                  style="flex: 1; box-sizing: border-box; font-size: 0.88rem; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; padding: 10px 12px; border: 1.5px solid #cbd5e1; border-radius: 10px; outline: none; background: #f8fafc; color: #0f172a;"
                 />
+                <button type="submit" id="btnSubmitPharmacy" style="padding: 10px 14px; font-size: 0.84rem; font-weight: 700; background: #334155; color: #fff; border: none; border-radius: 10px; cursor: pointer;">
+                  Entrar
+                </button>
               </div>
-            </div>
-
-            <div style="display: flex; align-items: center; justify-content: space-between; font-size: 0.82rem;">
-              <label style="display: flex; align-items: center; gap: 8px; color: #475569; font-weight: 600; cursor: pointer;">
-                <input type="checkbox" id="authRememberPharmacy" checked style="accent-color: #0f172a; width: 16px; height: 16px; border-radius: 4px;" />
-                Lembrar este dispositivo
-              </label>
-            </div>
-
-            <div id="authGateError" style="display: none; font-size: 0.84rem; color: #dc2626; background: #fee2e2; border: 1px solid #fca5a5; padding: 11px 14px; border-radius: 10px; text-align: center; font-weight: 600;"></div>
-
-            <button type="submit" id="btnSubmitPharmacy" style="width: 100%; padding: 15px; font-size: 1rem; font-weight: 800; display: flex; align-items: center; justify-content: center; gap: 8px; background: #0f172a; color: #ffffff; border-radius: 12px; border: none; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.25);">
-              Entrar no Painel <span style="font-size: 1.1rem;">→</span>
-            </button>
-          </form>
+            </form>
+          </div>
 
           <!-- BADGE DE SEGURANÇA -->
           <div style="margin-top: 26px; padding-top: 20px; border-top: 1px solid #f1f5f9; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 0.78rem; color: #0284c7; font-weight: 700;">
@@ -8838,6 +9128,107 @@ function getDashboardHtml(): string {
       }
     }
 
+    function toggleForgotPasswordBox(show) {
+      const loginForm = document.getElementById('authEmailLoginForm');
+      const forgotBox = document.getElementById('authForgotBox');
+      const msg = document.getElementById('authForgotMsg');
+      if (loginForm) loginForm.style.display = show ? 'none' : 'flex';
+      if (forgotBox) forgotBox.style.display = show ? 'block' : 'none';
+      if (msg) msg.style.display = 'none';
+      if (show) {
+        const emailVal = (document.getElementById('authEmailInput')?.value || '').trim();
+        const fInput = document.getElementById('authForgotEmailInput');
+        if (fInput && emailVal) fInput.value = emailVal;
+      }
+    }
+
+    function toggleLegacyCodeBox() {
+      const form = document.getElementById('authLegacyCodeForm');
+      if (form) form.style.display = form.style.display === 'none' ? 'block' : 'none';
+    }
+
+    async function submitEmailLogin() {
+      const email = (document.getElementById('authEmailInput')?.value || '').trim().toLowerCase();
+      const password = document.getElementById('authPasswordInput')?.value || '';
+      const errEl = document.getElementById('authGateError');
+      const btn = document.getElementById('btnSubmitEmailLogin');
+      if (errEl) errEl.style.display = 'none';
+      if (!email || !password) {
+        if (errEl) { errEl.textContent = 'Introduza o seu email e palavra-passe.'; errEl.style.display = 'block'; }
+        return;
+      }
+      if (btn) { btn.disabled = true; btn.textContent = 'A autenticar...'; }
+      try {
+        const res = await fetch('/api/auth/login-email', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          if (errEl) { errEl.textContent = data.error || 'Email ou palavra-passe incorretos.'; errEl.style.display = 'block'; }
+          if (btn) { btn.disabled = false; btn.innerHTML = 'Entrar no Painel <span style="font-size: 1.1rem;">→</span>'; }
+          return;
+        }
+        activeAuthRole = data.role;
+        localStorage.setItem('bi_pharma_auth_role', data.role);
+        if (data.lockedFarmacia) {
+          activeFarmaciaId = data.lockedFarmacia.id;
+          localStorage.setItem('bi_pharma_farmacia_id', activeFarmaciaId);
+        }
+        const gate = document.getElementById('authGateModal');
+        const mainLayout = document.getElementById('mainAppLayout');
+        if (gate) gate.style.display = 'none';
+        if (mainLayout) mainLayout.style.display = 'flex';
+        applyRoleUiState(data.role, data.lockedFarmacia);
+        dismissInitLoader();
+        await loadPharmaciesDropdown();
+      } catch (e) {
+        if (errEl) { errEl.textContent = 'Erro de ligação ao servidor.'; errEl.style.display = 'block'; }
+      } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = 'Entrar no Painel <span style="font-size: 1.1rem;">→</span>'; }
+      }
+    }
+
+    async function submitInlineForgotPassword() {
+      const email = (document.getElementById('authForgotEmailInput')?.value || '').trim().toLowerCase();
+      const msg = document.getElementById('authForgotMsg');
+      const btn = document.getElementById('btnSendResetEmail');
+      if (!email || !email.includes('@')) {
+        if (msg) {
+          msg.style.display = 'block';
+          msg.style.background = '#fee2e2';
+          msg.style.color = '#b91c1c';
+          msg.textContent = 'Introduza um endereço de email válido.';
+        }
+        return;
+      }
+      if (btn) { btn.disabled = true; btn.textContent = 'A enviar...'; }
+      try {
+        const res = await fetch('/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email }),
+        });
+        const data = await res.json();
+        if (msg) {
+          msg.style.display = 'block';
+          msg.style.background = res.ok && data.ok ? '#dcfce7' : '#fee2e2';
+          msg.style.color = res.ok && data.ok ? '#15803d' : '#b91c1c';
+          msg.textContent = data.message || data.error || 'Pedido enviado.';
+        }
+      } catch (e) {
+        if (msg) {
+          msg.style.display = 'block';
+          msg.style.background = '#fee2e2';
+          msg.style.color = '#b91c1c';
+          msg.textContent = 'Erro ao enviar pedido de recuperação.';
+        }
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Enviar email de recuperação'; }
+      }
+    }
+
     async function initPharmacies() {
       const urlParams = new URLSearchParams(window.location.search);
       const isLogout = urlParams.get('logout') === '1';
@@ -8859,6 +9250,10 @@ function getDashboardHtml(): string {
         openAuthGateModal(isLogout ? 'Sessão terminada com segurança.' : null, 'PHARMACY');
         return;
       }
+
+      // 0.5. Tentar restaurar sessão ativa via cookie HttpOnly (bipharma_session de login Email + Password)
+      const sessionOk = await verifyAndActivateAccessCode({}, false, 'PHARMACY');
+      if (sessionOk) return;
 
       const urlCode = urlParams.get('acesso') || urlParams.get('accessCode');
       const isAdminRoute = window.location.pathname === '/admin' || urlParams.get('admin') === '1';
