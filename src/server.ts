@@ -157,46 +157,20 @@ import { computePackCompositionHash } from './services/comercial';
 import { verifyPasswordScrypt } from './services/auth_crypto';
 import { logSecurityAudit } from './services/audit_service';
 import { resolveSessionAndTenant } from './services/auth_service';
+import {
+  subscribeFarmaciaEvents,
+  broadcastFarmaciaEvent,
+  getFarmaciaSyncVersion,
+  RealtimeEventPayload,
+} from './services/realtime_events';
 
 const customWeeklyTasksStore = new Map<string, any[]>();
 const customPacksStore = new Map<string, any[]>();
 const customRejectedPacksStore = new Map<string, Set<string>>();
-// ============================================================================
-// SINCRONIZAÇÃO EM TEMPO REAL MULTI-DISPOSITIVO (SSE PUBSUB POR FARMÁCIA)
-// ============================================================================
-interface TaskStreamClient {
-  id: string;
-  farmaciaId: string;
-  res: http.ServerResponse;
-  clientIp: string;
-}
-const taskStreamClients = new Set<TaskStreamClient>();
 
-export function broadcastTaskUpdate(farmaciaId: string, eventData: any): void {
-  if (!farmaciaId) return;
-  const payload = `event: task_update\ndata: ${JSON.stringify(eventData)}\n\n`;
-  for (const client of Array.from(taskStreamClients)) {
-    if (client.farmaciaId === farmaciaId) {
-      try {
-        client.res.write(payload);
-      } catch (err) {
-        taskStreamClients.delete(client);
-      }
-    }
-  }
+export function broadcastTaskUpdate(farmaciaId: string, eventData: RealtimeEventPayload): void {
+  broadcastFarmaciaEvent(farmaciaId, eventData);
 }
-
-// Keep-alive heartbeat a cada 20s para manter conexões ativas através de proxies/Cloudflare
-setInterval(() => {
-  const comment = `: keepalive ${Date.now()}\n\n`;
-  for (const client of Array.from(taskStreamClients)) {
-    try {
-      client.res.write(comment);
-    } catch {
-      taskStreamClients.delete(client);
-    }
-  }
-}, 20000);
 
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -2562,6 +2536,13 @@ async function startServer() {
             criadoPor: parsed.criadoPor || 'Diretor',
             tarefasPersonalizadas: Array.isArray(parsed.tarefasPersonalizadas) ? parsed.tarefasPersonalizadas : undefined,
           });
+          if ((resActivate as any)?.success !== false) {
+            broadcastFarmaciaEvent(activeFarmacia.id, {
+              type: 'CAMPAIGNS_CHANGED',
+              titulo: String(parsed.titulo || 'Campanha Comercial'),
+              actor: parsed.criadoPor || 'Diretor',
+            });
+          }
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(resActivate));
         } catch (e: any) {
@@ -2587,6 +2568,12 @@ async function startServer() {
             produtos: Array.isArray(parsed.produtos) ? parsed.produtos : undefined,
             atualizarTarefas: parsed.atualizarTarefas !== false,
           });
+          if (resUpdate.success) {
+            broadcastFarmaciaEvent(activeFarmacia.id, {
+              type: 'CAMPAIGNS_CHANGED',
+              titulo: parsed.titulo || undefined,
+            });
+          }
           res.writeHead(resUpdate.success ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(resUpdate));
         } catch (e: any) {
@@ -2667,6 +2654,11 @@ async function startServer() {
             String(parsed.campanhaId || ''),
             parsed.estado === 'CANCELADA' ? 'CANCELADA' : 'CONCLUIDA'
           );
+          if ((resDeact as any)?.success !== false) {
+            broadcastFarmaciaEvent(activeFarmacia.id, {
+              type: 'CAMPAIGNS_CHANGED',
+            });
+          }
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(resDeact));
         } catch (e: any) {
@@ -3616,43 +3608,33 @@ async function startServer() {
       }
 
       
-      // 2.5H2. Endpoint SSE para Sincronização em Tempo Real de Tarefas
+      // 2.5H2. Endpoint SSE para Sincronização em Tempo Real de Tarefas e Campanhas
       if (pathname === '/api/weekly-tasks/stream' && req.method === 'GET') {
         try {
           const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
           const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          const clientId = String(parsedUrl.query.clientId || '').trim();
+          const channel = parsedUrl.query.channel === 'mobile' ? 'mobile' : 'desktop';
 
-          res.writeHead(200, {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-cache, no-transform',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-            'X-Accel-Buffering': 'no',
+          subscribeFarmaciaEvents(activeFarmacia.id, req, res, {
+            clientId: clientId || undefined,
+            channel,
           });
-          res.write(': connected\n\n');
+        } catch (e: any) {
+          const status = e.statusCode || 500;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
 
-          const clientId = 'sse_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
-          const cip = getClientIp(req);
-
-          // Fechar conexões órfãs anteriores do mesmo cliente para evitar esgotamento de sockets
-          for (const c of Array.from(taskStreamClients)) {
-            if (c.farmaciaId === activeFarmacia.id && c.clientIp === cip) {
-              try { c.res.end(); } catch {}
-              taskStreamClients.delete(c);
-            }
-          }
-
-          const clientObj: TaskStreamClient = {
-            id: clientId,
-            farmaciaId: activeFarmacia.id,
-            res,
-            clientIp: cip,
-          };
-          taskStreamClients.add(clientObj);
-
-          req.on('close', () => {
-            taskStreamClients.delete(clientObj);
-          });
+      // 2.5H3. Endpoint ultra-leve (memória, 0 queries BD) para verificar versão de sincronização
+      if (pathname === '/api/sync/version' && req.method === 'GET') {
+        try {
+          const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+          const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ok: true, farmaciaId: activeFarmacia.id, version: getFarmaciaSyncVersion(activeFarmacia.id) }));
         } catch (e: any) {
           const status = e.statusCode || 500;
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -3710,11 +3692,11 @@ async function startServer() {
         return;
       }
 
-      // 2.5J. Endpoint Toggle Tarefa Semanal (Supabase Sync)
+      // 2.5J. Endpoint Toggle Tarefa Semanal (Supabase Sync + Anti-Colisão + SSE)
       if (pathname === '/api/weekly-tasks/toggle' && req.method === 'POST') {
         try {
           const rawBody = await readRequestBody(req, 128 * 1024);
-          const { farmaciaId, taskId, concluido, concluido_por, categoria, cnp_codigo, designacao, valor_impacto } = JSON.parse(rawBody || '{}');
+          const { farmaciaId, taskId, concluido, concluido_por, categoria, cnp_codigo, designacao, valor_impacto, actorClientId } = JSON.parse(rawBody || '{}');
           const farmIdQuery = String(farmaciaId || '').trim();
           const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
           const cleanConcluidoPor = String(concluido_por || 'Equipa').trim().slice(0, 50);
@@ -3728,19 +3710,35 @@ async function startServer() {
             designacao,
             valor_impacto: valor_impacto !== undefined ? Number(valor_impacto) : undefined,
           });
-          broadcastTaskUpdate(activeFarmacia.id, {
-            type: 'TOGGLE',
-            taskId,
-            concluido: !!concluido,
-            concluido_por: cleanConcluidoPor,
-            concluido_em: saved?.concluido_em ? saved.concluido_em.toISOString() : new Date().toISOString(),
-            categoria,
-            cnp_codigo,
-            designacao,
-            valor_impacto: valor_impacto !== undefined ? Number(valor_impacto) : undefined,
-          });
+          const alreadyCompleted = Boolean((saved as any)?.__alreadyCompleted);
+          const effectiveActor = alreadyCompleted ? String(saved?.concluido_por || cleanConcluidoPor) : cleanConcluidoPor;
+          const effectiveTime = saved?.concluido_em ? new Date(saved.concluido_em).toISOString() : new Date().toISOString();
+
+          if (!alreadyCompleted) {
+            broadcastTaskUpdate(activeFarmacia.id, {
+              type: 'TOGGLE',
+              taskId,
+              concluido: !!concluido,
+              concluido_por: effectiveActor,
+              concluido_em: effectiveTime,
+              categoria,
+              cnp_codigo,
+              designacao,
+              valor_impacto: valor_impacto !== undefined ? Number(valor_impacto) : undefined,
+              actorClientId: actorClientId ? String(actorClientId).slice(0, 64) : undefined,
+            });
+          }
+
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, task: saved }));
+          res.end(
+            JSON.stringify({
+              ok: true,
+              task: saved,
+              alreadyCompleted,
+              alreadyCompletedBy: alreadyCompleted ? effectiveActor : null,
+              alreadyCompletedAt: alreadyCompleted ? effectiveTime : null,
+            })
+          );
         } catch (e: any) {
           const status = e.statusCode || 500;
           res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -6381,6 +6379,10 @@ function getDashboardHtml(): string {
             </p>
           </div>
           <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <span id="desktopLiveSyncBadge" title="Sincronização automática em tempo real entre Web e Mobile" style="display: inline-flex; align-items: center; gap: 6px; font-size: 0.76rem; font-weight: 700; color: #065f46; background: #ecfdf5; border: 1px solid #a7f3d0; padding: 6px 10px; border-radius: 999px;">
+              <span id="desktopLiveSyncDot" style="width: 8px; height: 8px; border-radius: 50%; background: #94a3b8; display: inline-block;"></span>
+              <span id="desktopLiveSyncLabel">A ligar...</span>
+            </span>
             <button id="planoProgressText" class="btn" onclick="openCompletedTasksModal()" title="Clique para abrir histórico de auditoria e tarefas concluídas" style="cursor: pointer; transition: all 0.2s; font-size: 0.84rem; color: #065f46; font-weight: 700; background: #d1fae5; padding: 7px 14px; border-radius: 8px; border: 1px solid #a7f3d0; box-shadow: 0 1px 2px rgba(0,0,0,0.05); display: inline-flex; align-items: center; gap: 6px;">
               ✅ 0 de 0 tarefas concluídas
             </button>
@@ -9171,6 +9173,13 @@ function getDashboardHtml(): string {
 
     function updateActiveUserBadge(userObj, role) {
       const el = document.getElementById('activeUserBadge');
+      if (userObj && (userObj.nome || userObj.email)) {
+        window.currentActiveUserName = userObj.nome || userObj.email;
+      } else if (role === 'ADMIN') {
+        window.currentActiveUserName = 'Administrador';
+      } else {
+        window.currentActiveUserName = '';
+      }
       if (!el) return;
       if (userObj && (userObj.nome || userObj.email)) {
         const icon = userObj.isSuperadmin || role === 'ADMIN' ? '👑' : '👤';
@@ -10481,6 +10490,7 @@ function getDashboardHtml(): string {
       activeFarmaciaId = document.getElementById('farmaciaSelector').value;
       localStorage.setItem('bi_pharma_farmacia_id', activeFarmaciaId);
       currentCampaignSuggestions = [];
+      initDesktopTasksRealtime();
       loadAnalysis();
     }
 
@@ -10858,9 +10868,10 @@ function getDashboardHtml(): string {
       const current = map[taskId];
       const isDone = typeof current === 'object' ? !!current.concluido : !!current;
       const nextDone = !isDone;
+      const actorName = (window.currentActiveUserName && String(window.currentActiveUserName).trim()) || 'Desktop (Balcão)';
 
       if (nextDone) {
-        map[taskId] = { concluido: true, concluido_por: 'Desktop (Balcão)', concluido_em: new Date().toISOString() };
+        map[taskId] = { concluido: true, concluido_por: actorName, concluido_em: new Date().toISOString() };
       } else {
         delete map[taskId];
       }
@@ -10875,20 +10886,37 @@ function getDashboardHtml(): string {
       updateWeeklyTasksCounter();
 
       try {
-        await fetch('/api/weekly-tasks/toggle', {
+        const res = await fetch('/api/weekly-tasks/toggle', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             farmaciaId: activeFarmaciaId,
             taskId: taskId,
             concluido: nextDone,
-            concluido_por: 'Desktop (Balcão)',
+            concluido_por: actorName,
             categoria: categoria || 'GERAL',
             cnp_codigo: cnp,
             designacao: designacao,
-            valor_impacto: valor
+            valor_impacto: valor,
+            actorClientId: desktopRealtimeClientId
           })
         });
+        const data = await res.json().catch(() => ({}));
+        if (data && data.alreadyCompleted && data.alreadyCompletedBy) {
+          remoteDoneTasksMap[taskId] = {
+            concluido: true,
+            concluido_por: data.alreadyCompletedBy,
+            concluido_em: data.alreadyCompletedAt || new Date().toISOString()
+          };
+          localStorage.setItem('bi_pharma_weekly_done_' + activeFarmaciaId, JSON.stringify(remoteDoneTasksMap));
+          renderPlanoCustomTasks();
+          renderDesktopCard1(true);
+          renderDesktopCard2(true);
+          renderDesktopCard3(true);
+          renderDesktopCard4(true);
+          updateWeeklyTasksCounter();
+          showDesktopRealtimeToast('ℹ️ Já concluída por ' + data.alreadyCompletedBy, '#0284c7');
+        }
       } catch (e) {
         console.error('Erro ao sincronizar tarefa com a BD:', e);
       }
@@ -11511,29 +11539,127 @@ function getDashboardHtml(): string {
     }
 
     
+    const desktopRealtimeClientId = 'desk_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
     let desktopTasksEventSource = null;
     let desktopTasksFarmaciaId = null;
+    let desktopLastSyncVersion = -1;
+    let desktopReconnectTimer = null;
+    let desktopSyncDebounceTimer = null;
+    let desktopToastTimer = null;
 
-    function initDesktopTasksRealtime() {
+    function setDesktopLiveSyncStatus(state) {
+      const dot = document.getElementById('desktopLiveSyncDot');
+      const label = document.getElementById('desktopLiveSyncLabel');
+      const badge = document.getElementById('desktopLiveSyncBadge');
+      if (!dot || !label || !badge) return;
+      if (state === 'live') {
+        dot.style.background = '#10b981';
+        dot.style.boxShadow = '0 0 8px rgba(16,185,129,0.7)';
+        label.textContent = 'Em direto';
+        badge.style.color = '#065f46';
+        badge.style.background = '#ecfdf5';
+        badge.style.borderColor = '#a7f3d0';
+      } else if (state === 'reconnecting') {
+        dot.style.background = '#f59e0b';
+        dot.style.boxShadow = '0 0 6px rgba(245,158,11,0.6)';
+        label.textContent = 'A reconectar...';
+        badge.style.color = '#92400e';
+        badge.style.background = '#fffbeb';
+        badge.style.borderColor = '#fde68a';
+      } else {
+        dot.style.background = '#94a3b8';
+        dot.style.boxShadow = 'none';
+        label.textContent = 'A ligar...';
+      }
+    }
+
+    function showDesktopRealtimeToast(message, bgColor) {
+      let el = document.getElementById('desktopRealtimeToast');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'desktopRealtimeToast';
+        el.style.cssText = 'position:fixed;bottom:22px;right:22px;z-index:99999;max-width:360px;padding:10px 16px;border-radius:10px;color:#ffffff;font-size:0.84rem;font-weight:700;box-shadow:0 10px 25px rgba(15,23,42,0.28);transition:opacity 0.25s ease,transform 0.25s ease;opacity:0;transform:translateY(10px);pointer-events:none;';
+        document.body.appendChild(el);
+      }
+      el.textContent = message;
+      el.style.background = bgColor || '#059669';
+      el.style.opacity = '1';
+      el.style.transform = 'translateY(0)';
+      if (desktopToastTimer) clearTimeout(desktopToastTimer);
+      desktopToastTimer = setTimeout(function() {
+        el.style.opacity = '0';
+        el.style.transform = 'translateY(10px)';
+      }, 3200);
+    }
+
+    function scheduleDesktopTasksRefresh(includeCampaigns) {
+      if (desktopSyncDebounceTimer) clearTimeout(desktopSyncDebounceTimer);
+      desktopSyncDebounceTimer = setTimeout(function() {
+        if (typeof fetchWeeklyTasksFromDb === 'function') fetchWeeklyTasksFromDb();
+        if (includeCampaigns && typeof loadActiveCampaigns === 'function') loadActiveCampaigns();
+      }, 220);
+    }
+
+    function rerenderDesktopTaskViewsPreserveScroll() {
+      if (typeof renderPlanoCustomTasks === 'function') renderPlanoCustomTasks();
+      if (typeof renderDesktopCard1 === 'function') renderDesktopCard1(true);
+      if (typeof renderDesktopCard2 === 'function') renderDesktopCard2(true);
+      if (typeof renderDesktopCard3 === 'function') renderDesktopCard3(true);
+      if (typeof renderDesktopCard4 === 'function') renderDesktopCard4(true);
+      if (typeof updateWeeklyTasksCounter === 'function') updateWeeklyTasksCounter();
+    }
+
+    function initDesktopTasksRealtime(forceReconnect) {
       if (!activeFarmaciaId || typeof EventSource === 'undefined') return;
-      if (desktopTasksEventSource && desktopTasksFarmaciaId === activeFarmaciaId) return;
+      if (desktopReconnectTimer) {
+        clearTimeout(desktopReconnectTimer);
+        desktopReconnectTimer = null;
+      }
+      if (!forceReconnect && desktopTasksEventSource && desktopTasksFarmaciaId === activeFarmaciaId && desktopTasksEventSource.readyState !== 2) {
+        return;
+      }
       if (desktopTasksEventSource) {
         try { desktopTasksEventSource.close(); } catch(e) {}
         desktopTasksEventSource = null;
       }
       desktopTasksFarmaciaId = activeFarmaciaId;
+      setDesktopLiveSyncStatus('connecting');
       try {
-        const es = new EventSource('/api/weekly-tasks/stream?farmaciaId=' + encodeURIComponent(activeFarmaciaId));
+        const url = '/api/weekly-tasks/stream?farmaciaId=' + encodeURIComponent(activeFarmaciaId) + '&channel=desktop&clientId=' + encodeURIComponent(desktopRealtimeClientId);
+        const es = new EventSource(url);
         desktopTasksEventSource = es;
+
+        es.addEventListener('connected', function(e) {
+          setDesktopLiveSyncStatus('live');
+          try {
+            const info = JSON.parse(e.data || '{}');
+            if (typeof info.version === 'number') {
+              if (desktopLastSyncVersion >= 0 && info.version !== desktopLastSyncVersion) {
+                scheduleDesktopTasksRefresh(true);
+              }
+              desktopLastSyncVersion = info.version;
+            }
+          } catch(err) {}
+        });
+
+        es.onopen = function() {
+          setDesktopLiveSyncStatus('live');
+        };
+
         es.addEventListener('task_update', function(e) {
           try {
             const data = JSON.parse(e.data);
+            if (typeof data.version === 'number') desktopLastSyncVersion = data.version;
+            const isOwnEvent = data.actorClientId && data.actorClientId === desktopRealtimeClientId;
+
             if (data.type === 'RESET') {
               remoteDoneTasksMap = {};
               localStorage.removeItem('bi_pharma_weekly_done_' + activeFarmaciaId);
-              updateWeeklyTasksCounter();
+              rerenderDesktopTaskViewsPreserveScroll();
+              if (!isOwnEvent) showDesktopRealtimeToast('🔄 Os vistos da semana foram reiniciados.', '#0284c7');
               return;
             }
+
             if (data.type === 'TOGGLE' && data.taskId) {
               if (data.concluido) {
                 remoteDoneTasksMap[data.taskId] = {
@@ -11547,20 +11673,77 @@ function getDashboardHtml(): string {
                 delete remoteDoneTasksMap[data.taskId];
               }
               localStorage.setItem('bi_pharma_weekly_done_' + activeFarmaciaId, JSON.stringify(remoteDoneTasksMap));
-              updateWeeklyTasksCounter();
-              const chk = document.querySelector('.weekly-task-checkbox[data-task-id="' + data.taskId + '"]');
-              if (chk) chk.checked = !!data.concluido;
+              rerenderDesktopTaskViewsPreserveScroll();
+              if (!isOwnEvent) {
+                const who = data.concluido_por || 'Equipa';
+                const label = data.designacao ? ': ' + String(data.designacao).slice(0, 48) : '';
+                if (data.concluido) {
+                  showDesktopRealtimeToast('✓ ' + who + ' concluiu' + label, '#059669');
+                } else {
+                  showDesktopRealtimeToast('↩️ ' + who + ' reabriu tarefa' + label, '#475569');
+                }
+              }
+              return;
+            }
+
+            if (data.type === 'CUSTOM_REFRESH') {
+              scheduleDesktopTasksRefresh(false);
+              if (!isOwnEvent) showDesktopRealtimeToast('📋 Missões da equipa atualizadas em tempo real.', '#4f46e5');
+              return;
+            }
+
+            if (data.type === 'CAMPAIGNS_CHANGED') {
+              scheduleDesktopTasksRefresh(true);
+              if (!isOwnEvent) showDesktopRealtimeToast('🎯 Campanhas atualizadas em tempo real.', '#0284c7');
+              return;
             }
           } catch(err) {}
         });
+
         es.onerror = function() {
-          try { es.close(); } catch(e) {}
-          if (desktopTasksEventSource === es) desktopTasksEventSource = null;
+          setDesktopLiveSyncStatus('reconnecting');
+          // Se o browser fechou permanentemente (ex: 502/restart do servidor), reagenda reconexão limpa
+          if (es.readyState === 2) {
+            if (desktopTasksEventSource === es) desktopTasksEventSource = null;
+            if (!desktopReconnectTimer) {
+              desktopReconnectTimer = setTimeout(function() {
+                desktopReconnectTimer = null;
+                initDesktopTasksRealtime(true);
+              }, 3000);
+            }
+          }
         };
-      } catch(err) {}
+      } catch(err) {
+        setDesktopLiveSyncStatus('reconnecting');
+      }
     }
 
+    // Re-sincronização de segurança ao regressar ao separador / acordar o PC
+    document.addEventListener('visibilitychange', function() {
+      if (document.visibilityState !== 'visible' || !activeFarmaciaId) return;
+      if (!desktopTasksEventSource || desktopTasksEventSource.readyState === 2) {
+        initDesktopTasksRealtime(true);
+      }
+      fetch('/api/sync/version?farmaciaId=' + encodeURIComponent(activeFarmaciaId))
+        .then(function(r) { return r.json(); })
+        .then(function(vData) {
+          if (vData && vData.ok && typeof vData.version === 'number') {
+            if (desktopLastSyncVersion >= 0 && vData.version !== desktopLastSyncVersion) {
+              desktopLastSyncVersion = vData.version;
+              scheduleDesktopTasksRefresh(true);
+            } else {
+              desktopLastSyncVersion = vData.version;
+            }
+          }
+        })
+        .catch(function() {});
+    });
+
     window.addEventListener('pagehide', function() {
+      if (desktopReconnectTimer) {
+        clearTimeout(desktopReconnectTimer);
+        desktopReconnectTimer = null;
+      }
       if (desktopTasksEventSource) {
         try { desktopTasksEventSource.close(); } catch(e) {}
         desktopTasksEventSource = null;

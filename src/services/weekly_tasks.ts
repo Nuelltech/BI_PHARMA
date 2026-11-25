@@ -258,6 +258,29 @@ export async function toggleWeeklyTaskInDb(
       ? new Prisma.Decimal(params.valor_impacto)
       : null;
 
+  // Proteção anti-colisão: se um colega acabou de concluir esta tarefa há instantes,
+  // não sobrescreve a autoria dele — devolve o registo existente com sinalização clara.
+  if (params.concluido) {
+    const existing = await (prisma as any).tarefaEquipa.findUnique({
+      where: {
+        farmaciaId_week_key_task_id: {
+          farmaciaId: params.farmaciaId,
+          week_key: key,
+          task_id: params.taskId,
+        },
+      },
+    });
+    const incomingActor = (params.concluido_por || 'Equipa').trim();
+    if (
+      existing &&
+      existing.concluido &&
+      existing.concluido_por &&
+      existing.concluido_por.trim().toLowerCase() !== incomingActor.toLowerCase()
+    ) {
+      return { ...existing, __alreadyCompleted: true };
+    }
+  }
+
   const res = await (prisma as any).tarefaEquipa.upsert({
     where: {
       farmaciaId_week_key_task_id: {

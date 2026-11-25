@@ -864,7 +864,7 @@ export function getMobileStaffHtml(): string {
           💊 BI Pharma <span id="hdrFarmName">—</span>
         </div>
         <div class="header-user-badge">
-          <span class="live-dot" title="Sincronização em direto ativa"></span>
+          <span id="mobileLiveDot" class="live-dot" title="Sincronização em direto ativa"></span>
           <div class="user-pill" onclick="changeOperator()" id="hdrOperatorPill" title="Mudar operador">
             👤 <span id="hdrOperatorName">Operador</span>
           </div>
@@ -1537,11 +1537,88 @@ export function getMobileStaffHtml(): string {
 
     window.addEventListener('online', flushOfflineQueue);
 
+    const mobileRealtimeClientId = 'mob_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+    let mobileReconnectTimer = null;
+    let mobileVisibilityBound = false;
+    let mobileLastSyncVersion = -1;
+
+    function setMobileLiveDotState(state) {
+      const dot = document.getElementById('mobileLiveDot');
+      if (!dot) return;
+      if (state === 'live') {
+        dot.style.background = '#10b981';
+        dot.style.boxShadow = '0 0 8px #10b981';
+        dot.title = 'Sincronização em direto ativa';
+      } else if (state === 'reconnecting') {
+        dot.style.background = '#f59e0b';
+        dot.style.boxShadow = '0 0 8px #f59e0b';
+        dot.title = 'A reconectar sincronização em direto...';
+      } else {
+        dot.style.background = '#64748b';
+        dot.style.boxShadow = 'none';
+        dot.title = 'A ligar...';
+      }
+    }
+
+    function syncAllMobileCardsFromTasksMap() {
+      const cards = document.querySelectorAll('[id^="card_"]');
+      cards.forEach((card) => {
+        const taskId = card.id.slice(5);
+        const info = tasksMap[taskId];
+        if (info && info.concluido) {
+          applyLiveTaskPatch({ taskId, ...info, concluido: true });
+        } else if (card.classList.contains('completed')) {
+          applyLiveTaskPatch({ taskId, concluido: false });
+        }
+      });
+      renderMobileCustomMissionsBanner();
+      updateOverallProgress();
+    }
+
+    async function refreshMobileTasksSilently(toastMsg, toastColor) {
+      if (!currentFarmacia) return;
+      try {
+        const r = await fetchMobileAuth('/api/weekly-tasks?farmaciaId=' + encodeURIComponent(currentFarmacia.id));
+        const tData = await r.json();
+        if (tData && tData.ok && tData.tasksMap) {
+          tasksMap = tData.tasksMap;
+          if (Array.isArray(tData.customTasks)) {
+            window.customTasksList = tData.customTasks;
+          }
+          syncAllMobileCardsFromTasksMap();
+          if (toastMsg) {
+            showToast(toastMsg, toastColor || '#0284c7', 2600);
+          }
+        }
+      } catch (e) {
+        console.warn('[Mobile Sync] Falha no refresh silencioso:', e);
+      }
+    }
+
+    function bindMobileVisibilitySyncOnce() {
+      if (mobileVisibilityBound) return;
+      mobileVisibilityBound = true;
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && currentFarmacia) {
+          if (!taskEventSource || taskEventSource.readyState === 2) {
+            startLiveSync();
+          }
+          refreshMobileTasksSilently();
+          flushOfflineQueue();
+        }
+      });
+    }
+
     function startLiveSync() {
-      // Fecha qualquer polling anterior
+      bindMobileVisibilitySyncOnce();
+
       if (syncInterval) {
         clearInterval(syncInterval);
-        syncInterval = null; if (taskEventSource) { try { taskEventSource.close(); } catch(e) {} taskEventSource = null; }
+        syncInterval = null;
+      }
+      if (mobileReconnectTimer) {
+        clearTimeout(mobileReconnectTimer);
+        mobileReconnectTimer = null;
       }
 
       if (!currentFarmacia) return;
@@ -1550,18 +1627,48 @@ export function getMobileStaffHtml(): string {
         taskEventSource = null;
       }
 
-      const streamUrl = '/api/weekly-tasks/stream?farmaciaId=' + encodeURIComponent(currentFarmacia.id);
-      try {
-        taskEventSource = new EventSource(streamUrl);
+      const code = getMobileAccessCode();
+      let streamUrl = '/api/weekly-tasks/stream?farmaciaId=' + encodeURIComponent(currentFarmacia.id) +
+        '&channel=mobile&clientId=' + encodeURIComponent(mobileRealtimeClientId);
+      if (code) {
+        streamUrl += '&acesso=' + encodeURIComponent(code);
+      }
 
-        taskEventSource.addEventListener('task_update', (e) => {
+      setMobileLiveDotState('connecting');
+      try {
+        const es = new EventSource(streamUrl);
+        taskEventSource = es;
+
+        es.addEventListener('connected', (e) => {
+          setMobileLiveDotState('live');
+          try {
+            const info = JSON.parse(e.data || '{}');
+            if (typeof info.version === 'number') {
+              if (mobileLastSyncVersion >= 0 && info.version !== mobileLastSyncVersion) {
+                refreshMobileTasksSilently();
+              }
+              mobileLastSyncVersion = info.version;
+            }
+          } catch {}
+        });
+
+        es.onopen = () => {
+          setMobileLiveDotState('live');
+        };
+
+        es.addEventListener('task_update', (e) => {
           try {
             const data = JSON.parse(e.data);
+            if (typeof data.version === 'number') mobileLastSyncVersion = data.version;
+            const isOwnEvent = data.actorClientId && data.actorClientId === mobileRealtimeClientId;
+
             if (data.type === 'RESET') {
               tasksMap = {};
+              syncAllMobileCardsFromTasksMap();
               filterSection(currentSectionIndex);
-              updateOverallProgress();
-              showToast('🔄 As tarefas foram reiniciadas pelo Diretor', '#0284c7');
+              if (!isOwnEvent) {
+                showToast('🔄 As tarefas foram reiniciadas pelo Diretor', '#0284c7');
+              }
               return;
             }
 
@@ -1580,43 +1687,50 @@ export function getMobileStaffHtml(): string {
 
               // Atualização CIRÚRGICA do DOM sem tocar no scroll nem inputs
               applyLiveTaskPatch(data);
+              renderMobileCustomMissionsBanner();
               updateOverallProgress();
 
-              // Se outro colega concluiu a tarefa, avisa suavemente
-              if (data.concluido && data.concluido_por && data.concluido_por !== currentOperator) {
-                showToast('✓ ' + escapeHtml(data.concluido_por) + ' picou: ' + escapeHtml(data.designacao || 'produto'), '#059669', 2400);
+              // Se outro colega concluiu/reabriu a tarefa, avisa suavemente
+              if (!isOwnEvent && data.concluido_por) {
+                if (data.concluido) {
+                  showToast('✓ ' + data.concluido_por + ' picou: ' + (data.designacao || 'tarefa'), '#059669', 2600);
+                } else {
+                  showToast('↩️ ' + data.concluido_por + ' reabriu: ' + (data.designacao || 'tarefa'), '#475569', 2200);
+                }
               }
+              return;
+            }
+
+            if (data.type === 'CUSTOM_REFRESH') {
+              refreshMobileTasksSilently(isOwnEvent ? null : '📋 Novas missões da equipa atualizadas', '#4f46e5');
+              return;
+            }
+
+            if (data.type === 'CAMPAIGNS_CHANGED') {
+              refreshMobileTasksSilently(isOwnEvent ? null : '🎯 Campanhas e tarefas atualizadas', '#0284c7');
+              return;
             }
           } catch(err) {
             console.warn('[SSE] Erro ao processar:', err);
           }
         });
 
-        taskEventSource.onerror = () => {
-          // EventSource nativo reconecta automaticamente
+        es.onerror = () => {
+          setMobileLiveDotState('reconnecting');
+          if (es.readyState === 2) {
+            if (taskEventSource === es) taskEventSource = null;
+            if (!mobileReconnectTimer && currentFarmacia) {
+              mobileReconnectTimer = setTimeout(() => {
+                mobileReconnectTimer = null;
+                startLiveSync();
+              }, 3000);
+            }
+          }
         };
       } catch (err) {
-        console.warn('SSE não suportado ou erro de ligação, a usar fallback leve');
+        setMobileLiveDotState('reconnecting');
+        console.warn('SSE não suportado ou erro de ligação:', err);
       }
-
-      // Verificação pontual silenciosa apenas quando a app volta a estar visível (após desbloquear telemóvel)
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible' && currentFarmacia) {
-          fetchMobileAuth('/api/weekly-tasks?farmaciaId=' + currentFarmacia.id)
-            .then(r => r.json())
-            .then(tData => {
-              if (tData.ok && tData.tasksMap) {
-                tasksMap = tData.tasksMap;
-                updateOverallProgress();
-                for (const taskId in tasksMap) {
-                  applyLiveTaskPatch({ taskId, ...tasksMap[taskId] });
-                }
-              }
-            })
-            .catch(() => {});
-          flushOfflineQueue();
-        }
-      });
     }
 
     function applyLiveTaskPatch(data) {
@@ -2240,14 +2354,37 @@ export function getMobileStaffHtml(): string {
         cnp_codigo: cnp,
         designacao: designacao,
         valor_impacto: valor,
+        actorClientId: mobileRealtimeClientId,
       };
 
       try {
-        await fetchMobileAuth('/api/weekly-tasks/toggle', {
+        const res = await fetchMobileAuth('/api/weekly-tasks/toggle', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
+        const respData = await res.json().catch(() => ({}));
+        if (respData && respData.alreadyCompleted && respData.alreadyCompletedBy) {
+          tasksMap[taskId] = {
+            concluido: true,
+            concluido_por: respData.alreadyCompletedBy,
+            concluido_em: respData.alreadyCompletedAt || new Date().toISOString(),
+            valor_impacto: valor,
+            categoria: categoria,
+          };
+          applyLiveTaskPatch({
+            taskId: taskId,
+            concluido: true,
+            concluido_por: respData.alreadyCompletedBy,
+            concluido_em: respData.alreadyCompletedAt || new Date().toISOString(),
+            designacao: designacao,
+            valor_impacto: valor,
+            categoria: categoria,
+          });
+          renderMobileCustomMissionsBanner();
+          updateOverallProgress();
+          showToast('ℹ️ Já picada por ' + respData.alreadyCompletedBy + '!', '#0284c7', 2800);
+        }
       } catch (e) {
         console.warn('Falha de rede ao enviar tarefa, a colocar em fila offline:', e);
         const queue = getOfflineQueue();
