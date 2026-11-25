@@ -114,7 +114,7 @@ export async function sendPasswordResetEmail(input: {
   const appUrl = getBaseAppUrl();
   const resetLink = `${appUrl}/reset-password?token=${encodeURIComponent(input.token)}`;
 
-  const subject = 'Redefinição de Password — BI Pharma';
+  const subject = 'Redefinição de Credenciais (Password / PIN) — BI Pharma';
   const html = `
 <!DOCTYPE html>
 <html>
@@ -131,14 +131,15 @@ export async function sendPasswordResetEmail(input: {
 
     <p style="font-size: 15px; line-height: 1.6;">Olá <strong>${escapeHtml(input.nome)}</strong>,</p>
     <p style="font-size: 15px; line-height: 1.6;">
-      Recebemos um pedido para redefinir a password da sua conta no <strong>BI Pharma</strong>.
+      Recebemos um pedido para redefinir as suas credenciais no <strong>BI Pharma</strong>.
+      Através do link abaixo pode escolher alterar a sua <strong>palavra-passe</strong>, o seu <strong>PIN de acesso Mobile</strong>, ou ambos.
     </p>
 
     <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" style="margin: 28px auto;">
       <tr>
         <td align="center" bgcolor="#0284c7" style="border-radius: 8px; background-color: #0284c7;">
           <a href="${resetLink}" target="_blank" style="display: inline-block; padding: 13px 28px; font-family: Arial, sans-serif; font-size: 14px; font-weight: 700; color: #ffffff; text-decoration: none; border-radius: 8px;">
-            <span style="color: #ffffff;">Redefinir a Minha Password</span>
+            <span style="color: #ffffff;">Redefinir Password e/ou PIN</span>
           </a>
         </td>
       </tr>
@@ -162,7 +163,7 @@ export async function sendPasswordResetEmail(input: {
 </html>
   `.trim();
 
-  return sendRawEmail({ to: input.to, subject, html, text: `Redefinir password BI Pharma: ${resetLink}` });
+  return sendRawEmail({ to: input.to, subject, html, text: `Redefinir password e/ou PIN BI Pharma: ${resetLink}` });
 }
 
 /**

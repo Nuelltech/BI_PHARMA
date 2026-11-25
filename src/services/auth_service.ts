@@ -1363,18 +1363,39 @@ export async function consumePasswordReset(
   prisma: PrismaClient,
   input: {
     token: string;
-    newPassword: string;
+    newPassword?: string;
+    newPin?: string;
     ip?: string;
     userAgent?: string;
   }
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const token = String(input.token || '').trim();
   const newPassword = String(input.newPassword || '');
+  const newPin = String(input.newPin || '').trim();
   const ip = input.ip || '127.0.0.1';
   const userAgent = String(input.userAgent || '').slice(0, 250);
 
   if (!token || token.length < 32) {
     return { ok: false, error: 'Link de recuperação inválido ou expirado.' };
+  }
+
+  const wantsPassword = newPassword.length > 0;
+  const wantsPin = newPin.length > 0;
+
+  if (!wantsPassword && !wantsPin) {
+    return { ok: false, error: 'Indique uma nova palavra-passe, um novo PIN Mobile, ou ambos.' };
+  }
+
+  if (wantsPin) {
+    if (!/^[0-9]{4,6}$/.test(newPin)) {
+      return { ok: false, error: 'O PIN Mobile deve conter entre 4 e 6 dígitos numéricos.' };
+    }
+    if (isTrivialPin(newPin)) {
+      return {
+        ok: false,
+        error: 'PIN rejeitado por segurança: evite sequências (1234) ou dígitos repetidos (6666).',
+      };
+    }
   }
 
   const tokenHash = hashOpaqueToken(token);
@@ -1395,45 +1416,105 @@ export async function consumePasswordReset(
     return { ok: false, error: 'Conta associada inválida ou inativa.' };
   }
 
-  const policy = await validatePasswordPolicyAsync(newPassword, { email: user.email, nome: user.nome });
-  if (!policy.valid) {
-    return { ok: false, error: policy.error };
+  let passwordHash: string | null = null;
+  if (wantsPassword) {
+    const policy = await validatePasswordPolicyAsync(newPassword, { email: user.email, nome: user.nome });
+    if (!policy.valid) {
+      return { ok: false, error: policy.error };
+    }
+    passwordHash = await hashPasswordScrypt(newPassword);
   }
 
-  const passwordHash = await hashPasswordScrypt(newPassword);
-
-  await prisma.$transaction([
-    prisma.utilizador.update({
-      where: { id: user.id },
-      data: {
-        passwordHash,
-        passwordAlteradaEm: now,
-      },
-    }),
+  const txOps: any[] = [
     prisma.tokenSeguranca.update({
       where: { id: secToken.id },
       data: { usadoEm: now },
     }),
-    // Revoga todas as sessões anteriores para segurança imediata
-    prisma.sessao.updateMany({
-      where: { utilizadorId: user.id, revogadaEm: null },
-      data: { revogadaEm: now },
-    }),
-    prisma.dispositivoConfiado.updateMany({
-      where: { utilizadorId: user.id, revogadoEm: null },
-      data: { revogadoEm: now },
-    }),
-  ]);
+  ];
 
-  invalidateSessionCacheByUser(user.id);
+  if (wantsPassword && passwordHash) {
+    txOps.push(
+      prisma.utilizador.update({
+        where: { id: user.id },
+        data: {
+          passwordHash,
+          passwordAlteradaEm: now,
+        },
+      }),
+      // Revoga sessões anteriores para segurança imediata
+      prisma.sessao.updateMany({
+        where: { utilizadorId: user.id, revogadaEm: null },
+        data: { revogadaEm: now },
+      }),
+      prisma.dispositivoConfiado.updateMany({
+        where: { utilizadorId: user.id, revogadoEm: null },
+        data: { revogadoEm: now },
+      })
+    );
+  }
+
+  if (wantsPin) {
+    const memberships = await prisma.membroFarmacia.findMany({
+      where: { utilizadorId: user.id },
+      select: { id: true },
+    });
+    for (const mf of memberships) {
+      txOps.push(
+        prisma.membroFarmacia.update({
+          where: { id: mf.id },
+          data: {
+            pinHash: hashPinWithPepper(newPin, mf.id),
+            pinAlteradoEm: now,
+          },
+        })
+      );
+    }
+
+    if (user.email) {
+      const legacyMembers = await prisma.membroEquipa.findMany({
+        where: {
+          email: { equals: user.email, mode: 'insensitive' },
+        },
+        select: { id: true },
+      });
+      for (const me of legacyMembers) {
+        txOps.push(
+          prisma.membroEquipa.update({
+            where: { id: me.id },
+            data: {
+              pinHash: hashPinWithPepper(newPin, me.id),
+              pin: '••••',
+            },
+          })
+        );
+      }
+    }
+  }
+
+  await prisma.$transaction(txOps);
+
+  if (wantsPassword) {
+    invalidateSessionCacheByUser(user.id);
+  }
 
   await logSecurityAudit(prisma, {
     evento: 'PASSWORD_RESET',
     utilizadorId: user.id,
     ip,
     userAgent,
-    detalhes: { stage: 'password_reset_success' },
+    detalhes: {
+      stage: 'credentials_reset_success',
+      changedPassword: wantsPassword,
+      changedPin: wantsPin,
+    },
   });
 
-  return { ok: true, message: 'Password redefinida com sucesso. Pode agora iniciar sessão com as novas credenciais.' };
+  const msg =
+    wantsPassword && wantsPin
+      ? 'Palavra-passe e PIN Mobile atualizados com sucesso!'
+      : wantsPin
+      ? 'PIN Mobile atualizado com sucesso! Já pode usar o novo PIN no acesso Mobile.'
+      : 'Palavra-passe redefinida com sucesso! Pode agora iniciar sessão.';
+
+  return { ok: true, message: msg };
 }

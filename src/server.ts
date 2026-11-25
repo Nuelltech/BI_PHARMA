@@ -4162,14 +4162,15 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
-      // 4.8. Validação e Redefinição REAL de Nova Password (auth_service.consumePasswordReset)
+      // 4.8. Validação e Redefinição REAL de Nova Password e/ou PIN (auth_service.consumePasswordReset)
       if (pathname === '/api/auth/reset-password' && req.method === 'POST') {
         try {
           const rawBody = await readRequestBody(req, 32 * 1024);
-          const { token, newPassword } = JSON.parse(rawBody || '{}');
+          const { token, newPassword, newPin } = JSON.parse(rawBody || '{}');
           const result = await consumePasswordReset(prisma, {
             token: String(token || '').trim(),
-            newPassword: String(newPassword || ''),
+            newPassword: newPassword ? String(newPassword) : undefined,
+            newPin: newPin ? String(newPin).trim() : undefined,
             ip: getClientIp(req),
             userAgent: String(req.headers['user-agent'] || ''),
           });
@@ -4179,7 +4180,7 @@ self.addEventListener('fetch', (e) => {
             return;
           }
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, message: result.message || 'Palavra-passe redefinida com sucesso. Pode agora iniciar sessão.' }));
+          res.end(JSON.stringify({ ok: true, message: result.message || 'Credenciais atualizadas com sucesso.' }));
         } catch (e: any) {
           res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -4385,25 +4386,28 @@ self.addEventListener('fetch', (e) => {
         return;
       }
 
-      // 5.9. Página dedicada de Redefinição de Password (/reset-password?token=...)
+      // 5.9. Página dedicada de Redefinição de Credenciais (Password e/ou PIN) (/reset-password?token=...)
       if (pathname === '/reset-password' && req.method === 'GET') {
-        const tokenParam = String(parsedUrl.query.token || '').trim();
-        const safeToken = tokenParam.replace(/[^a-zA-Z0-9._-]/g, '');
         const resetHtml = `<!DOCTYPE html>
 <html lang="pt">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Redefinir Palavra-Passe — BI Pharma</title>
+  <title>Redefinir Credenciais — BI Pharma</title>
   <style>
     body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #070f1e; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; padding: 20px; box-sizing: border-box; }
-    .card { width: 100%; max-width: 440px; background: #fff; border-radius: 20px; padding: 36px 32px; box-shadow: 0 25px 60px rgba(0,0,0,0.35); }
-    h1 { margin: 0 0 8px 0; font-size: 1.55rem; font-weight: 900; color: #0f172a; }
-    p { margin: 0 0 22px 0; font-size: 0.9rem; color: #64748b; line-height: 1.45; }
-    label { display: block; font-size: 0.78rem; font-weight: 800; color: #334155; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-    input { width: 100%; box-sizing: border-box; padding: 13px 14px; border: 1.5px solid #cbd5e1; border-radius: 10px; font-size: 0.96rem; margin-bottom: 16px; outline: none; }
+    .card { width: 100%; max-width: 460px; background: #fff; border-radius: 20px; padding: 34px 30px; box-shadow: 0 25px 60px rgba(0,0,0,0.35); }
+    h1 { margin: 0 0 8px 0; font-size: 1.48rem; font-weight: 900; color: #0f172a; }
+    p { margin: 0 0 20px 0; font-size: 0.88rem; color: #64748b; line-height: 1.48; }
+    .section { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+    .section-title { font-size: 0.8rem; font-weight: 800; color: #0f172a; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
+    .opt-tag { font-size: 0.7rem; font-weight: 700; color: #64748b; background: #e2e8f0; padding: 2px 7px; border-radius: 999px; }
+    label { display: block; font-size: 0.74rem; font-weight: 800; color: #334155; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 5px; }
+    input { width: 100%; box-sizing: border-box; padding: 11px 13px; border: 1.5px solid #cbd5e1; border-radius: 9px; font-size: 0.94rem; margin-bottom: 10px; outline: none; background: #fff; }
+    input:last-child { margin-bottom: 0; }
     input:focus { border-color: #0284c7; box-shadow: 0 0 0 3px rgba(2,132,199,0.12); }
-    button { width: 100%; padding: 14px; border: none; border-radius: 10px; background: #0f172a; color: #fff; font-size: 0.98rem; font-weight: 800; cursor: pointer; }
+    .hint { font-size: 0.74rem; color: #64748b; margin-top: 6px; }
+    button { width: 100%; padding: 14px; border: none; border-radius: 10px; background: #0f172a; color: #fff; font-size: 0.96rem; font-weight: 800; cursor: pointer; margin-top: 6px; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
     .msg { display: none; padding: 12px 14px; border-radius: 10px; font-size: 0.86rem; font-weight: 600; margin-bottom: 16px; }
     .msg.err { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
@@ -4413,15 +4417,32 @@ self.addEventListener('fetch', (e) => {
 <body>
   <div class="card">
     <div style="font-size: 0.75rem; font-weight: 800; color: #0284c7; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 8px;">BI PHARMA · NUELLTECH</div>
-    <h1>Definir nova palavra-passe</h1>
-    <p>Introduza uma nova palavra-passe segura (mínimo 10 caracteres, sem usar o seu nome ou email).</p>
+    <h1>Redefinir Credenciais</h1>
+    <p>Escolha o que pretende alterar: a <b>palavra-passe</b> da App Web, o <b>PIN</b> da App Mobile, ou <b>ambos</b>. Deixe em branco o que não quiser alterar.</p>
     <div id="msgBox" class="msg"></div>
     <form id="resetForm">
-      <label for="pwd1">Nova palavra-passe</label>
-      <input type="password" id="pwd1" autocomplete="new-password" required minlength="10" placeholder="Mínimo 10 caracteres" />
-      <label for="pwd2">Confirmar palavra-passe</label>
-      <input type="password" id="pwd2" autocomplete="new-password" required minlength="10" placeholder="Repita a palavra-passe" />
-      <button type="submit" id="btnReset">Guardar nova palavra-passe</button>
+      <div class="section">
+        <div class="section-title">
+          <span>🔑 Palavra-passe (App Web)</span>
+          <span class="opt-tag">Opcional</span>
+        </div>
+        <label for="pwd1">Nova palavra-passe</label>
+        <input type="password" id="pwd1" autocomplete="new-password" placeholder="Mínimo 10 caracteres (deixe vazio para manter)" />
+        <label for="pwd2">Confirmar palavra-passe</label>
+        <input type="password" id="pwd2" autocomplete="new-password" placeholder="Repita a nova palavra-passe" />
+      </div>
+
+      <div class="section">
+        <div class="section-title">
+          <span>📱 PIN de Acesso Rápido (Mobile)</span>
+          <span class="opt-tag">Opcional</span>
+        </div>
+        <label for="pin1">Novo PIN (4 a 6 dígitos)</label>
+        <input type="password" id="pin1" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="Ex: 6294 (deixe vazio para manter)" />
+        <div class="hint">Evite dígitos repetidos (6666) ou sequências (1234).</div>
+      </div>
+
+      <button type="submit" id="btnReset">Guardar alterações</button>
     </form>
     <div style="margin-top: 18px; text-align: center;">
       <a href="/login" style="color: #0284c7; font-size: 0.85rem; font-weight: 700; text-decoration: none;">← Voltar ao login</a>
@@ -4438,36 +4459,53 @@ self.addEventListener('fetch', (e) => {
       msgBox.style.display = 'block';
     }
     if (!token) {
-      showMsg('Link de recuperação inválido ou incompleto. Peça uma nova recuperação no ecrã de login.', true);
+      showMsg('Link de recuperação inválido ou incompleto. Peça uma nova recuperação.', true);
       btn.disabled = true;
     }
     form.addEventListener('submit', async function(e) {
       e.preventDefault();
       const p1 = document.getElementById('pwd1').value;
       const p2 = document.getElementById('pwd2').value;
-      if (p1 !== p2) { showMsg('As palavras-passe não coincidem.', true); return; }
-      if (p1.length < 10) { showMsg('A palavra-passe deve ter pelo menos 10 caracteres.', true); return; }
+      const pin = document.getElementById('pin1').value.trim();
+
+      if (!p1 && !pin) {
+        showMsg('Preencha a nova palavra-passe, o novo PIN Mobile, ou ambos.', true);
+        return;
+      }
+      if (p1) {
+        if (p1 !== p2) { showMsg('As palavras-passe não coincidem.', true); return; }
+        if (p1.length < 10) { showMsg('A palavra-passe deve ter pelo menos 10 caracteres.', true); return; }
+      }
+      if (pin && !/^[0-9]{4,6}$/.test(pin)) {
+        showMsg('O PIN deve conter entre 4 e 6 dígitos numéricos.', true);
+        return;
+      }
+
       btn.disabled = true;
       btn.textContent = 'A guardar...';
       try {
         const res = await fetch('/api/auth/reset-password', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token, newPassword: p1 }),
+          body: JSON.stringify({
+            token: token,
+            newPassword: p1 || undefined,
+            newPin: pin || undefined
+          }),
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
-          showMsg(data.error || 'Não foi possível redefinir a palavra-passe.', true);
+          showMsg(data.error || 'Não foi possível guardar as alterações.', true);
           btn.disabled = false;
-          btn.textContent = 'Guardar nova palavra-passe';
+          btn.textContent = 'Guardar alterações';
           return;
         }
-        showMsg('Palavra-passe atualizada com sucesso! A redirecionar para o login...', false);
-        setTimeout(function() { window.location.href = '/login'; }, 1800);
+        showMsg((data.message || 'Credenciais atualizadas com sucesso!') + ' A redirecionar...', false);
+        setTimeout(function() { window.location.href = '/login'; }, 2000);
       } catch (err) {
         showMsg('Erro de ligação ao servidor.', true);
         btn.disabled = false;
-        btn.textContent = 'Guardar nova palavra-passe';
+        btn.textContent = 'Guardar alterações';
       }
     });
   </script>
@@ -11174,10 +11212,10 @@ function getDashboardHtml(): string {
             '<tr><th style="padding: 10px 14px;">Colaborador</th><th style="padding: 10px 14px;">Email</th><th style="padding: 10px 14px;">Perfil (RBAC)</th><th style="padding: 10px 14px;">PIN</th><th style="padding: 10px 14px; text-align: right;">Ações</th></tr></thead><tbody>';
 
           data.team.forEach(m => {
-            let roleBadge = '<span style="background: #e0f2fe; color: #0369a1; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem;">AUXILIAR</span>';
-            if (m.role === 'DIRETOR') roleBadge = '<span style="background: #dcfce7; color: #15803d; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem;">DIRETOR TÉCNICO</span>';
-            if (m.role === 'GESTOR') roleBadge = '<span style="background: #fef9c3; color: #854d0e; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem;">GESTOR GLOBAL</span>';
-            if (m.role === 'SUPORTE') roleBadge = '<span style="background: #f3e8ff; color: #7e22ce; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem;">SUPORTE TI</span>';
+            let roleBadge = '<span style="background: #e0f2fe; color: #0369a1; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem; white-space: nowrap; display: inline-block;">AUXILIAR</span>';
+            if (m.role === 'DIRETOR') roleBadge = '<span style="background: #dcfce7; color: #15803d; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem; white-space: nowrap; display: inline-block;">DIRETOR TÉCNICO</span>';
+            if (m.role === 'GESTOR') roleBadge = '<span style="background: #fef9c3; color: #854d0e; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem; white-space: nowrap; display: inline-block;">GESTOR GLOBAL</span>';
+            if (m.role === 'SUPORTE') roleBadge = '<span style="background: #f3e8ff; color: #7e22ce; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem; white-space: nowrap; display: inline-block;">SUPORTE TI</span>';
 
             html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
               '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(m.nome) + '</td>' +
@@ -11185,8 +11223,7 @@ function getDashboardHtml(): string {
               '<td style="padding: 10px 14px;">' + roleBadge + '</td>' +
               '<td style="padding: 10px 14px; font-family: monospace; font-weight: 700; color: #64748b;">' + escapeHtml(m.pin || '••••') + '</td>' +
               '<td style="padding: 10px 14px; text-align: right; white-space: nowrap;">' +
-              '<button data-email="' + escapeHtml(m.email) + '" data-nome="' + escapeHtml(m.nome) + '" onclick="sendMemberPasswordReset(this.dataset.email, this.dataset.nome)" style="background: none; border: none; color: #7c3aed; cursor: pointer; font-size: 0.78rem; font-weight: 700; margin-right: 10px;" title="Enviar email para o colaborador redefinir a sua password">Enviar Reset</button>' +
-              '<button data-id="' + m.id + '" data-nome="' + escapeHtml(m.nome) + '" onclick="resetTeamMemberPin(this.dataset.id, this.dataset.nome)" style="background: none; border: none; color: #0284c7; cursor: pointer; font-size: 0.78rem; font-weight: 700; margin-right: 10px;">Redefinir PIN</button>' +
+              '<button data-email="' + escapeHtml(m.email) + '" data-nome="' + escapeHtml(m.nome) + '" onclick="sendMemberPasswordReset(this.dataset.email, this.dataset.nome)" style="background: none; border: none; color: #0284c7; cursor: pointer; font-size: 0.78rem; font-weight: 700; margin-right: 12px;" title="Enviar email para o colaborador redefinir password e/ou PIN">Enviar Reset</button>' +
               '<button data-id="' + m.id + '" onclick="deleteTeamMember(this.dataset.id)" style="background: none; border: none; color: #e11d48; cursor: pointer; font-size: 0.78rem; font-weight: 700;">Remover</button>' +
               '</td></tr>';
           });
@@ -11262,7 +11299,7 @@ function getDashboardHtml(): string {
         alert('Este colaborador não tem email configurado.');
         return;
       }
-      if (!confirm('Enviar email de redefinição de palavra-passe para ' + (nome || email) + ' (' + email + ')?')) return;
+      if (!confirm('Enviar email de redefinição de credenciais (password e/ou PIN) para ' + (nome || email) + ' (' + email + ')?')) return;
       try {
         const res = await fetch('/api/auth/forgot-password', {
           method: 'POST',
@@ -11271,7 +11308,7 @@ function getDashboardHtml(): string {
         });
         const data = await res.json();
         if (res.ok && data.ok) {
-          alert('Email de recuperação enviado para ' + email + ' (link válido 15 minutos).');
+          alert('Email de redefinição (password e/ou PIN) enviado para ' + email + ' (link válido 15 minutos).');
         } else {
           alert('Erro: ' + (data.error || 'Não foi possível enviar o email.'));
         }
