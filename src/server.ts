@@ -47,7 +47,6 @@ import { recordCopilotFeedback } from './services/copilot_audit';
 import { runCopilotAgentV2, clearAgentV2Session } from './services/copilot_agent_v2';
 import {
   loginWithPassword,
-  resolveSessionAndTenant,
   logoutSession,
   requestPasswordReset,
   consumePasswordReset,
@@ -1713,15 +1712,15 @@ async function startServer() {
           const secureFlag = IS_PROD ? '; Secure' : '';
           res.setHeader(
             'Set-Cookie',
-            `bipharma_session=${encodeURIComponent(loginRes.token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${secureFlag}`
+            `bipharma_session=${encodeURIComponent(loginRes.rawToken || '')}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${secureFlag}`
           );
 
           const isSuper = Boolean(loginRes.user?.isSuperadmin);
           const role = isSuper ? 'ADMIN' : 'PHARMACY';
           const allFarms = isSuper
             ? await prisma.farmacia.findMany({ orderBy: { criadoEm: 'asc' } })
-            : loginRes.user?.farmaciaAtivaId
-            ? await prisma.farmacia.findMany({ where: { id: loginRes.user.farmaciaAtivaId } })
+            : loginRes.activeFarmaciaId
+            ? await prisma.farmacia.findMany({ where: { id: loginRes.activeFarmaciaId } })
             : [];
           const lockedFarm = !isSuper && allFarms.length > 0 ? allFarms[0] : null;
 
@@ -4244,7 +4243,7 @@ self.addEventListener('fetch', (e) => {
     </div>
   </div>
   <script>
-    const token = ${JSON.stringify(safeToken)};
+    const token = (new URLSearchParams(window.location.search).get('token') || '').trim();
     const msgBox = document.getElementById('msgBox');
     const form = document.getElementById('resetForm');
     const btn = document.getElementById('btnReset');
