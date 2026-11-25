@@ -141,6 +141,7 @@ export async function loginWithPassword(
     totpCode?: string;
     trustedDeviceToken?: string | null;
     requireDeviceVerification?: boolean;
+    allowWithoutMfa?: boolean;
     ip: string;
     userAgent: string;
   }
@@ -228,7 +229,7 @@ export async function loginWithPassword(
 
     // Se perfil exige MFA mas ainda não configurou TOTP:
     if (!user.totpAtivo || !secret) {
-      if (user.isSuperadmin) {
+      if (user.isSuperadmin && !input.allowWithoutMfa) {
         await logSecurityAudit(prisma, {
           evento: 'TOTP_FALHOU',
           utilizadorId: user.id,

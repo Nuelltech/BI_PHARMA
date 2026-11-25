@@ -1693,6 +1693,7 @@ async function startServer() {
             email,
             password,
             totpCode,
+            allowWithoutMfa: process.env.ENFORCE_SUPERADMIN_MFA !== 'true',
             ip: clientIp,
             userAgent: String(req.headers['user-agent'] || ''),
           });
