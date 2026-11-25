@@ -217,13 +217,15 @@ export async function loginWithPassword(
 
   // 4. MFA por Perfil:
   // Superadmin, Proprietário, Comprador e Diretor Técnico têm MFA obrigatório (TOTP ou Passkey)
+  // 4. Carregar vínculos ativos uma ÚNICA vez (com farmacia incluída) + verificar MFA
   const mfaRoles = new Set(['PROPRIETARIO', 'COMPRADOR', 'DIRETOR_TECNICO']);
-  const memberLinks = await prisma.membroFarmacia.findMany({
+  const vinculos = await prisma.membroFarmacia.findMany({
     where: { utilizadorId: user.id, estado: 'ATIVO' },
-    select: { perfil: true },
+    include: { farmacia: true },
+    orderBy: { criadoEm: 'asc' },
   });
   const mustEnforceMfa =
-    !input.allowWithoutMfa && (user.isSuperadmin || memberLinks.some((m) => mfaRoles.has(m.perfil)));
+    !input.allowWithoutMfa && (user.isSuperadmin || vinculos.some((m) => mfaRoles.has(m.perfil)));
 
   if (mustEnforceMfa || user.totpAtivo) {
     const secret = decryptTotpSecret(user.totpSecretEnc);
@@ -333,13 +335,7 @@ export async function loginWithPassword(
     }
   }
 
-  // 5. Carregar vínculos ativos do utilizador
-  const vinculos = await prisma.membroFarmacia.findMany({
-    where: { utilizadorId: user.id, estado: 'ATIVO' },
-    include: { farmacia: true },
-    orderBy: { criadoEm: 'asc' },
-  });
-
+  // 5. Mapear vínculos ativos já carregados acima (evita 2.ª query duplicada)
   const farmacias: AuthorizedPharmacy[] = vinculos
     .filter((v) => v.farmacia && v.farmacia.estado === 'ATIVO')
     .map((v) => ({
@@ -360,13 +356,6 @@ export async function loginWithPassword(
       error: 'A sua conta não tem acesso ativo a nenhuma farmácia. Fale com o proprietário.',
     };
   }
-
-  // Detetar IP ou User-Agent novo (compensação Spec v2.1: aviso por email/auditoria)
-  const prevSession = await prisma.sessao.findFirst({
-    where: { utilizadorId: user.id, ip, userAgent },
-    select: { id: true },
-  });
-  const newDeviceDetected = !prevSession;
 
   // 6. Criar nova sessão opaca de 256 bits (só hash SHA-256 na BD)
   const rawToken = crypto.randomBytes(32).toString('hex');
@@ -390,29 +379,41 @@ export async function loginWithPassword(
     },
   });
 
-  await Promise.all([
-    resetDbRateLimit(prisma, keyIpEmail),
-    resetDbRateLimit(prisma, keyEmailGlobal),
-    logSecurityAudit(prisma, {
-      evento: 'LOGIN_OK',
-      utilizadorId: user.id,
-      membroId: defaultFarm?.membroId || null,
-      farmaciaId: defaultFarm?.farmaciaId || null,
-      ip,
-      userAgent,
-      detalhes: { metodo: 'PASSWORD', newDeviceDetected },
-    }),
-  ]);
-
-  if (newDeviceDetected) {
-    await logSecurityAudit(prisma, {
-      evento: 'NEW_DEVICE_LOGIN',
-      utilizadorId: user.id,
-      farmaciaId: defaultFarm?.farmaciaId || null,
-      ip,
-      userAgent,
-    });
-  }
+  // Limpeza de rate-limits, deteção de dispositivo novo e auditoria em background (não bloqueia a resposta do login)
+  const newDeviceDetected = false;
+  void (async () => {
+    try {
+      const prevSession = await prisma.sessao.findFirst({
+        where: { utilizadorId: user.id, ip, userAgent, tokenHash: { not: tokenHash } },
+        select: { id: true },
+      });
+      const isNewDev = !prevSession;
+      await Promise.all([
+        resetDbRateLimit(prisma, keyIpEmail),
+        resetDbRateLimit(prisma, keyEmailGlobal),
+        logSecurityAudit(prisma, {
+          evento: 'LOGIN_OK',
+          utilizadorId: user.id,
+          membroId: defaultFarm?.membroId || null,
+          farmaciaId: defaultFarm?.farmaciaId || null,
+          ip,
+          userAgent,
+          detalhes: { metodo: 'PASSWORD', newDeviceDetected: isNewDev },
+        }),
+      ]);
+      if (isNewDev) {
+        await logSecurityAudit(prisma, {
+          evento: 'NEW_DEVICE_LOGIN',
+          utilizadorId: user.id,
+          farmaciaId: defaultFarm?.farmaciaId || null,
+          ip,
+          userAgent,
+        });
+      }
+    } catch {
+      // telemetria não-bloqueante
+    }
+  })();
 
   const perms = defaultFarm
     ? Array.from(computeEffectivePermissions(defaultFarm.perfil, defaultFarm.permissoesExtra, 'PASSWORD'))
