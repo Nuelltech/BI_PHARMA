@@ -731,12 +731,19 @@ async function startServer() {
                 userAgent: String(req.headers['user-agent'] || ''),
               });
               if (resolved.ok) {
+                const userInfo = {
+                  nome: resolved.ctx.nome || resolved.ctx.email || 'Utilizador',
+                  email: resolved.ctx.email || null,
+                  isSuperadmin: Boolean(resolved.ctx.isSuperadmin),
+                  perfil: resolved.ctx.isSuperadmin ? 'SUPERADMIN' : ((resolved.ctx as any).perfil || (resolved.ctx as any).perfilFarmacia || 'GESTOR'),
+                };
                 if (resolved.ctx.isSuperadmin) {
                   return {
                     authenticated: true,
                     role: 'ADMIN' as const,
                     code: rawSess,
                     lockedFarmacia: null,
+                    user: userInfo,
                   };
                 }
                 if (resolved.ctx.farmaciaId) {
@@ -747,6 +754,7 @@ async function startServer() {
                       role: 'PHARMACY' as const,
                       code: f.codigo_acesso || f.id,
                       lockedFarmacia: f,
+                      user: userInfo,
                     };
                   }
                 }
@@ -1843,6 +1851,7 @@ async function startServer() {
               ok: true,
               role: ctx.role,
               code: ctx.code,
+              user: (ctx as any).user || (ctx.role === 'ADMIN' ? { nome: 'Administrador', email: null, isSuperadmin: true, perfil: 'SUPERADMIN' } : null),
               lockedFarmacia: ctx.lockedFarmacia
                 ? {
                     id: ctx.lockedFarmacia.id,
@@ -6246,6 +6255,7 @@ function getDashboardHtml(): string {
         </div>
       </div>
       <div class="top-nav-right">
+        <div id="activeUserBadge" style="display:none;align-items:center;gap:6px;background:#f8fafc;border:1px solid #cbd5e1;color:#0f172a;padding:5px 11px;border-radius:999px;font-size:0.78rem;font-weight:700;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Utilizador autenticado nesta sessão"></div>
         <button class="top-btn top-btn-qr" onclick="openMobileStaffModal()" title="Abrir QR Code e link direto para o telemóvel da equipa de balcão">
           📱 Acesso Balcão (QR)
         </button>
@@ -9159,8 +9169,27 @@ function getDashboardHtml(): string {
       if (modal) modal.style.display = 'block';
     }
 
-    function applyRoleUiState(role, lockedFarmacia) {
+    function updateActiveUserBadge(userObj, role) {
+      const el = document.getElementById('activeUserBadge');
+      if (!el) return;
+      if (userObj && (userObj.nome || userObj.email)) {
+        const icon = userObj.isSuperadmin || role === 'ADMIN' ? '👑' : '👤';
+        const label = userObj.nome || userObj.email;
+        const perfilTxt = userObj.isSuperadmin ? 'Superadmin' : (userObj.perfil || '');
+        el.textContent = icon + ' ' + label + (perfilTxt ? ' · ' + perfilTxt : '');
+        el.title = (userObj.email ? userObj.email + ' — ' : '') + (perfilTxt || 'Sessão ativa');
+        el.style.display = 'inline-flex';
+      } else if (role === 'ADMIN') {
+        el.textContent = '👑 Administrador';
+        el.style.display = 'inline-flex';
+      } else {
+        el.style.display = 'none';
+      }
+    }
+
+    function applyRoleUiState(role, lockedFarmacia, userObj) {
       activeAuthRole = role;
+      if (userObj !== undefined) updateActiveUserBadge(userObj, role);
       const adminBar = document.getElementById('adminControlsBar');
       const sel = document.getElementById('farmaciaSelector');
       const selLabel = document.getElementById('farmaciaSelectorLabel');
@@ -9273,7 +9302,7 @@ function getDashboardHtml(): string {
           localStorage.setItem('bi_pharma_farmacia_id', activeFarmaciaId);
         }
 
-        applyRoleUiState(data.role, data.lockedFarmacia);
+        applyRoleUiState(data.role, data.lockedFarmacia, data.user);
         await loadPharmaciesDropdown();
         return true;
       } catch (e) {
@@ -9360,7 +9389,7 @@ function getDashboardHtml(): string {
         if (window.location.pathname === '/login' || window.location.search) {
           window.history.replaceState({}, document.title, '/');
         }
-        applyRoleUiState(data.role, data.lockedFarmacia);
+        applyRoleUiState(data.role, data.lockedFarmacia, data.user);
         dismissInitLoader();
         await loadPharmaciesDropdown();
       } catch (e) {
@@ -11128,8 +11157,9 @@ function getDashboardHtml(): string {
               '<td style="padding: 10px 14px;">' + roleBadge + '</td>' +
               '<td style="padding: 10px 14px; font-family: monospace; font-weight: 700; color: #64748b;">' + escapeHtml(m.pin || '••••') + '</td>' +
               '<td style="padding: 10px 14px; text-align: right; white-space: nowrap;">' +
-              '<button data-id="' + m.id + '" data-nome="' + escapeHtml(m.nome) + '" onclick="resetTeamMemberPin(this.dataset.id, this.dataset.nome)" style="background: none; border: none; color: #0284c7; cursor: pointer; font-size: 0.8rem; font-weight: 700; margin-right: 12px;">Redefinir PIN</button>' +
-              '<button data-id="' + m.id + '" onclick="deleteTeamMember(this.dataset.id)" style="background: none; border: none; color: #e11d48; cursor: pointer; font-size: 0.8rem; font-weight: 700;">Remover</button>' +
+              '<button data-email="' + escapeHtml(m.email) + '" data-nome="' + escapeHtml(m.nome) + '" onclick="sendMemberPasswordReset(this.dataset.email, this.dataset.nome)" style="background: none; border: none; color: #7c3aed; cursor: pointer; font-size: 0.78rem; font-weight: 700; margin-right: 10px;" title="Enviar email para o colaborador redefinir a sua password">Enviar Reset</button>' +
+              '<button data-id="' + m.id + '" data-nome="' + escapeHtml(m.nome) + '" onclick="resetTeamMemberPin(this.dataset.id, this.dataset.nome)" style="background: none; border: none; color: #0284c7; cursor: pointer; font-size: 0.78rem; font-weight: 700; margin-right: 10px;">Redefinir PIN</button>' +
+              '<button data-id="' + m.id + '" onclick="deleteTeamMember(this.dataset.id)" style="background: none; border: none; color: #e11d48; cursor: pointer; font-size: 0.78rem; font-weight: 700;">Remover</button>' +
               '</td></tr>';
           });
 
@@ -11196,6 +11226,29 @@ function getDashboardHtml(): string {
         }
       } catch (err) {
         alert('Erro ao enviar pedido.');
+      }
+    }
+
+    async function sendMemberPasswordReset(email, nome) {
+      if (!email) {
+        alert('Este colaborador não tem email configurado.');
+        return;
+      }
+      if (!confirm('Enviar email de redefinição de palavra-passe para ' + (nome || email) + ' (' + email + ')?')) return;
+      try {
+        const res = await fetch('/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          alert('Email de recuperação enviado para ' + email + ' (link válido 15 minutos).');
+        } else {
+          alert('Erro: ' + (data.error || 'Não foi possível enviar o email.'));
+        }
+      } catch (err) {
+        alert('Erro de ligação ao enviar email de recuperação.');
       }
     }
 
@@ -11275,19 +11328,27 @@ function getDashboardHtml(): string {
             return;
           }
 
-          let html = '<div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden;"><table style="width: 100%; border-collapse: collapse; font-size: 0.82rem; text-align: left;">';
+          let html = '<div style="border: 1px solid #e2e8f0; border-radius: 10px; overflow-x: auto;"><table style="width: 100%; border-collapse: collapse; font-size: 0.82rem; text-align: left;">';
           html += '<thead style="background: #f8fafc; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700;">' +
-            '<tr><th style="padding: 10px 14px;">Utilizador</th><th style="padding: 10px 14px;">Dispositivo / IP</th><th style="padding: 10px 14px;">Perfil</th><th style="padding: 10px 14px;">Última Atividade</th><th style="padding: 10px 14px; text-align: right;">Ação</th></tr></thead><tbody>';
+            '<tr><th style="padding: 10px 14px;">Utilizador</th><th style="padding: 10px 14px;">Canal</th><th style="padding: 10px 14px;">Dispositivo / IP</th><th style="padding: 10px 14px;">Perfil</th><th style="padding: 10px 14px;">Última Atividade</th><th style="padding: 10px 14px; text-align: right;">Ação</th></tr></thead><tbody>';
 
           data.sessions.forEach(s => {
-            const timeStr = new Date(s.lastSeenAt).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const dt = new Date(s.lastSeenAt);
+            const timeStr = dt.toLocaleDateString('pt-PT', { day: '2-digit', month: '2-digit' }) + ' ' + dt.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+            const canalBadge = s.canal === 'MOBILE'
+              ? '<span style="background: #dcfce7; color: #15803d; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem; white-space: nowrap;">📱 Mobile (PIN)</span>'
+              : s.canal === 'WEB_LEGADO'
+              ? '<span style="background: #f1f5f9; color: #475569; padding: 3px 8px; border-radius: 6px; font-weight: 700; font-size: 0.72rem; white-space: nowrap;">🔑 Web (Código)</span>'
+              : '<span style="background: #e0f2fe; color: #0369a1; padding: 3px 8px; border-radius: 6px; font-weight: 800; font-size: 0.72rem; white-space: nowrap;">💻 App Web</span>';
+            const userSub = s.userEmail ? '<div style="font-size: 0.72rem; color: #64748b; font-weight: 500;">' + escapeHtml(s.userEmail) + '</div>' : '';
             html += '<tr style="border-bottom: 1px solid #f1f5f9;">' +
-              '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(s.userName) + '</td>' +
-              '<td style="padding: 10px 14px; color: #475569;">' + escapeHtml(s.device) + ' (' + escapeHtml(s.ip) + ')</td>' +
+              '<td style="padding: 10px 14px; font-weight: 700; color: #0f172a;">' + escapeHtml(s.userName) + userSub + '</td>' +
+              '<td style="padding: 10px 14px;">' + canalBadge + '</td>' +
+              '<td style="padding: 10px 14px; color: #475569;">' + escapeHtml(s.device) + '<div style="font-size: 0.7rem; color: #94a3b8;">' + escapeHtml(s.ip) + '</div></td>' +
               '<td style="padding: 10px 14px; font-weight: 700; color: #0284c7;">' + escapeHtml(s.role) + '</td>' +
-              '<td style="padding: 10px 14px; color: #059669; font-weight: 600;">' + timeStr + '</td>' +
+              '<td style="padding: 10px 14px; color: #059669; font-weight: 600; white-space: nowrap;">' + timeStr + '</td>' +
               '<td style="padding: 10px 14px; text-align: right;">' +
-              '<button data-id="' + s.sessionId + '" onclick="revokeSession(this.dataset.id)" style="background: #fee2e2; border: 1px solid #fca5a5; color: #dc2626; border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 0.74rem; font-weight: 700;">Terminar Sessão</button>' +
+              '<button data-id="' + s.sessionId + '" onclick="revokeSession(this.dataset.id)" style="background: #fee2e2; border: 1px solid #fca5a5; color: #dc2626; border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 0.74rem; font-weight: 700; white-space: nowrap;">Terminar Sessão</button>' +
               '</td></tr>';
           });
 

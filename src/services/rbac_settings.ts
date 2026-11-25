@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { PrismaClient } from '@prisma/client';
+import { invalidateSessionCacheByHash } from './auth_service';
 import {
   validateNewPin,
   hashPinWithPepper,
@@ -509,10 +510,36 @@ export async function touchUserSession(prisma: PrismaClient, token: string): Pro
     .catch(() => {});
 }
 
+function parseFriendlyDevice(ua?: string | null): string {
+  const s = String(ua || '');
+  if (!s) return 'Browser Web';
+  const browser = /Edg\//i.test(s)
+    ? 'Edge'
+    : /Chrome\//i.test(s)
+    ? 'Chrome'
+    : /Firefox\//i.test(s)
+    ? 'Firefox'
+    : /Safari\//i.test(s)
+    ? 'Safari'
+    : 'Browser';
+  const os = /iPhone|iPad/i.test(s)
+    ? 'iOS'
+    : /Android/i.test(s)
+    ? 'Android'
+    : /Windows/i.test(s)
+    ? 'Windows'
+    : /Mac OS/i.test(s)
+    ? 'macOS'
+    : /Linux/i.test(s)
+    ? 'Linux'
+    : '';
+  return os ? `${browser} · ${os}` : browser;
+}
+
 export async function getActivePharmacySessions(
   prisma: PrismaClient,
   farmaciaId: string
-): Promise<ActiveUserSession[]> {
+): Promise<Array<ActiveUserSession & { canal?: 'WEB' | 'MOBILE' | 'WEB_LEGADO'; metodo?: string }>> {
   const now = new Date();
   await prisma.sessaoUtilizador
     .deleteMany({
@@ -520,22 +547,74 @@ export async function getActivePharmacySessions(
     })
     .catch(() => {});
 
-  const rows = await prisma.sessaoUtilizador.findMany({
-    where: { farmaciaId, expiraEm: { gte: now } },
-    orderBy: { ultimoAcessoEm: 'desc' },
+  const [v2Rows, legacyRows] = await Promise.all([
+    prisma.sessao.findMany({
+      where: {
+        revogadaEm: null,
+        expiraEm: { gte: now },
+        OR: [
+          { farmaciaAtivaId: farmaciaId },
+          { membro: { farmaciaId } },
+          { utilizador: { isSuperadmin: true } },
+        ],
+      },
+      include: {
+        utilizador: { select: { nome: true, email: true, isSuperadmin: true } },
+        membro: { select: { perfil: true, farmaciaId: true } },
+      },
+      orderBy: { ultimoUsoEm: 'desc' },
+      take: 50,
+    }),
+    prisma.sessaoUtilizador.findMany({
+      where: { farmaciaId, expiraEm: { gte: now } },
+      orderBy: { ultimoAcessoEm: 'desc' },
+      take: 50,
+    }),
+  ]);
+
+  const v2Sessions = v2Rows.map((s) => {
+    const isPin = String(s.metodo || '').toUpperCase() === 'PIN';
+    const isMobileUa = /Mobile|Android|iPhone|iPad/i.test(s.userAgent || '');
+    const canal: 'WEB' | 'MOBILE' = isPin || isMobileUa ? 'MOBILE' : 'WEB';
+    const roleLabel = s.utilizador?.isSuperadmin
+      ? ('DIRETOR' as UserRole)
+      : ((s.membro?.perfil || 'GESTOR') as UserRole);
+
+    return {
+      sessionId: s.id,
+      farmaciaId: s.farmaciaAtivaId || farmaciaId,
+      userName: s.utilizador?.nome || s.utilizador?.email || 'Utilizador',
+      userEmail: s.utilizador?.email || undefined,
+      role: roleLabel,
+      ip: s.ip || '127.0.0.1',
+      device: parseFriendlyDevice(s.userAgent),
+      canal,
+      metodo: s.metodo || 'PASSWORD',
+      loginAt: s.criadaEm,
+      lastSeenAt: s.ultimoUsoEm,
+    };
   });
 
-  return rows.map((s) => ({
-    sessionId: s.id,
-    farmaciaId: s.farmaciaId,
-    userName: s.userName,
-    userEmail: s.userEmail || undefined,
-    role: (s.role as UserRole) || 'AUXILIAR',
-    ip: s.ip || '127.0.0.1',
-    device: s.device || 'Desconhecido',
-    loginAt: s.criadoEm,
-    lastSeenAt: s.ultimoAcessoEm,
-  }));
+  const legacySessions = legacyRows.map((s) => {
+    const isMobile = /balc[aã]o|mobile|telem[oó]vel/i.test(s.device || '');
+    return {
+      sessionId: s.id,
+      farmaciaId: s.farmaciaId,
+      userName: s.userName,
+      userEmail: s.userEmail || undefined,
+      role: (s.role as UserRole) || 'AUXILIAR',
+      ip: s.ip || '127.0.0.1',
+      device: s.device || 'Terminal Balcão',
+      canal: (isMobile ? 'MOBILE' : 'WEB_LEGADO') as 'MOBILE' | 'WEB_LEGADO',
+      metodo: isMobile ? 'PIN' : 'CODIGO',
+      loginAt: s.criadoEm,
+      lastSeenAt: s.ultimoAcessoEm,
+    };
+  });
+
+  return [...v2Sessions, ...legacySessions].sort(
+    (a, b) => new Date(b.lastSeenAt).getTime() - new Date(a.lastSeenAt).getTime()
+  );
 }
 
 export async function revokeUserSession(
@@ -544,6 +623,19 @@ export async function revokeUserSession(
   farmaciaId?: string
 ): Promise<boolean> {
   try {
+    let revoked = false;
+    // 1. Revogar na tabela moderna Sessao (Email + Password)
+    const v2Sess = await prisma.sessao.findUnique({ where: { id: sessionIdOrToken } });
+    if (v2Sess && !v2Sess.revogadaEm) {
+      await prisma.sessao.update({
+        where: { id: v2Sess.id },
+        data: { revogadaEm: new Date() },
+      });
+      invalidateSessionCacheByHash(v2Sess.tokenHash);
+      revoked = true;
+    }
+
+    // 2. Revogar na tabela legada SessaoUtilizador (PIN Mobile / código)
     const hashed = hashOpaqueToken(sessionIdOrToken);
     const res = await prisma.sessaoUtilizador.deleteMany({
       where: {
@@ -551,7 +643,7 @@ export async function revokeUserSession(
         ...(farmaciaId ? { farmaciaId } : {}),
       },
     });
-    return res.count > 0;
+    return revoked || res.count > 0;
   } catch {
     return false;
   }
