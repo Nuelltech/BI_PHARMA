@@ -5667,7 +5667,64 @@ function getDashboardHtml(): string {
   </div>
   <style>
     @keyframes initLoaderSpin { to { transform: rotate(360deg); } }
+    @keyframes globalBarSlide {
+      0% { transform: translateX(-100%); }
+      50% { transform: translateX(0%); }
+      100% { transform: translateX(100%); }
+    }
+    #globalLoadingBarWrap {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 3.5px;
+      background: rgba(14, 165, 233, 0.15);
+      z-index: 999999;
+      overflow: hidden;
+      display: none;
+    }
+    #globalLoadingBarFill {
+      width: 45%;
+      height: 100%;
+      background: linear-gradient(90deg, #0284c7, #38bdf8, #0ea5e9);
+      border-radius: 0 3px 3px 0;
+      animation: globalBarSlide 1.3s ease-in-out infinite;
+    }
+    #globalLoadingPill {
+      position: fixed;
+      top: 14px;
+      right: 18px;
+      z-index: 999998;
+      display: none;
+      align-items: center;
+      gap: 9px;
+      background: rgba(15, 23, 42, 0.94);
+      color: #f8fafc;
+      padding: 8px 14px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      backdrop-filter: blur(6px);
+    }
+    .global-pill-spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(56, 189, 248, 0.25);
+      border-top-color: #38bdf8;
+      border-radius: 50%;
+      animation: initLoaderSpin 0.7s linear infinite;
+      flex-shrink: 0;
+    }
   </style>
+
+  <!-- BARRA DE PROGRESSO GLOBAL PARA CARREGAMENTO DE DADOS -->
+  <div id="globalLoadingBarWrap"><div id="globalLoadingBarFill"></div></div>
+  <div id="globalLoadingPill">
+    <div class="global-pill-spinner"></div>
+    <span id="globalLoadingPillText">A carregar dados da farmácia...</span>
+  </div>
 
   <div class="app-layout" id="mainAppLayout" style="display: none;">
     <!-- BARRA LATERAL DE NAVEGAÇÃO CLÍNICA (SIDEBAR) -->
@@ -9848,11 +9905,34 @@ function getDashboardHtml(): string {
       loadAnalysis();
     }
 
+    let globalLoadingCount = 0;
+    function showGlobalLoader(message) {
+      globalLoadingCount++;
+      const bar = document.getElementById('globalLoadingBarWrap');
+      const pill = document.getElementById('globalLoadingPill');
+      const txt = document.getElementById('globalLoadingPillText');
+      if (txt && message) txt.textContent = message;
+      if (bar) bar.style.display = 'block';
+      if (pill) pill.style.display = 'flex';
+    }
+
+    function hideGlobalLoader() {
+      globalLoadingCount = Math.max(0, globalLoadingCount - 1);
+      if (globalLoadingCount === 0) {
+        const bar = document.getElementById('globalLoadingBarWrap');
+        const pill = document.getElementById('globalLoadingPill');
+        if (bar) bar.style.display = 'none';
+        if (pill) pill.style.display = 'none';
+      }
+    }
+
     async function loadAnalysis() {
       const diasMonos = document.getElementById('selectDiasMonos').value;
       const cobertura = document.getElementById('selectCobertura').value;
       const btn = document.getElementById('btnRecalcular');
       const feedback = document.getElementById('calcFeedback');
+
+      showGlobalLoader('A carregar indicadores e dados da farmácia...');
 
       const tenantBadge = document.getElementById('tenantBadge');
       if (tenantBadge && (!currentReport || !currentReport.farmacia)) {
@@ -9928,6 +10008,7 @@ function getDashboardHtml(): string {
       } catch (err) {
         console.error('Erro ao carregar análise:', err);
       } finally {
+        hideGlobalLoader();
         if (btn) {
           btn.disabled = false;
           btn.innerHTML = '🔄 Recalcular';
