@@ -10731,9 +10731,6 @@ function getDashboardHtml(): string {
     }
 
     function switchTab(tab) {
-      if (tab === 'copilot' && activeAuthRole !== 'ADMIN') {
-        tab = 'plano';
-      }
       activeTab = tab;
       ['plano', 'copilot', 'campaigns', 'rebalance', 'labs', 'evolution', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
         const btn = document.getElementById('tabBtn-' + t);
