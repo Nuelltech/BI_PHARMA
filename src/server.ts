@@ -3271,14 +3271,13 @@ async function startServer() {
         return;
       }
 
-      // 3. Endpoint de Perguntas em Linguagem Natural / Consultas Rápidas (Multi-Tenant)
-      // Decisão v2: Copilot restrito estritamente a Superuser (ADMIN) durante a fase de validação.
+      // 3. Endpoint de Perguntas em Linguagem Natural / Consultas Rápidas (Multi-Tenant + RBAC)
       if (pathname === '/api/ask' && req.method === 'POST') {
         try {
           const accessCtx = await resolveAccessContext();
-          if (accessCtx.role !== 'ADMIN') {
-            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: false, error: 'O Assistente Copilot encontra-se temporariamente restrito a administradores durante a fase de validação.' }));
+          if (!accessCtx.authenticated || (accessCtx.role !== 'ADMIN' && accessCtx.role !== 'PHARMACY')) {
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'Sessão não autenticada para utilizar o Assistente Copilot.' }));
             return;
           }
           const rawBody = await readRequestBody(req, 256 * 1024);
@@ -3293,7 +3292,10 @@ async function startServer() {
           }
 
           // Contexto de Segurança Multi-Tenant Estrito & Anonimização para LLM
-          const callerRole = 'SUPERADMIN';
+          const callerRole =
+            accessCtx.role === 'ADMIN'
+              ? 'SUPERADMIN'
+              : String((accessCtx as any).user?.perfil || 'DIRETOR').toUpperCase();
           const secContext: ToolSecurityContext = {
             farmaciaId: activeFarmacia.id,
             farmaciaNome: 'Farmácia Comunitária',
@@ -3358,9 +3360,9 @@ async function startServer() {
       if (pathname === '/api/ask/stream' && req.method === 'POST') {
         try {
           const accessCtx = await resolveAccessContext();
-          if (accessCtx.role !== 'ADMIN') {
-            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: false, error: 'O Assistente Copilot encontra-se restrito a administradores.' }));
+          if (!accessCtx.authenticated || (accessCtx.role !== 'ADMIN' && accessCtx.role !== 'PHARMACY')) {
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'Sessão não autenticada para utilizar o Assistente Copilot.' }));
             return;
           }
           const rawBody = await readRequestBody(req, 256 * 1024);
@@ -3377,6 +3379,7 @@ async function startServer() {
             'Content-Type': 'text/event-stream; charset=utf-8',
             'Cache-Control': 'no-cache, no-transform',
             Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
           });
 
           const sendSse = (eventName: string, payload: any) => {
@@ -3385,12 +3388,16 @@ async function startServer() {
             } catch (_) {}
           };
 
+          const callerRole =
+            accessCtx.role === 'ADMIN'
+              ? 'SUPERADMIN'
+              : String((accessCtx as any).user?.perfil || 'DIRETOR').toUpperCase();
           const secContext: ToolSecurityContext = {
             farmaciaId: activeFarmacia.id,
             farmaciaNome: 'Farmácia Comunitária',
             nif: '',
-            perfil: 'SUPERADMIN',
-            verFaturacao: canVerFaturacao('SUPERADMIN'),
+            perfil: callerRole,
+            verFaturacao: canVerFaturacao(callerRole),
           };
           const cleanSid = String(sessionId || 'default').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'default';
           const scopedSid = `${activeFarmacia.id}:${cleanSid}`;
@@ -3432,9 +3439,9 @@ async function startServer() {
       if (pathname === '/api/copilot/feedback' && req.method === 'POST') {
         try {
           const accessCtx = await resolveAccessContext();
-          if (accessCtx.role !== 'ADMIN') {
-            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: false, error: 'Acesso restrito a administradores.' }));
+          if (!accessCtx.authenticated || (accessCtx.role !== 'ADMIN' && accessCtx.role !== 'PHARMACY')) {
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'Sessão não autenticada.' }));
             return;
           }
           const rawBody = await readRequestBody(req, 32 * 1024);
@@ -3472,9 +3479,9 @@ async function startServer() {
       if (pathname === '/api/copilot/clear' && req.method === 'POST') {
         try {
           const accessCtx = await resolveAccessContext();
-          if (accessCtx.role !== 'ADMIN') {
-            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: false, error: 'Acesso restrito a administradores.' }));
+          if (!accessCtx.authenticated || (accessCtx.role !== 'ADMIN' && accessCtx.role !== 'PHARMACY')) {
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'Sessão não autenticada.' }));
             return;
           }
           const rawBody = await readRequestBody(req, 64 * 1024);
@@ -3497,17 +3504,24 @@ async function startServer() {
       if (pathname === '/api/copilot/generate-report' && req.method === 'POST') {
         try {
           const accessCtx = await resolveAccessContext();
-          if (accessCtx.role !== 'ADMIN') {
-            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: false, error: 'Acesso restrito a administradores.' }));
+          if (!accessCtx.authenticated || (accessCtx.role !== 'ADMIN' && accessCtx.role !== 'PHARMACY')) {
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: false, error: 'Sessão não autenticada.' }));
             return;
           }
           const rawBody = await readRequestBody(req, 512 * 1024);
           const { farmaciaId, sessionId, rawText, relatorioEstruturado, responsavel } = JSON.parse(rawBody || '{}');
           const activeFarmacia = await requireActiveFarmacia(farmaciaId);
-          const callerRole = 'SUPERADMIN';
+          const callerRole =
+            accessCtx.role === 'ADMIN'
+              ? 'SUPERADMIN'
+              : String((accessCtx as any).user?.perfil || 'DIRETOR').toUpperCase();
           const allowFaturacao = canVerFaturacao(callerRole);
-          const emitente = String(responsavel || (accessCtx.role === 'ADMIN' ? 'Administrador' : `Sessão ${activeFarmacia.nome}`)).trim();
+          const emitente = String(
+            responsavel ||
+              ((accessCtx as any).user?.nome) ||
+              (accessCtx.role === 'ADMIN' ? 'Administrador' : `Sessão ${activeFarmacia.nome}`)
+          ).trim();
 
           let contentToReport = String(rawText || '').trim();
           if (!contentToReport && sessionId) {
@@ -6258,7 +6272,7 @@ function getDashboardHtml(): string {
 
         <button class="nav-item tab-btn" id="tabBtn-copilot" onclick="switchTab('copilot')" style="display: none;">
           <span class="nav-item-left">💬 Assistente Copilot</span>
-          <span class="badge badge-info" style="font-size:0.68rem;">ADMIN v2</span>
+          <span class="badge badge-info" style="font-size:0.68rem;">IA v2</span>
         </button>
 
         <button class="nav-item tab-btn" id="tabBtn-campaigns" onclick="switchTab('campaigns')">
@@ -9304,9 +9318,7 @@ function getDashboardHtml(): string {
         if (adminBar) adminBar.style.display = 'none';
         if (sel) sel.style.display = 'none';
         if (selLabel) selLabel.style.display = 'none';
-        if (copilotBtn) copilotBtn.style.display = 'none';
-        if (copilotView) copilotView.style.display = 'none';
-        if (activeTab === 'copilot') switchTab('plano');
+        if (copilotBtn) copilotBtn.style.display = 'flex';
         // Acesso estritamente isolado: esconder completamente o botão de trocar!
         if (btnTrocar) btnTrocar.style.display = 'none';
         if (lockedBadge) {
