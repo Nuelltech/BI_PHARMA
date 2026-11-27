@@ -1,6 +1,29 @@
 import pdfParse from 'pdf-parse';
 
-export type SifarmaPdfKind = 'SIFARMA_INVENTARIO_NORMAL' | 'SIFARMA_SEM_CONSUMO';
+export type SifarmaPdfKind = 'SIFARMA_INVENTARIO_NORMAL' | 'SIFARMA_INVENTARIO_IVA' | 'SIFARMA_SEM_CONSUMO';
+
+export interface SifarmaInventarioIvaRow {
+  prateleira: string | null;
+  aim: string | null;
+  codigo: string; // CNP 7 dígitos
+  designacao: string;
+  lote: string;
+  stock: number;
+  custoUnitario: number;
+  valorSemIva: number;
+  taxaIva: number; // 0 | 6 | 13 | 23
+}
+
+export interface ParsedSifarmaInventarioIvaPdf {
+  kind: 'SIFARMA_INVENTARIO_IVA';
+  farmaciaNome: string | null;
+  farmaciaNif: string | null;
+  dataImpressao: string | null; // YYYY-MM-DD
+  totalArtigosPdf: number | null;
+  totalUnidadesPdf: number | null;
+  totalValorSemIvaPdf: number | null;
+  rows: SifarmaInventarioIvaRow[];
+}
 
 export interface SifarmaInventarioRow {
   prateleira: string | null;
@@ -147,6 +170,9 @@ export function detectSifarmaPdfKindFromLines(lines: string[]): SifarmaPdfKind |
   const head = lines.slice(0, 40).join('\n');
   if (/Lista\s+Normal\s+de\s+Produtos\s+sem\s+Consumo/i.test(head) || /Produtos\s+sem\s+consumo\s+desde/i.test(head)) {
     return 'SIFARMA_SEM_CONSUMO';
+  }
+  if (/Invent[aá]rio\s+Por\s+Taxas?\s+de\s+IVA/i.test(head)) {
+    return 'SIFARMA_INVENTARIO_IVA';
   }
   if (/Invent[aá]rio\s+Normal/i.test(head) && (/Cst\s+Un\.\s+S\/\s*IVA/i.test(head) || /Pre[cç]o\s+Venda/i.test(head))) {
     return 'SIFARMA_INVENTARIO_NORMAL';
@@ -417,4 +443,115 @@ export function parseSifarmaSemConsumoLines(lines: string[]): ParsedSifarmaSemCo
 export async function parseSifarmaSemConsumoPdf(buffer: Buffer): Promise<ParsedSifarmaSemConsumoPdf> {
   const lines = await extractTabLinesFromPdf(buffer);
   return parseSifarmaSemConsumoLines(lines);
+}
+
+export function parseSifarmaInventarioIvaLines(lines: string[]): ParsedSifarmaInventarioIvaPdf {
+  const { farmaciaNome, farmaciaNif, dataImpressao } = extractCommonHeader(lines);
+  let currentIva = 23;
+  let totalArtigosPdf: number | null = null;
+  let totalUnidadesPdf: number | null = null;
+  let totalValorSemIvaPdf: number | null = null;
+  const rows: SifarmaInventarioIvaRow[] = [];
+
+  for (const line of lines) {
+    const ivaM = line.match(/^Taxa\s+de\s+IVA\s*\(%\):\s*\t?\s*(\d+)/i);
+    if (ivaM) {
+      currentIva = parseInt(ivaM[1], 10);
+      continue;
+    }
+
+    if (/^Totais\s+Globais\s*:/i.test(line)) {
+      const cols = line.split('\t').map((c) => c.trim()).filter(Boolean);
+      const nums = cols.filter((c) => /^\d+$/.test(c));
+      const eur = cols.find((c) => c.endsWith('€'));
+      if (nums.length >= 2) {
+        totalArtigosPdf = parseInt(nums[0], 10);
+        totalUnidadesPdf = parseInt(nums[1], 10);
+      }
+      if (eur) totalValorSemIvaPdf = parsePtEuro(eur);
+      continue;
+    }
+
+    if (
+      /^(FARM[AÁ]CIA|RUA\s|AVENIDA\s|Telefone:|Dir\.\s*T[eé]c|Localiza[cç][aã]o|Prat\.\t|Totais\s+para|Total\t|Impress[aã]o|Página|\d{4}-\d{3}\t)/i.test(
+        line
+      )
+    ) {
+      continue;
+    }
+
+    const cols = line.split('\t').map((c) => c.trim()).filter(Boolean);
+
+    // Continuação de designação partida em 2 linhas
+    if (cols.length === 1 && rows.length > 0 && !cols[0].endsWith('€') && !/^\d+$/.test(cols[0])) {
+      rows[rows.length - 1].designacao = `${rows[rows.length - 1].designacao} ${cols[0]}`.trim();
+      continue;
+    }
+
+    if (cols.length < 6) continue;
+
+    // Âncora: últimos 2 campos são Custo Unit.€ e Valor S/ IVA€
+    const n = cols.length;
+    if (!cols[n - 1].endsWith('€') || !cols[n - 2].endsWith('€')) continue;
+
+    const valorSemIva = parsePtEuro(cols[n - 1]);
+    const custoUnitario = parsePtEuro(cols[n - 2]);
+    const stock = parseInt(cols[n - 3].replace(/\D/g, ''), 10);
+    if (!Number.isFinite(stock) || !Number.isFinite(custoUnitario) || !Number.isFinite(valorSemIva)) continue;
+
+    const loteRaw = cols[n - 4] || 'LOTE ÚNICO';
+    const lote = /LOTE/i.test(loteRaw) ? loteRaw : 'LOTE ÚNICO';
+    const designacaoEndIdx = /LOTE/i.test(loteRaw) ? n - 4 : n - 3;
+
+    let cnpIdx = -1;
+    for (let i = 0; i < Math.min(3, designacaoEndIdx); i++) {
+      if (/^\d{7}$/.test(cols[i])) {
+        cnpIdx = i;
+        break;
+      }
+    }
+    if (cnpIdx === -1) continue;
+
+    const codigo = normalizeCnp7(cols[cnpIdx]);
+    const designacao = cols.slice(cnpIdx + 1, designacaoEndIdx).join(' ').trim();
+    if (!designacao) continue;
+
+    let prateleira: string | null = null;
+    let aim: string | null = null;
+    if (cnpIdx === 2) {
+      prateleira = cols[0];
+      aim = cols[1];
+    } else if (cnpIdx === 1) {
+      if (/^\d+$/.test(cols[0])) aim = cols[0];
+      else prateleira = cols[0];
+    }
+
+    rows.push({
+      prateleira,
+      aim,
+      codigo,
+      designacao,
+      lote,
+      stock,
+      custoUnitario,
+      valorSemIva,
+      taxaIva: currentIva,
+    });
+  }
+
+  return {
+    kind: 'SIFARMA_INVENTARIO_IVA',
+    farmaciaNome,
+    farmaciaNif,
+    dataImpressao,
+    totalArtigosPdf,
+    totalUnidadesPdf,
+    totalValorSemIvaPdf,
+    rows,
+  };
+}
+
+export async function parseSifarmaInventarioIvaPdf(buffer: Buffer): Promise<ParsedSifarmaInventarioIvaPdf> {
+  const lines = await extractTabLinesFromPdf(buffer);
+  return parseSifarmaInventarioIvaLines(lines);
 }

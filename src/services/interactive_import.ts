@@ -25,6 +25,7 @@ import { classifyProduct } from './classifier';
 import {
   detectSifarmaPdfKind,
   parseSifarmaInventarioNormalLines,
+  parseSifarmaInventarioIvaLines,
   parseSifarmaSemConsumoLines,
 } from './sifarma_pdf_parsers';
 
@@ -49,6 +50,7 @@ export interface FileInspectionResult {
     | 'VENDAS_DIARIO'
     | 'VALIDADES'
     | 'INVENTARIO_SIFARMA'
+    | 'INVENTARIO_IVA_SIFARMA'
     | 'SEM_CONSUMO_SIFARMA'
     | 'DESCONHECIDO';
   periodo: string | null;
@@ -338,6 +340,87 @@ export async function inspectFilesForInteractiveImport(
             questions,
             status: parsedInv.rows.length > 0 ? 'READY' : 'ERROR',
             errorMessage: parsedInv.rows.length === 0 ? 'Nenhum artigo extraído do PDF de Inventário Normal.' : undefined,
+          });
+          continue;
+        }
+
+        if (kind === 'SIFARMA_INVENTARIO_IVA') {
+          const parsedIva = parseSifarmaInventarioIvaLines(lines);
+          const questions: InspectionQuestion[] = [];
+          if (parsedIva.farmaciaNif && parsedIva.farmaciaNif !== farmaciaAtiva.nif) {
+            questions.push({
+              id: 'nif_action',
+              title: 'NIF Divergente Detetado',
+              description: `O documento indica NIF ${parsedIva.farmaciaNif} (${parsedIva.farmaciaNome || 'Farmácia'}), mas a farmácia ativa é ${farmaciaAtiva.nome} (NIF: ${farmaciaAtiva.nif}).`,
+              defaultValue: 'link_to_current',
+              options: [
+                {
+                  value: 'link_to_current',
+                  label: `Associar à farmácia ativa (${farmaciaAtiva.nome})`,
+                  isRecommended: true,
+                },
+              ],
+            });
+          }
+
+          // Verifica se já existe um snapshot mais recente na BD para proteger o stock ativo
+          const latestSnap = await prisma.inventarioSnapshot.findFirst({
+            where: { farmaciaId: farmaciaAtiva.id },
+            orderBy: { data_snapshot: 'desc' },
+            select: { data_snapshot: true },
+          });
+          const pdfDate = parsedIva.dataImpressao ? new Date(`${parsedIva.dataImpressao}T23:59:59.000Z`) : null;
+          const isOlderThanLatest = Boolean(latestSnap && pdfDate && latestSnap.data_snapshot > pdfDate);
+
+          questions.push({
+            id: 'stock_action',
+            title: isOlderThanLatest
+              ? 'Inventário por Taxas de IVA (Data Anterior ao Stock Atual)'
+              : 'Inventário por Taxas de IVA (Sifarma)',
+            description: isOlderThanLatest
+              ? `Este inventário é de ${parsedIva.dataImpressao} (${parsedIva.rows.length} artigos), anterior ao último fecho na BD (${latestSnap!.data_snapshot.toISOString().slice(0, 10)}). Recomendamos guardar apenas como Snapshot Histórico + Taxas de IVA oficiais.`
+              : `Foram lidos ${parsedIva.rows.length} artigos com Custo Unitário e Taxa de IVA oficial (data: ${parsedIva.dataImpressao || 'atual'}).`,
+            defaultValue: isOlderThanLatest ? 'snapshot_only' : 'update_active',
+            options: isOlderThanLatest
+              ? [
+                  {
+                    value: 'snapshot_only',
+                    label: 'Guardar Snapshot Histórico + Taxas de IVA oficiais (Recomendado: preserva o stock ativo mais recente)',
+                    isRecommended: true,
+                  },
+                  {
+                    value: 'update_active',
+                    label: 'Substituir também o stock ativo atual por esta data anterior',
+                    isRecommended: false,
+                  },
+                ]
+              : [
+                  {
+                    value: 'update_active',
+                    label: 'Atualizar existências ativas, Taxas de IVA oficiais e guardar Snapshot histórico (Recomendado)',
+                    isRecommended: true,
+                  },
+                  {
+                    value: 'snapshot_only',
+                    label: 'Guardar apenas Snapshot Histórico + Taxas de IVA oficiais (sem alterar o stock ativo)',
+                    isRecommended: false,
+                  },
+                ],
+          });
+
+          results.push({
+            fileName: f.name,
+            fileType: 'INVENTARIO_IVA_SIFARMA',
+            periodo: `Inventário por Taxas de IVA (${parsedIva.dataImpressao || 'atual'})`,
+            dataInicio: parsedIva.dataImpressao,
+            dataFim: parsedIva.dataImpressao,
+            anoReferencia: parsedIva.dataImpressao ? parseInt(parsedIva.dataImpressao.slice(0, 4), 10) : new Date().getUTCFullYear(),
+            nifDetectado: parsedIva.farmaciaNif,
+            farmaciaNomeDetectada: parsedIva.farmaciaNome,
+            totalArtigos: parsedIva.rows.length,
+            questions,
+            status: parsedIva.rows.length > 0 ? 'READY' : 'ERROR',
+            errorMessage: parsedIva.rows.length === 0 ? 'Nenhum artigo extraído do PDF de Inventário por Taxas de IVA.' : undefined,
           });
           continue;
         }
@@ -743,6 +826,97 @@ export async function executeInteractiveImport(
             tipo: 'INVENTARIO_SIFARMA',
             stockSnapshots: snapshotsCount,
             mensagem: `${parsedInv.rows.length} artigos de Inventário Normal Sifarma integrados (${snapshotsCount} snapshots${activeStockCount > 0 ? `, ${activeStockCount} stocks + preços PVP/CMP atualizados` : ''}).`,
+          });
+          continue;
+        }
+
+        if (kind === 'SIFARMA_INVENTARIO_IVA') {
+          const parsedIva = parseSifarmaInventarioIvaLines(lines);
+          const targetFarmaciaId = farmacia.id;
+          const stockPolicy = fileDecisions.stockAction || 'snapshot_only';
+          const snapDate = parsedIva.dataImpressao ? new Date(`${parsedIva.dataImpressao}T23:59:59.000Z`) : new Date();
+
+          onProgress?.(
+            basePct + Math.round(fileSlice * 0.2),
+            `A integrar Inventário por Taxas de IVA (Sifarma)...`,
+            `${parsedIva.rows.length} artigos lidos`
+          );
+
+          // 1. Produtos novos em ProdutoMestre com taxa_iva oficial
+          const uniqueProds = new Map<string, { cnp_codigo: string; designacao: string; tipo_venda: string; macro_area: string | null; categoria: string; subcategoria: string | null; sazonalidade: string | null; taxa_iva: number; aim?: string | null }>();
+          for (const r of parsedIva.rows) {
+            const cnp = normalizeCnp(r.codigo);
+            const cls = classifyProduct(cnp, r.designacao, r.taxaIva);
+            uniqueProds.set(cnp, {
+              cnp_codigo: cnp,
+              designacao: r.designacao,
+              tipo_venda: cls.tipo_venda,
+              macro_area: cls.macro_area || null,
+              categoria: cls.categoria,
+              subcategoria: cls.subcategoria || null,
+              sazonalidade: cls.sazonalidade || null,
+              taxa_iva: r.taxaIva,
+              aim: r.aim || null,
+            });
+          }
+          const prodChunks = Array.from(uniqueProds.values());
+          for (let i = 0; i < prodChunks.length; i += 500) {
+            const resCreate = await prisma.produtoMestre.createMany({
+              data: prodChunks.slice(i, i + 500),
+              skipDuplicates: true,
+            });
+            stats.totalProdutosNovos += resCreate.count;
+          }
+
+          // 2. Atualizar taxa_iva oficial em ProdutoMestre (fonte oficial Sifarma por taxa de IVA)
+          const ivaDedup = new Map<string, number>();
+          parsedIva.rows.forEach((r) => ivaDedup.set(normalizeCnp(r.codigo), r.taxaIva));
+          const ivaEntries = Array.from(ivaDedup.entries());
+          for (let i = 0; i < ivaEntries.length; i += BULK_BATCH_SIZE) {
+            const chunk = ivaEntries.slice(i, i + BULK_BATCH_SIZE);
+            await prisma.$executeRawUnsafe(
+              `UPDATE "ProdutoMestre" AS p
+               SET "taxa_iva" = u.iva
+               FROM unnest($1::text[], $2::int[]) AS u(cnp, iva)
+               WHERE p."cnp_codigo" = u.cnp`,
+              chunk.map(([cnp]) => cnp),
+              chunk.map(([, iva]) => iva)
+            );
+          }
+
+          // 3. Snapshots históricos
+          const snapRows = parsedIva.rows.map((r) => ({
+            farmaciaId: targetFarmaciaId,
+            cnp_codigo: normalizeCnp(r.codigo),
+            data_snapshot: snapDate,
+            quantidade: r.stock,
+            custo_unitario: r.custoUnitario,
+            valor_total: Number(r.valorSemIva.toFixed(2)),
+          }));
+          const snapshotsCount = await bulkUpsertSnapshots(prisma, snapRows);
+          stats.totalSnapshotsStockCriados += snapshotsCount;
+
+          // 4. Stock ativo apenas se o utilizador escolheu update_active
+          let activeStockCount = 0;
+          if (stockPolicy === 'update_active') {
+            const invRows = parsedIva.rows.map((r) => ({
+              farmaciaId: targetFarmaciaId,
+              cnp_codigo: normalizeCnp(r.codigo),
+              lote: r.lote || 'LOTE ÚNICO',
+              quantidade: r.stock,
+              custo_unitario: r.custoUnitario,
+            }));
+            activeStockCount = await bulkUpsertInventario(prisma, invRows);
+            stats.totalInventarioAtivoAtualizado += activeStockCount;
+          }
+
+          stats.filesProcessed++;
+          stats.detalhesPorFicheiro.push({
+            fileName: f.name,
+            sucesso: true,
+            tipo: 'INVENTARIO_IVA_SIFARMA',
+            stockSnapshots: snapshotsCount,
+            mensagem: `${parsedIva.rows.length} artigos integrados (${snapshotsCount} snapshots de ${parsedIva.dataImpressao || 'data do doc'}, ${ivaEntries.length} taxas de IVA oficiais atualizadas${activeStockCount > 0 ? `, ${activeStockCount} stocks ativos atualizados` : '; stock ativo preservado'}).`,
           });
           continue;
         }

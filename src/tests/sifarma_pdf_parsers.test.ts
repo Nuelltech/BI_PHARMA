@@ -4,12 +4,14 @@ import path from 'path';
 import {
   detectSifarmaPdfKind,
   parseSifarmaInventarioNormalLines,
+  parseSifarmaInventarioIvaLines,
   parseSifarmaSemConsumoLines,
 } from '../services/sifarma_pdf_parsers';
 
 const AREOSA_DIR = path.resolve(process.cwd(), 'Areosa_Viana');
 const INV_PDF = path.join(AREOSA_DIR, 'inventario_15_07_2026.pdf');
 const SEM_CONSUMO_PDF = path.join(AREOSA_DIR, 'Sem_consumo.pdf');
+const BAPTISTA_IVA_PDF = path.join(process.cwd(), 'baptista', '21000lista_20261019104350.pdf');
 
 describe('Sifarma PDF Parsers (Inventário Normal & Produtos sem Consumo)', () => {
   it('extrai e valida inventario_15_07_2026.pdf com precisão exata de artigos, stock, PVP e custo', async () => {
@@ -68,5 +70,27 @@ describe('Sifarma PDF Parsers (Inventário Normal & Produtos sem Consumo)', () =
     expect(loc?.pvp).toBe(32.65);
     expect(loc?.taxaIvaEstimada).toBe(6);
     expect(loc?.familia).toBe('Alopatia');
+  }, 30_000);
+
+  it('extrai e valida 21000lista_20261019104350.pdf (Inventário por Taxas de IVA) com totais exatos', async () => {
+    if (!fs.existsSync(BAPTISTA_IVA_PDF)) return;
+    const buf = fs.readFileSync(BAPTISTA_IVA_PDF);
+    const { kind, lines } = await detectSifarmaPdfKind(buf);
+    expect(kind).toBe('SIFARMA_INVENTARIO_IVA');
+
+    const parsed = parseSifarmaInventarioIvaLines(lines);
+    expect(parsed.farmaciaNif).toBe('505016419');
+    expect(parsed.dataImpressao).toBe('2026-10-19');
+    expect(parsed.rows.length).toBe(3426);
+
+    const totalUn = parsed.rows.reduce((s, r) => s + r.stock, 0);
+    const totalVal = Number(parsed.rows.reduce((s, r) => s + r.valorSemIva, 0).toFixed(2));
+    expect(totalUn).toBe(13155);
+    expect(totalVal).toBe(65422.6);
+
+    // Verifica taxa 0% (Fluarix) e taxa 6% (Acarbose) e taxa 23% (3 Claveles)
+    expect(parsed.rows.find((r) => r.codigo === '7588137')?.taxaIva).toBe(0);
+    expect(parsed.rows.find((r) => r.codigo === '5111505')?.taxaIva).toBe(6);
+    expect(parsed.rows.find((r) => r.codigo === '6047662')?.taxaIva).toBe(23);
   }, 30_000);
 });
