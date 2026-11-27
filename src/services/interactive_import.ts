@@ -363,13 +363,13 @@ export async function inspectFilesForInteractiveImport(
           const comprasRecentes = parsedSc.rows.filter((r) => r.dataUltimaCompra && parsedSc.semConsumoDesde && r.dataUltimaCompra >= parsedSc.semConsumoDesde).length;
           questions.push({
             id: 'stock_action',
-            title: 'Lista de Produtos sem Consumo (Monos Reais)',
-            description: `Detetados ${parsedSc.rows.length} produtos sem vendas desde ${parsedSc.semConsumoDesde || 'há >12M'} (${comprasRecentes} comprados recentemente apesar de não rodarem!).`,
+            title: 'Lista de Produtos sem Consumo (Enriquecimento Não-Destrutivo)',
+            description: `Detetados ${parsedSc.rows.length} produtos sem vendas desde ${parsedSc.semConsumoDesde || 'há >12M'} (${comprasRecentes} comprados recentemente apesar de não rodarem!). Não apaga nem altera stock ou custos reais existentes.`,
             defaultValue: 'update_active',
             options: [
               {
                 value: 'update_active',
-                label: 'Enriquecer catálogo (IVA, Família, PVP), atualizar stock e registar datas de última venda (Recomendado)',
+                label: 'Enriquecimento Não-Destrutivo (Recomendado: grava Última Compra, Última Venda histórica, IVA e PVP em falta — preserva stock e custos reais)',
                 isRecommended: true,
               },
             ],
@@ -802,33 +802,56 @@ export async function executeInteractiveImport(
             );
           }
 
-          // 3. Atualizar PVP em PrecoFarmacia (preservando custo_ref se já existir)
-          const precosRows = parsedSc.rows
-            .filter((r) => r.pvp > 0)
-            .map((r) => ({
-              farmaciaId: targetFarmaciaId,
-              cnp_codigo: normalizeCnp(r.codigo),
-              pvp: r.pvp,
-              custo_ref: r.stock > 0 && r.valorSemIva > 0 ? Number((r.valorSemIva / r.stock).toFixed(2)) : 0,
-            }));
-          if (precosRows.length > 0) {
-            await bulkUpsertPrecos(prisma, precosRows);
+          // 3. Enriquecer PVP em PrecoFarmacia (NÃO-DESTRUTIVO: nunca sobrescreve custo_ref nem PVP já preenchido)
+          const pvpDedup = new Map<string, number>();
+          for (const r of parsedSc.rows) {
+            if (r.pvp > 0) pvpDedup.set(normalizeCnp(r.codigo), Number(r.pvp.toFixed(2)));
+          }
+          const pvpEntries = Array.from(pvpDedup.entries());
+          for (let i = 0; i < pvpEntries.length; i += BULK_BATCH_SIZE) {
+            const chunk = pvpEntries.slice(i, i + BULK_BATCH_SIZE);
+            await prisma.$executeRawUnsafe(
+              `INSERT INTO "PrecoFarmacia" ("farmaciaId", "cnp_codigo", "pvp", "atualizadoEm")
+               SELECT $1, u.cnp, u.pvp, NOW()
+               FROM unnest($2::text[], $3::numeric[]) AS u(cnp, pvp)
+               ON CONFLICT ("farmaciaId", "cnp_codigo")
+               DO UPDATE SET
+                 "pvp" = CASE WHEN "PrecoFarmacia"."pvp" IS NULL OR "PrecoFarmacia"."pvp" = 0 THEN EXCLUDED."pvp" ELSE "PrecoFarmacia"."pvp" END,
+                 "atualizadoEm" = NOW()`,
+              targetFarmaciaId,
+              chunk.map(([cnp]) => cnp),
+              chunk.map(([, pvp]) => pvp)
+            );
           }
 
-          // 4. Atualizar Inventario (custo unitário inferido de Val. S/IVA ÷ Stock quando disponível)
-          const invRows = parsedSc.rows
-            .filter((r) => r.stock > 0)
-            .map((r) => ({
-              farmaciaId: targetFarmaciaId,
-              cnp_codigo: normalizeCnp(r.codigo),
-              lote: 'LOTE ÚNICO',
-              quantidade: r.stock,
-              custo_unitario: r.stock > 0 && r.valorSemIva > 0 ? Number((r.valorSemIva / r.stock).toFixed(2)) : 0,
-            }));
-          const activeStockCount = invRows.length > 0 ? await bulkUpsertInventario(prisma, invRows) : 0;
+          // 4. Inventario NÃO-DESTRUTIVO: insere apenas CNPs que ainda não existam em Inventario
+          //    (NUNCA altera quantidade nem custo_unitario de artigos já existentes!)
+          const invDedup = new Map<string, { qtd: number; prat: string | null }>();
+          for (const r of parsedSc.rows) {
+            if (r.stock > 0) {
+              invDedup.set(normalizeCnp(r.codigo), { qtd: r.stock, prat: r.prateleira || null });
+            }
+          }
+          const invEntries = Array.from(invDedup.entries());
+          let insertedMissingInv = 0;
+          for (let i = 0; i < invEntries.length; i += BULK_BATCH_SIZE) {
+            const chunk = invEntries.slice(i, i + BULK_BATCH_SIZE);
+            const affected = await prisma.$executeRawUnsafe(
+              `INSERT INTO "Inventario" ("id", "farmaciaId", "cnp_codigo", "lote", "prateleira", "quantidade", "custo_unitario", "data_extracao")
+               SELECT gen_random_uuid()::text, $1, u.cnp, 'LOTE ÚNICO', u.prat, u.qtd, 0, NOW()
+               FROM unnest($2::text[], $3::text[], $4::int[]) AS u(cnp, prat, qtd)
+               ON CONFLICT ("farmaciaId", "cnp_codigo", "lote") DO NOTHING`,
+              targetFarmaciaId,
+              chunk.map(([cnp]) => cnp),
+              chunk.map(([, v]) => v.prat),
+              chunk.map(([, v]) => v.qtd)
+            );
+            insertedMissingInv += Number(affected || 0);
+          }
+          const activeStockCount = insertedMissingInv;
           stats.totalInventarioAtivoAtualizado += activeStockCount;
 
-          // 4B. Gravar data_ultima_compra (e prateleira) no Inventario para deteção de compras em monos
+          // 4B. Gravar data_ultima_compra (e prateleira onde faltar) no Inventario para deteção de compras em monos
           const compraUpdates = parsedSc.rows
             .filter((r) => r.dataUltimaCompra)
             .map((r) => ({
@@ -842,9 +865,10 @@ export async function executeInteractiveImport(
             if (!prev || u.dt > prev.dt) compraDedup.set(u.cnp, { dt: u.dt, prat: u.prat });
           }
           const compraEntries = Array.from(compraDedup.entries());
+          let comprasAtualizadas = 0;
           for (let i = 0; i < compraEntries.length; i += BULK_BATCH_SIZE) {
             const chunk = compraEntries.slice(i, i + BULK_BATCH_SIZE);
-            await prisma.$executeRawUnsafe(
+            const affected = await prisma.$executeRawUnsafe(
               `UPDATE "Inventario" AS i
                SET "data_ultima_compra" = u.dt,
                    "prateleira" = COALESCE(u.prat, i."prateleira")
@@ -855,6 +879,7 @@ export async function executeInteractiveImport(
               chunk.map(([, v]) => v.prat),
               targetFarmaciaId
             );
+            comprasAtualizadas += Number(affected || 0);
           }
 
           // 5. Registar data da última venda real (apenas para CNPs sem histórico de vendas na BD)
@@ -892,8 +917,8 @@ export async function executeInteractiveImport(
             fileName: f.name,
             sucesso: true,
             tipo: 'SEM_CONSUMO_SIFARMA',
-            stockSnapshots: activeStockCount,
-            mensagem: `${parsedSc.rows.length} produtos sem consumo integrados (${activeStockCount} stocks, ${lastSaleRefsInserted} datas históricas de última venda, ${comprasRecentes} comprados recentemente sem rotação).`,
+            stockSnapshots: comprasAtualizadas,
+            mensagem: `${parsedSc.rows.length} produtos sem consumo analisados (não-destrutivo: ${comprasAtualizadas} datas de última compra gravadas, ${lastSaleRefsInserted} datas históricas de última venda, ${comprasRecentes} comprados recentemente sem rotação; stock e custos reais preservados).`,
           });
           continue;
         }
