@@ -13555,6 +13555,7 @@ function getDashboardHtml(): string {
               \${sortableTh('cobertura', 'pvp', 'PVP (Margem)')}
               \${sortableTh('cobertura', 'vmm', 'VMM')}
               \${sortableTh('cobertura', 'cobertura_meses', 'Cobertura')}
+              \${sortableTh('cobertura', 'ultima_compra', 'Última Compra')}
               <th>Orientação de Balcão / Substituição DCI</th>
             </tr>
           </thead>
@@ -13568,6 +13569,7 @@ function getDashboardHtml(): string {
                 <td>\${r.pvp !== null ? r.pvp.toFixed(2) + ' €' : '-'} \${r.margem_percentagem ? '(' + r.margem_percentagem.toFixed(0) + '%)' : ''}</td>
                 <td>\${r.vmm}/mês</td>
                 <td><span class="badge badge-info">\${r.cobertura_meses !== null ? r.cobertura_meses + ' m' : '∞ (VMM=0)'}</span></td>
+                <td>\${r.ultima_compra || '<span style="color:var(--muted)">—</span>'}</td>
                 <td>\${r.sugestao_balcao}</td>
               </tr>
             \`).join('')}

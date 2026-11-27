@@ -32,6 +32,7 @@ export interface ProdutoCoberturaItem {
   vmm: number;
   cobertura_meses: number | null;
   excesso_cobertura: boolean;
+  ultima_compra?: string | null;
 }
 
 export interface ProdutoMonoItem {
@@ -673,6 +674,9 @@ export async function analyzePharmacyInventory(
         vmm,
         cobertura_meses: coberturaMeses,
         excesso_cobertura: true,
+        ultima_compra: (item as any).data_ultima_compra
+          ? new Date((item as any).data_ultima_compra).toISOString().slice(0, 10)
+          : null,
       });
     }
 
