@@ -24,6 +24,7 @@ import {
 
 import { getMobileStaffHtml } from './views/mobile_staff_view';
 import { getStockEvolutionAnalytics } from './services/stock_evolution';
+import { getSalesExplorerData, getProductSalesHistory } from './services/sales_explorer';
 import {
   getWeeklyTasksAudit,
   getPharmacyWeeklyTasks,
@@ -3733,6 +3734,59 @@ async function startServer() {
           return;
         }
 
+        // 2.5I-SalesExplorer. Endpoint Explorador de Vendas & Posições de Stock por Produto (Multi-Tenant + RBAC)
+        if (pathname === '/api/analytics/sales-explorer' && req.method === 'GET') {
+          try {
+            const accessCtx = await resolveAccessContext();
+            const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+            const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+            const callerRole =
+              accessCtx.role === 'ADMIN'
+                ? 'SUPERADMIN'
+                : String((accessCtx as any).user?.perfil || 'DIRETOR').toUpperCase();
+            const allowFaturacao = canVerFaturacao(callerRole);
+
+            const salesData = await getSalesExplorerData(prisma, activeFarmacia.id, {
+              period: String(parsedUrl.query.period || '12m'),
+              mesInicio: String(parsedUrl.query.mesInicio || ''),
+              mesFim: String(parsedUrl.query.mesFim || ''),
+              verFaturacao: allowFaturacao,
+              forceRefresh: String(parsedUrl.query.refresh || '') === '1',
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(salesData));
+          } catch (e: any) {
+            const status = e.statusCode || 500;
+            res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+          return;
+        }
+
+        // 2.5I-SalesHistory. Endpoint Histórico Mensal (Vendas vs Posição de Stock) de um Produto
+        if (pathname === '/api/analytics/sales-product-history' && req.method === 'GET') {
+          try {
+            const accessCtx = await resolveAccessContext();
+            const farmIdQuery = String(parsedUrl.query.farmaciaId || '').trim();
+            const cnpQuery = String(parsedUrl.query.cnp || '').trim();
+            const activeFarmacia = await requireActiveFarmacia(farmIdQuery);
+            const callerRole =
+              accessCtx.role === 'ADMIN'
+                ? 'SUPERADMIN'
+                : String((accessCtx as any).user?.perfil || 'DIRETOR').toUpperCase();
+            const allowFaturacao = canVerFaturacao(callerRole);
+
+            const histData = await getProductSalesHistory(prisma, activeFarmacia.id, cnpQuery, allowFaturacao);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(histData));
+          } catch (e: any) {
+            const status = e.statusCode || 500;
+            res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+          return;
+        }
+
         // 2.5I. Endpoint Obter Tarefas Semanais da Farmácia
       if (pathname === '/api/weekly-tasks' && req.method === 'GET') {
         try {
@@ -6286,6 +6340,11 @@ function getDashboardHtml(): string {
           <span class="badge" style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 0.68rem; font-weight: 800; border: 1px solid rgba(16, 185, 129, 0.3);">NOVO</span>
         </button>
 
+        <button class="nav-item tab-btn" id="tabBtn-sales" onclick="switchTab('sales')">
+          <span class="nav-item-left">📊 Vendas & Histórico</span>
+          <span class="badge badge-info" id="badge-sales" style="font-size: 0.68rem;">NOVO</span>
+        </button>
+
         <div class="nav-section-title" style="margin-top:14px;">GESTÃO DE STOCK & COMPRAS</div>
 
         <button class="nav-item tab-btn" id="tabBtn-caducidade" onclick="switchTab('caducidade')">
@@ -7587,9 +7646,170 @@ function getDashboardHtml(): string {
         <table id="mainTable"></table>
       </div>
     </div>
+
+    <!-- ABA DEDICADA A VENDAS & POSIÇÕES DE STOCK AO LONGO DO TEMPO -->
+    <div id="tabContent-sales" style="display: none;">
+      <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: #ffffff; border-radius: 14px; padding: 20px 24px; margin-bottom: 18px; box-shadow: 0 4px 14px rgba(15,23,42,0.12);">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 14px;">
+          <div>
+            <div style="font-size: 1.2rem; font-weight: 800; display: flex; align-items: center; gap: 8px;">
+              <span>📊</span> Vendas &amp; Posições de Stock por Produto
+              <span id="salesPartialMonthBadge" style="display:none; font-size: 0.72rem; font-weight: 700; background: rgba(245,158,11,0.2); color: #fcd34d; border: 1px solid rgba(245,158,11,0.45); padding: 3px 9px; border-radius: 999px;"></span>
+            </div>
+            <p style="font-size: 0.85rem; color: #cbd5e1; margin-top: 4px; max-width: 780px; line-height: 1.45;">
+              Pesquise por produto, molécula DCI ou laboratório para analisar as vendas no período, tendência e posição de stock. Clique em qualquer produto para abrir a evolução mensal detalhada.
+            </p>
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <button type="button" class="btn" onclick="exportSalesExplorerCsv()" style="background: #10b981; color: #042f2e; font-weight: 800; border: none; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 0.82rem;">
+              📥 Exportar CSV (Excel)
+            </button>
+            <button type="button" class="btn" onclick="loadSalesExplorer(true)" style="background: #0284c7; color: #ffffff; font-weight: 700; border: none; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 0.82rem;">
+              🔄 Atualizar
+            </button>
+          </div>
+        </div>
+
+        <!-- Seletor Rápido de Período -->
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.1);">
+          <span style="font-size: 0.74rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">Período:</span>
+          <button type="button" class="sales-period-pill" data-period="1m" onclick="setSalesPeriod('1m')" style="background: rgba(255,255,255,0.08); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.16); padding: 5px 11px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; cursor: pointer;">Mês Atual</button>
+          <button type="button" class="sales-period-pill" data-period="3m" onclick="setSalesPeriod('3m')" style="background: rgba(255,255,255,0.08); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.16); padding: 5px 11px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; cursor: pointer;">3 Meses</button>
+          <button type="button" class="sales-period-pill" data-period="6m" onclick="setSalesPeriod('6m')" style="background: rgba(255,255,255,0.08); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.16); padding: 5px 11px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; cursor: pointer;">6 Meses</button>
+          <button type="button" class="sales-period-pill" data-period="12m" onclick="setSalesPeriod('12m')" style="background: #0284c7; color: #ffffff; border: 1px solid #38bdf8; padding: 5px 11px; border-radius: 999px; font-size: 0.78rem; font-weight: 800; cursor: pointer;">12 Meses</button>
+          <button type="button" class="sales-period-pill" data-period="2026" onclick="setSalesPeriod('2026')" style="background: rgba(255,255,255,0.08); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.16); padding: 5px 11px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; cursor: pointer;">Ano 2026</button>
+          <button type="button" class="sales-period-pill" data-period="2025" onclick="setSalesPeriod('2025')" style="background: rgba(255,255,255,0.08); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.16); padding: 5px 11px; border-radius: 999px; font-size: 0.78rem; font-weight: 700; cursor: pointer;">Ano 2025</button>
+          <div style="display: inline-flex; align-items: center; gap: 6px; margin-left: 6px;">
+            <select id="salesCustomStart" onchange="applySalesCustomPeriod()" style="background: #0f172a; color: #f8fafc; border: 1px solid #475569; border-radius: 8px; padding: 4px 8px; font-size: 0.78rem; font-weight: 600;"></select>
+            <span style="color: #94a3b8; font-size: 0.78rem;">→</span>
+            <select id="salesCustomEnd" onchange="applySalesCustomPeriod()" style="background: #0f172a; color: #f8fafc; border: 1px solid #475569; border-radius: 8px; padding: 4px 8px; font-size: 0.78rem; font-weight: 600;"></select>
+          </div>
+          <span id="salesActivePeriodLabel" style="margin-left: auto; font-size: 0.76rem; color: #94a3b8; font-weight: 600;"></span>
+        </div>
+      </div>
+
+      <!-- 4 Cartões KPI Dinâmicos (reagem à pesquisa e filtros!) -->
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-bottom: 18px;">
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #0284c7; border-radius: 12px; padding: 14px 16px;">
+          <div style="font-size: 0.72rem; font-weight: 800; color: #64748b; text-transform: uppercase;">📦 Unidades Vendidas</div>
+          <div id="salesKpiUnits" style="font-size: 1.45rem; font-weight: 900; color: #0f172a; margin-top: 4px;">--</div>
+          <div id="salesKpiUnitsSub" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">A calcular...</div>
+        </div>
+        <div id="salesKpiRevenueCard" style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #10b981; border-radius: 12px; padding: 14px 16px;">
+          <div id="salesKpiRevenueTitle" style="font-size: 0.72rem; font-weight: 800; color: #64748b; text-transform: uppercase;">💶 Faturação no Período</div>
+          <div id="salesKpiRevenue" style="font-size: 1.45rem; font-weight: 900; color: #059669; margin-top: 4px;">--</div>
+          <div id="salesKpiRevenueSub" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">--</div>
+        </div>
+        <div id="salesKpiMarginCard" style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #8b5cf6; border-radius: 12px; padding: 14px 16px;">
+          <div id="salesKpiMarginTitle" style="font-size: 0.72rem; font-weight: 800; color: #64748b; text-transform: uppercase;">📈 Margem Estimada (s/ IVA)</div>
+          <div id="salesKpiMargin" style="font-size: 1.45rem; font-weight: 900; color: #6d28d9; margin-top: 4px;">--</div>
+          <div id="salesKpiMarginSub" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">--</div>
+        </div>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #f59e0b; border-radius: 12px; padding: 14px 16px;">
+          <div style="font-size: 0.72rem; font-weight: 800; color: #64748b; text-transform: uppercase;">🏥 Stock Atual (Filtrado)</div>
+          <div id="salesKpiStock" style="font-size: 1.45rem; font-weight: 900; color: #0f172a; margin-top: 4px;">--</div>
+          <div id="salesKpiStockSub" style="font-size: 0.76rem; color: #64748b; margin-top: 2px;">--</div>
+        </div>
+      </div>
+
+      <!-- Barra de Pesquisa e Filtros (mesmo princípio das outras tabelas) -->
+      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+        <input type="text" id="salesSearchInput" placeholder="🔎 Pesquisar por nome, CNP, molécula DCI ou laboratório..." oninput="onSalesFilterChanged()" style="flex: 2; min-width: 240px; padding: 9px 13px; border: 1.5px solid #cbd5e1; border-radius: 9px; font-size: 0.86rem; outline: none;" />
+        <select id="salesTypeFilter" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
+          <option value="ALL">Todos os Tipos</option>
+          <option value="LIVRE_MNSRM">🟢 Venda Livre + MNSRM</option>
+          <option value="GENERICO">🧬 Só Genéricos</option>
+          <option value="MARCA">🏷️ Só Marca</option>
+          <option value="PSBE">🟢 Só PSBE / Cosmética</option>
+          <option value="MNSRM">🔵 Só MNSRM</option>
+          <option value="MSRM">🔴 Só MSRM</option>
+        </select>
+        <select id="salesLabFilter" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff; max-width: 210px;">
+          <option value="ALL">Todos os Laboratórios</option>
+        </select>
+        <select id="salesStockFilter" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
+          <option value="ALL">Qualquer Stock</option>
+          <option value="WITH_SALES">Com Vendas no Período</option>
+          <option value="RUTURA">⚠️ Em Rutura (Stock 0 c/ vendas)</option>
+          <option value="IN_STOCK">Com Stock Atual (&gt; 0)</option>
+          <option value="EXCESSO">Excesso (&gt; 4 meses cob.)</option>
+          <option value="MONOS">❄️ Monos (&gt; 90d s/ vendas)</option>
+        </select>
+        <select id="salesSortSelect" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
+          <option value="units_desc">Ordenar: Mais Vendidos (un)</option>
+          <option value="rev_desc">Ordenar: Maior Faturação (€)</option>
+          <option value="growth_desc">Ordenar: Maior Crescimento (%)</option>
+          <option value="drop_asc">Ordenar: Maior Queda (%)</option>
+          <option value="cov_asc">Ordenar: Menor Cobertura</option>
+          <option value="stock_desc">Ordenar: Maior Stock Atual</option>
+          <option value="name_asc">Ordenar: Nome A–Z</option>
+        </select>
+      </div>
+
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; padding: 0 2px; flex-wrap: wrap; gap: 8px;">
+        <span id="salesTableCountInfo" style="font-size: 0.82rem; font-weight: 700; color: #0284c7;">A carregar...</span>
+        <span style="font-size: 0.8rem; color: #64748b;">💡 Clique em qualquer linha para abrir o <b>Modal de Evolução Mensal (Vendas vs Stock)</b></span>
+      </div>
+
+      <div class="table-wrap" style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; overflow-x: auto;">
+        <table id="salesExplorerTable" style="width: 100%; border-collapse: collapse; font-size: 0.84rem;">
+          <thead id="salesExplorerThead" style="background: #f8fafc; border-bottom: 1.5px solid #e2e8f0;"></thead>
+          <tbody id="salesExplorerTbody">
+            <tr><td colspan="8" style="padding: 28px; text-align: center; color: #64748b;">A carregar histórico de vendas...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="salesLoadMoreWrap" style="display: none; text-align: center; margin-top: 14px;">
+        <button type="button" class="btn btn-secondary" onclick="loadMoreSalesRows()" style="padding: 9px 22px; font-weight: 700;">Mostrar mais artigos</button>
+      </div>
+    </div>
       </div> <!-- /main-content -->
     </div> <!-- /main-wrapper -->
   </div> <!-- /app-layout -->
+
+  <!-- MODAL DE DETALHE MENSAL DO PRODUTO (VENDAS VS POSIÇÃO DE STOCK AO LONGO DO TEMPO) -->
+  <div class="modal-backdrop" id="salesProductModal" style="display: none; z-index: 1050;" onclick="if(event.target===this) closeSalesProductModal()">
+    <div class="modal-card" style="max-width: 920px; width: 95%; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; padding: 0; border-radius: 16px;">
+      <div style="padding: 18px 24px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;">
+        <div>
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span id="salesModalTitle" style="font-size: 1.12rem; font-weight: 900; color: #0f172a;">Produto</span>
+            <span id="salesModalTypeBadge" class="badge badge-info" style="font-size: 0.72rem;"></span>
+          </div>
+          <div id="salesModalSubtitle" style="font-size: 0.82rem; color: #64748b; margin-top: 4px;"></div>
+        </div>
+        <button type="button" class="btn btn-secondary" onclick="closeSalesProductModal()" style="padding: 6px 12px; font-weight: 700;">✕ Fechar</button>
+      </div>
+
+      <div style="padding: 18px 24px; overflow-y: auto; flex: 1;">
+        <!-- 4 Mini-KPIs do Produto -->
+        <div id="salesModalKpis" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px;"></div>
+
+        <!-- Gráfico Combinado SVG: Barras de Vendas + Linha de Posição de Stock Real -->
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; margin-bottom: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px;">
+            <div style="font-size: 0.9rem; font-weight: 800; color: #0f172a;">📈 Evolução Mensal: Vendas (un) vs Posição de Stock</div>
+            <div style="display: flex; gap: 14px; align-items: center; font-size: 0.76rem; font-weight: 700; color: #475569;">
+              <span><span style="display:inline-block;width:10px;height:10px;background:#0284c7;border-radius:2px;margin-right:4px;"></span>Unidades Vendidas</span>
+              <span><span style="display:inline-block;width:10px;height:10px;background:#f59e0b;border-radius:50%;margin-right:4px;"></span>Posição de Stock (Fecho Real)</span>
+            </div>
+          </div>
+          <div id="salesModalChartContainer" style="width: 100%; min-height: 210px; display: flex; align-items: center; justify-content: center; color: #64748b;">
+            A carregar gráfico...
+          </div>
+          <div id="salesModalSnapshotNote" style="font-size: 0.74rem; color: #64748b; margin-top: 8px;"></div>
+        </div>
+
+        <!-- Tabela Mensal Detalhada -->
+        <div style="border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden;">
+          <table style="width: 100%; border-collapse: collapse; font-size: 0.82rem;">
+            <thead id="salesModalTableHead" style="background: #f8fafc; border-bottom: 1px solid #e2e8f0;"></thead>
+            <tbody id="salesModalTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
 
   
   <!-- MODAL EDITOR DE CAMPANHA (ANTES OU DEPOIS DE ATIVAR) -->
@@ -10732,7 +10952,7 @@ function getDashboardHtml(): string {
 
     function switchTab(tab) {
       activeTab = tab;
-      ['plano', 'copilot', 'campaigns', 'rebalance', 'labs', 'evolution', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
+      ['plano', 'copilot', 'campaigns', 'rebalance', 'labs', 'evolution', 'sales', 'caducidade', 'genericos', 'monos', 'cobertura'].forEach(t => {
         const btn = document.getElementById('tabBtn-' + t);
         if (btn) btn.classList.toggle('active', t === tab);
       });
@@ -10748,6 +10968,7 @@ function getDashboardHtml(): string {
         rebalance: document.getElementById('tabContent-rebalance'),
         labs: document.getElementById('tabContent-labs'),
         evolution: document.getElementById('tabContent-evolution'),
+        sales: document.getElementById('tabContent-sales'),
         tables: document.getElementById('tabContent-tables'),
       };
 
@@ -10778,6 +10999,9 @@ function getDashboardHtml(): string {
       } else if (tab === 'evolution') {
         if (views.evolution) views.evolution.style.display = 'block';
         loadStockEvolutionData();
+      } else if (tab === 'sales') {
+        if (views.sales) views.sales.style.display = 'block';
+        loadSalesExplorer(false);
       } else if (isStockTable) {
         if (views.tables) views.tables.style.display = 'block';
         renderActiveTable();
@@ -17539,6 +17763,621 @@ function getDashboardHtml(): string {
       });
 
       tbody.innerHTML = html;
+    }
+
+    // ========================================================================
+    // SEPARADOR DEDICADO: VENDAS & POSIÇÕES DE STOCK POR PRODUTO + MODAL MENSAL
+    // ========================================================================
+    const salesExplorerCacheByKey = {};
+    let salesExplorerState = {
+      period: '12m',
+      mesInicio: '',
+      mesFim: '',
+      data: null,
+      filtered: [],
+      visibleLimit: 150,
+    };
+
+    function updateSalesPeriodPillsUI() {
+      document.querySelectorAll('.sales-period-pill').forEach(function(btn) {
+        const isActive = btn.getAttribute('data-period') === salesExplorerState.period;
+        btn.style.background = isActive ? '#0284c7' : 'rgba(255,255,255,0.08)';
+        btn.style.color = isActive ? '#ffffff' : '#e2e8f0';
+        btn.style.borderColor = isActive ? '#38bdf8' : 'rgba(255,255,255,0.16)';
+        btn.style.fontWeight = isActive ? '800' : '700';
+      });
+    }
+
+    function setSalesPeriod(period) {
+      salesExplorerState.period = period;
+      salesExplorerState.visibleLimit = 150;
+      updateSalesPeriodPillsUI();
+      loadSalesExplorer(false);
+    }
+
+    function applySalesCustomPeriod() {
+      const sEl = document.getElementById('salesCustomStart');
+      const eEl = document.getElementById('salesCustomEnd');
+      if (!sEl || !eEl || !sEl.value || !eEl.value) return;
+      salesExplorerState.period = 'custom';
+      salesExplorerState.mesInicio = sEl.value;
+      salesExplorerState.mesFim = eEl.value;
+      salesExplorerState.visibleLimit = 150;
+      updateSalesPeriodPillsUI();
+      loadSalesExplorer(false);
+    }
+
+    async function loadSalesExplorer(forceRefresh) {
+      if (!activeFarmaciaId) return;
+      const p = salesExplorerState.period || '12m';
+      const s = p === 'custom' ? salesExplorerState.mesInicio : '';
+      const e = p === 'custom' ? salesExplorerState.mesFim : '';
+      const cacheKey = activeFarmaciaId + ':' + p + ':' + s + ':' + e;
+
+      if (!forceRefresh && salesExplorerCacheByKey[cacheKey]) {
+        applySalesExplorerPayload(salesExplorerCacheByKey[cacheKey]);
+        return;
+      }
+
+      const tbody = document.getElementById('salesExplorerTbody');
+      if (tbody) {
+        tbody.innerHTML = '<tr><td colspan="8" style="padding: 28px; text-align: center; color: #64748b;">⏳ A carregar dados de vendas e stock...</td></tr>';
+      }
+
+      try {
+        let url = '/api/analytics/sales-explorer?farmaciaId=' + encodeURIComponent(activeFarmaciaId) +
+          '&period=' + encodeURIComponent(p);
+        if (s) url += '&mesInicio=' + encodeURIComponent(s);
+        if (e) url += '&mesFim=' + encodeURIComponent(e);
+        if (forceRefresh) url += '&refresh=1';
+
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error((data && data.error) || 'Erro ao carregar vendas');
+
+        salesExplorerCacheByKey[cacheKey] = data;
+        applySalesExplorerPayload(data);
+      } catch (err) {
+        console.error('Erro em loadSalesExplorer:', err);
+        if (tbody) {
+          tbody.innerHTML = '<tr><td colspan="8" style="padding: 24px; text-align: center; color: #e11d48;">Erro ao carregar vendas: ' + escapeHtml(err.message || '') + '</td></tr>';
+        }
+      }
+    }
+
+    function applySalesExplorerPayload(data) {
+      salesExplorerState.data = data;
+
+      // Badge do menu lateral
+      const sideBadge = document.getElementById('badge-sales');
+      if (sideBadge) {
+        const withSalesCount = (data.items || []).filter(function(i) { return i.unidades_periodo > 0; }).length;
+        sideBadge.textContent = String(withSalesCount);
+      }
+
+      // Badge de mês parcial
+      const partialBadge = document.getElementById('salesPartialMonthBadge');
+      if (partialBadge) {
+        if (data.mesParcial && data.dataCorte) {
+          partialBadge.textContent = '⚠️ Mês atual parcial até ' + data.dataCorte;
+          partialBadge.style.display = 'inline-block';
+        } else {
+          partialBadge.style.display = 'none';
+        }
+      }
+
+      // Label período ativo
+      const periodLbl = document.getElementById('salesActivePeriodLabel');
+      if (periodLbl) {
+        periodLbl.textContent = 'Janela: ' + (data.mesInicio || '') + ' → ' + (data.mesFim || '');
+      }
+
+      // Popular seletores personalizados de mês (sem perder escolha atual)
+      const sSel = document.getElementById('salesCustomStart');
+      const eSel = document.getElementById('salesCustomEnd');
+      if (sSel && eSel && Array.isArray(data.mesesDisponiveis) && data.mesesDisponiveis.length > 0) {
+        const optsHtml = data.mesesDisponiveis.map(function(m) {
+          return '<option value="' + escapeHtml(m) + '">' + escapeHtml(m) + '</option>';
+        }).join('');
+        sSel.innerHTML = optsHtml;
+        eSel.innerHTML = optsHtml;
+        sSel.value = data.mesesDisponiveis.includes(data.mesInicio) ? data.mesInicio : data.mesesDisponiveis[0];
+        eSel.value = data.mesesDisponiveis.includes(data.mesFim) ? data.mesFim : data.mesesDisponiveis[data.mesesDisponiveis.length - 1];
+      }
+
+      // Popular dropdown de laboratórios
+      const labSel = document.getElementById('salesLabFilter');
+      if (labSel && Array.isArray(data.laboratorios)) {
+        const prevLab = labSel.value || 'ALL';
+        labSel.innerHTML = '<option value="ALL">Todos os Laboratórios (' + data.laboratorios.length + ')</option>' +
+          data.laboratorios.map(function(l) {
+            return '<option value="' + escapeHtml(l) + '">' + escapeHtml(l) + '</option>';
+          }).join('');
+        if (prevLab !== 'ALL' && data.laboratorios.includes(prevLab)) {
+          labSel.value = prevLab;
+        }
+      }
+
+      // Ajustar opção de ordenação por faturação se RBAC ocultar €
+      const sortSel = document.getElementById('salesSortSelect');
+      if (sortSel && !data.verFaturacao && sortSel.value === 'rev_desc') {
+        sortSel.value = 'units_desc';
+      }
+
+      onSalesFilterChanged();
+    }
+
+    function onSalesFilterChanged() {
+      const data = salesExplorerState.data;
+      if (!data || !Array.isArray(data.items)) return;
+
+      const q = normStr((document.getElementById('salesSearchInput')?.value || ''));
+      const typeF = document.getElementById('salesTypeFilter')?.value || 'ALL';
+      const labF = document.getElementById('salesLabFilter')?.value || 'ALL';
+      const stockF = document.getElementById('salesStockFilter')?.value || 'ALL';
+      const sortBy = document.getElementById('salesSortSelect')?.value || 'units_desc';
+
+      const filtered = data.items.filter(function(item) {
+        if (q) {
+          const hay = normStr(
+            (item.designacao || '') + ' ' +
+            (item.cnp_codigo || '') + ' ' +
+            (item.laboratorio_titular || '') + ' ' +
+            (item.molecula_dci || '') + ' ' +
+            (item.categoria || '')
+          );
+          if (!hay.includes(q)) return false;
+        }
+        if (typeF === 'LIVRE_MNSRM' && item.tipo_venda === 'MSRM') return false;
+        if (typeF === 'GENERICO' && !item.eh_generico) return false;
+        if (typeF === 'MARCA' && (item.eh_generico || item.tipo_venda === 'PSBE')) return false;
+        if (typeF === 'PSBE' && item.tipo_venda !== 'PSBE') return false;
+        if (typeF === 'MNSRM' && item.tipo_venda !== 'MNSRM') return false;
+        if (typeF === 'MSRM' && item.tipo_venda !== 'MSRM') return false;
+
+        if (labF !== 'ALL' && item.laboratorio_titular !== labF) return false;
+
+        if (stockF === 'WITH_SALES' && item.unidades_periodo <= 0) return false;
+        if (stockF === 'RUTURA' && !item.em_rutura) return false;
+        if (stockF === 'IN_STOCK' && item.stock_atual <= 0) return false;
+        if (stockF === 'EXCESSO' && !(item.cobertura_meses !== null && item.cobertura_meses > 4)) return false;
+        if (stockF === 'MONOS' && !item.eh_mono) return false;
+
+        return true;
+      });
+
+      filtered.sort(function(a, b) {
+        if (sortBy === 'rev_desc') return (b.faturacao_periodo || 0) - (a.faturacao_periodo || 0);
+        if (sortBy === 'growth_desc') return (b.variacao_un_pct ?? -999999) - (a.variacao_un_pct ?? -999999);
+        if (sortBy === 'drop_asc') return (a.variacao_un_pct ?? 999999) - (b.variacao_un_pct ?? 999999);
+        if (sortBy === 'cov_asc') {
+          const ca = a.cobertura_meses === null ? 999999 : a.cobertura_meses;
+          const cb = b.cobertura_meses === null ? 999999 : b.cobertura_meses;
+          return ca - cb;
+        }
+        if (sortBy === 'stock_desc') return b.stock_atual - a.stock_atual;
+        if (sortBy === 'name_asc') return (a.designacao || '').localeCompare(b.designacao || '', 'pt');
+        return b.unidades_periodo - a.unidades_periodo;
+      });
+
+      salesExplorerState.filtered = filtered;
+      salesExplorerState.visibleLimit = 150;
+
+      // Atualizar os 4 KPIs Dinâmicos
+      let sumUn = 0;
+      let sumUnPrev = 0;
+      let sumRev = 0;
+      let sumRevPrev = 0;
+      let sumMargin = 0;
+      let sumRevForMargin = 0;
+      let sumStockUn = 0;
+      let sumStockVal = 0;
+      let ruturasCount = 0;
+      let withSalesCount = 0;
+      let sumVmm = 0;
+
+      for (let i = 0; i < filtered.length; i++) {
+        const it = filtered[i];
+        sumUn += it.unidades_periodo || 0;
+        sumUnPrev += it.unidades_anterior || 0;
+        if (it.unidades_periodo > 0) withSalesCount++;
+        if (it.faturacao_periodo != null) sumRev += it.faturacao_periodo;
+        if (it.faturacao_anterior != null) sumRevPrev += it.faturacao_anterior;
+        if (it.margem_estimada_eur != null) {
+          sumMargin += it.margem_estimada_eur;
+          sumRevForMargin += (it.faturacao_periodo || 0);
+        }
+        sumStockUn += it.stock_atual || 0;
+        if (it.stock_valor_custo != null) sumStockVal += it.stock_valor_custo;
+        if (it.em_rutura) ruturasCount++;
+        sumVmm += it.vmm || 0;
+      }
+
+      const unDeltaPct = sumUnPrev > 0 ? (((sumUn - sumUnPrev) / sumUnPrev) * 100) : null;
+      const kUnits = document.getElementById('salesKpiUnits');
+      const kUnitsSub = document.getElementById('salesKpiUnitsSub');
+      if (kUnits) kUnits.textContent = sumUn.toLocaleString('pt-PT') + ' un';
+      if (kUnitsSub) {
+        if (unDeltaPct !== null) {
+          const sign = unDeltaPct >= 0 ? '+' : '';
+          kUnitsSub.innerHTML = '<span style="font-weight:700;color:' + (unDeltaPct >= 0 ? '#059669' : '#e11d48') + ';">' + sign + unDeltaPct.toFixed(1) + '%</span> vs período anterior (' + sumUnPrev.toLocaleString('pt-PT') + ' un)';
+        } else {
+          kUnitsSub.textContent = withSalesCount.toLocaleString('pt-PT') + ' artigos com vendas';
+        }
+      }
+
+      const kRevTitle = document.getElementById('salesKpiRevenueTitle');
+      const kRev = document.getElementById('salesKpiRevenue');
+      const kRevSub = document.getElementById('salesKpiRevenueSub');
+      const kMarTitle = document.getElementById('salesKpiMarginTitle');
+      const kMar = document.getElementById('salesKpiMargin');
+      const kMarSub = document.getElementById('salesKpiMarginSub');
+
+      if (data.verFaturacao) {
+        if (kRevTitle) kRevTitle.textContent = '💶 Faturação no Período';
+        if (kRev) kRev.textContent = sumRev.toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+        const revDeltaPct = sumRevPrev > 0 ? (((sumRev - sumRevPrev) / sumRevPrev) * 100) : null;
+        if (kRevSub) {
+          kRevSub.innerHTML = revDeltaPct !== null
+            ? '<span style="font-weight:700;color:' + (revDeltaPct >= 0 ? '#059669' : '#e11d48') + ';">' + (revDeltaPct >= 0 ? '+' : '') + revDeltaPct.toFixed(1) + '%</span> vs período anterior'
+            : withSalesCount.toLocaleString('pt-PT') + ' artigos faturados';
+        }
+
+        if (kMarTitle) kMarTitle.textContent = '📈 Margem Estimada (s/ IVA)';
+        if (kMar) kMar.textContent = sumMargin.toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+        if (kMarSub) {
+          const approxPct = sumRevForMargin > 0 ? ((sumMargin / sumRevForMargin) * 100).toFixed(1) + '% sobre PVP' : 'Com base no custo médio';
+          kMarSub.textContent = approxPct;
+        }
+      } else {
+        if (kRevTitle) kRevTitle.textContent = '🏷️ Artigos com Movimento';
+        if (kRev) kRev.textContent = withSalesCount.toLocaleString('pt-PT');
+        if (kRevSub) kRevSub.textContent = 'de ' + filtered.length.toLocaleString('pt-PT') + ' artigos filtrados';
+        if (kMarTitle) kMarTitle.textContent = '⚡ VMM Total Filtrada';
+        if (kMar) kMar.textContent = sumVmm.toLocaleString('pt-PT', { maximumFractionDigits: 1 }) + ' un/mês';
+        if (kMarSub) kMarSub.textContent = 'Ritmo médio mensal';
+      }
+
+      const kStock = document.getElementById('salesKpiStock');
+      const kStockSub = document.getElementById('salesKpiStockSub');
+      if (kStock) kStock.textContent = sumStockUn.toLocaleString('pt-PT') + ' un';
+      if (kStockSub) {
+        const valTxt = data.verFaturacao ? (sumStockVal.toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' € custo · ') : '';
+        kStockSub.innerHTML = valTxt + '<span style="color:' + (ruturasCount > 0 ? '#e11d48;font-weight:700;' : '#64748b;') + '">' + ruturasCount + ' em rutura c/ vendas</span>';
+      }
+
+      renderSalesExplorerTable();
+    }
+
+    function renderSalesExplorerTable() {
+      const data = salesExplorerState.data;
+      const filtered = salesExplorerState.filtered || [];
+      const verFat = !!(data && data.verFaturacao);
+
+      const thead = document.getElementById('salesExplorerThead');
+      const tbody = document.getElementById('salesExplorerTbody');
+      const countEl = document.getElementById('salesTableCountInfo');
+      const loadMoreWrap = document.getElementById('salesLoadMoreWrap');
+
+      if (thead) {
+        thead.innerHTML =
+          '<tr>' +
+          '<th style="padding: 10px 14px; text-align: left;">Produto / CNP / Laboratório</th>' +
+          '<th style="padding: 10px 12px; text-align: right;">Vendas (un)</th>' +
+          (verFat ? '<th style="padding: 10px 12px; text-align: right;">Faturação (€)</th>' : '') +
+          '<th style="padding: 10px 12px; text-align: center;">Tendência</th>' +
+          '<th style="padding: 10px 12px; text-align: right;">VMM</th>' +
+          '<th style="padding: 10px 12px; text-align: right;">Stock Atual</th>' +
+          '<th style="padding: 10px 12px; text-align: center;">Cobertura</th>' +
+          '<th style="padding: 10px 12px; text-align: center;">Última Venda</th>' +
+          '</tr>';
+      }
+
+      const slice = filtered.slice(0, salesExplorerState.visibleLimit);
+      if (countEl) {
+        countEl.textContent = 'A mostrar ' + slice.length.toLocaleString('pt-PT') + ' de ' + filtered.length.toLocaleString('pt-PT') + ' produtos';
+      }
+      if (loadMoreWrap) {
+        loadMoreWrap.style.display = filtered.length > slice.length ? 'block' : 'none';
+      }
+
+      if (!tbody) return;
+      if (slice.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="' + (verFat ? 8 : 7) + '" style="padding: 28px; text-align: center; color: #64748b;">Nenhum produto encontrado com estes filtros.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = slice.map(function(it) {
+        let trendHtml = '<span style="color:#94a3b8;font-size:0.78rem;">—</span>';
+        if (it.variacao_un_pct !== null) {
+          const isUp = it.variacao_un_pct >= 0;
+          const bg = isUp ? '#dcfce7' : '#fee2e2';
+          const col = isUp ? '#15803d' : '#b91c1c';
+          trendHtml = '<span style="background:' + bg + ';color:' + col + ';padding:2px 7px;border-radius:999px;font-weight:800;font-size:0.74rem;white-space:nowrap;">' +
+            (isUp ? '▲ +' : '▼ ') + it.variacao_un_pct.toFixed(0) + '%</span>';
+        }
+
+        let stockHtml = '<span style="font-weight:800;color:#0f172a;">' + it.stock_atual.toLocaleString('pt-PT') + '</span>';
+        if (it.em_rutura) {
+          stockHtml = '<span style="background:#fee2e2;color:#b91c1c;padding:2px 7px;border-radius:6px;font-weight:800;font-size:0.74rem;">0 (Rutura)</span>';
+        } else if (it.eh_mono) {
+          stockHtml = '<span style="font-weight:800;color:#b45309;">' + it.stock_atual.toLocaleString('pt-PT') + ' ❄️</span>';
+        }
+
+        const covHtml = it.cobertura_meses !== null
+          ? '<span style="font-weight:700;color:' + (it.cobertura_meses < 0.5 ? '#e11d48' : (it.cobertura_meses > 4 ? '#d97706' : '#0f172a')) + ';">' + it.cobertura_meses.toFixed(1) + ' m</span>'
+          : '<span style="color:#94a3b8;">—</span>';
+
+        const typeColor = it.tipo_venda === 'MSRM' ? '#b91c1c' : (it.tipo_venda === 'MNSRM' ? '#0369a1' : '#15803d');
+        const typeBg = it.tipo_venda === 'MSRM' ? '#fee2e2' : (it.tipo_venda === 'MNSRM' ? '#e0f2fe' : '#dcfce7');
+
+        return '<tr onclick="openSalesProductModal(this.dataset.cnp)" data-cnp="' + escapeHtml(it.cnp_codigo) + '" style="border-bottom: 1px solid #f1f5f9; cursor: pointer;">' +
+          '<td style="padding: 10px 14px;">' +
+            '<div style="font-weight: 700; color: #0f172a;">' + escapeHtml(it.designacao) + '</div>' +
+            '<div style="font-size: 0.74rem; color: #64748b; margin-top: 2px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">' +
+              '<span style="font-family: monospace; background: #f1f5f9; padding: 1px 5px; border-radius: 4px;">' + escapeHtml(it.cnp_codigo) + '</span>' +
+              '<span style="background:' + typeBg + ';color:' + typeColor + ';padding:1px 6px;border-radius:4px;font-weight:700;">' + escapeHtml(it.tipo_venda) + '</span>' +
+              '<span>' + escapeHtml(it.laboratorio_titular) + '</span>' +
+            '</div>' +
+          '</td>' +
+          '<td style="padding: 10px 12px; text-align: right; font-weight: 800; color: #0284c7;">' + it.unidades_periodo.toLocaleString('pt-PT') + '</td>' +
+          (verFat ? '<td style="padding: 10px 12px; text-align: right; font-weight: 700; color: #059669;">' + Number(it.faturacao_periodo || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €</td>' : '') +
+          '<td style="padding: 10px 12px; text-align: center;">' + trendHtml + '</td>' +
+          '<td style="padding: 10px 12px; text-align: right; color: #475569; font-weight: 600;">' + Number(it.vmm || 0).toFixed(1) + '</td>' +
+          '<td style="padding: 10px 12px; text-align: right;">' + stockHtml + '</td>' +
+          '<td style="padding: 10px 12px; text-align: center;">' + covHtml + '</td>' +
+          '<td style="padding: 10px 12px; text-align: center; font-family: monospace; font-size: 0.78rem; color: #64748b;">' + escapeHtml(it.data_ultima_venda || '—') + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+
+    function loadMoreSalesRows() {
+      salesExplorerState.visibleLimit += 200;
+      renderSalesExplorerTable();
+    }
+
+    function exportSalesExplorerCsv() {
+      const data = salesExplorerState.data;
+      const rows = salesExplorerState.filtered || [];
+      if (!data || rows.length === 0) {
+        alert('Não existem dados filtrados para exportar.');
+        return;
+      }
+      const verFat = !!data.verFaturacao;
+      const csvEscape = function(v) {
+        const s = v === null || v === undefined ? '' : String(v);
+        return '"' + s.replace(/"/g, '""') + '"';
+      };
+      const fmtNum = function(n) {
+        if (n === null || n === undefined) return '';
+        return Number(n).toFixed(2).replace('.', ',');
+      };
+
+      const headers = ['CNP', 'Designação', 'Laboratório', 'Tipo Venda', 'DCI', 'Unidades Período', 'Unidades Período Ant.', 'Variação %'];
+      if (verFat) headers.push('Faturação (€)', 'Margem Est. s/ IVA (€)');
+      headers.push('VMM (un/mês)', 'Stock Atual (un)');
+      if (verFat) headers.push('Valor Stock Custo (€)');
+      headers.push('Cobertura (meses)', 'Última Venda');
+
+      const lines = [headers.map(csvEscape).join(';')];
+      for (let i = 0; i < rows.length; i++) {
+        const it = rows[i];
+        const cols = [
+          it.cnp_codigo,
+          it.designacao,
+          it.laboratorio_titular,
+          it.tipo_venda,
+          it.molecula_dci || '',
+          it.unidades_periodo,
+          it.unidades_anterior,
+          it.variacao_un_pct !== null ? fmtNum(it.variacao_un_pct) : '',
+        ];
+        if (verFat) {
+          cols.push(fmtNum(it.faturacao_periodo), fmtNum(it.margem_estimada_eur));
+        }
+        cols.push(fmtNum(it.vmm), it.stock_atual);
+        if (verFat) {
+          cols.push(fmtNum(it.stock_valor_custo));
+        }
+        cols.push(it.cobertura_meses !== null ? fmtNum(it.cobertura_meses) : '', it.data_ultima_venda || '');
+        lines.push(cols.map(csvEscape).join(';'));
+      }
+
+      const bom = '\\uFEFF';
+      const blob = new Blob([bom + lines.join('\\r\\n')], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'vendas_stock_' + (data.mesInicio || 'periodo') + '_a_' + (data.mesFim || 'atual') + '.csv';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+    }
+
+    function closeSalesProductModal() {
+      const m = document.getElementById('salesProductModal');
+      if (m) m.style.display = 'none';
+    }
+
+    async function openSalesProductModal(cnp) {
+      if (!cnp || !activeFarmaciaId) return;
+      const modal = document.getElementById('salesProductModal');
+      const titleEl = document.getElementById('salesModalTitle');
+      const subEl = document.getElementById('salesModalSubtitle');
+      const badgeEl = document.getElementById('salesModalTypeBadge');
+      const kpisEl = document.getElementById('salesModalKpis');
+      const chartEl = document.getElementById('salesModalChartContainer');
+      const noteEl = document.getElementById('salesModalSnapshotNote');
+      const theadEl = document.getElementById('salesModalTableHead');
+      const tbodyEl = document.getElementById('salesModalTableBody');
+
+      if (modal) modal.style.display = 'flex';
+      if (titleEl) titleEl.textContent = 'A carregar produto ' + cnp + '...';
+      if (subEl) subEl.textContent = '';
+      if (kpisEl) kpisEl.innerHTML = '';
+      if (chartEl) chartEl.innerHTML = '⏳ A carregar série mensal de vendas e stock...';
+      if (tbodyEl) tbodyEl.innerHTML = '';
+
+      try {
+        const res = await fetch('/api/analytics/sales-product-history?farmaciaId=' + encodeURIComponent(activeFarmaciaId) + '&cnp=' + encodeURIComponent(cnp));
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error((data && data.error) || 'Erro ao carregar histórico');
+
+        const p = data.produto;
+        const r = data.resumo;
+        const verFat = !!data.verFaturacao;
+
+        if (titleEl) titleEl.textContent = p.designacao;
+        if (badgeEl) badgeEl.textContent = p.tipo_venda + (p.eh_generico ? ' · GENÉRICO' : '');
+        if (subEl) {
+          subEl.textContent = 'CNP ' + p.cnp_codigo + ' · ' + p.laboratorio_titular + (p.molecula_dci ? ' · DCI: ' + p.molecula_dci : '');
+        }
+
+        if (kpisEl) {
+          kpisEl.innerHTML =
+            '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;">' +
+              '<div style="font-size:0.7rem;font-weight:800;color:#64748b;text-transform:uppercase;">Vendas 12M</div>' +
+              '<div style="font-size:1.15rem;font-weight:900;color:#0284c7;margin-top:2px;">' + r.total_unidades_12m.toLocaleString('pt-PT') + ' un</div>' +
+              (verFat ? '<div style="font-size:0.72rem;color:#059669;font-weight:700;">' + Number(r.total_faturacao_12m || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</div>' : '') +
+            '</div>' +
+            '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;">' +
+              '<div style="font-size:0.7rem;font-weight:800;color:#64748b;text-transform:uppercase;">Stock Atual</div>' +
+              '<div style="font-size:1.15rem;font-weight:900;color:' + (p.stock_atual === 0 ? '#e11d48' : '#0f172a') + ';margin-top:2px;">' + p.stock_atual.toLocaleString('pt-PT') + ' un</div>' +
+              (verFat && p.stock_valor_custo != null ? '<div style="font-size:0.72rem;color:#64748b;">' + Number(p.stock_valor_custo).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € custo</div>' : '') +
+            '</div>' +
+            '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;">' +
+              '<div style="font-size:0.7rem;font-weight:800;color:#64748b;text-transform:uppercase;">VMM / Cobertura</div>' +
+              '<div style="font-size:1.15rem;font-weight:900;color:#7c3aed;margin-top:2px;">' + Number(p.vmm || 0).toFixed(1) + ' /mês</div>' +
+              '<div style="font-size:0.72rem;color:#64748b;">Cobertura: ' + (p.cobertura_meses !== null ? p.cobertura_meses.toFixed(1) + ' meses' : '—') + '</div>' +
+            '</div>' +
+            '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;">' +
+              '<div style="font-size:0.7rem;font-weight:800;color:#64748b;text-transform:uppercase;">Pico de Vendas</div>' +
+              '<div style="font-size:1.05rem;font-weight:900;color:#059669;margin-top:2px;">' + (r.melhor_mes ? (r.melhor_mes.unidades + ' un') : '—') + '</div>' +
+              '<div style="font-size:0.72rem;color:#64748b;">' + (r.melhor_mes ? escapeHtml(r.melhor_mes.mes_label) : 'Sem vendas') + '</div>' +
+            '</div>';
+        }
+
+        if (chartEl) {
+          chartEl.innerHTML = renderSalesProductChartSvg(data.series || [], verFat);
+        }
+
+        if (noteEl) {
+          noteEl.textContent = r.tem_historico_stock
+            ? '📍 Posição de stock apresentada apenas nos ' + r.meses_com_snapshot + ' mês(es) com fecho real auditado (sem simulação de stock passado).'
+            : 'ℹ️ Ainda sem snapshots históricos mensais para este produto (apenas stock atual auditado: ' + p.stock_atual + ' un).';
+        }
+
+        if (theadEl) {
+          theadEl.innerHTML =
+            '<tr>' +
+            '<th style="padding: 8px 12px; text-align: left;">Mês</th>' +
+            '<th style="padding: 8px 12px; text-align: right;">Unidades Vendidas</th>' +
+            (verFat ? '<th style="padding: 8px 12px; text-align: right;">Faturação (€)</th>' : '') +
+            '<th style="padding: 8px 12px; text-align: right;">Stock no Fecho</th>' +
+            '<th style="padding: 8px 12px; text-align: center;">Variação MoM</th>' +
+            '</tr>';
+        }
+
+        if (tbodyEl) {
+          const reversed = (data.series || []).slice().reverse();
+          if (reversed.length === 0) {
+            tbodyEl.innerHTML = '<tr><td colspan="' + (verFat ? 5 : 4) + '" style="padding: 18px; text-align: center; color: #64748b;">Sem histórico mensal registado.</td></tr>';
+          } else {
+            tbodyEl.innerHTML = reversed.map(function(pt) {
+              let momHtml = '<span style="color:#94a3b8;">—</span>';
+              if (pt.variacao_mom_pct !== null) {
+                const up = pt.variacao_mom_pct >= 0;
+                momHtml = '<span style="font-weight:700;color:' + (up ? '#059669' : '#e11d48') + ';">' + (up ? '+' : '') + pt.variacao_mom_pct.toFixed(0) + '%</span>';
+              }
+              const snapHtml = pt.has_snapshot && pt.stock_fecho !== null
+                ? '<span style="font-weight:800;color:#b45309;">' + pt.stock_fecho.toLocaleString('pt-PT') + ' un</span>'
+                : '<span style="color:#94a3b8;font-size:0.76rem;">Sem fecho</span>';
+              return '<tr style="border-bottom: 1px solid #f1f5f9;">' +
+                '<td style="padding: 8px 12px; font-weight: 700; color: #0f172a;">' + escapeHtml(pt.mes_label) + (pt.is_parcial ? ' <span style="font-size:0.7rem;color:#d97706;">(parcial)</span>' : '') + '</td>' +
+                '<td style="padding: 8px 12px; text-align: right; font-weight: 800; color: #0284c7;">' + pt.unidades.toLocaleString('pt-PT') + '</td>' +
+                (verFat ? '<td style="padding: 8px 12px; text-align: right; font-weight: 700; color: #059669;">' + Number(pt.faturacao || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</td>' : '') +
+                '<td style="padding: 8px 12px; text-align: right;">' + snapHtml + '</td>' +
+                '<td style="padding: 8px 12px; text-align: center;">' + momHtml + '</td>' +
+                '</tr>';
+            }).join('');
+          }
+        }
+      } catch (err) {
+        if (chartEl) chartEl.innerHTML = '<div style="color:#e11d48;font-weight:700;">Erro: ' + escapeHtml(err.message || '') + '</div>';
+      }
+    }
+
+    function renderSalesProductChartSvg(series, verFat) {
+      if (!series || series.length === 0) {
+        return '<div style="padding: 20px; color: #64748b;">Sem dados mensais para desenhar gráfico.</div>';
+      }
+      const W = 820;
+      const H = 220;
+      const padL = 42;
+      const padR = 24;
+      const padT = 20;
+      const padB = 36;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+
+      let maxVal = 1;
+      for (let i = 0; i < series.length; i++) {
+        if (series[i].unidades > maxVal) maxVal = series[i].unidades;
+        if (series[i].stock_fecho !== null && series[i].stock_fecho > maxVal) maxVal = series[i].stock_fecho;
+      }
+
+      const step = plotW / series.length;
+      const barW = Math.max(8, Math.min(28, step * 0.56));
+      let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width: 100%; height: auto; display: block;">';
+
+      // Linhas de grelha horizontais
+      for (let g = 0; g <= 4; g++) {
+        const y = padT + (plotH * g) / 4;
+        const val = Math.round(maxVal * (1 - g / 4));
+        svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="#e2e8f0" stroke-dasharray="3,3" />';
+        svg += '<text x="' + (padL - 6) + '" y="' + (y + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="#64748b">' + val + '</text>';
+      }
+
+      // Barras de vendas + pontos da linha de stock (apenas em meses com snapshot real)
+      const stockPoints = [];
+      for (let i = 0; i < series.length; i++) {
+        const pt = series[i];
+        const cx = padL + step * i + step / 2;
+        const barH = (pt.unidades / maxVal) * plotH;
+        const by = padT + plotH - barH;
+        const tip = escapeHtml(pt.mes_label + ': ' + pt.unidades + ' un' + (verFat && pt.faturacao != null ? ' (' + Number(pt.faturacao).toFixed(2) + ' €)' : '') + (pt.stock_fecho !== null ? ' | Stock fecho: ' + pt.stock_fecho + ' un' : ''));
+
+        svg += '<rect x="' + (cx - barW / 2).toFixed(1) + '" y="' + by.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + Math.max(1, barH).toFixed(1) + '" rx="3" fill="' + (pt.is_parcial ? '#38bdf8' : '#0284c7') + '" opacity="0.88"><title>' + tip + '</title></rect>';
+
+        if (pt.unidades > 0 && series.length <= 16) {
+          svg += '<text x="' + cx.toFixed(1) + '" y="' + Math.max(padT + 10, by - 4).toFixed(1) + '" text-anchor="middle" font-size="9.5" font-weight="700" fill="#0369a1">' + pt.unidades + '</text>';
+        }
+
+        if (pt.has_snapshot && pt.stock_fecho !== null) {
+          const sy = padT + plotH - (pt.stock_fecho / maxVal) * plotH;
+          stockPoints.push({ x: cx, y: sy, val: pt.stock_fecho, label: pt.mes_label });
+        }
+
+        // Etiqueta do mês no eixo X
+        const showLabel = series.length <= 14 || i % 2 === 0 || i === series.length - 1;
+        if (showLabel) {
+          const shortLbl = pt.mes_label.replace(' 20', '/');
+          svg += '<text x="' + cx.toFixed(1) + '" y="' + (H - 12) + '" text-anchor="middle" font-size="9.5" fill="#475569">' + escapeHtml(shortLbl) + '</text>';
+        }
+      }
+
+      if (stockPoints.length >= 2) {
+        const ptsAttr = stockPoints.map(function(p) { return p.x.toFixed(1) + ',' + p.y.toFixed(1); }).join(' ');
+        svg += '<polyline fill="none" stroke="#f59e0b" stroke-width="2.5" points="' + ptsAttr + '" />';
+      }
+      for (let i = 0; i < stockPoints.length; i++) {
+        const sp = stockPoints[i];
+        svg += '<circle cx="' + sp.x.toFixed(1) + '" cy="' + sp.y.toFixed(1) + '" r="4.5" fill="#f59e0b" stroke="#ffffff" stroke-width="1.5"><title>' + escapeHtml(sp.label + ' — Stock Fecho: ' + sp.val + ' un') + '</title></circle>';
+      }
+
+      svg += '</svg>';
+      return svg;
     }
 
     initPharmacies();
