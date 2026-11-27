@@ -7724,9 +7724,11 @@ function getDashboardHtml(): string {
           <option value="MNSRM">🔵 Só MNSRM</option>
           <option value="MSRM">🔴 Só MSRM</option>
         </select>
-        <select id="salesLabFilter" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff; max-width: 210px;">
-          <option value="ALL">Todos os Laboratórios</option>
-        </select>
+        <div style="position: relative; display: inline-flex; align-items: center; min-width: 210px; max-width: 260px; flex: 1;">
+          <input type="text" id="salesLabInput" list="salesLabDatalist" placeholder="🏭 Laboratório ou Grupo (ex: Bial)..." oninput="onSalesFilterChanged()" style="width: 100%; padding: 9px 26px 9px 11px; border: 1.5px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff; outline: none;" />
+          <button type="button" id="salesLabClearBtn" onclick="clearSalesLabFilter()" title="Limpar filtro de laboratório" style="display: none; position: absolute; right: 7px; background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 0.82rem; font-weight: 800; padding: 2px 4px;">✕</button>
+          <datalist id="salesLabDatalist"></datalist>
+        </div>
         <select id="salesStockFilter" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
           <option value="ALL">Qualquer Stock</option>
           <option value="WITH_SALES">Com Vendas no Período</option>
@@ -7735,14 +7737,16 @@ function getDashboardHtml(): string {
           <option value="EXCESSO">Excesso (&gt; 4 meses cob.)</option>
           <option value="MONOS">❄️ Monos (&gt; 90d s/ vendas)</option>
         </select>
-        <select id="salesSortSelect" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
-          <option value="units_desc">Ordenar: Mais Vendidos (un)</option>
-          <option value="rev_desc">Ordenar: Maior Faturação (€)</option>
-          <option value="growth_desc">Ordenar: Maior Crescimento (%)</option>
-          <option value="drop_asc">Ordenar: Maior Queda (%)</option>
-          <option value="cov_asc">Ordenar: Menor Cobertura</option>
-          <option value="stock_desc">Ordenar: Maior Stock Atual</option>
-          <option value="name_asc">Ordenar: Nome A–Z</option>
+        <select id="salesSortSelect" onchange="onSalesSortSelectChange()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
+          <option value="units:desc">Ordenar: Mais Vendidos (un)</option>
+          <option value="rev:desc">Ordenar: Maior Faturação (€)</option>
+          <option value="trend:desc">Ordenar: Maior Crescimento (%)</option>
+          <option value="trend:asc">Ordenar: Maior Queda (%)</option>
+          <option value="vmm:desc">Ordenar: Maior VMM</option>
+          <option value="cov:asc">Ordenar: Menor Cobertura</option>
+          <option value="stock:desc">Ordenar: Maior Stock Atual</option>
+          <option value="last_sale:desc">Ordenar: Venda Mais Recente</option>
+          <option value="name:asc">Ordenar: Nome A–Z</option>
         </select>
       </div>
 
@@ -10928,10 +10932,13 @@ function getDashboardHtml(): string {
         loadActiveCampaigns();
         switchTab(activeTab);
 
-        // Prefetch silencioso da Evolução de Stock em background para abertura instantânea (0ms)
+        // Prefetch silencioso da Evolução de Stock e Vendas & Histórico em background para abertura instantânea (0ms)
         setTimeout(() => {
           if (typeof prefetchStockEvolutionData === 'function') {
             prefetchStockEvolutionData();
+          }
+          if (typeof prefetchSalesExplorerData === 'function') {
+            prefetchSalesExplorerData();
           }
         }, 300);
 
@@ -17769,14 +17776,55 @@ function getDashboardHtml(): string {
     // SEPARADOR DEDICADO: VENDAS & POSIÇÕES DE STOCK POR PRODUTO + MODAL MENSAL
     // ========================================================================
     const salesExplorerCacheByKey = {};
+    const inflightSalesByKey = {};
     let salesExplorerState = {
       period: '12m',
       mesInicio: '',
       mesFim: '',
+      sortCol: 'units',
+      sortDir: 'desc',
       data: null,
       filtered: [],
       visibleLimit: 150,
     };
+
+    function prefetchSalesExplorerData() {
+      const fid = activeFarmaciaId || '';
+      if (!fid) return;
+      const p = salesExplorerState.period || '12m';
+      const s = p === 'custom' ? salesExplorerState.mesInicio : '';
+      const e = p === 'custom' ? salesExplorerState.mesFim : '';
+      const cacheKey = fid + ':' + p + ':' + s + ':' + e;
+      if (salesExplorerCacheByKey[cacheKey] || inflightSalesByKey[cacheKey]) return;
+
+      let url = '/api/analytics/sales-explorer?farmaciaId=' + encodeURIComponent(fid) + '&period=' + encodeURIComponent(p);
+      if (s) url += '&mesInicio=' + encodeURIComponent(s);
+      if (e) url += '&mesFim=' + encodeURIComponent(e);
+
+      const job = fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data && data.ok) {
+            salesExplorerCacheByKey[cacheKey] = data;
+            if (activeFarmaciaId === fid) {
+              const sideBadge = document.getElementById('badge-sales');
+              if (sideBadge) {
+                const withSalesCount = (data.items || []).filter(function(i) { return i.unidades_periodo > 0; }).length;
+                sideBadge.textContent = String(withSalesCount);
+              }
+              if (activeTab === 'sales') {
+                applySalesExplorerPayload(data);
+              }
+            }
+          }
+          return data;
+        })
+        .catch(function() { return null; })
+        .finally(function() {
+          delete inflightSalesByKey[cacheKey];
+        });
+      inflightSalesByKey[cacheKey] = job;
+    }
 
     function updateSalesPeriodPillsUI() {
       document.querySelectorAll('.sales-period-pill').forEach(function(btn) {
@@ -17825,14 +17873,20 @@ function getDashboardHtml(): string {
       }
 
       try {
-        let url = '/api/analytics/sales-explorer?farmaciaId=' + encodeURIComponent(activeFarmaciaId) +
-          '&period=' + encodeURIComponent(p);
-        if (s) url += '&mesInicio=' + encodeURIComponent(s);
-        if (e) url += '&mesFim=' + encodeURIComponent(e);
-        if (forceRefresh) url += '&refresh=1';
+        let data = null;
+        if (!forceRefresh && inflightSalesByKey[cacheKey]) {
+          data = await inflightSalesByKey[cacheKey];
+        }
+        if (!data || !data.ok) {
+          let url = '/api/analytics/sales-explorer?farmaciaId=' + encodeURIComponent(activeFarmaciaId) +
+            '&period=' + encodeURIComponent(p);
+          if (s) url += '&mesInicio=' + encodeURIComponent(s);
+          if (e) url += '&mesFim=' + encodeURIComponent(e);
+          if (forceRefresh) url += '&refresh=1';
 
-        const res = await fetch(url);
-        const data = await res.json();
+          const res = await fetch(url);
+          data = await res.json();
+        }
         if (!data || !data.ok) throw new Error((data && data.error) || 'Erro ao carregar vendas');
 
         salesExplorerCacheByKey[cacheKey] = data;
@@ -17885,25 +17939,72 @@ function getDashboardHtml(): string {
         eSel.value = data.mesesDisponiveis.includes(data.mesFim) ? data.mesFim : data.mesesDisponiveis[data.mesesDisponiveis.length - 1];
       }
 
-      // Popular dropdown de laboratórios
-      const labSel = document.getElementById('salesLabFilter');
-      if (labSel && Array.isArray(data.laboratorios)) {
-        const prevLab = labSel.value || 'ALL';
-        labSel.innerHTML = '<option value="ALL">Todos os Laboratórios (' + data.laboratorios.length + ')</option>' +
-          data.laboratorios.map(function(l) {
-            return '<option value="' + escapeHtml(l) + '">' + escapeHtml(l) + '</option>';
-          }).join('');
-        if (prevLab !== 'ALL' && data.laboratorios.includes(prevLab)) {
-          labSel.value = prevLab;
-        }
+      // Popular datalist de laboratórios para autocomplete + pesquisa por grupo
+      const dl = document.getElementById('salesLabDatalist');
+      if (dl && Array.isArray(data.laboratorios)) {
+        dl.innerHTML = data.laboratorios.map(function(l) {
+          return '<option value="' + escapeHtml(l) + '"></option>';
+        }).join('');
       }
 
-      // Ajustar opção de ordenação por faturação se RBAC ocultar €
-      const sortSel = document.getElementById('salesSortSelect');
-      if (sortSel && !data.verFaturacao && sortSel.value === 'rev_desc') {
-        sortSel.value = 'units_desc';
+      // Ajustar ordenação se RBAC ocultar faturação €
+      if (!data.verFaturacao && salesExplorerState.sortCol === 'rev') {
+        salesExplorerState.sortCol = 'units';
+        salesExplorerState.sortDir = 'desc';
       }
 
+      onSalesFilterChanged();
+    }
+
+    function matchesLabGroupQuery(labName, query) {
+      const qNorm = normStr(query);
+      if (!qNorm) return true;
+      const labNorm = normStr(labName || '');
+      if (!labNorm) return false;
+      if (labNorm === qNorm) return true;
+      // Cada palavra pesquisada deve coincidir com o INÍCIO de uma palavra no nome do laboratório
+      // Ex: "bial" apanha "BIAL - PORTELA..." e "BIALFAR...", mas NUNCA "LABIALFARMA" nem "Stick Labial"!
+      const labWords = labNorm.split(/[^a-z0-9]+/).filter(Boolean);
+      const qTokens = qNorm.split(/[^a-z0-9]+/).filter(Boolean);
+      return qTokens.every(function(tok) {
+        return labWords.some(function(w) { return w.startsWith(tok); });
+      });
+    }
+
+    function clearSalesLabFilter() {
+      const inp = document.getElementById('salesLabInput');
+      if (inp) inp.value = '';
+      onSalesFilterChanged();
+    }
+
+    function filterSalesByLab(labName) {
+      const inp = document.getElementById('salesLabInput');
+      if (inp) inp.value = labName || '';
+      onSalesFilterChanged();
+    }
+
+    function onSalesSortSelectChange() {
+      const sel = document.getElementById('salesSortSelect');
+      if (!sel || !sel.value) return;
+      const parts = sel.value.split(':');
+      salesExplorerState.sortCol = parts[0] || 'units';
+      salesExplorerState.sortDir = parts[1] || 'desc';
+      onSalesFilterChanged();
+    }
+
+    function toggleSalesColumnSort(col) {
+      if (salesExplorerState.sortCol === col) {
+        salesExplorerState.sortDir = salesExplorerState.sortDir === 'desc' ? 'asc' : 'desc';
+      } else {
+        salesExplorerState.sortCol = col;
+        salesExplorerState.sortDir = (col === 'name' || col === 'cov') ? 'asc' : 'desc';
+      }
+      const sel = document.getElementById('salesSortSelect');
+      const key = salesExplorerState.sortCol + ':' + salesExplorerState.sortDir;
+      if (sel) {
+        const hasOpt = Array.from(sel.options).some(function(o) { return o.value === key; });
+        if (hasOpt) sel.value = key;
+      }
       onSalesFilterChanged();
     }
 
@@ -17913,9 +18014,10 @@ function getDashboardHtml(): string {
 
       const q = normStr((document.getElementById('salesSearchInput')?.value || ''));
       const typeF = document.getElementById('salesTypeFilter')?.value || 'ALL';
-      const labF = document.getElementById('salesLabFilter')?.value || 'ALL';
+      const labQuery = (document.getElementById('salesLabInput')?.value || '').trim();
+      const labClearBtn = document.getElementById('salesLabClearBtn');
+      if (labClearBtn) labClearBtn.style.display = labQuery ? 'inline-block' : 'none';
       const stockF = document.getElementById('salesStockFilter')?.value || 'ALL';
-      const sortBy = document.getElementById('salesSortSelect')?.value || 'units_desc';
 
       const filtered = data.items.filter(function(item) {
         if (q) {
@@ -17935,7 +18037,7 @@ function getDashboardHtml(): string {
         if (typeF === 'MNSRM' && item.tipo_venda !== 'MNSRM') return false;
         if (typeF === 'MSRM' && item.tipo_venda !== 'MSRM') return false;
 
-        if (labF !== 'ALL' && item.laboratorio_titular !== labF) return false;
+        if (labQuery && !matchesLabGroupQuery(item.laboratorio_titular, labQuery)) return false;
 
         if (stockF === 'WITH_SALES' && item.unidades_periodo <= 0) return false;
         if (stockF === 'RUTURA' && !item.em_rutura) return false;
@@ -17946,18 +18048,38 @@ function getDashboardHtml(): string {
         return true;
       });
 
+      const col = salesExplorerState.sortCol || 'units';
+      const dir = salesExplorerState.sortDir === 'asc' ? 1 : -1;
+
       filtered.sort(function(a, b) {
-        if (sortBy === 'rev_desc') return (b.faturacao_periodo || 0) - (a.faturacao_periodo || 0);
-        if (sortBy === 'growth_desc') return (b.variacao_un_pct ?? -999999) - (a.variacao_un_pct ?? -999999);
-        if (sortBy === 'drop_asc') return (a.variacao_un_pct ?? 999999) - (b.variacao_un_pct ?? 999999);
-        if (sortBy === 'cov_asc') {
-          const ca = a.cobertura_meses === null ? 999999 : a.cobertura_meses;
-          const cb = b.cobertura_meses === null ? 999999 : b.cobertura_meses;
-          return ca - cb;
+        if (col === 'name') {
+          return dir * (a.designacao || '').localeCompare(b.designacao || '', 'pt');
         }
-        if (sortBy === 'stock_desc') return b.stock_atual - a.stock_atual;
-        if (sortBy === 'name_asc') return (a.designacao || '').localeCompare(b.designacao || '', 'pt');
-        return b.unidades_periodo - a.unidades_periodo;
+        if (col === 'rev') {
+          return dir * ((a.faturacao_periodo || 0) - (b.faturacao_periodo || 0));
+        }
+        if (col === 'trend') {
+          const va = a.variacao_un_pct === null ? (dir === 1 ? 999999 : -999999) : a.variacao_un_pct;
+          const vb = b.variacao_un_pct === null ? (dir === 1 ? 999999 : -999999) : b.variacao_un_pct;
+          return dir * (va - vb);
+        }
+        if (col === 'vmm') {
+          return dir * ((a.vmm || 0) - (b.vmm || 0));
+        }
+        if (col === 'stock') {
+          return dir * ((a.stock_atual || 0) - (b.stock_atual || 0));
+        }
+        if (col === 'cov') {
+          const ca = a.cobertura_meses === null ? (dir === 1 ? 999999 : -999999) : a.cobertura_meses;
+          const cb = b.cobertura_meses === null ? (dir === 1 ? 999999 : -999999) : b.cobertura_meses;
+          return dir * (ca - cb);
+        }
+        if (col === 'last_sale') {
+          const da = a.data_ultima_venda || '';
+          const db = b.data_ultima_venda || '';
+          return dir * da.localeCompare(db);
+        }
+        return dir * ((a.unidades_periodo || 0) - (b.unidades_periodo || 0));
       });
 
       salesExplorerState.filtered = filtered;
@@ -18060,16 +18182,25 @@ function getDashboardHtml(): string {
       const loadMoreWrap = document.getElementById('salesLoadMoreWrap');
 
       if (thead) {
+        const sortArrow = function(colKey) {
+          if (salesExplorerState.sortCol !== colKey) return ' <span style="color:#cbd5e1;font-size:0.7rem;">↕</span>';
+          return salesExplorerState.sortDir === 'asc'
+            ? ' <span style="color:#0284c7;font-size:0.74rem;">▲</span>'
+            : ' <span style="color:#0284c7;font-size:0.74rem;">▼</span>';
+        };
+        const thBtn = function(colKey, label, align) {
+          return '<th onclick="toggleSalesColumnSort(this.dataset.col)" data-col="' + colKey + '" style="padding: 10px 12px; text-align: ' + align + '; cursor: pointer; user-select: none; white-space: nowrap;" title="Clique para ordenar">' + label + sortArrow(colKey) + '</th>';
+        };
         thead.innerHTML =
           '<tr>' +
-          '<th style="padding: 10px 14px; text-align: left;">Produto / CNP / Laboratório</th>' +
-          '<th style="padding: 10px 12px; text-align: right;">Vendas (un)</th>' +
-          (verFat ? '<th style="padding: 10px 12px; text-align: right;">Faturação (€)</th>' : '') +
-          '<th style="padding: 10px 12px; text-align: center;">Tendência</th>' +
-          '<th style="padding: 10px 12px; text-align: right;">VMM</th>' +
-          '<th style="padding: 10px 12px; text-align: right;">Stock Atual</th>' +
-          '<th style="padding: 10px 12px; text-align: center;">Cobertura</th>' +
-          '<th style="padding: 10px 12px; text-align: center;">Última Venda</th>' +
+          thBtn('name', 'Produto / CNP / Laboratório', 'left') +
+          thBtn('units', 'Vendas (un)', 'right') +
+          (verFat ? thBtn('rev', 'Faturação (€)', 'right') : '') +
+          thBtn('trend', 'Tendência', 'center') +
+          thBtn('vmm', 'VMM', 'right') +
+          thBtn('stock', 'Stock Atual', 'right') +
+          thBtn('cov', 'Cobertura', 'center') +
+          thBtn('last_sale', 'Última Venda', 'center') +
           '</tr>';
       }
 
@@ -18117,7 +18248,7 @@ function getDashboardHtml(): string {
             '<div style="font-size: 0.74rem; color: #64748b; margin-top: 2px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">' +
               '<span style="font-family: monospace; background: #f1f5f9; padding: 1px 5px; border-radius: 4px;">' + escapeHtml(it.cnp_codigo) + '</span>' +
               '<span style="background:' + typeBg + ';color:' + typeColor + ';padding:1px 6px;border-radius:4px;font-weight:700;">' + escapeHtml(it.tipo_venda) + '</span>' +
-              '<span>' + escapeHtml(it.laboratorio_titular) + '</span>' +
+              '<span data-lab="' + escapeHtml(it.laboratorio_titular) + '" onclick="event.stopPropagation(); filterSalesByLab(this.dataset.lab)" title="Clique para filtrar por este laboratório" style="cursor:pointer;text-decoration:underline;text-decoration-style:dotted;color:#334155;">' + escapeHtml(it.laboratorio_titular) + '</span>' +
             '</div>' +
           '</td>' +
           '<td style="padding: 10px 12px; text-align: right; font-weight: 800; color: #0284c7;">' + it.unidades_periodo.toLocaleString('pt-PT') + '</td>' +
