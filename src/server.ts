@@ -7740,8 +7740,6 @@ function getDashboardHtml(): string {
             <option value="units:desc">Ordenar: Mais Vendidos (un)</option>
             <option value="rev:desc">Ordenar: Maior Faturação (€)</option>
             <option value="margin:desc">Ordenar: Maior Margem (€)</option>
-            <option value="trend:desc">Ordenar: Maior Crescimento (%)</option>
-            <option value="trend:asc">Ordenar: Maior Queda (%)</option>
             <option value="vmm:desc">Ordenar: Maior VMM</option>
             <option value="cov:asc">Ordenar: Menor Cobertura</option>
             <option value="stock:desc">Ordenar: Maior Stock Atual</option>
@@ -18163,12 +18161,7 @@ function getDashboardHtml(): string {
       const kUnitsSub = document.getElementById('salesKpiUnitsSub');
       if (kUnits) kUnits.textContent = sumUn.toLocaleString('pt-PT') + ' un';
       if (kUnitsSub) {
-        if (data.trendMode === 'PERIODO_ANTERIOR' && unDeltaPct !== null) {
-          const sign = unDeltaPct >= 0 ? '+' : '';
-          kUnitsSub.innerHTML = '<span style="font-weight:700;color:' + (unDeltaPct >= 0 ? '#059669' : '#e11d48') + ';">' + sign + unDeltaPct.toFixed(1) + '%</span> vs período anterior (' + sumUnPrev.toLocaleString('pt-PT') + ' un)';
-        } else {
-          kUnitsSub.textContent = withSalesCount.toLocaleString('pt-PT') + ' artigos com vendas' + (data.trendMode === 'RITMO_3M' ? ' · Tendência por ritmo 3M' : '');
-        }
+        kUnitsSub.textContent = withSalesCount.toLocaleString('pt-PT') + ' artigos com vendas no período';
       }
 
       const kRevTitle = document.getElementById('salesKpiRevenueTitle');
@@ -18234,15 +18227,12 @@ function getDashboardHtml(): string {
         const thBtn = function(colKey, label, align, tip) {
           return '<th onclick="toggleSalesColumnSort(this.dataset.col)" data-col="' + colKey + '" style="padding: 10px 12px; text-align: ' + align + '; cursor: pointer; user-select: none; white-space: nowrap;" title="' + escapeHtml(tip || 'Clique para ordenar') + '">' + label + sortArrow(colKey) + '</th>';
         };
-        const trendColTitle = data && data.trendMode === 'RITMO_3M' ? 'Tendência (3M)' : 'Tendência';
-        const trendColTip = (data && data.trendLabel) ? data.trendLabel : 'Variação face ao período anterior';
         thead.innerHTML =
           '<tr>' +
           thBtn('name', 'Produto / CNP / Grupo', 'left') +
           thBtn('units', 'Vendas (un)', 'right') +
           (verFat ? thBtn('rev', 'Faturação / Preços', 'right', 'Faturação do período + CMP e PVP unitários') : '') +
           (verFat ? thBtn('margin', 'Margem (s/ IVA)', 'right', 'Margem estimada sem IVA (€ e %)') : '') +
-          thBtn('trend', trendColTitle, 'center', trendColTip) +
           thBtn('vmm', 'VMM', 'right') +
           thBtn('stock', verFat ? 'Stock / Inventário' : 'Stock Atual', 'right', verFat ? 'Unidades em stock e valor de inventário a preço de custo' : 'Unidades em stock atual') +
           thBtn('cov', 'Cobertura', 'center') +
@@ -18260,24 +18250,11 @@ function getDashboardHtml(): string {
 
       if (!tbody) return;
       if (slice.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="' + (verFat ? 9 : 7) + '" style="padding: 28px; text-align: center; color: #64748b;">Nenhum produto encontrado com estes filtros.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="' + (verFat ? 8 : 6) + '" style="padding: 28px; text-align: center; color: #64748b;">Nenhum produto encontrado com estes filtros.</td></tr>';
         return;
       }
 
-      const globalTrendTip = (data && data.trendLabel) ? data.trendLabel : '';
-
       tbody.innerHTML = slice.map(function(it) {
-        let trendHtml = '<span style="color:#94a3b8;font-size:0.78rem;" title="' + escapeHtml(globalTrendTip || 'Sem base anterior') + '">—</span>';
-        const rowTrendTip = it.trend_un_atual + ' un vs ' + it.trend_un_anterior + ' un' + (globalTrendTip ? ' (' + globalTrendTip + ')' : '');
-        if (it.is_novo_periodo) {
-          trendHtml = '<span title="' + escapeHtml(rowTrendTip) + '" style="background:#e0f2fe;color:#0369a1;padding:2px 7px;border-radius:999px;font-weight:800;font-size:0.72rem;white-space:nowrap;">Novo</span>';
-        } else if (it.variacao_un_pct !== null) {
-          const isUp = it.variacao_un_pct >= 0;
-          const bg = isUp ? '#dcfce7' : '#fee2e2';
-          const col = isUp ? '#15803d' : '#b91c1c';
-          trendHtml = '<span title="' + escapeHtml(rowTrendTip) + '" style="background:' + bg + ';color:' + col + ';padding:2px 7px;border-radius:999px;font-weight:800;font-size:0.74rem;white-space:nowrap;">' +
-            (isUp ? '▲ +' : '▼ ') + it.variacao_un_pct.toFixed(0) + '%</span>';
-        }
 
         let stockHtml = '<div style="font-weight:800;color:#0f172a;">' + it.stock_atual.toLocaleString('pt-PT') + ' un</div>';
         if (it.em_rutura) {
@@ -18334,7 +18311,6 @@ function getDashboardHtml(): string {
           '<td style="padding: 10px 12px; text-align: right; font-weight: 800; color: #0284c7;">' + it.unidades_periodo.toLocaleString('pt-PT') + '</td>' +
           revCellHtml +
           marginCellHtml +
-          '<td style="padding: 10px 12px; text-align: center;">' + trendHtml + '</td>' +
           '<td style="padding: 10px 12px; text-align: right; color: #475569; font-weight: 600;">' + Number(it.vmm || 0).toFixed(1) + '</td>' +
           '<td style="padding: 10px 12px; text-align: right;">' + stockHtml + '</td>' +
           '<td style="padding: 10px 12px; text-align: center;">' + covHtml + '</td>' +
@@ -18365,7 +18341,7 @@ function getDashboardHtml(): string {
         return Number(n).toFixed(2).replace('.', ',');
       };
 
-      const headers = ['CNP', 'Designação', 'Grupo Laboratório', 'Laboratório Titular', 'Tipo Venda', 'DCI', 'Unidades Período', 'Tendência %'];
+      const headers = ['CNP', 'Designação', 'Grupo Laboratório', 'Laboratório Titular', 'Tipo Venda', 'DCI', 'Unidades Período'];
       if (verFat) headers.push('Faturação (€)', 'CMP (€)', 'PVP (€)', 'Margem Est. s/ IVA (€)', 'Margem (%)');
       headers.push('VMM (un/mês)', 'Stock Atual (un)');
       if (verFat) headers.push('Valor Inventário Custo (€)');
@@ -18382,7 +18358,6 @@ function getDashboardHtml(): string {
           it.tipo_venda,
           it.molecula_dci || '',
           it.unidades_periodo,
-          it.is_novo_periodo ? 'Novo' : (it.variacao_un_pct !== null ? fmtNum(it.variacao_un_pct) : ''),
         ];
         if (verFat) {
           cols.push(
