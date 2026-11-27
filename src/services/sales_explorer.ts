@@ -1,9 +1,10 @@
 import type { PrismaClient } from '@prisma/client';
 import { getLatestImportForPharmacy } from './import_registry';
-import { calcularTaxaIva } from './metricas';
+import { calcularTaxaIva, calcularMargemSemIva } from './metricas';
 import { normalizeLabGroup } from './lab_groups';
 
 export type SalesPeriodKey = '1m' | '3m' | '6m' | '12m' | '2026' | '2025' | 'custom';
+export type TrendMode = 'PERIODO_ANTERIOR' | 'RITMO_3M' | 'SEM_BASE';
 
 export interface SalesExplorerItem {
   cnp_codigo: string;
@@ -17,7 +18,10 @@ export interface SalesExplorerItem {
   eh_mono: boolean;
   unidades_periodo: number;
   unidades_anterior: number;
+  trend_un_atual: number;
+  trend_un_anterior: number;
   variacao_un_pct: number | null;
+  is_novo_periodo: boolean;
   faturacao_periodo: number | null;
   faturacao_anterior: number | null;
   margem_estimada_eur: number | null;
@@ -40,6 +44,8 @@ export interface SalesExplorerResponse {
   mesFim: string;
   mesAnteriorInicio: string | null;
   mesAnteriorFim: string | null;
+  trendMode: TrendMode;
+  trendLabel: string;
   mesParcial: boolean;
   dataCorte: string | null;
   mesesDisponiveis: string[];
@@ -77,6 +83,8 @@ export interface ProductSalesHistoryResponse {
     stock_valor_custo: number | null;
     custo_unitario_medio: number | null;
     pvp: number | null;
+    margem_unitaria_eur: number | null;
+    margem_unitaria_pct: number | null;
     vmm: number;
     cobertura_meses: number | null;
     data_ultima_venda: string | null;
@@ -180,7 +188,7 @@ export async function getSalesExplorerData(
     ? mesesDisponiveis[mesesDisponiveis.length - 1]
     : `${new Date().getUTCFullYear()}-${String(new Date().getUTCMonth() + 1).padStart(2, '0')}`;
 
-  // 2. Resolver intervalo [mesInicio, mesFim] + período anterior de igual duração
+  // 2. Resolver intervalo [mesInicio, mesFim] + período de comparação justo (YTD exato ou Ritmo 3M se faltar histórico)
   let mesFim = latestMonth;
   let mesInicio = shiftMonth(latestMonth, -11);
 
@@ -198,10 +206,12 @@ export async function getSalesExplorerData(
     mesFim = latestMonth;
   } else if (period === '2026') {
     mesInicio = '2026-01';
-    mesFim = '2026-12';
+    const months2026 = mesesDisponiveis.filter((m) => m.startsWith('2026-'));
+    mesFim = months2026.length > 0 ? months2026[months2026.length - 1] : '2026-12';
   } else if (period === '2025') {
     mesInicio = '2025-01';
-    mesFim = '2025-12';
+    const months2025 = mesesDisponiveis.filter((m) => m.startsWith('2025-'));
+    mesFim = months2025.length > 0 ? months2025[months2025.length - 1] : '2025-12';
   } else if (period === 'custom' && cleanStart && cleanEnd) {
     mesInicio = cleanStart <= cleanEnd ? cleanStart : cleanEnd;
     mesFim = cleanStart <= cleanEnd ? cleanEnd : cleanStart;
@@ -209,11 +219,44 @@ export async function getSalesExplorerData(
 
   const currentMonths = enumerateMonths(mesInicio, mesFim);
   const spanLen = Math.max(1, currentMonths.length);
-  const mesAnteriorFim = shiftMonth(mesInicio, -1);
-  const mesAnteriorInicio = shiftMonth(mesInicio, -spanLen);
+  const isYearlyPeriod = period === '2026' || period === '2025';
+  const mesAnteriorInicio = isYearlyPeriod ? shiftMonth(mesInicio, -12) : shiftMonth(mesInicio, -spanLen);
+  const mesAnteriorFim = isYearlyPeriod ? shiftMonth(mesFim, -12) : shiftMonth(mesInicio, -1);
 
-  // 3. Buscar vendas agregadas no período atual, período anterior e catálogo de métricas em paralelo
-  const [curSalesAgg, prevSalesAgg, martMetrics] = await Promise.all([
+  const firstAvailableMonth = mesesDisponiveis.length > 0 ? mesesDisponiveis[0] : mesInicio;
+  const hasFullPriorPeriod = mesesDisponiveis.length > 0 && firstAvailableMonth <= mesAnteriorInicio;
+
+  // Se o período anterior completo não existe na BD (ex: 12M numa farmácia com 13 meses),
+  // usar Ritmo 3M (últimos 3M vs 3M anteriores) para tendência honesta e comparável!
+  let trendMode: TrendMode = 'PERIODO_ANTERIOR';
+  let trendCurStart = mesInicio;
+  let trendCurEnd = mesFim;
+  let trendPrevStart = mesAnteriorInicio;
+  let trendPrevEnd = mesAnteriorFim;
+  let trendLabel = `${formatMonthLabel(mesInicio)}–${formatMonthLabel(mesFim)} vs ${formatMonthLabel(mesAnteriorInicio)}–${formatMonthLabel(mesAnteriorFim)}`;
+
+  if (!hasFullPriorPeriod) {
+    const r3CurStart = shiftMonth(mesFim, -2);
+    const r3PrevEnd = shiftMonth(mesFim, -3);
+    const r3PrevStart = shiftMonth(mesFim, -5);
+    if (mesesDisponiveis.length >= 6 && firstAvailableMonth <= r3PrevStart) {
+      trendMode = 'RITMO_3M';
+      trendCurStart = r3CurStart;
+      trendCurEnd = mesFim;
+      trendPrevStart = r3PrevStart;
+      trendPrevEnd = r3PrevEnd;
+      trendLabel = `Ritmo 3M: ${formatMonthLabel(r3CurStart)}–${formatMonthLabel(mesFim)} vs ${formatMonthLabel(r3PrevStart)}–${formatMonthLabel(r3PrevEnd)}`;
+    } else {
+      trendMode = 'SEM_BASE';
+      trendLabel = 'Sem histórico anterior suficiente para comparação';
+    }
+  } else if (mesInicio === mesFim) {
+    trendLabel = `${formatMonthLabel(mesInicio)} vs ${formatMonthLabel(mesAnteriorInicio)}`;
+  }
+
+  // 3. Buscar vendas agregadas no período atual, período de tendência e catálogo de métricas em paralelo
+  const needSeparateTrendCur = trendMode === 'RITMO_3M' && (trendCurStart !== mesInicio || trendCurEnd !== mesFim);
+  const [curSalesAgg, prevSalesAgg, trendCurAgg, martMetrics] = await Promise.all([
     prisma.martProdutoMes.groupBy({
       by: ['cnp_codigo'],
       where: {
@@ -222,14 +265,26 @@ export async function getSalesExplorerData(
       },
       _sum: { quantidade: true, valor_total: true },
     }),
-    prisma.martProdutoMes.groupBy({
-      by: ['cnp_codigo'],
-      where: {
-        farmaciaId,
-        mes: { gte: mesAnteriorInicio, lte: mesAnteriorFim },
-      },
-      _sum: { quantidade: true, valor_total: true },
-    }),
+    trendMode === 'SEM_BASE'
+      ? Promise.resolve([])
+      : prisma.martProdutoMes.groupBy({
+          by: ['cnp_codigo'],
+          where: {
+            farmaciaId,
+            mes: { gte: trendPrevStart, lte: trendPrevEnd },
+          },
+          _sum: { quantidade: true, valor_total: true },
+        }),
+    needSeparateTrendCur
+      ? prisma.martProdutoMes.groupBy({
+          by: ['cnp_codigo'],
+          where: {
+            farmaciaId,
+            mes: { gte: trendCurStart, lte: trendCurEnd },
+          },
+          _sum: { quantidade: true, valor_total: true },
+        })
+      : Promise.resolve(null),
     prisma.martProdutoMetricas.findMany({
       where: { farmaciaId },
       select: {
@@ -267,6 +322,16 @@ export async function getSalesExplorerData(
       un: Number(r._sum.quantidade || 0),
       eur: round2(Number(r._sum.valor_total || 0)),
     });
+  }
+
+  const trendCurMap = new Map<string, { un: number; eur: number }>();
+  if (trendCurAgg) {
+    for (const r of trendCurAgg) {
+      trendCurMap.set(r.cnp_codigo, {
+        un: Number(r._sum.quantidade || 0),
+        eur: round2(Number(r._sum.valor_total || 0)),
+      });
+    }
   }
 
   const metricsMap = new Map<string, typeof martMetrics[number]>();
@@ -339,11 +404,12 @@ export async function getSalesExplorerData(
       margemPct = fatSemIva > 0 ? round2((margemEur / fatSemIva) * 100) : null;
     }
 
+    const trendCurUn = trendMode === 'SEM_BASE' ? 0 : (trendCurAgg ? (trendCurMap.get(cnp)?.un || 0) : cur.un);
+    const trendPrevUn = trendMode === 'SEM_BASE' ? 0 : prev.un;
+    const isNovoPeriodo = trendMode !== 'SEM_BASE' && trendPrevUn === 0 && trendCurUn > 0;
     const variacaoUnPct =
-      prev.un > 0
-        ? round2(((cur.un - prev.un) / prev.un) * 100)
-        : cur.un > 0
-        ? 100
+      trendMode !== 'SEM_BASE' && trendPrevUn > 0
+        ? round2(((trendCurUn - trendPrevUn) / trendPrevUn) * 100)
         : null;
 
     items.push({
@@ -358,7 +424,10 @@ export async function getSalesExplorerData(
       eh_mono: Boolean(m?.eh_mono ?? false),
       unidades_periodo: cur.un,
       unidades_anterior: prev.un,
+      trend_un_atual: trendCurUn,
+      trend_un_anterior: trendPrevUn,
       variacao_un_pct: variacaoUnPct,
+      is_novo_periodo: isNovoPeriodo,
       faturacao_periodo: params.verFaturacao ? cur.eur : null,
       faturacao_anterior: params.verFaturacao ? prev.eur : null,
       margem_estimada_eur: params.verFaturacao ? margemEur : null,
@@ -397,8 +466,10 @@ export async function getSalesExplorerData(
     period,
     mesInicio,
     mesFim,
-    mesAnteriorInicio,
-    mesAnteriorFim,
+    mesAnteriorInicio: trendMode === 'SEM_BASE' ? null : trendPrevStart,
+    mesAnteriorFim: trendMode === 'SEM_BASE' ? null : trendPrevEnd,
+    trendMode,
+    trendLabel,
     mesParcial,
     dataCorte,
     mesesDisponiveis,
@@ -531,6 +602,18 @@ export async function getProductSalesHistory(
   const stockAtual = metric ? Number(metric.stock_total_unidades || 0) : 0;
   const vmm = metric ? round2(Number(metric.vmm || 0)) : 0;
   const cobertura = vmm > 0 ? round2(stockAtual / vmm) : null;
+  const custoUnit = metric && Number(metric.custo_unitario_medio || 0) > 0 ? round2(Number(metric.custo_unitario_medio)) : null;
+  const pvpUnit = metric && metric.pvp != null && Number(metric.pvp) > 0 ? round2(Number(metric.pvp)) : null;
+  const tipoVendaProd = (metric?.tipo_venda || prodMestre?.tipo_venda || 'OUTRO').toUpperCase();
+  const margemUnit =
+    verFaturacao && custoUnit != null && pvpUnit != null
+      ? calcularMargemSemIva({
+          pvpFarmacia: pvpUnit,
+          custoUnitario: custoUnit,
+          taxaIvaDb: metric?.taxa_iva ?? null,
+          tipoVenda: tipoVendaProd,
+        })
+      : null;
 
   return {
     ok: true,
@@ -540,14 +623,16 @@ export async function getProductSalesHistory(
       designacao: metric?.designacao || prodMestre?.designacao || `CNP ${cleanCnp}`,
       laboratorio_titular: metric?.laboratorio_titular || prodMestre?.laboratorio_titular || 'Sem Laboratório',
       molecula_dci: metric?.molecula_dci || null,
-      tipo_venda: (metric?.tipo_venda || prodMestre?.tipo_venda || 'OUTRO').toUpperCase(),
+      tipo_venda: tipoVendaProd,
       categoria: metric?.categoria || prodMestre?.categoria || null,
       eh_generico: Boolean(metric?.eh_generico ?? false),
       eh_mono: Boolean(metric?.eh_mono ?? false),
       stock_atual: stockAtual,
       stock_valor_custo: verFaturacao && metric ? round2(Number(metric.stock_total_valor_custo || 0)) : null,
-      custo_unitario_medio: verFaturacao && metric ? round2(Number(metric.custo_unitario_medio || 0)) : null,
-      pvp: verFaturacao && metric && metric.pvp != null ? round2(Number(metric.pvp)) : null,
+      custo_unitario_medio: verFaturacao ? custoUnit : null,
+      pvp: verFaturacao ? pvpUnit : null,
+      margem_unitaria_eur: verFaturacao && margemUnit ? margemUnit.margem_unitaria_eur : null,
+      margem_unitaria_pct: verFaturacao && margemUnit ? margemUnit.margem_pct : null,
       vmm,
       cobertura_meses: cobertura,
       data_ultima_venda: metric?.data_ultima_venda ? metric.data_ultima_venda.toISOString().slice(0, 10) : null,

@@ -7739,6 +7739,7 @@ function getDashboardHtml(): string {
           <select id="salesSortSelect" onchange="onSalesSortSelectChange()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
             <option value="units:desc">Ordenar: Mais Vendidos (un)</option>
             <option value="rev:desc">Ordenar: Maior Faturação (€)</option>
+            <option value="margin:desc">Ordenar: Maior Margem (€)</option>
             <option value="trend:desc">Ordenar: Maior Crescimento (%)</option>
             <option value="trend:asc">Ordenar: Maior Queda (%)</option>
             <option value="vmm:desc">Ordenar: Maior VMM</option>
@@ -17953,7 +17954,7 @@ function getDashboardHtml(): string {
       }
 
       // Ajustar ordenação se RBAC ocultar faturação €
-      if (!data.verFaturacao && salesExplorerState.sortCol === 'rev') {
+      if (!data.verFaturacao && (salesExplorerState.sortCol === 'rev' || salesExplorerState.sortCol === 'margin')) {
         salesExplorerState.sortCol = 'units';
         salesExplorerState.sortDir = 'desc';
       }
@@ -18097,6 +18098,9 @@ function getDashboardHtml(): string {
         if (col === 'rev') {
           return dir * ((a.faturacao_periodo || 0) - (b.faturacao_periodo || 0));
         }
+        if (col === 'margin') {
+          return dir * ((a.margem_estimada_eur ?? -999999) - (b.margem_estimada_eur ?? -999999));
+        }
         if (col === 'trend') {
           const va = a.variacao_un_pct === null ? (dir === 1 ? 999999 : -999999) : a.variacao_un_pct;
           const vb = b.variacao_un_pct === null ? (dir === 1 ? 999999 : -999999) : b.variacao_un_pct;
@@ -18159,11 +18163,11 @@ function getDashboardHtml(): string {
       const kUnitsSub = document.getElementById('salesKpiUnitsSub');
       if (kUnits) kUnits.textContent = sumUn.toLocaleString('pt-PT') + ' un';
       if (kUnitsSub) {
-        if (unDeltaPct !== null) {
+        if (data.trendMode === 'PERIODO_ANTERIOR' && unDeltaPct !== null) {
           const sign = unDeltaPct >= 0 ? '+' : '';
           kUnitsSub.innerHTML = '<span style="font-weight:700;color:' + (unDeltaPct >= 0 ? '#059669' : '#e11d48') + ';">' + sign + unDeltaPct.toFixed(1) + '%</span> vs período anterior (' + sumUnPrev.toLocaleString('pt-PT') + ' un)';
         } else {
-          kUnitsSub.textContent = withSalesCount.toLocaleString('pt-PT') + ' artigos com vendas';
+          kUnitsSub.textContent = withSalesCount.toLocaleString('pt-PT') + ' artigos com vendas' + (data.trendMode === 'RITMO_3M' ? ' · Tendência por ritmo 3M' : '');
         }
       }
 
@@ -18227,17 +18231,20 @@ function getDashboardHtml(): string {
             ? ' <span style="color:#0284c7;font-size:0.74rem;">▲</span>'
             : ' <span style="color:#0284c7;font-size:0.74rem;">▼</span>';
         };
-        const thBtn = function(colKey, label, align) {
-          return '<th onclick="toggleSalesColumnSort(this.dataset.col)" data-col="' + colKey + '" style="padding: 10px 12px; text-align: ' + align + '; cursor: pointer; user-select: none; white-space: nowrap;" title="Clique para ordenar">' + label + sortArrow(colKey) + '</th>';
+        const thBtn = function(colKey, label, align, tip) {
+          return '<th onclick="toggleSalesColumnSort(this.dataset.col)" data-col="' + colKey + '" style="padding: 10px 12px; text-align: ' + align + '; cursor: pointer; user-select: none; white-space: nowrap;" title="' + escapeHtml(tip || 'Clique para ordenar') + '">' + label + sortArrow(colKey) + '</th>';
         };
+        const trendColTitle = data && data.trendMode === 'RITMO_3M' ? 'Tendência (3M)' : 'Tendência';
+        const trendColTip = (data && data.trendLabel) ? data.trendLabel : 'Variação face ao período anterior';
         thead.innerHTML =
           '<tr>' +
-          thBtn('name', 'Produto / CNP / Laboratório', 'left') +
+          thBtn('name', 'Produto / CNP / Grupo', 'left') +
           thBtn('units', 'Vendas (un)', 'right') +
-          (verFat ? thBtn('rev', 'Faturação (€)', 'right') : '') +
-          thBtn('trend', 'Tendência', 'center') +
+          (verFat ? thBtn('rev', 'Faturação / Preços', 'right', 'Faturação do período + CMP e PVP unitários') : '') +
+          (verFat ? thBtn('margin', 'Margem (s/ IVA)', 'right', 'Margem estimada sem IVA (€ e %)') : '') +
+          thBtn('trend', trendColTitle, 'center', trendColTip) +
           thBtn('vmm', 'VMM', 'right') +
-          thBtn('stock', 'Stock Atual', 'right') +
+          thBtn('stock', verFat ? 'Stock / Inventário' : 'Stock Atual', 'right', verFat ? 'Unidades em stock e valor de inventário a preço de custo' : 'Unidades em stock atual') +
           thBtn('cov', 'Cobertura', 'center') +
           thBtn('last_sale', 'Última Venda', 'center') +
           '</tr>';
@@ -18253,25 +18260,59 @@ function getDashboardHtml(): string {
 
       if (!tbody) return;
       if (slice.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="' + (verFat ? 8 : 7) + '" style="padding: 28px; text-align: center; color: #64748b;">Nenhum produto encontrado com estes filtros.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="' + (verFat ? 9 : 7) + '" style="padding: 28px; text-align: center; color: #64748b;">Nenhum produto encontrado com estes filtros.</td></tr>';
         return;
       }
 
+      const globalTrendTip = (data && data.trendLabel) ? data.trendLabel : '';
+
       tbody.innerHTML = slice.map(function(it) {
-        let trendHtml = '<span style="color:#94a3b8;font-size:0.78rem;">—</span>';
-        if (it.variacao_un_pct !== null) {
+        let trendHtml = '<span style="color:#94a3b8;font-size:0.78rem;" title="' + escapeHtml(globalTrendTip || 'Sem base anterior') + '">—</span>';
+        const rowTrendTip = it.trend_un_atual + ' un vs ' + it.trend_un_anterior + ' un' + (globalTrendTip ? ' (' + globalTrendTip + ')' : '');
+        if (it.is_novo_periodo) {
+          trendHtml = '<span title="' + escapeHtml(rowTrendTip) + '" style="background:#e0f2fe;color:#0369a1;padding:2px 7px;border-radius:999px;font-weight:800;font-size:0.72rem;white-space:nowrap;">Novo</span>';
+        } else if (it.variacao_un_pct !== null) {
           const isUp = it.variacao_un_pct >= 0;
           const bg = isUp ? '#dcfce7' : '#fee2e2';
           const col = isUp ? '#15803d' : '#b91c1c';
-          trendHtml = '<span style="background:' + bg + ';color:' + col + ';padding:2px 7px;border-radius:999px;font-weight:800;font-size:0.74rem;white-space:nowrap;">' +
+          trendHtml = '<span title="' + escapeHtml(rowTrendTip) + '" style="background:' + bg + ';color:' + col + ';padding:2px 7px;border-radius:999px;font-weight:800;font-size:0.74rem;white-space:nowrap;">' +
             (isUp ? '▲ +' : '▼ ') + it.variacao_un_pct.toFixed(0) + '%</span>';
         }
 
-        let stockHtml = '<span style="font-weight:800;color:#0f172a;">' + it.stock_atual.toLocaleString('pt-PT') + '</span>';
+        let stockHtml = '<div style="font-weight:800;color:#0f172a;">' + it.stock_atual.toLocaleString('pt-PT') + ' un</div>';
         if (it.em_rutura) {
-          stockHtml = '<span style="background:#fee2e2;color:#b91c1c;padding:2px 7px;border-radius:6px;font-weight:800;font-size:0.74rem;">0 (Rutura)</span>';
+          stockHtml = '<div><span style="background:#fee2e2;color:#b91c1c;padding:2px 7px;border-radius:6px;font-weight:800;font-size:0.74rem;">0 (Rutura)</span></div>';
         } else if (it.eh_mono) {
-          stockHtml = '<span style="font-weight:800;color:#b45309;">' + it.stock_atual.toLocaleString('pt-PT') + ' ❄️</span>';
+          stockHtml = '<div style="font-weight:800;color:#b45309;">' + it.stock_atual.toLocaleString('pt-PT') + ' un ❄️</div>';
+        }
+        if (verFat && it.stock_valor_custo != null && it.stock_atual > 0) {
+          stockHtml += '<div style="font-size:0.72rem;color:#64748b;font-weight:600;margin-top:2px;">' + Number(it.stock_valor_custo).toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €</div>';
+        }
+
+        let revCellHtml = '';
+        let marginCellHtml = '';
+        if (verFat) {
+          const cmpTxt = it.custo_unitario_medio != null ? ('CMP ' + Number(it.custo_unitario_medio).toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €') : '';
+          const pvpTxt = it.pvp != null ? ('PVP ' + Number(it.pvp).toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €') : '';
+          const pricesSub = [cmpTxt, pvpTxt].filter(Boolean).join(' · ');
+          revCellHtml = '<td style="padding: 10px 12px; text-align: right;">' +
+            '<div style="font-weight: 700; color: #059669;">' + Number(it.faturacao_periodo || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €</div>' +
+            (pricesSub ? '<div style="font-size:0.7rem;color:#64748b;margin-top:2px;white-space:nowrap;">' + pricesSub + '</div>' : '') +
+            '</td>';
+
+          if (it.margem_estimada_eur != null) {
+            const mPct = it.margem_pct;
+            const lowMargin = mPct !== null && mPct < 15;
+            const negMargin = it.margem_estimada_eur < 0;
+            const mColor = negMargin ? '#b91c1c' : (lowMargin ? '#b45309' : '#6d28d9');
+            const mBg = negMargin ? '#fee2e2' : (lowMargin ? '#fef3c7' : '#f3e8ff');
+            marginCellHtml = '<td style="padding: 10px 12px; text-align: right;">' +
+              '<div style="font-weight:800;color:' + mColor + ';">' + Number(it.margem_estimada_eur).toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €</div>' +
+              (mPct !== null ? '<span style="display:inline-block;margin-top:2px;background:' + mBg + ';color:' + mColor + ';padding:1px 6px;border-radius:999px;font-size:0.7rem;font-weight:800;">' + Number(mPct).toFixed(1) + '%</span>' : '') +
+              '</td>';
+          } else {
+            marginCellHtml = '<td style="padding: 10px 12px; text-align: right; color: #94a3b8;">—</td>';
+          }
         }
 
         const covHtml = it.cobertura_meses !== null
@@ -18291,7 +18332,8 @@ function getDashboardHtml(): string {
             '</div>' +
           '</td>' +
           '<td style="padding: 10px 12px; text-align: right; font-weight: 800; color: #0284c7;">' + it.unidades_periodo.toLocaleString('pt-PT') + '</td>' +
-          (verFat ? '<td style="padding: 10px 12px; text-align: right; font-weight: 700; color: #059669;">' + Number(it.faturacao_periodo || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €</td>' : '') +
+          revCellHtml +
+          marginCellHtml +
           '<td style="padding: 10px 12px; text-align: center;">' + trendHtml + '</td>' +
           '<td style="padding: 10px 12px; text-align: right; color: #475569; font-weight: 600;">' + Number(it.vmm || 0).toFixed(1) + '</td>' +
           '<td style="padding: 10px 12px; text-align: right;">' + stockHtml + '</td>' +
@@ -18323,10 +18365,10 @@ function getDashboardHtml(): string {
         return Number(n).toFixed(2).replace('.', ',');
       };
 
-      const headers = ['CNP', 'Designação', 'Laboratório', 'Tipo Venda', 'DCI', 'Unidades Período', 'Unidades Período Ant.', 'Variação %'];
-      if (verFat) headers.push('Faturação (€)', 'Margem Est. s/ IVA (€)');
+      const headers = ['CNP', 'Designação', 'Grupo Laboratório', 'Laboratório Titular', 'Tipo Venda', 'DCI', 'Unidades Período', 'Tendência %'];
+      if (verFat) headers.push('Faturação (€)', 'CMP (€)', 'PVP (€)', 'Margem Est. s/ IVA (€)', 'Margem (%)');
       headers.push('VMM (un/mês)', 'Stock Atual (un)');
-      if (verFat) headers.push('Valor Stock Custo (€)');
+      if (verFat) headers.push('Valor Inventário Custo (€)');
       headers.push('Cobertura (meses)', 'Última Venda');
 
       const lines = [headers.map(csvEscape).join(';')];
@@ -18335,15 +18377,21 @@ function getDashboardHtml(): string {
         const cols = [
           it.cnp_codigo,
           it.designacao,
+          it.grupo_laboratorio || it.laboratorio_titular,
           it.laboratorio_titular,
           it.tipo_venda,
           it.molecula_dci || '',
           it.unidades_periodo,
-          it.unidades_anterior,
-          it.variacao_un_pct !== null ? fmtNum(it.variacao_un_pct) : '',
+          it.is_novo_periodo ? 'Novo' : (it.variacao_un_pct !== null ? fmtNum(it.variacao_un_pct) : ''),
         ];
         if (verFat) {
-          cols.push(fmtNum(it.faturacao_periodo), fmtNum(it.margem_estimada_eur));
+          cols.push(
+            fmtNum(it.faturacao_periodo),
+            fmtNum(it.custo_unitario_medio),
+            fmtNum(it.pvp),
+            fmtNum(it.margem_estimada_eur),
+            fmtNum(it.margem_pct)
+          );
         }
         cols.push(fmtNum(it.vmm), it.stock_atual);
         if (verFat) {
@@ -18407,6 +18455,20 @@ function getDashboardHtml(): string {
         }
 
         if (kpisEl) {
+          const financialCard = verFat
+            ? '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;">' +
+                '<div style="font-size:0.7rem;font-weight:800;color:#64748b;text-transform:uppercase;">CMP / PVP / Margem</div>' +
+                '<div style="font-size:0.95rem;font-weight:900;color:#6d28d9;margin-top:3px;">' +
+                  (p.margem_unitaria_pct != null ? (Number(p.margem_unitaria_pct).toFixed(1) + '% (' + Number(p.margem_unitaria_eur || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €)') : '—') +
+                '</div>' +
+                '<div style="font-size:0.72rem;color:#64748b;margin-top:2px;">CMP ' +
+                  (p.custo_unitario_medio != null ? (Number(p.custo_unitario_medio).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €') : '—') +
+                  ' · PVP ' +
+                  (p.pvp != null ? (Number(p.pvp).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €') : '—') +
+                '</div>' +
+              '</div>'
+            : '';
+
           kpisEl.innerHTML =
             '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;">' +
               '<div style="font-size:0.7rem;font-weight:800;color:#64748b;text-transform:uppercase;">Vendas 12M</div>' +
@@ -18414,10 +18476,11 @@ function getDashboardHtml(): string {
               (verFat ? '<div style="font-size:0.72rem;color:#059669;font-weight:700;">' + Number(r.total_faturacao_12m || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €</div>' : '') +
             '</div>' +
             '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;">' +
-              '<div style="font-size:0.7rem;font-weight:800;color:#64748b;text-transform:uppercase;">Stock Atual</div>' +
+              '<div style="font-size:0.7rem;font-weight:800;color:#64748b;text-transform:uppercase;">Stock / Inventário</div>' +
               '<div style="font-size:1.15rem;font-weight:900;color:' + (p.stock_atual === 0 ? '#e11d48' : '#0f172a') + ';margin-top:2px;">' + p.stock_atual.toLocaleString('pt-PT') + ' un</div>' +
-              (verFat && p.stock_valor_custo != null ? '<div style="font-size:0.72rem;color:#64748b;">' + Number(p.stock_valor_custo).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € custo</div>' : '') +
+              (verFat && p.stock_valor_custo != null ? '<div style="font-size:0.72rem;color:#64748b;font-weight:700;">' + Number(p.stock_valor_custo).toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' € custo</div>' : '') +
             '</div>' +
+            financialCard +
             '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;">' +
               '<div style="font-size:0.7rem;font-weight:800;color:#64748b;text-transform:uppercase;">VMM / Cobertura</div>' +
               '<div style="font-size:1.15rem;font-weight:900;color:#7c3aed;margin-top:2px;">' + Number(p.vmm || 0).toFixed(1) + ' /mês</div>' +

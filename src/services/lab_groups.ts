@@ -64,7 +64,9 @@ const KNOWN_LAB_GROUPS: LabGroupRule[] = [
 ];
 
 export function normalizeLabGroup(rawLab?: string | null): string {
-  const clean = String(rawLab || '').trim();
+  const clean = String(rawLab || '')
+    .replace(/^["'“”\s]+|["'“”\s]+$/g, '')
+    .trim();
   if (!clean || clean.toLowerCase() === 'sem laboratório') {
     return 'Sem Laboratório';
   }
