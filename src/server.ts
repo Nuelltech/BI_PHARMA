@@ -23,8 +23,8 @@ import {
 } from './services/rbac_settings';
 
 import { getMobileStaffHtml } from './views/mobile_staff_view';
-import { getStockEvolutionAnalytics } from './services/stock_evolution';
-import { getSalesExplorerData, getProductSalesHistory } from './services/sales_explorer';
+import { getStockEvolutionAnalytics, invalidateStockEvolutionCache } from './services/stock_evolution';
+import { getSalesExplorerData, getProductSalesHistory, invalidateSalesExplorerCache } from './services/sales_explorer';
 import {
   getWeeklyTasksAudit,
   getPharmacyWeeklyTasks,
@@ -402,6 +402,8 @@ function sendOptimizedJson(
 
 function invalidateAllPharmacyCaches(farmaciaId?: string) {
   invalidateCatalog(farmaciaId);
+  invalidateStockEvolutionCache(farmaciaId);
+  invalidateSalesExplorerCache(farmaciaId);
   if (farmaciaId) {
     for (const k of Array.from(analysisCache.keys())) {
       if (k.startsWith(`${farmaciaId}:`)) analysisCache.delete(k);
@@ -2056,6 +2058,159 @@ async function startServer() {
         }
       }
 
+      // 0B2. Endpoint Admin: Criar Nova Farmácia + Onboarding do 1º Responsável (sem exigir ficheiros à partida)
+      if (pathname === '/api/admin/create-pharmacy' && req.method === 'POST') {
+        try {
+          const ctx = await resolveAccessContext();
+          if (ctx.role !== 'ADMIN') {
+            res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'Apenas administradores podem criar novas farmácias.' }));
+            return;
+          }
+
+          const rawBody = await readRequestBody(req, 64 * 1024);
+          const parsed = JSON.parse(rawBody || '{}');
+          const nome = String(parsed.nome || '').trim();
+          const nif = String(parsed.nif || '').trim();
+          if (nome.length < 2) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'O nome da farmácia é obrigatório (mínimo 2 caracteres).' }));
+            return;
+          }
+          if (nif.length < 4) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, error: 'O NIF / identificador da farmácia é obrigatório.' }));
+            return;
+          }
+
+          let codigoAcesso = String(parsed.codigo_acesso || '').trim().toUpperCase().replace(/[^A-Z0-9-]+/g, '-');
+          if (!codigoAcesso) {
+            const slugPart = nome
+              .normalize('NFD')
+              .replace(/[\u0300-\u036f]/g, '')
+              .toUpperCase()
+              .replace(/[^A-Z0-9]+/g, '')
+              .slice(0, 6) || 'FARM';
+            const rand4 = String(Math.floor(1000 + Math.random() * 9000));
+            codigoAcesso = `FARM-${slugPart}-${rand4}`;
+          }
+
+          // Proteção anti-sobrescrita: nunca sobrescreve farmácia existente com mesmo NIF ou código
+          const existing = await prisma.farmacia.findFirst({
+            where: {
+              OR: [
+                { nif },
+                { codigo_acesso: { equals: codigoAcesso, mode: 'insensitive' } },
+              ],
+            },
+            select: { id: true, nome: true, nif: true, codigo_acesso: true },
+          });
+          if (existing) {
+            const field = existing.nif === nif ? `NIF "${nif}"` : `código "${codigoAcesso}"`;
+            res.writeHead(409, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(
+              JSON.stringify({
+                ok: false,
+                error: `Já existe uma farmácia registada com o mesmo ${field} (${existing.nome}).`,
+              })
+            );
+            return;
+          }
+
+          const newFarm = await prisma.farmacia.create({
+            data: {
+              nome,
+              nif,
+              codigo_acesso: codigoAcesso,
+            },
+          });
+
+          // Onboarding opcional do 1º Responsável (Diretor Técnico / Proprietário)
+          const diretorNome = String(parsed.diretorNome || '').trim();
+          const diretorEmail = String(parsed.diretorEmail || '').trim().toLowerCase();
+          const diretorPerfilRaw = String(parsed.diretorPerfil || 'DIRETOR_TECNICO').toUpperCase();
+          const enviarConvite = parsed.enviarConvite !== false;
+
+          let onboarding: { invited: boolean; email: string | null; inviteSent: boolean; note: string } = {
+            invited: false,
+            email: null,
+            inviteSent: false,
+            note: 'Nenhum responsável adicionado agora (pode convidar mais tarde em Configurações → Equipa).',
+          };
+
+          if (diretorNome && diretorEmail) {
+            const legacyRole = diretorPerfilRaw.includes('PROPRIET') || diretorPerfilRaw.includes('DIRETOR')
+              ? 'DIRETOR'
+              : diretorPerfilRaw.includes('GEST') || diretorPerfilRaw.includes('COMPRADOR')
+              ? 'GESTOR'
+              : 'AUXILIAR';
+
+            await addPharmacyTeamMember(prisma, newFarm.id, {
+              nome: diretorNome,
+              email: diretorEmail,
+              role: legacyRole,
+            }).catch(() => null);
+
+            if (enviarConvite) {
+              const mappedPerfil = diretorPerfilRaw.includes('PROPRIET')
+                ? 'PROPRIETARIO'
+                : diretorPerfilRaw.includes('DIRETOR')
+                ? 'DIRETOR_TECNICO'
+                : diretorPerfilRaw.includes('COMPRADOR') || diretorPerfilRaw.includes('GEST')
+                ? 'COMPRADOR'
+                : 'OPERADOR_BALCAO';
+
+              const inviteRes = await createTeamMemberInvite(
+                prisma,
+                {
+                  farmaciaId: newFarm.id,
+                  ip: getClientIp(req),
+                  userAgent: String(req.headers['user-agent'] || ''),
+                },
+                { nome: diretorNome, email: diretorEmail, perfil: mappedPerfil }
+              ).catch((err: any) => ({ ok: false, error: err?.message || 'Erro ao enviar email de convite' }));
+
+              onboarding = {
+                invited: true,
+                email: diretorEmail,
+                inviteSent: Boolean(inviteRes.ok),
+                note: inviteRes.ok
+                  ? `Email de boas-vindas enviado para ${diretorEmail} (válido 48h para definir password e PIN Mobile).`
+                  : inviteRes.error || 'Responsável registado, mas o envio de email falhou.',
+              };
+            } else {
+              onboarding = {
+                invited: true,
+                email: diretorEmail,
+                inviteSent: false,
+                note: `Responsável ${diretorNome} adicionado à equipa (sem envio de email).`,
+              };
+            }
+          }
+
+          invalidateAllPharmacyCaches(newFarm.id);
+
+          res.writeHead(201, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              farmacia: {
+                id: newFarm.id,
+                nome: newFarm.nome,
+                nif: maskNif(newFarm.nif),
+                codigo_acesso: newFarm.codigo_acesso,
+              },
+              onboarding,
+            })
+          );
+        } catch (e: any) {
+          const status = e.statusCode || 400;
+          res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: e.message }));
+        }
+        return;
+      }
+
       // 0C. Endpoint Admin: Importar Nova Farmácia via Browser (PDF Inventário + PDF Validades + CSV Vendas)
       if (pathname === '/api/admin/import-pharmacy' && req.method === 'POST') {
         const tmpFiles: string[] = [];
@@ -2122,6 +2277,11 @@ async function startServer() {
           const venTrans = await transformStagingVendas(prisma, newFarm.id, venIngest.batchId);
 
           await classifyAllExistingProducts(prisma);
+          try {
+            await computeAndPersistMarts(prisma, newFarm.id);
+          } catch (martErr: any) {
+            console.error('[Import-Pharmacy] Erro ao recalcular marts:', martErr.message);
+          }
           invalidateAllPharmacyCaches(newFarm.id);
           getCachedOrComputeAnalysis(prisma, newFarm.id, 90, 4, 12).catch(() => {});
           getCachedOrComputeCampaignsPayload(prisma, newFarm).catch(() => {});
@@ -6385,7 +6545,7 @@ function getDashboardHtml(): string {
             📥 Importação Inteligente (Novos Ficheiros)
           </button>
           <button class="btn btn-secondary" onclick="openImportPharmacyModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;">
-            📥 Importar Nova Farmácia
+            🏥 Nova Farmácia &amp; Onboarding
           </button>
         </div>
         <button class="btn btn-secondary" id="btnTrocarAcesso" onclick="openAuthGateModal()" style="font-size:0.78rem;padding:7px 10px;width:100%;text-align:left;display:flex;align-items:center;gap:6px;">
@@ -8688,56 +8848,91 @@ function getDashboardHtml(): string {
     </div>
   </div>
 
-  <!-- MODAL 5: IMPORTADOR WEB DE NOVA FARMÁCIA (PDF INVENTÁRIO + PDF VALIDADES + CSV VENDAS) -->
-  <div class="modal-backdrop" id="importPharmacyModal" style="display: none;" onclick="if(event.target===this) closeImportPharmacyModal()">
-    <div class="modal" style="max-width: 680px;">
-      <div class="modal-header">
+  <!-- MODAL 5: WIZARD DE CRIAÇÃO DE NOVA FARMÁCIA & ONBOARDING DO 1º RESPONSÁVEL -->
+  <div class="modal-backdrop" id="importPharmacyModal" style="display: none; z-index: 1060; align-items: center; justify-content: center; padding: 20px;" onclick="if(event.target===this) closeImportPharmacyModal()">
+    <div style="background: #ffffff; color: #0f172a; max-width: 640px; width: 100%; border-radius: 16px; border: 1px solid #cbd5e1; box-shadow: 0 25px 60px rgba(15, 23, 42, 0.35); overflow: hidden;">
+      <div style="padding: 18px 24px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;">
         <div>
-          <h2 style="font-size: 1.15rem; color: #34d399;">📥 Importar Nova Farmácia (ETL Completo + Anonimização)</h2>
-          <p style="font-size: 0.84rem; color: var(--muted); margin-top: 4px;">
-            Carregue os ficheiros da farmácia diretamente pelo navegador. O sistema executa o ETL, classifica os produtos Infarmed e cria o código de acesso isolado.
+          <h2 style="font-size: 1.15rem; font-weight: 900; color: #0f172a; margin: 0;">🏥 Nova Farmácia &amp; Onboarding</h2>
+          <p style="font-size: 0.83rem; color: #64748b; margin: 4px 0 0 0;">
+            Passo 1: Registe a farmácia e convide o 1.º responsável. Passo 2: Carregue os ficheiros iniciais (.xlsx, .csv ou .pdf).
           </p>
         </div>
-        <button class="btn btn-secondary" onclick="closeImportPharmacyModal()">✕ Fechar</button>
+        <button type="button" class="btn btn-secondary" onclick="closeImportPharmacyModal()" style="padding: 6px 12px; font-weight: 700;">✕ Fechar</button>
       </div>
 
-      <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px;">
-        <div>
-          <label style="font-size: 0.78rem; font-weight: 700; color: #cbd5e1; display: block; margin-bottom: 6px;">Nome Anónimo (Pitch):</label>
-          <input type="text" id="impFarmNome" placeholder="Ex: Farmácia C" value="Farmácia C" style="width: 100%;" />
+      <!-- PASSO 1: FORMULÁRIO -->
+      <div id="newFarmStep1" style="padding: 20px 24px;">
+        <div style="font-size: 0.78rem; font-weight: 800; color: #0284c7; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;">
+          1. Identificação da Farmácia
         </div>
-        <div>
-          <label style="font-size: 0.78rem; font-weight: 700; color: #cbd5e1; display: block; margin-bottom: 6px;">Identificador / NIF:</label>
-          <input type="text" id="impFarmNif" placeholder="Ex: DEMO-03" value="DEMO-03" style="width: 100%;" />
+        <div style="display: grid; grid-template-columns: 1.4fr 1fr; gap: 12px; margin-bottom: 12px;">
+          <div>
+            <label style="font-size: 0.78rem; font-weight: 700; color: #334155; display: block; margin-bottom: 5px;">Nome da Farmácia *</label>
+            <input type="text" id="impFarmNome" placeholder="Ex: Farmácia Central" style="width: 100%; padding: 9px 12px; border: 1.5px solid #cbd5e1; border-radius: 8px; font-size: 0.88rem;" />
+          </div>
+          <div>
+            <label style="font-size: 0.78rem; font-weight: 700; color: #334155; display: block; margin-bottom: 5px;">NIF / Identificador *</label>
+            <input type="text" id="impFarmNif" placeholder="Ex: 501234567" style="width: 100%; padding: 9px 12px; border: 1.5px solid #cbd5e1; border-radius: 8px; font-size: 0.88rem;" />
+          </div>
         </div>
-        <div>
-          <label style="font-size: 0.78rem; font-weight: 700; color: #cbd5e1; display: block; margin-bottom: 6px;">Código de Acesso Isolado:</label>
-          <input type="text" id="impFarmCode" placeholder="Ex: FARMACIA-C" value="FARMACIA-C" style="width: 100%; text-transform: uppercase;" />
+        <div style="margin-bottom: 18px;">
+          <label style="font-size: 0.78rem; font-weight: 700; color: #334155; display: block; margin-bottom: 5px;">Código de Acesso Isolado (opcional — gerado automaticamente se vazio)</label>
+          <input type="text" id="impFarmCode" placeholder="Ex: FARM-CENTRAL-4821 (deixe vazio para gerar)" style="width: 100%; padding: 9px 12px; border: 1.5px solid #cbd5e1; border-radius: 8px; font-size: 0.86rem; text-transform: uppercase;" />
+        </div>
+
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; margin-bottom: 16px;">
+          <div style="font-size: 0.78rem; font-weight: 800; color: #059669; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;">
+            2. Onboarding do 1.º Responsável (Opcional)
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
+            <div>
+              <label style="font-size: 0.75rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">Nome do Diretor / Proprietário</label>
+              <input type="text" id="impDirNome" placeholder="Ex: Dra. Ana Silva" style="width: 100%; padding: 8px 11px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 0.85rem; background: #fff;" />
+            </div>
+            <div>
+              <label style="font-size: 0.75rem; font-weight: 700; color: #475569; display: block; margin-bottom: 4px;">Email</label>
+              <input type="email" id="impDirEmail" placeholder="ana.silva@farmacia.pt" style="width: 100%; padding: 8px 11px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 0.85rem; background: #fff;" />
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
+            <select id="impDirPerfil" style="padding: 7px 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 0.82rem; font-weight: 600; background: #fff;">
+              <option value="DIRETOR_TECNICO">Diretor Técnico (Acesso Total)</option>
+              <option value="PROPRIETARIO">Proprietário (Acesso Total)</option>
+              <option value="GESTOR">Gestor / Comprador</option>
+            </select>
+            <label style="display: inline-flex; align-items: center; gap: 7px; font-size: 0.8rem; font-weight: 600; color: #334155; cursor: pointer;">
+              <input type="checkbox" id="impDirSendEmail" checked style="width: 15px; height: 15px;" />
+              Enviar email de convite (48h) para definir Password e PIN
+            </label>
+          </div>
+        </div>
+
+        <div id="importPharmacyStatus" style="font-size: 0.84rem; margin-bottom: 14px; min-height: 20px;"></div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px;">
+          <button type="button" class="btn btn-secondary" onclick="closeImportPharmacyModal()">Cancelar</button>
+          <button type="button" class="btn" id="btnRunImportPharmacy" onclick="submitCreatePharmacyWizard()" style="background: #0284c7; color: #ffffff; font-weight: 800; border: none; padding: 9px 18px; border-radius: 8px; cursor: pointer;">
+            ✅ Criar Farmácia &amp; Continuar →
+          </button>
         </div>
       </div>
 
-      <div style="display: flex; flex-direction: column; gap: 12px; background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px;">
-        <div>
-          <label style="font-size: 0.82rem; font-weight: 700; color: #38bdf8; display: block; margin-bottom: 4px;">1️⃣ Ficheiro PDF de Inventário (Obrigatório):</label>
-          <input type="file" id="impFileInv" accept=".pdf" style="width: 100%; font-size: 0.84rem;" />
+      <!-- PASSO 2: SUCESSO + ABERTURA DIRETA DO IMPORTADOR INTERATIVO MODERNO -->
+      <div id="newFarmStep2" style="display: none; padding: 22px 24px;">
+        <div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 12px; padding: 16px 18px; margin-bottom: 18px;">
+          <div style="font-size: 1rem; font-weight: 900; color: #065f46; margin-bottom: 6px;">🎉 Farmácia criada com sucesso!</div>
+          <div id="newFarmCreatedSummary" style="font-size: 0.85rem; color: #064e3b; line-height: 1.55;"></div>
         </div>
-        <div>
-          <label style="font-size: 0.82rem; font-weight: 700; color: #fbbf24; display: block; margin-bottom: 4px;">2️⃣ Ficheiro PDF de Controlo de Validades (Opcional mas Recomendado):</label>
-          <input type="file" id="impFileVal" accept=".pdf" style="width: 100%; font-size: 0.84rem;" />
+        <p style="font-size: 0.84rem; color: #475569; margin: 0 0 18px 0; line-height: 1.5;">
+          Próximo passo: carregue os ficheiros iniciais da farmácia (<b>Excel .xlsx</b>, <b>CSV</b> ou <b>PDF</b> de existências, validades e histórico de vendas) no Importador Interativo para ativar o Painel, Copilot v2, Vendas &amp; Histórico e Evolução.
+        </p>
+        <div style="display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap;">
+          <button type="button" class="btn btn-secondary" onclick="finishNewPharmacyWithoutImport()">Concluir sem importar agora</button>
+          <button type="button" class="btn" onclick="proceedNewPharmacyToImport()" style="background: #10b981; color: #042f2e; font-weight: 800; border: none; padding: 10px 18px; border-radius: 8px; cursor: pointer;">
+            📂 Carregar Ficheiros Iniciais (.xlsx / .csv / .pdf) →
+          </button>
         </div>
-        <div>
-          <label style="font-size: 0.82rem; font-weight: 700; color: #34d399; display: block; margin-bottom: 4px;">3️⃣ Ficheiro CSV de Vendas Mensais (Obrigatório):</label>
-          <input type="file" id="impFileVen" accept=".csv" style="width: 100%; font-size: 0.84rem;" />
-        </div>
-      </div>
-
-      <div id="importPharmacyStatus" style="font-size: 0.85rem; margin-bottom: 14px; color: #38bdf8;"></div>
-
-      <div style="display: flex; justify-content: flex-end; gap: 10px;">
-        <button class="btn btn-secondary" onclick="closeImportPharmacyModal()">Cancelar</button>
-        <button class="btn" id="btnRunImportPharmacy" onclick="submitImportPharmacy()" style="background: #10b981; color: #052e16;">
-          ⚙️ Processar Ficheiros & Criar Farmácia
-        </button>
       </div>
     </div>
   </div>
@@ -10725,16 +10920,118 @@ function getDashboardHtml(): string {
       }
     }
 
+    let newlyCreatedFarmaciaId = '';
+
     function openImportPharmacyModal() {
       const modal = document.getElementById('importPharmacyModal');
+      const s1 = document.getElementById('newFarmStep1');
+      const s2 = document.getElementById('newFarmStep2');
       const st = document.getElementById('importPharmacyStatus');
+      if (s1) s1.style.display = 'block';
+      if (s2) s2.style.display = 'none';
       if (st) st.textContent = '';
+      ['impFarmNome', 'impFarmNif', 'impFarmCode', 'impDirNome', 'impDirEmail'].forEach(function(id) {
+        const el = document.getElementById(id);
+        if (el) el.value = '';
+      });
+      const chk = document.getElementById('impDirSendEmail');
+      if (chk) chk.checked = true;
+      newlyCreatedFarmaciaId = '';
       if (modal) modal.style.display = 'flex';
     }
 
     function closeImportPharmacyModal() {
       const modal = document.getElementById('importPharmacyModal');
       if (modal) modal.style.display = 'none';
+    }
+
+    async function submitCreatePharmacyWizard() {
+      const nome = (document.getElementById('impFarmNome')?.value || '').trim();
+      const nif = (document.getElementById('impFarmNif')?.value || '').trim();
+      const codigo_acesso = (document.getElementById('impFarmCode')?.value || '').trim().toUpperCase();
+      const diretorNome = (document.getElementById('impDirNome')?.value || '').trim();
+      const diretorEmail = (document.getElementById('impDirEmail')?.value || '').trim();
+      const diretorPerfil = document.getElementById('impDirPerfil')?.value || 'DIRETOR_TECNICO';
+      const enviarConvite = !!document.getElementById('impDirSendEmail')?.checked;
+      const st = document.getElementById('importPharmacyStatus');
+      const btn = document.getElementById('btnRunImportPharmacy');
+
+      if (nome.length < 2 || nif.length < 4) {
+        if (st) st.innerHTML = '<span style="color:#e11d48;font-weight:700;">⚠️ Preencha o Nome e o NIF da farmácia.</span>';
+        return;
+      }
+      if ((diretorNome && !diretorEmail) || (!diretorNome && diretorEmail)) {
+        if (st) st.innerHTML = '<span style="color:#e11d48;font-weight:700;">⚠️ Para convidar o 1.º responsável, preencha o Nome e o Email (ou deixe ambos vazios).</span>';
+        return;
+      }
+
+      try {
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ A criar farmácia...'; }
+        if (st) st.innerHTML = '<span style="color:#0284c7;font-weight:600;">⏳ A criar farmácia e a preparar onboarding...</span>';
+
+        const res = await fetch('/api/admin/create-pharmacy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            nome,
+            nif,
+            codigo_acesso,
+            diretorNome,
+            diretorEmail,
+            diretorPerfil,
+            enviarConvite,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          if (st) st.innerHTML = '<span style="color:#e11d48;font-weight:700;">❌ ' + escapeHtml(data.error || 'Não foi possível criar a farmácia.') + '</span>';
+          return;
+        }
+
+        newlyCreatedFarmaciaId = data.farmacia.id;
+        activeFarmaciaId = data.farmacia.id;
+        localStorage.setItem('bi_pharma_farmacia_id', activeFarmaciaId);
+        if (typeof initPharmacies === 'function') {
+          await initPharmacies();
+        }
+
+        const sumEl = document.getElementById('newFarmCreatedSummary');
+        if (sumEl) {
+          const ob = data.onboarding || {};
+          sumEl.innerHTML =
+            '<div><b>Farmácia:</b> ' + escapeHtml(data.farmacia.nome) + '</div>' +
+            '<div><b>Código de Acesso Isolado:</b> <code style="background:#d1fae5;padding:2px 6px;border-radius:4px;font-weight:800;">' + escapeHtml(data.farmacia.codigo_acesso || '') + '</code></div>' +
+            '<div style="margin-top:6px;"><b>Onboarding:</b> ' + escapeHtml(ob.note || '') + '</div>';
+        }
+        const s1 = document.getElementById('newFarmStep1');
+        const s2 = document.getElementById('newFarmStep2');
+        if (s1) s1.style.display = 'none';
+        if (s2) s2.style.display = 'block';
+      } catch (err) {
+        if (st) st.innerHTML = '<span style="color:#e11d48;font-weight:700;">❌ Erro de ligação: ' + escapeHtml(err.message || '') + '</span>';
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '✅ Criar Farmácia & Continuar →'; }
+      }
+    }
+
+    function proceedNewPharmacyToImport() {
+      closeImportPharmacyModal();
+      if (newlyCreatedFarmaciaId) {
+        activeFarmaciaId = newlyCreatedFarmaciaId;
+        const sel = document.getElementById('farmaciaSelector');
+        if (sel) sel.value = newlyCreatedFarmaciaId;
+      }
+      if (typeof openInteractiveImportModal === 'function') {
+        openInteractiveImportModal();
+      }
+    }
+
+    function finishNewPharmacyWithoutImport() {
+      closeImportPharmacyModal();
+      if (newlyCreatedFarmaciaId && typeof loadAnalysis === 'function') {
+        activeFarmaciaId = newlyCreatedFarmaciaId;
+        loadAnalysis();
+      }
     }
 
     function fileToBase64(file) {
