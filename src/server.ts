@@ -8759,22 +8759,19 @@ function getDashboardHtml(): string {
       <!-- Passo 1: Seleção de Ficheiros -->
       <div id="importStep1" style="display: block;">
         <div style="background: #ffffff; border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <label style="font-size: 0.85rem; font-weight: 700; color: #0f172a;">Origem dos Ficheiros:</label>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 10px; flex-wrap: wrap;">
+            <label style="font-size: 0.85rem; font-weight: 700; color: #0f172a;">Selecionar Ficheiros do Computador:</label>
             <div style="display: flex; gap: 8px;">
-              <button class="btn btn-secondary" onclick="loadAvenidaFolderFiles()" style="font-size: 0.78rem; padding: 5px 10px; border-color: #38bdf8; color: #0284c7;">
-                📁 Ficheiros da Pasta Avenida
-              </button>
-              <button class="btn btn-secondary" onclick="document.getElementById('impCustomFilesInput').click()" style="font-size: 0.78rem; padding: 5px 10px;">
+              <button class="btn" type="button" onclick="document.getElementById('impCustomFilesInput').click()" style="font-size: 0.8rem; padding: 7px 14px; background: #0284c7; color: #ffffff; border: none; border-radius: 8px; font-weight: 700; cursor: pointer;">
                 📤 Carregar do Computador
               </button>
-              <input type="file" id="impCustomFilesInput" multiple accept=".pdf,.csv" style="display:none;" onchange="handleCustomFilesSelected(event)" />
+              <input type="file" id="impCustomFilesInput" multiple accept=".pdf,.csv,.xlsx,.xls" style="display:none;" onchange="handleCustomFilesSelected(event)" />
             </div>
           </div>
 
-          <div id="avenidaFilesContainer" style="max-height: 240px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: #f8fafc;">
-            <div style="text-align: center; color: var(--muted); padding: 16px; font-size: 0.82rem;">
-              Clique em "📁 Ficheiros da Pasta Avenida" ou selecione ficheiros do seu computador.
+          <div id="avenidaFilesContainer" onclick="if(selectedImportFiles.length===0) document.getElementById('impCustomFilesInput').click()" style="max-height: 240px; overflow-y: auto; border: 1.5px dashed #cbd5e1; border-radius: 8px; padding: 12px; background: #f8fafc; cursor: pointer;">
+            <div style="text-align: center; color: var(--muted); padding: 18px; font-size: 0.84rem;">
+              📤 Clique aqui ou em <b>"Carregar do Computador"</b> para selecionar os ficheiros (<b>.xlsx</b>, <b>.csv</b> ou <b>.pdf</b>).
             </div>
           </div>
 
@@ -10555,7 +10552,11 @@ function getDashboardHtml(): string {
       var modal = document.getElementById('interactiveImportModal');
       if (modal) modal.style.display = 'flex';
       backToImportStep1();
-      loadAvenidaFolderFiles();
+      var c = document.getElementById('avenidaFilesContainer');
+      if (c) {
+        c.innerHTML = '<div style="text-align:center;color:var(--muted);padding:18px;font-size:0.84rem;">📤 Clique aqui ou em <b>"Carregar do Computador"</b> para selecionar os ficheiros (<b>.xlsx</b>, <b>.csv</b> ou <b>.pdf</b>).</div>';
+      }
+      updateSelectedFilesCount();
     }
 
     function closeInteractiveImportModal() {
