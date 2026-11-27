@@ -7712,42 +7712,43 @@ function getDashboardHtml(): string {
         </div>
       </div>
 
-      <!-- Barra de Pesquisa e Filtros (mesmo princípio das outras tabelas) -->
-      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
-        <input type="text" id="salesSearchInput" placeholder="🔎 Pesquisar por nome, CNP, molécula DCI ou laboratório..." oninput="onSalesFilterChanged()" style="flex: 2; min-width: 240px; padding: 9px 13px; border: 1.5px solid #cbd5e1; border-radius: 9px; font-size: 0.86rem; outline: none;" />
-        <select id="salesTypeFilter" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
-          <option value="ALL">Todos os Tipos</option>
-          <option value="LIVRE_MNSRM">🟢 Venda Livre + MNSRM</option>
-          <option value="GENERICO">🧬 Só Genéricos</option>
-          <option value="MARCA">🏷️ Só Marca</option>
-          <option value="PSBE">🟢 Só PSBE / Cosmética</option>
-          <option value="MNSRM">🔵 Só MNSRM</option>
-          <option value="MSRM">🔴 Só MSRM</option>
-        </select>
-        <div style="position: relative; display: inline-flex; align-items: center; min-width: 210px; max-width: 260px; flex: 1;">
-          <input type="text" id="salesLabInput" list="salesLabDatalist" placeholder="🏭 Laboratório ou Grupo (ex: Bial)..." oninput="onSalesFilterChanged()" style="width: 100%; padding: 9px 26px 9px 11px; border: 1.5px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff; outline: none;" />
-          <button type="button" id="salesLabClearBtn" onclick="clearSalesLabFilter()" title="Limpar filtro de laboratório" style="display: none; position: absolute; right: 7px; background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 0.82rem; font-weight: 800; padding: 2px 4px;">✕</button>
-          <datalist id="salesLabDatalist"></datalist>
+      <!-- Barra de Pesquisa Inteligente (com atalhos lab:Bial, dci:..., cnp:...) e Filtros -->
+      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; margin-bottom: 14px;">
+        <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+          <div style="position: relative; flex: 2.5; min-width: 260px; display: flex; align-items: center;">
+            <input type="text" id="salesSearchInput" placeholder="🔎 Pesquisar produto, CNP, DCI ou lab:Bial / lab:Teva..." oninput="onSalesFilterChanged()" style="width: 100%; padding: 9px 28px 9px 13px; border: 1.5px solid #cbd5e1; border-radius: 9px; font-size: 0.86rem; outline: none;" />
+            <button type="button" id="salesSearchClearBtn" onclick="clearSalesSearchInput()" title="Limpar pesquisa" style="display: none; position: absolute; right: 8px; background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 0.85rem; font-weight: 800; padding: 2px 5px;">✕</button>
+          </div>
+          <select id="salesTypeFilter" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
+            <option value="ALL">Todos os Tipos</option>
+            <option value="LIVRE_MNSRM">🟢 Venda Livre + MNSRM</option>
+            <option value="GENERICO">🧬 Só Genéricos</option>
+            <option value="MARCA">🏷️ Só Marca</option>
+            <option value="PSBE">🟢 Só PSBE / Cosmética</option>
+            <option value="MNSRM">🔵 Só MNSRM</option>
+            <option value="MSRM">🔴 Só MSRM</option>
+          </select>
+          <select id="salesStockFilter" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
+            <option value="ALL">Qualquer Stock</option>
+            <option value="WITH_SALES">Com Vendas no Período</option>
+            <option value="RUTURA">⚠️ Em Rutura (Stock 0 c/ vendas)</option>
+            <option value="IN_STOCK">Com Stock Atual (&gt; 0)</option>
+            <option value="EXCESSO">Excesso (&gt; 4 meses cob.)</option>
+            <option value="MONOS">❄️ Monos (&gt; 90d s/ vendas)</option>
+          </select>
+          <select id="salesSortSelect" onchange="onSalesSortSelectChange()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
+            <option value="units:desc">Ordenar: Mais Vendidos (un)</option>
+            <option value="rev:desc">Ordenar: Maior Faturação (€)</option>
+            <option value="trend:desc">Ordenar: Maior Crescimento (%)</option>
+            <option value="trend:asc">Ordenar: Maior Queda (%)</option>
+            <option value="vmm:desc">Ordenar: Maior VMM</option>
+            <option value="cov:asc">Ordenar: Menor Cobertura</option>
+            <option value="stock:desc">Ordenar: Maior Stock Atual</option>
+            <option value="last_sale:desc">Ordenar: Venda Mais Recente</option>
+            <option value="name:asc">Ordenar: Nome A–Z</option>
+          </select>
         </div>
-        <select id="salesStockFilter" onchange="onSalesFilterChanged()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
-          <option value="ALL">Qualquer Stock</option>
-          <option value="WITH_SALES">Com Vendas no Período</option>
-          <option value="RUTURA">⚠️ Em Rutura (Stock 0 c/ vendas)</option>
-          <option value="IN_STOCK">Com Stock Atual (&gt; 0)</option>
-          <option value="EXCESSO">Excesso (&gt; 4 meses cob.)</option>
-          <option value="MONOS">❄️ Monos (&gt; 90d s/ vendas)</option>
-        </select>
-        <select id="salesSortSelect" onchange="onSalesSortSelectChange()" style="padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 9px; font-size: 0.82rem; font-weight: 600; background: #fff;">
-          <option value="units:desc">Ordenar: Mais Vendidos (un)</option>
-          <option value="rev:desc">Ordenar: Maior Faturação (€)</option>
-          <option value="trend:desc">Ordenar: Maior Crescimento (%)</option>
-          <option value="trend:asc">Ordenar: Maior Queda (%)</option>
-          <option value="vmm:desc">Ordenar: Maior VMM</option>
-          <option value="cov:asc">Ordenar: Menor Cobertura</option>
-          <option value="stock:desc">Ordenar: Maior Stock Atual</option>
-          <option value="last_sale:desc">Ordenar: Venda Mais Recente</option>
-          <option value="name:asc">Ordenar: Nome A–Z</option>
-        </select>
+        <div id="salesLabQuickChips" style="display: none; margin-top: 10px; padding-top: 8px; border-top: 1px solid #f1f5f9; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 0.74rem; color: #64748b;"></div>
       </div>
 
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; padding: 0 2px; flex-wrap: wrap; gap: 8px;">
@@ -17939,12 +17940,16 @@ function getDashboardHtml(): string {
         eSel.value = data.mesesDisponiveis.includes(data.mesFim) ? data.mesFim : data.mesesDisponiveis[data.mesesDisponiveis.length - 1];
       }
 
-      // Popular datalist de laboratórios para autocomplete + pesquisa por grupo
-      const dl = document.getElementById('salesLabDatalist');
-      if (dl && Array.isArray(data.laboratorios)) {
-        dl.innerHTML = data.laboratorios.map(function(l) {
-          return '<option value="' + escapeHtml(l) + '"></option>';
-        }).join('');
+      // Popular chips rápidos de grupos laboratoriais principais (ex: lab:Bial, lab:Teva...)
+      const chipsWrap = document.getElementById('salesLabQuickChips');
+      if (chipsWrap && Array.isArray(data.topGruposLab) && data.topGruposLab.length > 0) {
+        chipsWrap.style.display = 'flex';
+        chipsWrap.innerHTML =
+          '<span style="font-weight:700;color:#475569;">Atalhos <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px;color:#0284c7;">lab:</code></span>' +
+          data.topGruposLab.map(function(g) {
+            return '<button type="button" data-grp="' + escapeHtml(g.grupo) + '" onclick="filterSalesByLab(this.dataset.grp)" style="background:#f8fafc;border:1px solid #cbd5e1;color:#334155;padding:3px 9px;border-radius:999px;font-size:0.74rem;font-weight:700;cursor:pointer;">' +
+              escapeHtml(g.grupo) + ' <span style="color:#94a3b8;font-weight:600;">(' + g.count + ')</span></button>';
+          }).join('');
       }
 
       // Ajustar ordenação se RBAC ocultar faturação €
@@ -17956,30 +17961,53 @@ function getDashboardHtml(): string {
       onSalesFilterChanged();
     }
 
-    function matchesLabGroupQuery(labName, query) {
-      const qNorm = normStr(query);
+    function matchesWordStart(targetText, queryToken) {
+      const qNorm = normStr(queryToken);
       if (!qNorm) return true;
-      const labNorm = normStr(labName || '');
-      if (!labNorm) return false;
-      if (labNorm === qNorm) return true;
-      // Cada palavra pesquisada deve coincidir com o INÍCIO de uma palavra no nome do laboratório
-      // Ex: "bial" apanha "BIAL - PORTELA..." e "BIALFAR...", mas NUNCA "LABIALFARMA" nem "Stick Labial"!
-      const labWords = labNorm.split(/[^a-z0-9]+/).filter(Boolean);
-      const qTokens = qNorm.split(/[^a-z0-9]+/).filter(Boolean);
-      return qTokens.every(function(tok) {
-        return labWords.some(function(w) { return w.startsWith(tok); });
+      const tNorm = normStr(targetText || '');
+      if (!tNorm) return false;
+      if (tNorm === qNorm) return true;
+      const words = tNorm.split(/[^a-z0-9]+/).filter(Boolean);
+      const tokens = qNorm.split(/[^a-z0-9]+/).filter(Boolean);
+      return tokens.every(function(tok) {
+        return words.some(function(w) { return w.startsWith(tok); });
       });
     }
 
-    function clearSalesLabFilter() {
-      const inp = document.getElementById('salesLabInput');
+    function parseSmartSalesQuery(raw) {
+      const text = String(raw || '').trim();
+      const parsed = { lab: '', dci: '', cnp: '', free: '' };
+      if (!text) return parsed;
+
+      // Suporta lab:bial, lab: bial, lab:"pierre fabre", dci:ibuprofeno, cnp:5413745 + texto livre combinado
+      let remainder = text.replace(/\\b(lab|laboratorio|grupo|dci|cnp)\\s*:\\s*(?:"([^"]+)"|'([^']+)'|(\\S+))/gi, function(_, key, q1, q2, q3) {
+        const val = (q1 || q2 || q3 || '').trim();
+        const k = String(key).toLowerCase();
+        if (k === 'lab' || k === 'laboratorio' || k === 'grupo') parsed.lab = val;
+        else if (k === 'dci') parsed.dci = val;
+        else if (k === 'cnp') parsed.cnp = val;
+        return ' ';
+      });
+      // Ignora prefixo incompleto enquanto o utilizador ainda está a escrever "lab:"
+      remainder = remainder.replace(/\\b(lab|laboratorio|grupo|dci|cnp)\\s*:\\s*$/i, '').trim();
+      parsed.free = normStr(remainder);
+      return parsed;
+    }
+
+    function clearSalesSearchInput() {
+      const inp = document.getElementById('salesSearchInput');
       if (inp) inp.value = '';
       onSalesFilterChanged();
     }
 
-    function filterSalesByLab(labName) {
-      const inp = document.getElementById('salesLabInput');
-      if (inp) inp.value = labName || '';
+    function filterSalesByLab(groupOrLabName) {
+      const inp = document.getElementById('salesSearchInput');
+      if (!inp) return;
+      const clean = String(groupOrLabName || '').trim();
+      if (!clean) return;
+      const formatted = clean.includes(' ') ? ('lab:"' + clean + '"') : ('lab:' + clean);
+      inp.value = formatted;
+      inp.focus();
       onSalesFilterChanged();
     }
 
@@ -18012,23 +18040,36 @@ function getDashboardHtml(): string {
       const data = salesExplorerState.data;
       if (!data || !Array.isArray(data.items)) return;
 
-      const q = normStr((document.getElementById('salesSearchInput')?.value || ''));
+      const rawSearch = (document.getElementById('salesSearchInput')?.value || '').trim();
+      const clearBtn = document.getElementById('salesSearchClearBtn');
+      if (clearBtn) clearBtn.style.display = rawSearch ? 'inline-block' : 'none';
+
+      const sq = parseSmartSalesQuery(rawSearch);
       const typeF = document.getElementById('salesTypeFilter')?.value || 'ALL';
-      const labQuery = (document.getElementById('salesLabInput')?.value || '').trim();
-      const labClearBtn = document.getElementById('salesLabClearBtn');
-      if (labClearBtn) labClearBtn.style.display = labQuery ? 'inline-block' : 'none';
       const stockF = document.getElementById('salesStockFilter')?.value || 'ALL';
 
       const filtered = data.items.filter(function(item) {
-        if (q) {
+        if (sq.lab) {
+          const matchGrupo = matchesWordStart(item.grupo_laboratorio, sq.lab);
+          const matchTitular = matchesWordStart(item.laboratorio_titular, sq.lab);
+          if (!matchGrupo && !matchTitular) return false;
+        }
+        if (sq.dci) {
+          if (!normStr(item.molecula_dci || '').includes(normStr(sq.dci))) return false;
+        }
+        if (sq.cnp) {
+          if (!String(item.cnp_codigo || '').includes(sq.cnp)) return false;
+        }
+        if (sq.free) {
           const hay = normStr(
             (item.designacao || '') + ' ' +
             (item.cnp_codigo || '') + ' ' +
+            (item.grupo_laboratorio || '') + ' ' +
             (item.laboratorio_titular || '') + ' ' +
             (item.molecula_dci || '') + ' ' +
             (item.categoria || '')
           );
-          if (!hay.includes(q)) return false;
+          if (!hay.includes(sq.free)) return false;
         }
         if (typeF === 'LIVRE_MNSRM' && item.tipo_venda === 'MSRM') return false;
         if (typeF === 'GENERICO' && !item.eh_generico) return false;
@@ -18036,8 +18077,6 @@ function getDashboardHtml(): string {
         if (typeF === 'PSBE' && item.tipo_venda !== 'PSBE') return false;
         if (typeF === 'MNSRM' && item.tipo_venda !== 'MNSRM') return false;
         if (typeF === 'MSRM' && item.tipo_venda !== 'MSRM') return false;
-
-        if (labQuery && !matchesLabGroupQuery(item.laboratorio_titular, labQuery)) return false;
 
         if (stockF === 'WITH_SALES' && item.unidades_periodo <= 0) return false;
         if (stockF === 'RUTURA' && !item.em_rutura) return false;
@@ -18248,7 +18287,7 @@ function getDashboardHtml(): string {
             '<div style="font-size: 0.74rem; color: #64748b; margin-top: 2px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">' +
               '<span style="font-family: monospace; background: #f1f5f9; padding: 1px 5px; border-radius: 4px;">' + escapeHtml(it.cnp_codigo) + '</span>' +
               '<span style="background:' + typeBg + ';color:' + typeColor + ';padding:1px 6px;border-radius:4px;font-weight:700;">' + escapeHtml(it.tipo_venda) + '</span>' +
-              '<span data-lab="' + escapeHtml(it.laboratorio_titular) + '" onclick="event.stopPropagation(); filterSalesByLab(this.dataset.lab)" title="Clique para filtrar por este laboratório" style="cursor:pointer;text-decoration:underline;text-decoration-style:dotted;color:#334155;">' + escapeHtml(it.laboratorio_titular) + '</span>' +
+              '<span data-lab="' + escapeHtml(it.grupo_laboratorio || it.laboratorio_titular) + '" onclick="event.stopPropagation(); filterSalesByLab(this.dataset.lab)" title="Clique para filtrar por lab:' + escapeHtml(it.grupo_laboratorio || it.laboratorio_titular) + ' (' + escapeHtml(it.laboratorio_titular) + ')" style="cursor:pointer;text-decoration:underline;text-decoration-style:dotted;color:#334155;">' + escapeHtml(it.grupo_laboratorio || it.laboratorio_titular) + '</span>' +
             '</div>' +
           '</td>' +
           '<td style="padding: 10px 12px; text-align: right; font-weight: 800; color: #0284c7;">' + it.unidades_periodo.toLocaleString('pt-PT') + '</td>' +

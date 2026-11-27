@@ -1,6 +1,7 @@
 import type { PrismaClient } from '@prisma/client';
 import { getLatestImportForPharmacy } from './import_registry';
 import { calcularTaxaIva } from './metricas';
+import { normalizeLabGroup } from './lab_groups';
 
 export type SalesPeriodKey = '1m' | '3m' | '6m' | '12m' | '2026' | '2025' | 'custom';
 
@@ -8,6 +9,7 @@ export interface SalesExplorerItem {
   cnp_codigo: string;
   designacao: string;
   laboratorio_titular: string;
+  grupo_laboratorio: string;
   molecula_dci: string | null;
   tipo_venda: string;
   categoria: string | null;
@@ -44,6 +46,7 @@ export interface SalesExplorerResponse {
   verFaturacao: boolean;
   items: SalesExplorerItem[];
   laboratorios: string[];
+  topGruposLab: Array<{ grupo: string; count: number }>;
 }
 
 export interface ProductMonthlyPoint {
@@ -297,6 +300,7 @@ export async function getSalesExplorerData(
 
   const allCnps = new Set<string>([...metricsMap.keys(), ...curMap.keys()]);
   const labsSet = new Set<string>();
+  const groupCounts = new Map<string, number>();
   const items: SalesExplorerItem[] = [];
 
   for (const cnp of allCnps) {
@@ -311,8 +315,12 @@ export async function getSalesExplorerData(
 
     const designacao = m?.designacao || ep?.designacao || `CNP ${cnp}`;
     const lab = (m?.laboratorio_titular || ep?.laboratorio_titular || 'Sem Laboratório').trim();
+    const grupoLab = normalizeLabGroup(lab);
     const tipoVenda = (m?.tipo_venda || ep?.tipo_venda || 'OUTRO').toUpperCase();
     if (lab) labsSet.add(lab);
+    if (grupoLab && grupoLab !== 'Sem Laboratório') {
+      groupCounts.set(grupoLab, (groupCounts.get(grupoLab) || 0) + 1);
+    }
 
     const custoMedio = m ? Number(m.custo_unitario_medio || 0) : 0;
     const stockValor = m ? round2(Number(m.stock_total_valor_custo || 0)) : 0;
@@ -342,6 +350,7 @@ export async function getSalesExplorerData(
       cnp_codigo: cnp,
       designacao,
       laboratorio_titular: lab,
+      grupo_laboratorio: grupoLab,
       molecula_dci: m?.molecula_dci || null,
       tipo_venda: tipoVenda,
       categoria: m?.categoria || ep?.categoria || null,
@@ -377,6 +386,11 @@ export async function getSalesExplorerData(
   const dataCorte = latestImport?.dados_ate ? String(latestImport.dados_ate).slice(0, 10) : null;
   const mesParcial = Boolean(latestImport?.mes_parcial && mesFim >= latestMonth);
 
+  const topGruposLab = Array.from(groupCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([grupo, count]) => ({ grupo, count }));
+
   const response: SalesExplorerResponse = {
     ok: true,
     farmaciaId,
@@ -391,6 +405,7 @@ export async function getSalesExplorerData(
     verFaturacao: params.verFaturacao,
     items,
     laboratorios: Array.from(labsSet).sort((a, b) => a.localeCompare(b, 'pt')),
+    topGruposLab,
   };
 
   salesExplorerCache.set(cacheKey, { data: response, expiresAt: Date.now() + CACHE_TTL_MS });
