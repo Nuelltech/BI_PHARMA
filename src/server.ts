@@ -7772,9 +7772,9 @@ function getDashboardHtml(): string {
   </div> <!-- /app-layout -->
 
   <!-- MODAL DE DETALHE MENSAL DO PRODUTO (VENDAS VS POSIÇÃO DE STOCK AO LONGO DO TEMPO) -->
-  <div class="modal-backdrop" id="salesProductModal" style="display: none; z-index: 1050;" onclick="if(event.target===this) closeSalesProductModal()">
-    <div class="modal-card" style="max-width: 920px; width: 95%; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; padding: 0; border-radius: 16px;">
-      <div style="padding: 18px 24px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;">
+  <div class="modal-backdrop" id="salesProductModal" style="display: none; z-index: 1050; align-items: center; justify-content: center; padding: 20px;" onclick="if(event.target===this) closeSalesProductModal()">
+    <div style="background: #ffffff; color: #0f172a; max-width: 940px; width: 100%; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; padding: 0; border-radius: 16px; border: 1px solid #cbd5e1; box-shadow: 0 25px 60px rgba(15, 23, 42, 0.38);">
+      <div style="padding: 18px 24px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-shrink: 0;">
         <div>
           <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
             <span id="salesModalTitle" style="font-size: 1.12rem; font-weight: 900; color: #0f172a;">Produto</span>
@@ -7782,12 +7782,12 @@ function getDashboardHtml(): string {
           </div>
           <div id="salesModalSubtitle" style="font-size: 0.82rem; color: #64748b; margin-top: 4px;"></div>
         </div>
-        <button type="button" class="btn btn-secondary" onclick="closeSalesProductModal()" style="padding: 6px 12px; font-weight: 700;">✕ Fechar</button>
+        <button type="button" class="btn btn-secondary" onclick="closeSalesProductModal()" style="padding: 6px 12px; font-weight: 700; flex-shrink: 0;">✕ Fechar</button>
       </div>
 
-      <div style="padding: 18px 24px; overflow-y: auto; flex: 1;">
+      <div id="salesModalScrollBody" style="padding: 20px 24px; overflow-y: auto; flex: 1; background: #ffffff;">
         <!-- 4 Mini-KPIs do Produto -->
-        <div id="salesModalKpis" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px;"></div>
+        <div id="salesModalKpis" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px;"></div>
 
         <!-- Gráfico Combinado SVG: Barras de Vendas + Linha de Posição de Stock Real -->
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; margin-bottom: 16px;">
@@ -7805,10 +7805,10 @@ function getDashboardHtml(): string {
         </div>
 
         <!-- Tabela Mensal Detalhada -->
-        <div style="border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden;">
-          <table style="width: 100%; border-collapse: collapse; font-size: 0.82rem;">
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden;">
+          <table style="width: 100%; border-collapse: collapse; font-size: 0.82rem; background: #ffffff;">
             <thead id="salesModalTableHead" style="background: #f8fafc; border-bottom: 1px solid #e2e8f0;"></thead>
-            <tbody id="salesModalTableBody"></tbody>
+            <tbody id="salesModalTableBody" style="background: #ffffff;"></tbody>
           </table>
         </div>
       </div>
@@ -18344,6 +18344,8 @@ function getDashboardHtml(): string {
       const tbodyEl = document.getElementById('salesModalTableBody');
 
       if (modal) modal.style.display = 'flex';
+      const scrollBody = document.getElementById('salesModalScrollBody');
+      if (scrollBody) scrollBody.scrollTop = 0;
       if (titleEl) titleEl.textContent = 'A carregar produto ' + cnp + '...';
       if (subEl) subEl.textContent = '';
       if (kpisEl) kpisEl.innerHTML = '';
@@ -18490,8 +18492,8 @@ function getDashboardHtml(): string {
           stockPoints.push({ x: cx, y: sy, val: pt.stock_fecho, label: pt.mes_label });
         }
 
-        // Etiqueta do mês no eixo X
-        const showLabel = series.length <= 14 || i % 2 === 0 || i === series.length - 1;
+        // Etiqueta do mês no eixo X (evita colisão entre o penúltimo e o último rótulo)
+        const showLabel = series.length <= 14 || i === series.length - 1 || (i % 2 === 0 && i !== series.length - 2);
         if (showLabel) {
           const shortLbl = pt.mes_label.replace(' 20', '/');
           svg += '<text x="' + cx.toFixed(1) + '" y="' + (H - 12) + '" text-anchor="middle" font-size="9.5" fill="#475569">' + escapeHtml(shortLbl) + '</text>';
