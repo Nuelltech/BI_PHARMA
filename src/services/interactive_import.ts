@@ -21,7 +21,7 @@ async function parseVendasAnyFormat(buf: Buffer, fileName: string): Promise<Pars
   }
   return parseWinpharVendasCsvFile(buf, fileName);
 }
-import { classifyProduct, classifyAllExistingProducts } from './classifier';
+import { classifyProduct } from './classifier';
 import {
   detectSifarmaPdfKind,
   parseSifarmaInventarioNormalLines,
@@ -671,8 +671,8 @@ export async function executeInteractiveImport(
             `${parsedInv.rows.length} artigos lidos`
           );
 
-          // 1. Produtos novos em ProdutoMestre (skipDuplicates)
-          const uniqueProds = new Map<string, { cnp_codigo: string; designacao: string; tipo_venda: string; categoria: string; aim?: string | null }>();
+          // 1. Produtos novos em ProdutoMestre (skipDuplicates, já classificados em memória)
+          const uniqueProds = new Map<string, { cnp_codigo: string; designacao: string; tipo_venda: string; macro_area: string | null; categoria: string; subcategoria: string | null; sazonalidade: string | null; aim?: string | null }>();
           for (const r of parsedInv.rows) {
             const cnp = normalizeCnp(r.codigo);
             const cls = classifyProduct(cnp, r.designacao, null);
@@ -680,7 +680,10 @@ export async function executeInteractiveImport(
               cnp_codigo: cnp,
               designacao: r.designacao,
               tipo_venda: cls.tipo_venda,
+              macro_area: cls.macro_area || null,
               categoria: cls.categoria,
+              subcategoria: cls.subcategoria || null,
+              sazonalidade: cls.sazonalidade || null,
               aim: r.aim || null,
             });
           }
@@ -754,17 +757,19 @@ export async function executeInteractiveImport(
             `${parsedSc.rows.length} produtos sem consumo detetados`
           );
 
-          // 1. Criar produtos novos em ProdutoMestre com Família/Sub-Família e IVA real
-          const uniqueProds = new Map<string, { cnp_codigo: string; designacao: string; tipo_venda: string; categoria: string; subcategoria: string | null; taxa_iva: number | null; aim: string | null }>();
+          // 1. Criar produtos novos em ProdutoMestre com Família/Sub-Família, classificação completa e IVA real
+          const uniqueProds = new Map<string, { cnp_codigo: string; designacao: string; tipo_venda: string; macro_area: string | null; categoria: string; subcategoria: string | null; sazonalidade: string | null; taxa_iva: number | null; aim: string | null }>();
           for (const r of parsedSc.rows) {
             const cnp = normalizeCnp(r.codigo);
-            const cls = classifyProduct(cnp, r.designacao, null);
+            const cls = classifyProduct(cnp, r.designacao, r.taxaIvaEstimada);
             uniqueProds.set(cnp, {
               cnp_codigo: cnp,
               designacao: r.designacao,
               tipo_venda: cls.tipo_venda,
+              macro_area: cls.macro_area || null,
               categoria: r.familia || cls.categoria,
-              subcategoria: r.subfamilia || null,
+              subcategoria: r.subfamilia || cls.subcategoria || null,
+              sazonalidade: cls.sazonalidade || null,
               taxa_iva: r.taxaIvaEstimada,
               aim: r.aim || null,
             });
@@ -1127,16 +1132,6 @@ export async function executeInteractiveImport(
         tipo: 'ERRO',
         mensagem: err.message || String(err),
       });
-    }
-  }
-
-  // Enriquecimento automático do catálogo global sempre que entrarem produtos novos
-  if (stats.totalProdutosNovos > 0) {
-    try {
-      onProgress?.(94, `A enriquecer ${stats.totalProdutosNovos} produto(s) novo(s) no catálogo...`, 'A cruzar classificação Infarmed...');
-      await classifyAllExistingProducts(prisma);
-    } catch (clsErr: any) {
-      console.warn('[Import] Aviso ao enriquecer produtos novos:', clsErr?.message || clsErr);
     }
   }
 
