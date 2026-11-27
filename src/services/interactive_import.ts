@@ -828,6 +828,35 @@ export async function executeInteractiveImport(
           const activeStockCount = invRows.length > 0 ? await bulkUpsertInventario(prisma, invRows) : 0;
           stats.totalInventarioAtivoAtualizado += activeStockCount;
 
+          // 4B. Gravar data_ultima_compra (e prateleira) no Inventario para deteção de compras em monos
+          const compraUpdates = parsedSc.rows
+            .filter((r) => r.dataUltimaCompra)
+            .map((r) => ({
+              cnp: normalizeCnp(r.codigo),
+              dt: new Date(`${r.dataUltimaCompra}T12:00:00.000Z`),
+              prat: r.prateleira || null,
+            }));
+          const compraDedup = new Map<string, { dt: Date; prat: string | null }>();
+          for (const u of compraUpdates) {
+            const prev = compraDedup.get(u.cnp);
+            if (!prev || u.dt > prev.dt) compraDedup.set(u.cnp, { dt: u.dt, prat: u.prat });
+          }
+          const compraEntries = Array.from(compraDedup.entries());
+          for (let i = 0; i < compraEntries.length; i += BULK_BATCH_SIZE) {
+            const chunk = compraEntries.slice(i, i + BULK_BATCH_SIZE);
+            await prisma.$executeRawUnsafe(
+              `UPDATE "Inventario" AS i
+               SET "data_ultima_compra" = u.dt,
+                   "prateleira" = COALESCE(u.prat, i."prateleira")
+               FROM unnest($1::text[], $2::timestamptz[], $3::text[]) AS u(cnp, dt, prat)
+               WHERE i."farmaciaId" = $4 AND i."cnp_codigo" = u.cnp`,
+              chunk.map(([cnp]) => cnp),
+              chunk.map(([, v]) => v.dt),
+              chunk.map(([, v]) => v.prat),
+              targetFarmaciaId
+            );
+          }
+
           // 5. Registar data da última venda real (apenas para CNPs sem histórico de vendas na BD)
           const rowsWithLastSale = parsedSc.rows.filter((r) => r.dataUltimaVenda);
           let lastSaleRefsInserted = 0;

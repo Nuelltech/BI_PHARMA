@@ -13521,6 +13521,7 @@ function getDashboardHtml(): string {
               \${sortableTh('monos', 'pvp', 'PVP (Margem)')}
               \${sortableTh('monos', 'capital_imobilizado', 'Capital Imobilizado (€)')}
               \${sortableTh('monos', 'ultima_venda', 'Última Venda')}
+              \${sortableTh('monos', 'ultima_compra', 'Última Compra')}
               <th>Estratégia Recomendada</th>
             </tr>
           </thead>
@@ -13535,6 +13536,9 @@ function getDashboardHtml(): string {
                 <td>\${r.pvp !== null ? r.pvp.toFixed(2) + ' €' : '-'} \${r.margem_percentagem ? '(' + r.margem_percentagem.toFixed(0) + '%)' : ''}</td>
                 <td style="color:#fbbf24;font-weight:700">\${r.capital_imobilizado.toFixed(2)} €</td>
                 <td>\${r.ultima_venda || 'Sem vendas (13m)'}</td>
+                <td>\${r.ultima_compra
+                  ? (r.ultima_compra + ((!r.ultima_venda || r.ultima_compra > r.ultima_venda) ? '<br/><span class="badge badge-danger" style="font-size:0.68rem;margin-top:3px;">⚠️ Comprado s/ rotação</span>' : ''))
+                  : '<span style="color:var(--muted)">—</span>'}</td>
                 <td>\${r.acao_sugerida}</td>
               </tr>
             \`).join('')}

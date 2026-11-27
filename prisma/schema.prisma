@@ -462,8 +462,9 @@ model Inventario {
   prateleira       String?
   quantidade       Int
   custo_unitario   Decimal       @db.Decimal(10, 2)
-  data_validade    DateTime?     // Mapeado a partir do ficheiro de validades
-  data_extracao    DateTime      @default(now())
+  data_validade      DateTime?     // Mapeado a partir do ficheiro de validades
+  data_ultima_compra DateTime?     // Mapeado a partir do relatório Sifarma "Produtos sem Consumo"
+  data_extracao      DateTime      @default(now())
   
   farmacia         Farmacia      @relation(fields: [farmaciaId], references: [id])
   produto          ProdutoMestre @relation(fields: [cnp_codigo], references: [cnp_codigo])

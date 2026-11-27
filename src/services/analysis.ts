@@ -54,6 +54,7 @@ export interface ProdutoMonoItem {
   margem_percentagem: number | null;
   capital_imobilizado: number;
   ultima_venda: string | null;
+  ultima_compra?: string | null;
   unidades_vendidas_ano: number;
   data_validade: string | null;
   acao_sugerida: string;
@@ -718,6 +719,9 @@ export async function analyzePharmacyInventory(
         capital_imobilizado: valorStockItem,
         ultima_venda: statsVenda.ultimaDataVenda
           ? statsVenda.ultimaDataVenda.toISOString().slice(0, 10)
+          : null,
+        ultima_compra: (item as any).data_ultima_compra
+          ? new Date((item as any).data_ultima_compra).toISOString().slice(0, 10)
           : null,
         unidades_vendidas_ano: statsVenda.totalUnidades,
         data_validade: item.data_validade ? item.data_validade.toISOString().slice(0, 10) : null,
