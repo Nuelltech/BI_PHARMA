@@ -13225,13 +13225,162 @@ function getDashboardHtml(): string {
       });
     }
 
+    function updateAnalyticsKpisFromFilters(matchRow, hasActiveFilter, tvFilter, filter) {
+      if (!currentReport || !currentReport.resumo_executivo) return;
+      const r = currentReport.resumo_executivo;
+      const diasMonos = document.getElementById('selectDiasMonos')?.value || '90';
+
+      if (!hasActiveFilter) {
+        const elStock = document.getElementById('kpiStockValor');
+        const elStockSub = document.getElementById('kpiStockSub');
+        if (elStock) elStock.textContent = r.valor_total_stock_custo.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (elStockSub) elStockSub.textContent = r.total_artigos_inventario + ' artigos | ' + r.total_unidades_stock + ' unidades';
+
+        const elGen = document.getElementById('kpiGenericosValor');
+        const elGenSub = document.getElementById('kpiGenericosSub');
+        if (elGen) elGen.textContent = r.valor_stock_genericos_mg.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (elGenSub) elGenSub.textContent = r.artigos_genericos_mg + ' MG vs ' + r.artigos_medicamentos_marca + ' Marca (' + r.total_grupos_dci_duplicados + ' moléculas dup.)';
+
+        const totalLivre = r.artigos_venda_livre_psbe + r.artigos_mnsrm;
+        const pctLivre = r.total_artigos_inventario > 0 ? ((totalLivre / r.total_artigos_inventario) * 100).toFixed(1) : '0.0';
+        const elEst = document.getElementById('kpiEstatutoRatio');
+        const elEstSub = document.getElementById('kpiEstatutoSub');
+        if (elEst) elEst.textContent = pctLivre + '% Sem Receita';
+        if (elEstSub) elEstSub.textContent = r.artigos_venda_livre_psbe + ' PSBE | ' + r.artigos_mnsrm + ' MNSRM | ' + r.artigos_msrm_receita + ' MSRM';
+
+        const restosTxt = r.total_artigos_restos_gaveta ? (' (Restos ≤2 un: ' + r.total_artigos_restos_gaveta + ')') : '';
+        const elMon = document.getElementById('kpiMonosValor');
+        const elMonSub = document.getElementById('kpiMonosSub');
+        if (elMon) elMon.textContent = r.valor_total_monos.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (elMonSub) elMonSub.textContent = r.total_artigos_monos + ' artigos (' + r.percentagem_capital_em_monos + '% do stock) s/ vendas a ' + diasMonos + 'd' + restosTxt;
+
+        const elCad = document.getElementById('kpiCaducidadeValor');
+        const elCadSub = document.getElementById('kpiCaducidadeSub');
+        if (elCad) elCad.textContent = r.valor_total_risco_caducidade.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+        if (elCadSub) elCadSub.textContent = r.total_artigos_risco_caducidade + ' artigos (' + r.unidades_totais_risco_caducidade + ' emb. em risco)';
+        return;
+      }
+
+      // Recalcula dinamicamente os 5 cartões KPI com base nos filtros ativos
+      const filtMonos = (currentReport.monos || []).filter(matchRow);
+      const filtCad = (currentReport.risco_elevado_caducidade || []).filter(matchRow);
+      const filtCob = (currentReport.alertas_excesso_cobertura || []).filter(matchRow);
+
+      // União deduplicada dos artigos filtrados para estimar Stock, Estatuto e Genéricos do segmento selecionado
+      const seenMap = new Map();
+      [filtMonos, filtCad, filtCob].forEach(function(arr) {
+        arr.forEach(function(item) {
+          if (item && item.cnp_codigo && !seenMap.has(item.cnp_codigo)) {
+            seenMap.set(item.cnp_codigo, item);
+          }
+        });
+      });
+      const filtItems = Array.from(seenMap.values());
+
+      let filtStockVal = 0;
+      let filtStockUn = 0;
+      let fPsbe = 0;
+      let fMnsrm = 0;
+      let fMsrm = 0;
+      let fGenVal = 0;
+      let fGenCount = 0;
+      let fMarcaCount = 0;
+
+      filtItems.forEach(function(it) {
+        const un = Number(it.stock_atual || 0);
+        const val = Number(it.valor_imobilizado ?? it.valor_stock_excesso ?? (un * Number(it.custo_unitario || 0)) ?? 0);
+        filtStockUn += un;
+        filtStockVal += val;
+        if (it.tipo_venda === 'VENDA_LIVRE' || it.tipo_venda === 'PSBE') fPsbe++;
+        else if (it.tipo_venda === 'MNSRM') fMnsrm++;
+        else if (it.tipo_venda === 'MSRM') fMsrm++;
+        if (it.segmento === 'GENERICO_MG' || it.eh_generico) {
+          fGenCount++;
+          fGenVal += val;
+        } else if (it.segmento === 'MEDICAMENTO_MARCA') {
+          fMarcaCount++;
+        }
+      });
+
+      const monosVal = filtMonos.reduce(function(s, i) { return s + Number(i.valor_imobilizado || 0); }, 0);
+      const monosRestos = filtMonos.filter(function(i) { return Number(i.stock_atual || 0) <= 2; }).length;
+      const monosPct = filtStockVal > 0 ? ((monosVal / filtStockVal) * 100).toFixed(1) : '0.0';
+
+      const cadVal = filtCad.reduce(function(s, i) { return s + Number(i.valor_em_risco || 0); }, 0);
+      const cadUn = filtCad.reduce(function(s, i) { return s + Number(i.unidades_em_risco || 0); }, 0);
+
+      const isGenCompatible = tvFilter === 'ALL' || tvFilter === 'GENERICO_MG' || tvFilter === 'MSRM';
+      const filtGenGroups = isGenCompatible
+        ? (currentReport.consolidacao_genericos_dci || []).filter(function(g) {
+            return !filter ||
+              normStr(g.grupo_equivalencia_dci).includes(filter) ||
+              normStr(g.molecula_dci).includes(filter) ||
+              (g.todos_laboratorios || []).some(function(l) { return normStr(l.cnp_codigo).includes(filter) || normStr(l.designacao).includes(filter); });
+          })
+        : [];
+
+      const elStock = document.getElementById('kpiStockValor');
+      const elStockSub = document.getElementById('kpiStockSub');
+      if (elStock) elStock.textContent = filtStockVal.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+      if (elStockSub) elStockSub.textContent = filtItems.length + ' artigos filtrados | ' + filtStockUn.toLocaleString('pt-PT') + ' unidades';
+
+      const elGen = document.getElementById('kpiGenericosValor');
+      const elGenSub = document.getElementById('kpiGenericosSub');
+      if (elGen) elGen.textContent = fGenVal.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+      if (elGenSub) elGenSub.textContent = fGenCount + ' MG vs ' + fMarcaCount + ' Marca (' + filtGenGroups.length + ' moléculas dup.)';
+
+      const fTotalLivre = fPsbe + fMnsrm;
+      const fPctLivre = filtItems.length > 0 ? ((fTotalLivre / filtItems.length) * 100).toFixed(1) : '0.0';
+      const elEst = document.getElementById('kpiEstatutoRatio');
+      const elEstSub = document.getElementById('kpiEstatutoSub');
+      if (elEst) elEst.textContent = fPctLivre + '% Sem Receita';
+      if (elEstSub) elEstSub.textContent = fPsbe + ' PSBE | ' + fMnsrm + ' MNSRM | ' + fMsrm + ' MSRM (filtrado)';
+
+      const elMon = document.getElementById('kpiMonosValor');
+      const elMonSub = document.getElementById('kpiMonosSub');
+      if (elMon) elMon.textContent = monosVal.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+      if (elMonSub) elMonSub.textContent = filtMonos.length + ' artigos (' + monosPct + '% do filtrado) s/ vendas a ' + diasMonos + 'd (Restos ≤2 un: ' + monosRestos + ')';
+
+      const elCad = document.getElementById('kpiCaducidadeValor');
+      const elCadSub = document.getElementById('kpiCaducidadeSub');
+      if (elCad) elCad.textContent = cadVal.toLocaleString('pt-PT', { minimumFractionDigits: 2 }) + ' €';
+      if (elCadSub) elCadSub.textContent = filtCad.length + ' artigos (' + cadUn + ' emb. em risco — filtrado)';
+    }
+
     function renderActiveTable() {
       if (!currentReport || activeTab === 'plano' || activeTab === 'copilot' || activeTab === 'campaigns') return;
       const rawFilter = document.getElementById('tableFilter') ? document.getElementById('tableFilter').value : '';
       const filter = normStr(rawFilter);
       const tvFilter = document.getElementById('selectTipoVenda').value;
+      const macroAreaFilter = document.getElementById('selectMacroArea') ? document.getElementById('selectMacroArea').value : 'ALL';
+      const catFilter = document.getElementById('selectCategoria') ? document.getElementById('selectCategoria').value : 'ALL';
+      const sazFilter = document.getElementById('selectSazonalidade') ? document.getElementById('selectSazonalidade').value : 'ALL';
       const table = document.getElementById('mainTable');
       const countEl = document.getElementById('tableRowCount');
+
+      const matchRow = (i) => {
+        if (!matchesTipoVendaFilter(i, tvFilter)) return false;
+        if (!matchesMacroAreaFilter(i, macroAreaFilter)) return false;
+        if (!matchesCategoriaFilter(i, catFilter)) return false;
+        if (!matchesSazonalidadeFilter(i, sazFilter)) return false;
+        if (!filter) return true;
+        return (
+          normStr(i.cnp_codigo).includes(filter) ||
+          normStr(i.designacao).includes(filter) ||
+          normStr(i.categoria).includes(filter) ||
+          normStr(i.subcategoria).includes(filter) ||
+          normStr(i.grupo_equivalencia_dci).includes(filter)
+        );
+      };
+
+      const hasActiveFilter =
+        tvFilter !== 'ALL' ||
+        macroAreaFilter !== 'ALL' ||
+        catFilter !== 'ALL' ||
+        sazFilter !== 'ALL' ||
+        filter.length > 0;
+
+      updateAnalyticsKpisFromFilters(matchRow, hasActiveFilter, tvFilter, filter);
 
       if (activeTab === 'genericos') {
         const isCompatible = tvFilter === 'ALL' || tvFilter === 'GENERICO_MG' || tvFilter === 'MSRM';
@@ -13295,25 +13444,6 @@ function getDashboardHtml(): string {
         \`;
         return;
       }
-
-      const macroAreaFilter = document.getElementById('selectMacroArea') ? document.getElementById('selectMacroArea').value : 'ALL';
-      const catFilter = document.getElementById('selectCategoria') ? document.getElementById('selectCategoria').value : 'ALL';
-      const sazFilter = document.getElementById('selectSazonalidade') ? document.getElementById('selectSazonalidade').value : 'ALL';
-
-      const matchRow = (i) => {
-        if (!matchesTipoVendaFilter(i, tvFilter)) return false;
-        if (!matchesMacroAreaFilter(i, macroAreaFilter)) return false;
-        if (!matchesCategoriaFilter(i, catFilter)) return false;
-        if (!matchesSazonalidadeFilter(i, sazFilter)) return false;
-        if (!filter) return true;
-        return (
-          normStr(i.cnp_codigo).includes(filter) ||
-          normStr(i.designacao).includes(filter) ||
-          normStr(i.categoria).includes(filter) ||
-          normStr(i.subcategoria).includes(filter) ||
-          normStr(i.grupo_equivalencia_dci).includes(filter)
-        );
-      };
 
       let allRows = [];
       if (activeTab === 'caducidade') {
